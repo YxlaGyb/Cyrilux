@@ -1,4 +1,5 @@
 /ola_out
+out*
 /.venv
 /__pycache__
 /dataset
@@ -6,3 +7,5 @@
 *.pt
 *.jsonl
 /docs
+*.egg-info
+/.vscode

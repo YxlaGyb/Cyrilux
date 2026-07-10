@@ -131,7 +131,7 @@ def main():
     pc_model.eval()
 
     # ── 数据 (用于 PPL) ──
-    data_path = os.path.join(ROOT, 'dataset', 'pretrain_t2t_mini.jsonl')
+    data_path = os.path.join(ROOT, 'datasets', 'pretrain_t2t_mini.jsonl')
     ds = _LocalDataset(data_path, max_length=128, max_samples=500)
     loader = DataLoader(ds, batch_size=8, shuffle=False, num_workers=0)
 

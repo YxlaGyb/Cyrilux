@@ -15,7 +15,7 @@
 import os, json
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DST = os.path.join(ROOT, 'dataset')
+DST = os.path.join(ROOT, 'datasets')
 
 TASKS = {
     'a': 'agent_rl_math.jsonl',
@@ -50,7 +50,7 @@ def conv_to_text(conversations, gt=None):
 
 
 def process():
-    src_dir = os.path.join(ROOT, 'dataset')
+    src_dir = os.path.join(ROOT, 'datasets')
     for task_id, fname in sorted(TASKS.items()):
         src_path = os.path.join(src_dir, fname)
         dst_path = os.path.join(DST, f'task_{task_id}.jsonl')

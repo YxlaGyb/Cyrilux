@@ -17,7 +17,7 @@ Phase 1: 无回放 (A→B→C→D 灾难性遗忘基线)
 Phase 2: MemoryBank + Sniffer 保护 (A→B→C→D 持续学习)
 输出: 4×4 CE 矩阵 (行=训练完第 i 个任务, 列=在第 j 个任务上的 CE)
 """
-import os, sys, json, math, time, argparse
+import os, sys, json, math, time, argparse, re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
@@ -33,38 +33,103 @@ from trainer_utils import get_lr, setup_seed
 # 数据集
 # ═══════════════════════════════════════════════════════════════════
 
-class ByteDataset(Dataset):
+class DualChannelDataset(Dataset):
+    """双通道数据集: ch0=原始字节值, ch1=角色编码 0:pad/1:user/2:assistant/3:system."""
+
+    ROLE_MAP = {"padding": 0, "user": 1, "assistant": 2, "system": 3}
+
     def __init__(self, data_path, max_length=128, max_samples=None):
         super().__init__()
-        self.byte_tensors = []
+        self.dual_tensors = []  # list of [2, max_length] float32
         self.label_tensors = []
         with open(data_path, 'r', encoding='utf-8') as f:
             for i, line in enumerate(f):
                 if max_samples and i >= max_samples:
                     break
                 sample = json.loads(line)
-                # ponytail: 兼容多种 jsonl 格式
-                if 'text' in sample:
-                    raw = sample['text']
-                elif 'conversations' in sample:
-                    raw = '\n'.join(m.get('value', '') for m in sample['conversations'])
-                elif 'chosen' in sample:
-                    raw = sample['chosen']
-                else:
-                    raw = str(sample)
-                byte_seq = str(raw).encode('utf-8')[:max_length]
+                raw_text, roles = self._extract_with_roles(sample)
+                byte_seq = raw_text.encode('utf-8')[:max_length]
                 padded = byte_seq.ljust(max_length, b'\x00')
-                t = torch.frombuffer(bytearray(padded), dtype=torch.uint8).clone()
-                self.byte_tensors.append(t)
-                lbl = t.clone()
-                lbl[t == 0x00] = -100
-                self.label_tensors.append(lbl.to(torch.long))
+                byte_t = torch.frombuffer(bytearray(padded), dtype=torch.uint8).clone().float()
+
+                # 角色编码: 按字节偏移填充, padding 处填 0
+                role_t = torch.zeros(max_length, dtype=torch.float)
+                for start, end, role in roles:
+                    # 将 role 映射到对应 UTF-8 字节区间
+                    b_start = len(raw_text[:start].encode('utf-8'))
+                    b_end = min(len(raw_text[:end].encode('utf-8')), max_length)
+                    if b_start < max_length:
+                        role_t[b_start:b_end] = self.ROLE_MAP.get(role, 2.0)
+
+                dual_t = torch.stack([byte_t, role_t], dim=0)  # [2, max_length]
+                self.dual_tensors.append(dual_t)
+
+                lbl = byte_t.clone().long()
+                lbl[byte_t == 0x00] = -100
+                self.label_tensors.append(lbl)
+
+    @staticmethod
+    def _extract_with_roles(sample):
+        """从 sample 提取 (raw_text, [(start, end, role), ...]).
+
+        支持 conversations 格式 (含 role 字段) 和 text 格式 (启发式拆分).
+        """
+        if 'conversations' in sample:
+            raw = ''
+            roles = []
+            for m in sample['conversations']:
+                role = m.get('role', 'assistant')
+                content = m.get('content', m.get('value', ''))
+                start = len(raw)
+                raw += content
+                end = len(raw)
+                roles.append((start, end, role))
+            return raw, roles
+        elif 'text' in sample:
+            raw = sample['text']
+        elif 'chosen' in sample:
+            raw = sample['chosen']
+        else:
+            raw = str(sample)
+
+        # 1) 优先尝试解析 <|user|>/<|assistant|>/<|system|> 标记 (data_converter 格式)
+        marker_re = r'(<\|user\|>|<\|assistant\|>|<\|system\|>|<\|end\|>)'
+        parts = re.split(marker_re, raw)
+        if len(parts) >= 5:  # 至少 user + assistant + end
+            clean_raw = ''
+            roles = []
+            i = 1  # parts[0] 是标记前的空字符串
+            while i < len(parts) - 1:
+                tag = parts[i]
+                if tag == '<|end|>':
+                    break
+                if tag in ('<|user|>', '<|assistant|>', '<|system|>', '<|tool|>'):
+                    role = tag.strip('<>|')
+                    content = parts[i + 1].strip() if i + 1 < len(parts) else ''
+                    if content:
+                        start = len(clean_raw)
+                        clean_raw += content
+                        end = len(clean_raw)
+                        roles.append((start, end, role))
+                    i += 2
+                else:
+                    i += 1
+            if roles:
+                return clean_raw, roles
+
+        # 2) 回退: 启发式拆分 — 首行 \n 前 → user, 后 → assistant
+        first_nl = raw.find('\n')
+        if first_nl > 0 and first_nl < len(raw) * 0.6:
+            roles = [(0, first_nl, 'user'), (first_nl, len(raw), 'assistant')]
+        else:
+            roles = [(0, len(raw), 'assistant')]
+        return raw, roles
 
     def __len__(self):
-        return len(self.byte_tensors)
+        return len(self.dual_tensors)
 
     def __getitem__(self, index):
-        return self.byte_tensors[index].clone(), self.label_tensors[index].clone()
+        return self.dual_tensors[index].clone(), self.label_tensors[index].clone()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -86,19 +151,23 @@ def make_optimizer(model, lr):
 
 def warmup(model, batch_size, seq_len, device):
     with torch.no_grad():
-        dummy = torch.randint(0, 256, (batch_size, seq_len), device=device).long()
+        dummy_byte = torch.full((batch_size, seq_len), 128.0, device=device)
+        dummy_role = torch.full((batch_size, seq_len), 2.0, device=device)
+        dummy = torch.stack([dummy_byte, dummy_role], dim=1)  # [bsz, 2, seq]
+        dummy_lbl = torch.full((batch_size, seq_len), -100, device=device).long()
         dummy_pos = model.get_position_embeddings(seq_len, device)
-        model.forward_with_ce(dummy, dummy, dummy_pos)
+        model.forward_with_ce(dummy, dummy_lbl, dummy_pos)
 
 @torch.no_grad()
 def evaluate(model, data_path, max_seq_len, batch_size, max_samples, device):
-    ds = ByteDataset(data_path, max_length=max_seq_len, max_samples=max_samples)
+    ds = DualChannelDataset(data_path, max_length=max_seq_len, max_samples=max_samples)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
     total_ce, total_tokens = 0.0, 0
     model.eval()
     for bt, lt in loader:
         bt, lt = bt.to(device), lt.to(device)
-        pos = model.get_position_embeddings(bt.size(1), device)
+        seq_len = bt.size(2)  # [bsz, 2, seq]
+        pos = model.get_position_embeddings(seq_len, device)
         _, ce = model.forward_with_ce(bt, lt, pos)
         n_valid = (lt != -100).sum().item()
         total_ce += ce.item() * n_valid
@@ -111,7 +180,7 @@ def evaluate(model, data_path, max_seq_len, batch_size, max_samples, device):
 def train_step(model, optim, bt, lt, device, base_lr, gs, total_steps):
     """单步训练, 返回 loss + 更新后的 gs."""
     bt, lt = bt.to(device), lt.to(device)
-    pos = model.get_position_embeddings(bt.size(1), device)
+    pos = model.get_position_embeddings(bt.size(2), device)  # [bsz, 2, seq]
     _, ce = model.forward_with_ce(bt, lt, pos)
     optim.zero_grad(set_to_none=True)
     ce.backward()
@@ -139,7 +208,7 @@ def run_phase1(model, optim, task_paths, epochs, max_seq_len, batch_size,
     matrix = [[0.0] * n for _ in range(n)]
 
     for i, path in enumerate(task_paths):
-        ds = ByteDataset(path, max_length=max_seq_len, max_samples=None)
+        ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
         total_steps = len(loader) * epochs
         gs = 0
@@ -192,7 +261,7 @@ def run_phase2(model, optim, task_paths, epochs, max_seq_len, batch_size, max_sa
         if i == 0:
             # 第一个任务: 纯 CE 训练 (无保护)
             print(f'\n--- [P2-{name}] {os.path.basename(path)} (首次, 无保护) ---')
-            ds = ByteDataset(path, max_length=max_seq_len, max_samples=None)
+            ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
             loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
             total_steps = len(loader) * epochs
             gs = 0
@@ -209,7 +278,7 @@ def run_phase2(model, optim, task_paths, epochs, max_seq_len, batch_size, max_sa
         else:
             # 后续任务: 带 MemoryBank 回放 + Sniffer 保护
             print(f'\n--- [P2-{name}] {os.path.basename(path)} [回放保护中] ---')
-            ds = ByteDataset(path, max_length=max_seq_len, max_samples=None)
+            ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
             loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
             total_steps = len(loader) * epochs
             gs = 0
@@ -230,7 +299,7 @@ def run_phase2(model, optim, task_paths, epochs, max_seq_len, batch_size, max_sa
                         if replay_ex:
                             rb = torch.stack([ex.byte_tensor for ex in replay_ex], dim=0).to(device)
                             rl = torch.stack([ex.label_tensor for ex in replay_ex], dim=0).to(device)
-                            rp = model.get_position_embeddings(rb.size(1), device)
+                            rp = model.get_position_embeddings(rb.size(2), device)  # [bsz, 2, seq]
                             _, rloss = model.forward_with_ce(rb, rl, rp)
                             optim.zero_grad(set_to_none=True)
                             rloss.backward()
@@ -253,7 +322,7 @@ def run_phase2(model, optim, task_paths, epochs, max_seq_len, batch_size, max_sa
                                 if replay_data is None:
                                     break
                                 rb, rl = replay_data
-                                rp = model.get_position_embeddings(rb.size(1), device)
+                                rp = model.get_position_embeddings(rb.size(2), device)  # [bsz, 2, seq]
                                 _, rloss = model.forward_with_ce(rb, rl, rp)
                                 optim.zero_grad(set_to_none=True)
                                 rloss.backward()
@@ -271,7 +340,7 @@ def run_phase2(model, optim, task_paths, epochs, max_seq_len, batch_size, max_sa
 
         # 收集 exemplars → MemoryBank (每任务都做, 即使第一个任务)
         print(f'  [P2-{name}] 收集 exemplars → MemoryBank...')
-        ds_eval = ByteDataset(path, max_length=max_seq_len, max_samples=None)
+        ds_eval = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
         n_ex = min(n_exemplars, len(ds_eval))
         idx = torch.randperm(len(ds_eval))[:n_ex].tolist()
         samples_list, total_bl = [], 0.0
@@ -280,7 +349,7 @@ def run_phase2(model, optim, task_paths, epochs, max_seq_len, batch_size, max_sa
                 bt, lt = ds_eval[idx_i]
                 samples_list.append((bt, lt))
                 x, y = bt.unsqueeze(0).to(device), lt.unsqueeze(0).to(device)
-                p = model.get_position_embeddings(x.size(1), device)
+                p = model.get_position_embeddings(x.size(2), device)  # [1, 2, seq]
                 _, bl = model.forward_with_ce(x, y, p)
                 total_bl += bl.item()
         memory_bank.add_samples(name, samples_list, dopamine_score=0.5,

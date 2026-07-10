@@ -158,7 +158,7 @@ def main():
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     LOG(f'Device: {device}')
 
-    ds = EvalDataset(os.path.join(ROOT, 'dataset', 'pretrain_t2t_mini.jsonl'))
+    ds = EvalDataset(os.path.join(ROOT, 'datasets', 'pretrain_t2t_mini.jsonl'))
     loader = DataLoader(ds, batch_size=8, shuffle=False, num_workers=0)
     loader_ss = DataLoader(ds, batch_size=8, shuffle=True, num_workers=0)  # 自监督用shuffle
     

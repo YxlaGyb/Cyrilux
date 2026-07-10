@@ -33,7 +33,7 @@ class PCLocalBackbone(nn.Module):
 
         # ── 字节输入投影 (替代 Embedding) ──
         # Conv1D(1→hidden, k=13, causal), 13 字节滑动窗口 ≈ 4-13 UTF-8 字符
-        self.byte_proj = nn.Conv1d(1, config.hidden_size, kernel_size=13, padding=0, bias=False)
+        self.byte_proj = nn.Conv1d(2, config.hidden_size, kernel_size=13, padding=0, bias=False)
 
         # ── 局部 Dilated Conv 层 (L=6, d=1,2,4,8,16,32, RF=127) ──
         self.layers = nn.ModuleList([
@@ -65,9 +65,8 @@ class PCLocalBackbone(nn.Module):
               hidden_states[2] = MLP₁ output (pre-next-Conv)
               ...
         """
-        # 字节 → 连续波: [bsz, seq] → [bsz, 1, seq] → causal pad(12,0) → [bsz, hidden, seq] → [bsz, seq, hidden]
-        x = byte_seq.float().unsqueeze(1)
-        x = F.pad(x, (12, 0))  # causal pad for byte_proj k=13
+        # 双通道: [bsz, 2, seq] → causal pad(12,0) → [bsz, hidden, seq] → [bsz, seq, hidden]
+        x = F.pad(byte_seq.float(), (12, 0))  # causal pad for byte_proj k=13
         h = self.byte_proj(x).transpose(1, 2)
         hidden_states = [h]
 
@@ -123,17 +122,22 @@ class PCLocalBackbone(nn.Module):
         """
         device = byte_seq.device
         batch_size = byte_seq.shape[0]
+
+        # 单通道 [bsz, seq] uint8 → 双通道 [bsz, 2, seq] float (角色=assistant)
+        byte_float = byte_seq.float()
+        role_ch = torch.full_like(byte_float, 2.0)
+        dual_input = torch.stack([byte_float, role_ch], dim=1)  # [bsz, 2, seq]
+
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        generated = byte_seq.clone()
 
         for _ in range(max_new_tokens):
-            logits, _ = self.forward_with_hidden(generated)
+            logits, _ = self.forward_with_hidden(dual_input)
             next_logits = logits[:, -1, :] / temperature
 
             # 重复惩罚
             if repetition_penalty != 1.0:
                 for i in range(batch_size):
-                    seen = torch.unique(generated[i])
+                    seen = torch.unique(dual_input[i, 0])  # byte channel
                     score = next_logits[i, seen]
                     next_logits[i, seen] = torch.where(
                         score > 0, score / repetition_penalty, score * repetition_penalty
@@ -171,11 +175,16 @@ class PCLocalBackbone(nn.Module):
                     next_byte,
                 )
 
-            generated = torch.cat([generated, next_byte.to(torch.uint8)], dim=-1)
+            # 追加到双通道: byte + role(assistant)
+            new_byte = next_byte.float()
+            new_role = torch.full_like(new_byte, 2.0)
+            new_dual = torch.stack([new_byte, new_role], dim=1)  # [bsz, 2, 1]
+            dual_input = torch.cat([dual_input, new_dual], dim=-1)  # [bsz, 2, seq+1]
 
             if eos_byte is not None:
                 finished |= next_byte.squeeze(-1).eq(eos_byte)
                 if finished.all():
                     break
 
-        return generated
+        # 从双通道提取字节通道作为返回值
+        return dual_input[:, 0].to(torch.uint8)

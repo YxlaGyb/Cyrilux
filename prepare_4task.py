@@ -15,11 +15,11 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # --- 源数据路径 ---
 SOURCES = {
-    'A': os.path.join(ROOT, 'dataset', 'pretrain_t2t_mini.jsonl'),
-    'B_exam': os.path.join(ROOT, 'dataset', 'lora_exam.jsonl'),
-    'B_math': os.path.join(ROOT, 'dataset', 'agent_rl_math.jsonl'),
-    'C': os.path.join(ROOT, 'dataset', 'lora_medical.jsonl'),
-    'D': os.path.join(ROOT, 'dataset', 'sft_t2t_mini.jsonl'),
+    'A': os.path.join(ROOT, 'datasets', 'pretrain_t2t_mini.jsonl'),
+    'B_exam': os.path.join(ROOT, 'datasets', 'lora_exam.jsonl'),
+    'B_math': os.path.join(ROOT, 'datasets', 'agent_rl_math.jsonl'),
+    'C': os.path.join(ROOT, 'datasets', 'lora_medical.jsonl'),
+    'D': os.path.join(ROOT, 'datasets', 'sft_t2t_mini.jsonl'),
 }
 
 OUT_DIR = os.path.join(ROOT, 'datasets')
@@ -27,21 +27,32 @@ N_PER_TASK = 20_000
 SEED = 42
 
 
-def extract_text(sample):
-    """统一提取文本, 兼容 text / conversations / chosen / fallback."""
+def extract_conversations(sample):
+    """统一提取 conversations 列表, 兼容 text / conversations / chosen / fallback.
+
+    返回: [{"role": "user"|"assistant"|"system", "content": str}, ...]
+    """
     if isinstance(sample, str):
-        return sample
-    if 'text' in sample:
-        return sample['text']
+        return [{"role": "assistant", "content": sample}]
     if 'conversations' in sample:
-        # 兼容 content 和 value 两种字段名
-        parts = []
+        convs = []
         for m in sample['conversations']:
-            parts.append(m.get('content') or m.get('value') or '')
-        return '\n'.join(parts)
+            content = m.get('content') or m.get('value') or ''
+            role = m.get('role', 'user')
+            convs.append({"role": role, "content": content})
+        return convs
+    if 'text' in sample:
+        text = sample['text']
+        first_nl = text.find('\n')
+        if 0 < first_nl < len(text) - 1:
+            return [
+                {"role": "user", "content": text[:first_nl].strip()},
+                {"role": "assistant", "content": text[first_nl + 1:].strip()}
+            ]
+        return [{"role": "assistant", "content": text.strip()}]
     if 'chosen' in sample:
-        return sample['chosen']
-    return str(sample)
+        return [{"role": "assistant", "content": sample['chosen']}]
+    return [{"role": "assistant", "content": str(sample)}]
 
 
 def sample_jsonl(src_path, n, seed=SEED):
@@ -56,9 +67,10 @@ def sample_jsonl(src_path, n, seed=SEED):
     sampled = []
     for line in lines[:n]:
         sample = json.loads(line)
-        text = extract_text(sample)
-        if text and len(text.strip()) > 10:  # 过滤空/过短样本
-            sampled.append({'text': text.strip()})
+        convs = extract_conversations(sample)
+        total_len = sum(len(c.get('content', '').strip()) for c in convs)
+        if total_len > 10:  # 过滤空/过短样本
+            sampled.append({'conversations': convs})
     print(f'  {src_path}: {len(lines)} lines → {len(sampled)} valid samples (requested {n})')
     return sampled
 

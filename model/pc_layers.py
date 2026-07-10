@@ -681,9 +681,8 @@ class PCLocalDynamicMiniMind(PCDynamicMiniMind):
     def init_z(self, byte_seq):
         """前向传播初始化 z — 字节→连续波→dilated conv."""
         z = []
-        # 字节 → 连续波: [bsz, seq] → [bsz, 1, seq] → causal pad(12,0) → [bsz, hidden, seq] → [bsz, seq, hidden]
-        x = byte_seq.float().unsqueeze(1)
-        x = nn.functional.pad(x, (12, 0))
+        # 双通道: [bsz, 2, seq] → causal pad(12,0) → [bsz, hidden, seq] → [bsz, seq, hidden]
+        x = nn.functional.pad(byte_seq.float(), (12, 0))
         h = self.model.byte_proj(x).transpose(1, 2)
         z.append(h)
 
@@ -707,8 +706,7 @@ class PCLocalDynamicMiniMind(PCDynamicMiniMind):
     def forward_with_ce(self, byte_seq, labels, pos_emb):
         """梯度启用的前向 (字节→连续波→dilated conv), 返回 z + CE loss."""
         z = []
-        x = byte_seq.float().unsqueeze(1)
-        x = nn.functional.pad(x, (12, 0))
+        x = nn.functional.pad(byte_seq.float(), (12, 0))
         h = self.model.byte_proj(x).transpose(1, 2)
         z.append(h)
 

@@ -1,29 +1,28 @@
 [project]
-name = "virtuosov1"
-version = "0.1.0"
-description = "Add your description here"
+name = "virtuosov2"
+version = "0.2.0"
+description = "Predictive Coding 局部动态小语言模型 — 统一 PC + 多巴胺 + QAT + 持续学习"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "numpy>=2.4.5",
-    "pillow>=12.2.0",
-    "pygame>=2.6.1",
     "torch>=2.12.0",
-    "torchvision>=0.27.0",
-    "vncdotool>=1.3.0",
-    "encodec>=0.1.1",
-    "soundfile>=0.12.0",
-    "paramiko>=5.0.0",
+    "numpy>=2.4.5",
+    "torchao>=0.17.0",
     "bitsandbytes>=0.43.0",
     "accelerate>=1.13.0",
-    "addict>=2.4.0",
+    "typer>=0.15.0",
+    "rich>=13.0.0",
+    "flet[all]>=0.85.2",
     "matplotlib>=3.10.9",
     "requests>=2.34.2",
-    "torchao>=0.17.0",
-    "coloraide>=8.8.1",
-    "material-color-utilities>=0.2.6",
-    "flet[all]>=0.85.2",
+    "pillow>=12.2.0",
 ]
+
+[project.scripts]
+virtuoso = "cli.app:app"
+
+[tool.setuptools.packages.find]
+include = ["cli", "cli.*", "model", "model.*", "continual", "continual.*"]
 
 
 [tool.uv.sources]
