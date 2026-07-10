@@ -1,0 +1,8 @@
+/ola_out
+/.venv
+/__pycache__
+/dataset
+*.pyc
+*.pt
+*.jsonl
+/docs

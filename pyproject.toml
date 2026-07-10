@@ -1,0 +1,70 @@
+[project]
+name = "virtuosov1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.5",
+    "pillow>=12.2.0",
+    "pygame>=2.6.1",
+    "torch>=2.12.0",
+    "torchvision>=0.27.0",
+    "vncdotool>=1.3.0",
+    "encodec>=0.1.1",
+    "soundfile>=0.12.0",
+    "paramiko>=5.0.0",
+    "bitsandbytes>=0.43.0",
+    "accelerate>=1.13.0",
+    "addict>=2.4.0",
+    "matplotlib>=3.10.9",
+    "requests>=2.34.2",
+    "torchao>=0.17.0",
+    "coloraide>=8.8.1",
+    "material-color-utilities>=0.2.6",
+    "flet[all]>=0.85.2",
+]
+
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+]
+torchvision = [
+    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+]
+
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://mirrors.nju.edu.cn/pytorch/whl/cu132"
+explicit = true
+
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
+reportPrivateImportUsage = "none"
+
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+lint.select = [
+    "F",   # Pyflakes — 未定义变量、未使用导入/变量等真正错误
+    "E",   # pycodestyle 错误 — 基本风格问题（缩进、空行等）
+    "I",   # isort — 导入排序
+    "D",   # pydocstyle — 文档字符串规范（配合 Google 风格）
+]
+
+lint.per-file-ignores = { "__init__.py" = ["F401"] }
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["alm", "col", "training", "scripts"]
+
+[tool.ruff.format]
+quote-style = "double"
+
