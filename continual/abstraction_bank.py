@@ -623,46 +623,10 @@ class AbstractionBank:
         imp_cpu = {tid: imp.cpu() for tid, imp in self._prototype_importances.items()}
         proto_score_cpu = {tid: score.cpu() for tid, score in self._prototype_scores.items()}
 
-        def _pack_store(store: Dict) -> dict:
-            packed = {}
-            for tid, entries in store.items():
-                if not entries:
-                    continue
-                n = len(entries)
-                seq_lens = [e['seq_len'] for e in entries]
-                max_seq = max(seq_lens)
-                hidden = entries[0]['z_states'][-1].size(-1)
-                n_layers = len(entries[0]['z_states'])
-                z_layers = []
-                for ℓ in range(n_layers):
-                    layer_zs = []
-                    for e in entries:
-                        z = e['z_states'][ℓ]
-                        if z.size(1) < max_seq:
-                            pad = torch.zeros(1, max_seq - z.size(1), z.size(2), dtype=z.dtype)
-                            z = torch.cat([z, pad], dim=1)
-                        layer_zs.append(z)
-                    z_layers.append(torch.stack(layer_zs, dim=0))
-                layer_importance = torch.stack([e['layer_importance'] for e in entries], dim=0)
-                packed[tid] = {
-                    'z_layers': [z.cpu() for z in z_layers],
-                    'layer_importance': layer_importance.cpu(),
-                    'dopamine_scores': [e['dopamine_score'] for e in entries],
-                    'world_model_surprises': [e.get('world_model_surprise', 0.0) for e in entries],
-                    'retention_weights': [e.get('retention_weight', 1.0) for e in entries],
-                    'information_gains': [e.get('information_gain', 0.0) for e in entries],
-                    'concept_ids': [e.get('concept_id', '') for e in entries],
-                    'task_ids': [e.get('task_id', tid) for e in entries],
-                    'seq_lens': seq_lens,
-                }
-            return packed
-
         return {
             'prototypes': proto_cpu,
             'prototype_importances': imp_cpu,
             'prototype_scores': proto_score_cpu,
-            '_store': _pack_store(self._store),
-            '_store_by_concept': _pack_store(self._store_by_concept),
             'meta': self._meta,
             'config': {
                 'max_entries_per_task': self.max_entries_per_task,
@@ -686,39 +650,8 @@ class AbstractionBank:
         self.n_prototypes = cfg.get('n_prototypes', self.n_prototypes)
         self.enable_concept_grouping = cfg.get('enable_concept_grouping', self.enable_concept_grouping)
 
-        def _unpack_store(packed: dict) -> Dict:
-            store = {}
-            for tid, pk in packed.items():
-                z_layers = pk['z_layers']
-                layer_imp = pk['layer_importance']
-                seq_lens = pk['seq_lens']
-                n = len(seq_lens)
-                n_layers = len(z_layers)
-                entries = []
-                for i in range(n):
-                    seq_len = seq_lens[i]
-                    z_states = []
-                    for ℓ in range(n_layers):
-                        zi = z_layers[ℓ][i]
-                        z_states.append(zi[:, :seq_len, :].clone())
-                    entries.append({
-                        'z_states': z_states,
-                        'layer_importance': layer_imp[i].clone(),
-                        'dopamine_score': pk['dopamine_scores'][i],
-                        'world_model_surprise': pk['world_model_surprises'][i],
-                        'retention_weight': pk['retention_weights'][i],
-                        'information_gain': pk.get('information_gains', [0.0])[i],
-                        'concept_id': pk.get('concept_ids', [''])[i],
-                        'task_id': pk.get('task_ids', [tid])[i],
-                        'seq_len': seq_len,
-                    })
-                store[tid] = entries
-            return store
-
         self._store.clear()
         self._store_by_concept.clear()
-        self._store = _unpack_store(state.get('_store', {}))
-        self._store_by_concept = _unpack_store(state.get('_store_by_concept', {}))
 
     def __len__(self):
         return self.total_prototypes

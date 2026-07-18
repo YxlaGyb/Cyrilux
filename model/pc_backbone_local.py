@@ -65,18 +65,22 @@ class PCLocalBackbone(nn.Module):
               hidden_states[2] = MLP₁ output (pre-next-Conv)
               ...
         """
-        # 双通道: [bsz, 2, seq] → causal pad(12,0) → [bsz, hidden, seq] → [bsz, seq, hidden]
-        x = F.pad(byte_seq.float(), (12, 0))  # causal pad for byte_proj k=13
-        h = self.byte_proj(x).transpose(1, 2)
+        # 双通道: [bsz, 2, seq] → causal pad(12,0) → fp32 conv → [bsz, seq, hidden]
+        x = F.pad(byte_seq.float(), (12, 0))
+        h = F.conv1d(x, self.byte_proj.weight.float()).transpose(1, 2).half()
         hidden_states = [h]
 
         for block in self.layers:
-            # Conv sub-layer (causal padding, dilation-aware)
+            # Conv sub-layer (causal padding, dilation-aware, fp32 安全)
             res = h
             d = block.dilation
             h = F.pad(block.input_layernorm(h), (0, 0, 2 * d, 0))
-            h = block.local_conv(h.transpose(1, 2)).transpose(1, 2)
-            h = h + res
+            h32 = F.conv1d(
+                h.transpose(1, 2).float(),
+                block.local_conv.weight.float(),
+                bias=None, stride=1, padding=0, dilation=d, groups=1,
+            ).transpose(1, 2).half()
+            h = h32 + res
             hidden_states.append(h)
 
             # MLP sub-layer

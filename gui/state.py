@@ -48,9 +48,6 @@ class ExperimentState:
         "eval_samples": "100",
         "n_prototypes": "8",
         "abstraction_replay_interval": "200",
-        "enable_qat": "1",
-        "qat_groupsize": "64",
-        "no_quantize_embed": "0",
     })
 
     # 任务管线
@@ -101,14 +98,14 @@ class ExperimentState:
             "T_infer", "replay_ratio", "bank_size", "sniff_interval",
             "repair_steps", "eval_samples", "n_prototypes",
             "abstraction_replay_interval", "split_size", "hidden_size",
-            "num_hidden_layers", "qat_groupsize",
+            "num_hidden_layers",
         }
         float_keys = {
             "lr", "gamma", "max_beta", "max_beta_conv", "grad_clip",
             "dopamine_eta", "dopamine_beta", "dopamine_gamma",
             "repair_threshold",
         }
-        bool_keys = {"enable_qat", "no_quantize_embed"}
+        bool_keys = set()
         for k, v in self.config.items():
             if k in int_keys:
                 kw[k] = int(v)

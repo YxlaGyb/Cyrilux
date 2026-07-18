@@ -249,7 +249,14 @@ class FeedForward(nn.Module):
         self.act_fn = _ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        """fp32 前向 (显式权重提升, 防 silu(gate)*up→down 链溢出)."""
+        w_g = self.gate_proj.weight.float()
+        w_u = self.up_proj.weight.float()
+        w_d = self.down_proj.weight.float()
+        x32 = x.float()
+        g = self.act_fn(F.linear(x32, w_g))
+        u = F.linear(x32, w_u)
+        return F.linear(g * u, w_d).to(x.dtype)
 
 
 class MOEFeedForward(nn.Module):

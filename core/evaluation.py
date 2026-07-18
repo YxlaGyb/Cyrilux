@@ -97,7 +97,7 @@ def compute_perplexity(pc_model, loader, pos_emb, gamma=0.1, T=2, max_batches=20
 
         # CE loss
         h_norm = pc_model.model.norm(z_by_layer[pc_model.num_sub_layers])
-        logits = pc_model.model.lm_head(h_norm)
+        logits = pc_model.model.lm_head(h_norm.to(dtype=pc_model.model.lm_head.weight.dtype))
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         loss = torch.nn.functional.cross_entropy(
@@ -187,7 +187,7 @@ def generate_text_manual(pc_model, prompt, pos_emb, max_new=50,
             z, _, _ = pc_model.spatiotemporal_infer(z, pos, gamma=gamma, T=T)
 
         h_norm = pc_model.model.norm(z[pc_model.num_sub_layers])
-        logits = pc_model.model.lm_head(h_norm)
+        logits = pc_model.model.lm_head(h_norm.to(dtype=pc_model.model.lm_head.weight.dtype))
         next_logits = logits[0, -1, :] / temp
 
         if top_k > 0:
@@ -251,7 +251,7 @@ def eval_self_supervised(pc_model, loader, pos_emb, gamma=0.1, T=2, max_batches=
             metrics['variance'][f'L{ℓ}'].append(rep['variance'][ℓ - 1])
 
         h_norm = pc_model.model.norm(z[pc_model.num_sub_layers])
-        logits = pc_model.model.lm_head(h_norm)
+        logits = pc_model.model.lm_head(h_norm.to(dtype=pc_model.model.lm_head.weight.dtype))
         valid = labels != -100
         acc = (logits.argmax(-1)[valid] == input_ids[valid]).float().mean().item() if valid.any() else 0.0
         metrics['recon_acc'].append(acc)
@@ -299,7 +299,7 @@ def eval_ppl(pc_model, loader, pos_emb, gamma=0.1, T=2, max_batches=20):
         if T > 0:
             z, _, _ = pc_model.spatiotemporal_infer(z, pos, gamma=gamma, T=T)
         h_norm = pc_model.model.norm(z[pc_model.num_sub_layers])
-        logits = pc_model.model.lm_head(h_norm)
+        logits = pc_model.model.lm_head(h_norm.to(dtype=pc_model.model.lm_head.weight.dtype))
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         loss = torch.nn.functional.cross_entropy(

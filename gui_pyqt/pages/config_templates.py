@@ -44,11 +44,6 @@ TEMPLATE_GROUPS = {
         "dopamine_beta": ("0.8", "β — 探索偏好"),
         "dopamine_gamma": ("0.9", "γ — 折扣因子"),
     },
-    "QAT (量化感知训练)": {
-        "enable_qat": ("1", "启用 QAT (0/1)"),
-        "qat_groupsize": ("64", "量化分组大小"),
-        "no_quantize_embed": ("0", "不量化 Embedding"),
-    },
 }
 
 

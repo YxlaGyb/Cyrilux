@@ -15,8 +15,6 @@ from typing import List, Tuple, Optional
 
 import torch
 
-import torch
-
 
 @dataclasses.dataclass
 class Exemplar:
@@ -189,7 +187,7 @@ class MemoryBank:
                 y = ex.label_tensor.unsqueeze(0).to(device)
                 z = model.init_z(x)
                 h = model.model.norm(z[model.num_sub_layers])
-                logits = model.model.lm_head(h)
+                logits = model.model.lm_head(h.to(dtype=model.model.lm_head.weight.dtype))
                 s_logits = logits[..., :-1, :].contiguous()
                 s_labels = y[..., 1:].contiguous()
                 loss = torch.nn.functional.cross_entropy(

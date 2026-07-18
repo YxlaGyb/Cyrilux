@@ -72,11 +72,6 @@ PARAM_GROUPS = [
         ("n_prototypes", "N Prototypes"),
         ("abstraction_replay_interval", "Abstraction Replay"),
     ]),
-    ("QAT 量化", [
-        ("enable_qat", "Enable QAT"),
-        ("qat_groupsize", "QAT Groupsize"),
-        ("no_quantize_embed", "No Quant Embed"),
-    ]),
 ]
 
 

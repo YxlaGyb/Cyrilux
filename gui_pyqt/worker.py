@@ -139,9 +139,6 @@ class EvalWorker(QThread):
                  gamma: float = 0.1,
                  T: int = 2,
                  prompts: list[str] | None = None,
-                 enable_qat: bool = True,
-                 qat_groupsize: int = 64,
-                 no_quantize_embed: bool = False,
                  parent=None):
         super().__init__(parent)
         self._ckpt = checkpoint_path
@@ -155,9 +152,6 @@ class EvalWorker(QThread):
         self._gamma = gamma
         self._T = T
         self._prompts = prompts or ["人工智能的未来在于", "小明今天去了公园，他看到", "深度学习是一种"]
-        self._enable_qat = enable_qat
-        self._qat_groupsize = qat_groupsize
-        self._no_quantize_embed = no_quantize_embed
 
     def run(self) -> None:
         try:

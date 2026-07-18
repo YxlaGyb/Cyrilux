@@ -32,15 +32,16 @@ class LatentWorldModel(nn.Module):
         self.uncertainty_head = nn.Linear(hidden_dim, 1)
 
     def _prepare_state(self, state: torch.Tensor, context: torch.Tensor | None):
+        state = state.float()
         if state.dim() == 2:
             state = state.unsqueeze(1)
         if state.dim() != 3:
             raise ValueError(f"state must have shape [B, S, D] or [B, D], got {tuple(state.shape)}")
 
         if context is None:
-            context = torch.zeros(state.size(0), self.context_dim, device=state.device, dtype=state.dtype)
+            context = torch.zeros(state.size(0), self.context_dim, device=state.device, dtype=torch.float32)
         else:
-            context = context.to(device=state.device, dtype=state.dtype)
+            context = context.to(device=state.device, dtype=torch.float32)
             if context.dim() == 1:
                 context = context.unsqueeze(0)
             if context.dim() != 2:

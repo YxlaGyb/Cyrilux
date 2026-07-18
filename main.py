@@ -87,14 +87,6 @@ def _build_cl_parser(subparser):
     return subparser
 
 
-def _build_qat_parser(subparser):
-    """QAT 参数。"""
-    subparser.add_argument("--no-qat", action="store_true", default=False, help="禁用 QAT (默认开启)")
-    subparser.add_argument("--qat-groupsize", type=int, default=64)
-    subparser.add_argument("--no-quantize-embed", action="store_true", default=False)
-    return subparser
-
-
 def _build_opt_parser(subparser):
     """加速参数: AMP / CUDA Graphs。"""
     subparser.add_argument("--amp", action="store_true", default=False, help="启用 AMP bf16 (默认关)")
@@ -107,16 +99,15 @@ def register_train_parser(subparsers):
     _build_common_parser(p)
     _build_pc_parser(p)
     _build_cl_parser(p)
-    _build_qat_parser(p)
     _build_opt_parser(p)
     p.add_argument("data", nargs="+", help="数据文件路径")
     p.add_argument(
         "--task-order",
         type=str,
-        default="a,b,c,d",
-        help="任务顺序: a=agent_rl_math, b=lora_medical, c=lora_exam, d=rlaif",
+        default="a",
+        help="任务顺序: 逗号分隔, 每项对应一个数据文件 (默认单任务 'a')",
     )
-    p.add_argument("--save-interval", type=int, default=500)
+    p.add_argument("--save-interval", type=int, default=500, help="中间检查点间隔步数")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--split-size", type=int, default=0)
 
@@ -154,20 +145,18 @@ def cmd_train(args):
         n_prototypes=args.n_prototypes,
         abstraction_replay_interval=args.abstraction_replay_interval,
         save_interval=args.save_interval,
-        enable_qat=not args.no_qat,
-        qat_groupsize=args.qat_groupsize,
-        no_quantize_embed=args.no_quantize_embed,
         enable_amp=args.amp,
         use_cuda_graphs=args.cuda_graphs,
     )
 
-    # 任务流水线
+    # 任务流水线: 每个 task_id 对应一个数据文件
     task_order = args.task_order.split(",")
     task_ids = ["a", "b", "c", "d", "e"]
     pipelines = []
-    for tid in task_order:
+    for i, tid in enumerate(task_order):
         if tid in task_ids:
-            pipelines.append((tid, args.data, args.subset if args.subset > 0 else None))
+            data_files = [args.data[i]] if i < len(args.data) else args.data
+            pipelines.append((tid, data_files, args.subset if args.subset > 0 else None))
 
     # 启动训练
     run_training_standalone(cfg, pipelines)
@@ -196,7 +185,7 @@ def register_eval_parser(subparsers):
         nargs="+",
         default=["人工智能的未来在于", "小明今天去了公园，他看到", "深度学习是一种"],
     )
-    _build_qat_parser(p)
+    # QAT related args removed
 
 
 def cmd_eval(args):

@@ -72,15 +72,16 @@ class IntrinsicCuriosityModule(nn.Module):
     # ── 前向预测 (同 LatentWorldModel.forward) ──
 
     def _prepare_state(self, state: torch.Tensor, context: torch.Tensor | None):
+        state = state.float()
         if state.dim() == 2:
             state = state.unsqueeze(1)
         if state.dim() != 3:
             raise ValueError(f"state must have shape [B, S, D] or [B, D], got {tuple(state.shape)}")
 
         if context is None:
-            context = torch.zeros(state.size(0), self.context_dim, device=state.device, dtype=state.dtype)
+            context = torch.zeros(state.size(0), self.context_dim, device=state.device, dtype=torch.float32)
         else:
-            context = context.to(device=state.device, dtype=state.dtype)
+            context = context.to(device=state.device, dtype=torch.float32)
             if context.dim() == 1:
                 context = context.unsqueeze(0)
             if context.dim() != 2:
@@ -113,8 +114,8 @@ class IntrinsicCuriosityModule(nn.Module):
 
     def forward_inverse(self, state_t: torch.Tensor, state_t1: torch.Tensor):
         """反向模型: concat(z_t, z_{t+1}) → action_embed + 对比特征。"""
-        z_t = state_t.mean(dim=1) if state_t.dim() == 3 else state_t
-        z_t1 = state_t1.mean(dim=1) if state_t1.dim() == 3 else state_t1
+        z_t = state_t.float().mean(dim=1) if state_t.dim() == 3 else state_t.float()
+        z_t1 = state_t1.float().mean(dim=1) if state_t1.dim() == 3 else state_t1.float()
         x = torch.cat([z_t, z_t1], dim=-1)
         action_embed = self.inverse_net(x)
         contrast_feat = self.contrast_proj(action_embed)
@@ -175,6 +176,8 @@ class IntrinsicCuriosityModule(nn.Module):
         # 头 10 步返回 0 以稳定 EMA
         if self._step.item() < 10:
             return torch.zeros_like(ig)
+        # fp16 安全: 替换 nan/inf
+        ig = torch.nan_to_num(ig, nan=0.0, posinf=1.0, neginf=-1.0)
         return ig
 
     def forward(
