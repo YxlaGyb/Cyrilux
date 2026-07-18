@@ -165,26 +165,37 @@ class AbstractionBank:
     """表示级抽象记忆银行.
 
     不存原始字节, 存 PC 推理收敛后的 z 表示.
-    每任务自动做 k-means 原型压缩, 压缩比 ~32000:1.
+    每任务/概念自动做 k-means 原型压缩, 压缩比 ~32000:1.
+
+    支持:
+      - task_id 分组 (旧)
+      - concept_id 分组 (新, 内在动机)
+      - information_gain 加权 consolidate
     """
 
     def __init__(
         self,
         max_entries_per_task: int = 2000,
         n_prototypes: int = 8,
-        consolidation_frequency: int = 1,  # 每存几次任务触发一次 consolidate
+        consolidation_frequency: int = 1,
+        enable_concept_grouping: bool = True,
     ):
         self.max_entries_per_task = max_entries_per_task
         self.n_prototypes = n_prototypes
         self.consolidation_frequency = consolidation_frequency
+        self.enable_concept_grouping = enable_concept_grouping
 
         # 原始 z 存储 (按任务)
         self._store: Dict[str, List[dict]] = {}
 
-        # 压缩后的原型 (按任务)
-        self._prototypes: Dict[str, torch.Tensor] = {}  # task_id → [k, hidden]
-        self._prototype_importances: Dict[str, torch.Tensor] = {}  # task_id → [k, 12]
-        self._meta: Dict[str, dict] = {}  # task_id → {n_entries, n_consolidations, ...}
+        # 按概念分组的存储 (与 _store 并存, 优先使用)
+        self._store_by_concept: Dict[str, List[dict]] = {}
+
+        # 压缩后的原型 (按任务/概念)
+        self._prototypes: Dict[str, torch.Tensor] = {}  # id → [k, hidden]
+        self._prototype_importances: Dict[str, torch.Tensor] = {}  # id → [k, 12]
+        self._prototype_scores: Dict[str, torch.Tensor] = {}  # id → [k] retention score
+        self._meta: Dict[str, dict] = {}  # id → {n_entries, n_consolidations, ...}
         self._consolidation_counter: Dict[str, int] = {}
 
     # ── 属性 ──────────────────────────────────────────────────────────
@@ -218,21 +229,29 @@ class AbstractionBank:
         z_states_list: List[List[torch.Tensor]],
         layer_importance: Optional[torch.Tensor] = None,
         dopamine_score: float = 0.0,
+        world_model_surprise: float = 0.0,
+        # 内在动机扩展
+        concept_id: str = '',
+        information_gain: float = 0.0,
+        group_by_concept: bool = False,
     ):
-        """追加一批收敛后的 z 表示到指定任务.
+        """追加一批收敛后的 z 表示到指定任务/概念.
 
         Args:
             task_id: 任务 ID
-            z_states_list: list of z_conv, 每个为 [13] × [1, seq, hidden]
-            layer_importance: [12] 可选的层重要性向量
-            dopamine_score: 全局多巴胺分数 (fallback)
+            concept_id: 概念 ID (ConceptDiscovery 分配)
+            information_gain: ICM 信息增益 (用于加权)
+            group_by_concept: True → 按 concept_id 分组存储 (而非 task_id)
         """
-        if task_id not in self._store:
-            self._store[task_id] = []
-            self._consolidation_counter[task_id] = 0
-            self._meta[task_id] = {'n_entries': 0, 'n_consolidations': 0}
+        group_key = concept_id if (self.enable_concept_grouping and group_by_concept and concept_id) else task_id
+        store = self._store_by_concept if (self.enable_concept_grouping and group_by_concept and concept_id) else self._store
 
-        buf = self._store[task_id]
+        if group_key not in store:
+            store[group_key] = []
+            self._consolidation_counter[group_key] = 0
+            self._meta[group_key] = {'n_entries': 0, 'n_consolidations': 0}
+
+        buf = store[group_key]
         for z_states in z_states_list:
             if layer_importance is None:
                 π = torch.ones(12, dtype=torch.float)
@@ -243,77 +262,125 @@ class AbstractionBank:
                 'z_states': [z.clone().cpu() for z in z_states],
                 'layer_importance': π,
                 'dopamine_score': dopamine_score,
+                'world_model_surprise': float(world_model_surprise),
+                'information_gain': float(information_gain),
+                'retention_weight': 1.0 + max(float(world_model_surprise), 0.0) + float(information_gain),
                 'seq_len': z_states[0].size(1),
+                'task_id': task_id,
+                'concept_id': concept_id,
             })
 
         # FIFO 淘汰
         while len(buf) > self.max_entries_per_task:
             buf.pop(0)
 
-        self._meta[task_id]['n_entries'] = len(buf)
+        self._meta[group_key]['n_entries'] = len(buf)
 
         # 自动触发异步 consolidate
-        self._consolidation_counter[task_id] += 1
-        if self._consolidation_counter[task_id] >= self.consolidation_frequency:
-            self.consolidate(task_id)
+        self._consolidation_counter[group_key] += 1
+        if self._consolidation_counter[group_key] >= self.consolidation_frequency:
+            self.consolidate(group_key)
 
     # ── 核心: 原型压缩 ─────────────────────────────────────────────────
 
     @torch.no_grad()
-    def consolidate(self, task_id: Optional[str] = None, n_prototypes: Optional[int] = None):
-        """对指定任务 (或全部任务) 做 k-means 原型压缩.
+    def consolidate(self, group_key: Optional[str] = None, n_prototypes: Optional[int] = None):
+        """对指定组 (任务/概念) 或全部组做 k-means 原型压缩.
 
-        压缩比: max_entries_per_task × seq_len → n_prototypes, 约 32000:1
+        使用 information_gain 加权 retention_weight.
         """
         n_proto = n_prototypes or self.n_prototypes
-        task_ids = [task_id] if task_id else list(self._store.keys())
+        # 同时检查 _store 和 _store_by_concept
+        all_stores = {'_store': self._store, '_store_by_concept': self._store_by_concept}
 
-        for tid in task_ids:
-            if tid not in self._store or not self._store[tid]:
-                continue
+        if group_key:
+            # 找到 group_key 所属的 store
+            for store_name, store in all_stores.items():
+                if group_key in store:
+                    self._consolidate_one(store, group_key, n_proto)
+                    return
+        else:
+            for store_name, store in all_stores.items():
+                for gk in list(store.keys()):
+                    self._consolidate_one(store, gk, n_proto)
 
-            entries = self._store[tid]
+    @torch.no_grad()
+    def _consolidate_one(self, store: Dict, group_key: str, n_proto: int):
+        """对一个组的条目做原型压缩."""
+        if group_key not in store or not store[group_key]:
+            return
 
-            # 收集顶层表示: z_states[-1] = [1, seq, 256]
-            z_tops = []
-            importances = []
-            for e in entries:
-                z_top = e['z_states'][-1]  # [1, seq, 256]
-                z_tops.append(z_top.squeeze(0))  # [seq, 256]
-                importances.append(e['layer_importance'])
+        entries = store[group_key]
 
-            all_z = torch.cat(z_tops, dim=0)  # [N * seq, 256]
-            hidden = all_z.size(-1)
+        # 收集顶层表示
+        z_tops = []
+        importances = []
+        retention_weights = []
+        info_gains = []
+        for e in entries:
+            z_top = e['z_states'][-1]
+            z_tops.append(z_top.squeeze(0))
+            importances.append(e['layer_importance'])
+            rw = e.get('retention_weight', 1.0 + max(e.get('world_model_surprise', 0.0), 0.0)
+                        + e.get('information_gain', 0.0))
+            retention_weights.append(rw)
+            info_gains.append(e.get('information_gain', 0.0))
 
-            # k-means 聚类 (余弦距离)
-            k = min(n_proto, all_z.size(0))
-            if k < 1:
-                continue
+        all_z = torch.cat(z_tops, dim=0)
+        hidden = all_z.size(-1)
+        k = min(n_proto, all_z.size(0))
+        if k < 1:
+            return
 
-            centroids, assignments = _kmeans_cosine(all_z, k)
+        centroids, assignments = _kmeans_cosine(all_z, k)
 
-            # 计算每个原型的平均层重要性
-            n_total = all_z.size(0)
-            imp_stack = torch.stack(importances)  # [n_entries, 12]
-            proto_importances = torch.zeros(k, 12, dtype=torch.float)
-            for i in range(k):
-                mask = assignments == i
-                if mask.any():
-                    # 找到这些点属于哪些 entry
-                    entry_indices = mask.nonzero(as_tuple=False)[:, 0] // max(
-                        entries[0]['z_states'][-1].size(1), 1
-                    )
-                    # 取对应 entry 的层重要性平均
-                    matched = imp_stack[entry_indices.clamp(0, len(importances) - 1)]
-                    proto_importances[i] = matched.mean(dim=0)
+        # information_gain 加权评分
+        n_total = all_z.size(0)
+        seq_len = max(entries[0]['z_states'][-1].size(1), 1)
+        point_entry_idx = torch.arange(n_total, device=assignments.device) // seq_len
+        imp_stack = torch.stack(importances)
+        retention_stack = torch.tensor(retention_weights, dtype=torch.float)
+        info_gain_stack = torch.tensor(info_gains, dtype=torch.float)
+        proto_importances = torch.zeros(k, 12, dtype=torch.float)
+        proto_scores = torch.zeros(k, dtype=torch.float)
+        proto_info_gains = torch.zeros(k, dtype=torch.float)
+        for i in range(k):
+            mask = assignments == i
+            if mask.any():
+                entry_indices = point_entry_idx[mask].unique().long()
+                matched = imp_stack[entry_indices.clamp(0, len(importances) - 1)]
+                entry_weights = retention_stack[entry_indices.clamp(0, len(retention_weights) - 1)]
+                proto_importances[i] = (matched * entry_weights.unsqueeze(1)).mean(dim=0)
+                proto_scores[i] = entry_weights.mean()
+                proto_info_gains[i] = info_gain_stack[entry_indices.clamp(0, len(info_gains) - 1)].mean()
+            else:
+                proto_scores[i] = 1.0
 
-            self._prototypes[tid] = centroids  # [k, hidden]
-            self._prototype_importances[tid] = proto_importances  # [k, 12]
-            self._meta[tid]['n_consolidations'] += 1
-            self._meta[tid]['compression_ratio'] = (
-                len(entries) * entries[0]['seq_len'] / max(k, 1)
-            )
-            self._consolidation_counter[tid] = 0
+        self._prototypes[group_key] = centroids
+        self._prototype_importances[group_key] = proto_importances
+        self._prototype_scores[group_key] = proto_scores
+
+        # 2c: 淘汰低 retention 原型 — 结合 info_gain 加权
+        effective_scores = proto_scores * (1.0 + 0.5 * proto_info_gains)
+        keep_mask = effective_scores >= 0.3
+        if keep_mask.any() and not keep_mask.all():
+            n_pruned = (~keep_mask).sum().item()
+            self._prototypes[group_key] = centroids[keep_mask]
+            self._prototype_importances[group_key] = proto_importances[keep_mask]
+            self._prototype_scores[group_key] = proto_scores[keep_mask]
+            self._meta[group_key]['n_pruned'] = self._meta[group_key].get('n_pruned', 0) + n_pruned
+        elif not keep_mask.any():
+            best_idx = effective_scores.argmax()
+            self._prototypes[group_key] = centroids[best_idx:best_idx+1]
+            self._prototype_importances[group_key] = proto_importances[best_idx:best_idx+1]
+            self._prototype_scores[group_key] = proto_scores[best_idx:best_idx+1]
+            self._meta[group_key]['n_pruned'] = self._meta[group_key].get('n_pruned', 0) + (k - 1)
+
+        self._meta[group_key]['n_consolidations'] += 1
+        self._meta[group_key]['compression_ratio'] = (
+            len(entries) * entries[0]['seq_len'] / max(k, 1)
+        )
+        self._consolidation_counter[group_key] = 0
 
     # ── 核心: 采样原型 ────────────────────────────────────────────────
 
@@ -330,21 +397,25 @@ class AbstractionBank:
         if self.total_prototypes == 0:
             return []
 
-        # 收集所有 (task_id, prototype_vector, importance)
-        all_protos: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
+        # 收集所有 (task_id, prototype_vector, importance, weight)
+        all_protos: List[Tuple[str, torch.Tensor, torch.Tensor, float]] = []
         for tid, protos in self._prototypes.items():
             imp = self._prototype_importances.get(tid, torch.ones(12, dtype=torch.float))
+            score = self._prototype_scores.get(tid, torch.ones(protos.size(0), dtype=torch.float))
             for i in range(protos.size(0)):
-                all_protos.append((tid, protos[i: i + 1], imp[i]))
+                weight = max(float(score[i]) if i < score.size(0) else 1.0, 0.1)
+                all_protos.append((tid, protos[i: i + 1], imp[i], weight))
 
         if not all_protos:
             return []
 
+        weights = torch.tensor([item[3] for item in all_protos], dtype=torch.float32)
+        weights = weights / weights.sum().clamp_min(1e-8)
         n = min(batch_size, len(all_protos))
-        idx = torch.randperm(len(all_protos))[:n].tolist()
+        idx = torch.multinomial(weights, n, replacement=False).tolist()
         result = []
         for i in idx:
-            tid, pz, imp = all_protos[i]
+            tid, pz, imp, _ = all_protos[i]
             result.append((tid, pz.to(device), imp.to(device)))
         return result
 
@@ -548,19 +619,55 @@ class AbstractionBank:
 
     def state_dict(self) -> dict:
         """返回可序列化的状态字典."""
-        proto_cpu = {}
-        for tid, p in self._prototypes.items():
-            proto_cpu[tid] = p.cpu()
-        imp_cpu = {}
-        for tid, imp in self._prototype_importances.items():
-            imp_cpu[tid] = imp.cpu()
+        proto_cpu = {tid: p.cpu() for tid, p in self._prototypes.items()}
+        imp_cpu = {tid: imp.cpu() for tid, imp in self._prototype_importances.items()}
+        proto_score_cpu = {tid: score.cpu() for tid, score in self._prototype_scores.items()}
+
+        def _pack_store(store: Dict) -> dict:
+            packed = {}
+            for tid, entries in store.items():
+                if not entries:
+                    continue
+                n = len(entries)
+                seq_lens = [e['seq_len'] for e in entries]
+                max_seq = max(seq_lens)
+                hidden = entries[0]['z_states'][-1].size(-1)
+                n_layers = len(entries[0]['z_states'])
+                z_layers = []
+                for ℓ in range(n_layers):
+                    layer_zs = []
+                    for e in entries:
+                        z = e['z_states'][ℓ]
+                        if z.size(1) < max_seq:
+                            pad = torch.zeros(1, max_seq - z.size(1), z.size(2), dtype=z.dtype)
+                            z = torch.cat([z, pad], dim=1)
+                        layer_zs.append(z)
+                    z_layers.append(torch.stack(layer_zs, dim=0))
+                layer_importance = torch.stack([e['layer_importance'] for e in entries], dim=0)
+                packed[tid] = {
+                    'z_layers': [z.cpu() for z in z_layers],
+                    'layer_importance': layer_importance.cpu(),
+                    'dopamine_scores': [e['dopamine_score'] for e in entries],
+                    'world_model_surprises': [e.get('world_model_surprise', 0.0) for e in entries],
+                    'retention_weights': [e.get('retention_weight', 1.0) for e in entries],
+                    'information_gains': [e.get('information_gain', 0.0) for e in entries],
+                    'concept_ids': [e.get('concept_id', '') for e in entries],
+                    'task_ids': [e.get('task_id', tid) for e in entries],
+                    'seq_lens': seq_lens,
+                }
+            return packed
+
         return {
             'prototypes': proto_cpu,
             'prototype_importances': imp_cpu,
+            'prototype_scores': proto_score_cpu,
+            '_store': _pack_store(self._store),
+            '_store_by_concept': _pack_store(self._store_by_concept),
             'meta': self._meta,
             'config': {
                 'max_entries_per_task': self.max_entries_per_task,
                 'n_prototypes': self.n_prototypes,
+                'enable_concept_grouping': self.enable_concept_grouping,
             },
         }
 
@@ -570,10 +677,48 @@ class AbstractionBank:
         self._prototype_importances = {
             tid: imp.clone() for tid, imp in state.get('prototype_importances', {}).items()
         }
+        self._prototype_scores = {
+            tid: score.clone() for tid, score in state.get('prototype_scores', {}).items()
+        }
         self._meta = state.get('meta', {})
         cfg = state.get('config', {})
         self.max_entries_per_task = cfg.get('max_entries_per_task', self.max_entries_per_task)
         self.n_prototypes = cfg.get('n_prototypes', self.n_prototypes)
+        self.enable_concept_grouping = cfg.get('enable_concept_grouping', self.enable_concept_grouping)
+
+        def _unpack_store(packed: dict) -> Dict:
+            store = {}
+            for tid, pk in packed.items():
+                z_layers = pk['z_layers']
+                layer_imp = pk['layer_importance']
+                seq_lens = pk['seq_lens']
+                n = len(seq_lens)
+                n_layers = len(z_layers)
+                entries = []
+                for i in range(n):
+                    seq_len = seq_lens[i]
+                    z_states = []
+                    for ℓ in range(n_layers):
+                        zi = z_layers[ℓ][i]
+                        z_states.append(zi[:, :seq_len, :].clone())
+                    entries.append({
+                        'z_states': z_states,
+                        'layer_importance': layer_imp[i].clone(),
+                        'dopamine_score': pk['dopamine_scores'][i],
+                        'world_model_surprise': pk['world_model_surprises'][i],
+                        'retention_weight': pk['retention_weights'][i],
+                        'information_gain': pk.get('information_gains', [0.0])[i],
+                        'concept_id': pk.get('concept_ids', [''])[i],
+                        'task_id': pk.get('task_ids', [tid])[i],
+                        'seq_len': seq_len,
+                    })
+                store[tid] = entries
+            return store
+
+        self._store.clear()
+        self._store_by_concept.clear()
+        self._store = _unpack_store(state.get('_store', {}))
+        self._store_by_concept = _unpack_store(state.get('_store_by_concept', {}))
 
     def __len__(self):
         return self.total_prototypes
@@ -727,6 +872,11 @@ class AbstractionSniffer:
     - 让模型重新 infer 对应 task 的数据
     - 计算收敛后的 z 与存储的原型之间的 cosine 距离
     - cosine < 0.7 → 抽象已偏移 → 触发回放
+
+    世界模型集成:
+    - 同时计算 transition surprise 作为第二维度
+    - surprise 高 + cosine 低 → 双重确认漂移
+    - surprise 高但 cosine 正常 → 可能是学到了新的变异, 不触发漂移
     """
 
     def __init__(
@@ -737,6 +887,8 @@ class AbstractionSniffer:
         drift_threshold: float = 0.7,
         repair_steps: int = 10,
         repair_lr_factor: float = 0.3,
+        world_model=None,
+        world_model_context_dim: int = 5,
     ):
         self.bank = bank
         self.model = model
@@ -747,6 +899,9 @@ class AbstractionSniffer:
         self._repairing = False
         self._repair_counter = 0
         self._last_similarities: Dict[str, float] = {}
+        self._last_wm_surprises: Dict[str, float] = {}
+        self.world_model = world_model
+        self.world_model_context_dim = world_model_context_dim
 
     # ── 属性 ──────────────────────────────────────────────────────────
 
@@ -774,9 +929,11 @@ class AbstractionSniffer:
           1. 从 bank 获取 task 的原型
           2. 从 bank 获取原始 z 存储, 取一条 re-infer
           3. 计算收敛后的顶层表示与所有原型的 max cosine 相似度
+          4. 如果世界模型可用, 计算 transition surprise 作为第二维度
 
         Returns:
-            max_cosine_sim ∈ [-1, 1], < drift_threshold → 遗忘
+            effective_sim ∈ [-1, 1], < drift_threshold → 遗忘
+            (world model surprise 高时会降低 effective_sim)
         """
         prototypes = self.bank.get_prototypes(task_id)
         if prototypes is None or prototypes.size(0) == 0:
@@ -794,14 +951,12 @@ class AbstractionSniffer:
         prototypes_norm = F.normalize(prototypes, dim=-1)  # [k, hidden]
 
         similarities = []
+        wm_surprises = []
         for i in idx:
             entry = entries[i]
-            # 使用存储的 z_conv[-1] (顶层表示) — 它是 PC 推理收敛后的
             z_top_stored = entry['z_states'][-1]  # [1, seq, hidden]
 
             # 当前模型对同一样本重新 infer
-            # 但我们没存原始 byte, 所以用存储的 z_top_stored 做 PC 推理起点
-            # 构造初始 z: 用 z_stored 作为起点, re-infer
             z_init = [z.clone().to(device) for z in entry['z_states']]
             z_reconv, _, _, _ = self.model.spatiotemporal_infer(
                 z_init, pos_emb, gamma=0.1, T=4,
@@ -817,9 +972,26 @@ class AbstractionSniffer:
             max_sim = cos_sim.max().item()
             similarities.append(max_sim)
 
+            # 世界模型 transition surprise
+            if self.world_model is not None:
+                ctx = torch.zeros(1, self.world_model_context_dim, device=device)
+                _, uncertainty = self.world_model(z_current, ctx)
+                wm_surprises.append(uncertainty.mean().item())
+
         avg_sim = sum(similarities) / max(len(similarities), 1)
         self._last_similarities[task_id] = avg_sim
-        return avg_sim
+
+        if wm_surprises:
+            avg_wm = sum(wm_surprises) / len(wm_surprises)
+            self._last_wm_surprises[task_id] = avg_wm
+            # 世界模型 surprise 高时降低 effective_sim
+            # (高 surprise 意味着 transition dynamics 不稳定 → 可能已漂移)
+            wm_penalty = min(avg_wm * 0.5, 0.3)  # 最多扣 0.3
+            effective_sim = avg_sim - wm_penalty
+        else:
+            effective_sim = avg_sim
+
+        return effective_sim
 
     def check(
         self,

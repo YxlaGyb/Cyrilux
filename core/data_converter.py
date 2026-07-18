@@ -9,7 +9,7 @@
 
 输出: {"text": "<|user|>...<|assistant|>...<|end|>"}
 """
-import os, json, sys, argparse
+import os, json, argparse
 from typing import Iterator
 
 

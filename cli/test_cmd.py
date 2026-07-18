@@ -3,22 +3,13 @@ virtuoso test — 测试子命令.
 
 子命令:
   forgetting  多任务灾难性遗忘压力测试
-  run         快速单任务测试
 """
 
 import os
-import sys
-from pathlib import Path
 from typing import Optional, List
 
-CLI_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(CLI_DIR)
-sys.path.insert(0, PROJECT_ROOT)
-
 import typer
-from rich import print as rprint
-
-from cli.utils import PROJECT_ROOT, resolve_path
+from cli.utils import resolve_path
 
 app = typer.Typer(name="test", help="测试命令", no_args_is_help=True)
 
@@ -37,20 +28,20 @@ def forgetting(
     bank_size: int = typer.Option(2000, "--bank-size", help="MemoryBank 大小"),
     exemplars: int = typer.Option(500, "--exemplars", help="每任务保存的 exemplar 数"),
     replay_ratio: int = typer.Option(5, "--replay-ratio", help="回放比例"),
-    threshold: float = typer.Option(1.5, "--threshold", help="遗忘嗅探阈值"),
-    repair_steps: int = typer.Option(5, "--repair-steps", help="修复步数"),
-    check_interval: int = typer.Option(500, "--check-interval", help="检查间隔步数"),
+    threshold: float = typer.Option(1.2, "--threshold", help="遗忘嗅探阈值"),
+    repair_steps: int = typer.Option(10, "--repair-steps", help="修复步数"),
+    check_interval: int = typer.Option(200, "--check-interval", help="检查间隔步数"),
 ):
-    """多任务灾难性遗忘压力测试 (无回放 vs MemoryBank+Sniffer)."""
-    from forgetting_pressure_test import main as forgetting_main
+    """多任务灾难性遗忘压力测试."""
+    import sys
+    from core.forgetting_pressure_test import main as forgetting_main
 
-    rprint("[bold]遗忘压力测试[/]")
-    rprint(f"  任务数: {len(tasks)}")
+    print(f"遗忘压力测试 — 任务数: {len(tasks)}")
 
     resolved_tasks = [resolve_path(t) for t in tasks]
     for t in resolved_tasks:
         if not os.path.exists(t):
-            rprint(f"[red]✗[/] 任务文件不存在: {t}")
+            print(f"✗ 任务文件不存在: {t}")
             raise typer.Exit(1)
 
     sys.argv = ["forgetting_pressure_test.py",

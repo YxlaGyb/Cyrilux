@@ -1,34 +1,34 @@
 """
 virtuoso config — 配置管理子命令.
-
-子命令:
-  init      生成默认配置文件模板
-  show      显示配置文件内容
-  validate  验证配置文件
 """
 
-import os
-import sys
-import json
-from pathlib import Path
+import os, json
 from typing import Optional
 
-CLI_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(CLI_DIR)
-sys.path.insert(0, PROJECT_ROOT)
-
 import typer
-from rich import print as rprint
-from rich.syntax import Syntax
-from rich.console import Console
-
-from cli.utils import (
-    PROJECT_ROOT, resolve_path, save_config, load_config,
-    TRAIN_CONFIG_TEMPLATE, AUTONOMOUS_CONFIG_TEMPLATE,
-)
+from cli.utils import resolve_path, save_config, load_config
 
 app = typer.Typer(name="config", help="配置管理", no_args_is_help=True)
-console = Console()
+
+
+TRAIN_TEMPLATE = {
+    "batch_size": 48, "max_seq_len": 128, "lr": 3e-4, "epochs": 1,
+    "subset": 0, "seed": 42, "hidden_size": 256, "num_hidden_layers": 4,
+    "T_infer": 2, "gamma": 0.1, "max_beta": 2.0, "max_beta_conv": 1.0, "grad_clip": 1.0,
+    "dopamine_eta": 1.0, "dopamine_beta": 0.5, "dopamine_gamma": 0.3,
+    "replay_ratio": 5, "bank_size": 2000, "sniff_interval": 200,
+    "repair_threshold": 1.2, "repair_steps": 10, "eval_samples": 100,
+    "n_prototypes": 8, "abstraction_replay_interval": 200,
+    "save_interval": 500, "out_dir": "out_pc_unified",
+    "task_order": ["a", "b", "c", "d"],
+    "data_paths": ["dataset/agent_rl_math.jsonl"],
+}
+
+AUTO_TEMPLATE = {
+    "wake_steps": 20, "play_steps": 100, "sleep_interval": 500,
+    "batch_size": 16, "lr": 1e-4, "gamma": 0.05, "T_infer": 1,
+    "data_dir": "dataset", "out_dir": "out_autonomous",
+}
 
 
 @app.command()
@@ -39,16 +39,15 @@ def init(
 ):
     """生成默认配置文件模板."""
     if template == "train":
-        config = TRAIN_CONFIG_TEMPLATE
+        config = TRAIN_TEMPLATE
     elif template == "autonomous":
-        config = AUTONOMOUS_CONFIG_TEMPLATE
+        config = AUTO_TEMPLATE
     else:
-        rprint(f"[red]✗[/] 未知模板类型: {template} (可选: train, autonomous)")
+        print(f"✗ 未知模板类型: {template} (可选: train, autonomous)")
         raise typer.Exit(1)
 
     save_config(config, output)
-    rprint(f"[green]✓[/] {template} 配置模板已生成: {output}")
-    rprint("  [dim]编辑此文件后使用: virtuoso train --config <path>[/]")
+    print(f"✓ {template} 配置模板已生成: {output}")
 
 
 @app.command()
@@ -59,13 +58,11 @@ def show(
     """显示配置文件内容."""
     path = resolve_path(config)
     if not os.path.exists(path):
-        rprint(f"[red]✗[/] 文件不存在: {path}")
+        print(f"✗ 文件不存在: {path}")
         raise typer.Exit(1)
 
     data = load_config(config)
-    syntax = Syntax(json.dumps(data, indent=2, ensure_ascii=False),
-                    "json", theme="monokai", line_numbers=True)
-    console.print(syntax)
+    print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
 @app.command()
@@ -73,21 +70,19 @@ def validate(
     ctx: typer.Context,
     config: str = typer.Argument(..., help="配置文件路径"),
 ):
-    """验证配置文件格式和必填项."""
+    """验证配置文件格式."""
     path = resolve_path(config)
     if not os.path.exists(path):
-        rprint(f"[red]✗[/] 文件不存在: {path}")
+        print(f"✗ 文件不存在: {path}")
         raise typer.Exit(1)
 
     try:
         data = load_config(config)
     except json.JSONDecodeError as e:
-        rprint(f"[red]✗[/] JSON 格式错误: {e}")
+        print(f"✗ JSON 格式错误: {e}")
         raise typer.Exit(1)
 
     warnings = []
-
-    # 校验训练配置
     if "training" in data:
         t = data["training"]
         if t.get("batch_size", 1) > 160:
@@ -100,11 +95,11 @@ def validate(
     if "model" in data:
         m = data["model"]
         if m.get("hidden_size", 0) not in (128, 256, 512):
-            warnings.append(f"hidden_size={m.get('hidden_size')} 非常规值 (128/256/512)")
+            warnings.append(f"hidden_size={m.get('hidden_size')} 非常规值")
 
     if warnings:
-        rprint("[yellow]配置检查:[/]")
+        print("配置检查:")
         for w in warnings:
-            rprint(f"  [yellow]⚠ {w}[/]")
+            print(f"  ⚠ {w}")
     else:
-        rprint("[green]✓[/] 配置文件通过验证")
+        print("✓ 配置文件通过验证")

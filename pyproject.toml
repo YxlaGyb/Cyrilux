@@ -11,18 +11,24 @@ dependencies = [
     "bitsandbytes>=0.43.0",
     "accelerate>=1.13.0",
     "typer>=0.15.0",
-    "rich>=13.0.0",
-    "flet[all]>=0.85.2",
     "matplotlib>=3.10.9",
     "requests>=2.34.2",
     "pillow>=12.2.0",
+    "maliang>=3.1.5",
+    "PyQt6>=6.8.0",
 ]
 
 [project.scripts]
 virtuoso = "cli.app:app"
 
 [tool.setuptools.packages.find]
-include = ["cli", "cli.*", "model", "model.*", "continual", "continual.*"]
+include = [
+    "cli", "cli.*",
+    "core", "core.*",
+    "model", "model.*",
+    "continual", "continual.*",
+    "dataset", "dataset.*",
+]
 
 
 [tool.uv.sources]

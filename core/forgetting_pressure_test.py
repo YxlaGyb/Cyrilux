@@ -2,134 +2,23 @@
 多任务灾难性遗忘压力测试 — 无回放 vs MemoryBank+Sniffer 4×4 CE 矩阵.
 
 用法:
-  # 先准备数据
-  python prepare_4task.py
-
-  # 跑 4 任务压力测试
-  python forgetting_pressure_test.py ^
-      --tasks datasets/task_a_daily_20k.jsonl datasets/task_b_tech_20k.jsonl ^
-              datasets/task_c_medical_20k.jsonl datasets/task_d_sft_20k.jsonl ^
-      --task-names "日常对话" "科技知识" "医疗问诊" "SFT指令" ^
-      --epochs 1 --batch-size 16 --max-seq-len 256 --lr 3e-4 ^
-      --threshold 1.5 --repair-steps 5 --check-interval 500
+  virtuoso test forgetting ...
 
 Phase 1: 无回放 (A→B→C→D 灾难性遗忘基线)
 Phase 2: MemoryBank + Sniffer 保护 (A→B→C→D 持续学习)
 输出: 4×4 CE 矩阵 (行=训练完第 i 个任务, 列=在第 j 个任务上的 CE)
 """
 import os, sys, json, math, time, argparse, re
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from model.pc_layers import PCLocalDynamicMiniMind
 from model.model_minimind import MiniMindConfig
 from continual.memory_bank import MemoryBank
 from continual.forgetting_sniffer import ForgettingSniffer
-from trainer_utils import get_lr, setup_seed
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 数据集
-# ═══════════════════════════════════════════════════════════════════
-
-class DualChannelDataset(Dataset):
-    """双通道数据集: ch0=原始字节值, ch1=角色编码 0:pad/1:user/2:assistant/3:system."""
-
-    ROLE_MAP = {"padding": 0, "user": 1, "assistant": 2, "system": 3}
-
-    def __init__(self, data_path, max_length=128, max_samples=None):
-        super().__init__()
-        self.dual_tensors = []  # list of [2, max_length] float32
-        self.label_tensors = []
-        with open(data_path, 'r', encoding='utf-8') as f:
-            for i, line in enumerate(f):
-                if max_samples and i >= max_samples:
-                    break
-                sample = json.loads(line)
-                raw_text, roles = self._extract_with_roles(sample)
-                byte_seq = raw_text.encode('utf-8')[:max_length]
-                padded = byte_seq.ljust(max_length, b'\x00')
-                byte_t = torch.frombuffer(bytearray(padded), dtype=torch.uint8).clone().float()
-
-                # 角色编码: 按字节偏移填充, padding 处填 0
-                role_t = torch.zeros(max_length, dtype=torch.float)
-                for start, end, role in roles:
-                    # 将 role 映射到对应 UTF-8 字节区间
-                    b_start = len(raw_text[:start].encode('utf-8'))
-                    b_end = min(len(raw_text[:end].encode('utf-8')), max_length)
-                    if b_start < max_length:
-                        role_t[b_start:b_end] = self.ROLE_MAP.get(role, 2.0)
-
-                dual_t = torch.stack([byte_t, role_t], dim=0)  # [2, max_length]
-                self.dual_tensors.append(dual_t)
-
-                lbl = byte_t.clone().long()
-                lbl[byte_t == 0x00] = -100
-                self.label_tensors.append(lbl)
-
-    @staticmethod
-    def _extract_with_roles(sample):
-        """从 sample 提取 (raw_text, [(start, end, role), ...]).
-
-        支持 conversations 格式 (含 role 字段) 和 text 格式 (启发式拆分).
-        """
-        if 'conversations' in sample:
-            raw = ''
-            roles = []
-            for m in sample['conversations']:
-                role = m.get('role', 'assistant')
-                content = m.get('content', m.get('value', ''))
-                start = len(raw)
-                raw += content
-                end = len(raw)
-                roles.append((start, end, role))
-            return raw, roles
-        elif 'text' in sample:
-            raw = sample['text']
-        elif 'chosen' in sample:
-            raw = sample['chosen']
-        else:
-            raw = str(sample)
-
-        # 1) 优先尝试解析 <|user|>/<|assistant|>/<|system|> 标记 (data_converter 格式)
-        marker_re = r'(<\|user\|>|<\|assistant\|>|<\|system\|>|<\|end\|>)'
-        parts = re.split(marker_re, raw)
-        if len(parts) >= 5:  # 至少 user + assistant + end
-            clean_raw = ''
-            roles = []
-            i = 1  # parts[0] 是标记前的空字符串
-            while i < len(parts) - 1:
-                tag = parts[i]
-                if tag == '<|end|>':
-                    break
-                if tag in ('<|user|>', '<|assistant|>', '<|system|>', '<|tool|>'):
-                    role = tag.strip('<>|')
-                    content = parts[i + 1].strip() if i + 1 < len(parts) else ''
-                    if content:
-                        start = len(clean_raw)
-                        clean_raw += content
-                        end = len(clean_raw)
-                        roles.append((start, end, role))
-                    i += 2
-                else:
-                    i += 1
-            if roles:
-                return clean_raw, roles
-
-        # 2) 回退: 启发式拆分 — 首行 \n 前 → user, 后 → assistant
-        first_nl = raw.find('\n')
-        if first_nl > 0 and first_nl < len(raw) * 0.6:
-            roles = [(0, first_nl, 'user'), (first_nl, len(raw), 'assistant')]
-        else:
-            roles = [(0, len(raw), 'assistant')]
-        return raw, roles
-
-    def __len__(self):
-        return len(self.dual_tensors)
-
-    def __getitem__(self, index):
-        return self.dual_tensors[index].clone(), self.label_tensors[index].clone()
+from core.trainer_utils import get_lr, setup_seed
+from core.dataset import DualChannelDataset
+from core.globals import DEVICE_STR
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -492,7 +381,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    device = DEVICE_STR
 
     n_tasks = len(args.tasks)
     if n_tasks < 2:
@@ -562,6 +451,7 @@ def main():
     # 结论
     # ═══════════════════════════════════════════════════════════
     print_conclusion(p1_matrix, p2_matrix, task_names)
+    print()
 
 
 if __name__ == '__main__':

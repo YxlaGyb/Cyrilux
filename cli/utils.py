@@ -1,27 +1,8 @@
 """
-CLI 共享工具: Rich 进度面板, 配置加载, 路径处理.
+CLI 共享工具: 路径处理 & 配置加载.
 """
 
-import os
-import sys
-import json
-from typing import Optional
-from pathlib import Path
-
-# ── 项目根路径 ──
-CLI_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(CLI_DIR)
-sys.path.insert(0, PROJECT_ROOT)
-
-# ── Rich 组件 ──
-from rich.layout import Layout
-from rich.panel import Panel
-from rich.table import Table
-from rich.live import Live
-from rich.console import Console
-from rich.text import Text
-
-console = Console()
+import os, json
 
 
 def resolve_path(p: str) -> str:
@@ -30,10 +11,6 @@ def resolve_path(p: str) -> str:
         return p
     return os.path.join(PROJECT_ROOT, p)
 
-
-# ═══════════════════════════════════════════════════════════════════
-# 配置加载
-# ═══════════════════════════════════════════════════════════════════
 
 def load_config(path: str) -> dict:
     """加载 JSON 配置文件."""
@@ -47,11 +24,11 @@ def save_config(config: dict, path: str):
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
-    console.print(f"[green]✓[/] 配置已保存: {path}")
+    print(f"✓ 配置已保存: {path}")
 
 
 def merge_config(config: dict, cli_overrides: dict) -> dict:
-    """CLI 参数覆写配置项. CLI 参数优先级 > 配置文件."""
+    """CLI 参数覆写配置项."""
     merged = dict(config)
     for k, v in cli_overrides.items():
         if v is not None:

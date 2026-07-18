@@ -7,7 +7,7 @@
   - 支持分割后自动转换格式 (conversations→text)
 """
 import os, json, math, argparse
-from data_converter import convert_sample
+from core.data_converter import convert_sample
 
 
 def split_file(input_path: str, output_dir: str, chunk_size: int = 1000,
@@ -118,10 +118,10 @@ if __name__ == '__main__':
         results = split_directory(args.input, output_dir, args.chunk_size,
                                   not args.no_convert, dry_run=args.dry_run)
         for fname, r in results.items():
-            print(f'{fname}: {r["total_lines"]} 条 → {r["n_chunks"]} 个文件')
+            print(f'{fname}: {r["n_chunks"]} chunks, {r["total_lines"]} lines')
     else:
-        r = split_file(args.input, output_dir, args.chunk_size,
-                       not args.no_convert, dry_run=args.dry_run)
-        print(f'{args.input}: {r["total_lines"]} 条 → {r["n_chunks"]} 个文件')
-        for f in r['output_files']:
-            print(f'  {f}')
+        result = split_file(args.input, output_dir, args.chunk_size,
+                            not args.no_convert, dry_run=args.dry_run)
+        print(f'{os.path.basename(args.input)}: {result["n_chunks"]} chunks, {result["total_lines"]} lines')
+        for fp in result['output_files']:
+            print(f'  → {fp}')

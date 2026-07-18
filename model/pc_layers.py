@@ -334,155 +334,172 @@ class PCDynamicMiniMind(nn.Module):
         else:
             return block.mlp(block.post_attention_layernorm(z_prev))
 
+    # ── 批量化 temporal/topdown (Phase E) ────────────────────
+
+    def _compute_batched_temporal_topdown(self, z_list, seq_len):
+        """批量化 temporal/topdown 预测: 用 bmm 替代 einsum."""
+        L = self.num_sub_layers
+        if seq_len <= 1:
+            return None, None
+
+        z_sub = torch.stack(z_list[1:], dim=0)  # [L, B, S, H]
+        B, H = z_sub.size(1), z_sub.size(3)
+        W_temp = torch.stack([p.weight for p in self.temporal_proj])  # [L, H, H]
+        # [L, B, S-1, H] → [L, B*(S-1), H], bmm with [L, H, H] → [L, B*(S-1), H]
+        z_flat = z_sub[:, :, :-1, :].reshape(L, -1, H)
+        μ_temp_flat = torch.bmm(z_flat, W_temp)  # [L, B*(S-1), H]
+        μ_temp = μ_temp_flat.reshape(L, B, -1, H)  # [L, B, S-1, H]
+        pad = torch.zeros(L, B, 1, H, device=z_sub.device, dtype=z_sub.dtype)
+        μ_temp_all = torch.cat([pad, μ_temp], dim=2)
+
+        if L > 1:
+            z_down = torch.stack(z_list[2:], dim=0)  # [L-1, B, S, H]
+            W_down = torch.stack([p.weight for p in self.topdown_proj])
+            z_down_flat = z_down[:, :, :-1, :].reshape(L - 1, -1, H)
+            μ_down_flat = torch.bmm(z_down_flat, W_down)
+            μ_down = μ_down_flat.reshape(L - 1, B, -1, H)
+            pad_d = torch.zeros(L - 1, B, 1, H, device=z_sub.device, dtype=z_sub.dtype)
+            μ_down_all = torch.cat([pad_d, μ_down], dim=2)
+        else:
+            μ_down_all = None
+
+        return μ_temp_all, μ_down_all
+
     # ── 时空推理单步 ──────────────────────────────────────────
 
     def spatiotemporal_infer_step(self, z_by_layer, pos_emb, gamma, padding_mask=None,
                                     return_errors=True, return_pred_loss=False,
                                     precision_scales=None):
-        """单步时空推理: 对所有层 ell=1..L 和时间 t 更新 z。
+        """单步时空推理: 对所有层 ell=1..L 更新 z.
 
-        注意: 无论调用方是否在 torch.no_grad() 下, 内部始终启用 grad。
+        推理始终在 no_grad 下运行 (手动 ∇F_z = ε).
+        F_pred 通过 compute_spatiotemporal_loss 在推理后单独计算。
         """
-        with torch.enable_grad():
-            return self._spatiotemporal_infer_step(z_by_layer, pos_emb, gamma, padding_mask,
-                                                    return_errors=return_errors,
-                                                    return_pred_loss=return_pred_loss,
-                                                    precision_scales=precision_scales)
+        return self._spatiotemporal_infer_step(
+            z_by_layer, pos_emb, gamma, padding_mask,
+            return_errors=return_errors,
+            return_pred_loss=return_pred_loss,
+            precision_scales=precision_scales,
+        )
 
     def _spatiotemporal_infer_step(self, z_by_layer, pos_emb, gamma, padding_mask,
                                      return_errors=True, return_pred_loss=False,
                                      precision_scales=None):
-        """grad-enabled 实现 (被包装调用)."""
+        """单步时空推理: 手动 ∇F_z = ε, 同时可选累积 F_pred.
+
+        核心原则:
+          - z 始终不追踪梯度 (detach)
+          - 如果 grad 已启用 (最后一轮), F_pred 通过 predict/temporal/topdown 累积梯度
+          - 如果 no_grad, 返回 (new_z, errors_info, F_val_scalar, None)
+
+        Returns:
+            new_z: list[tensor] — 更新后的 z (均无 grad)
+            errors_info: list[(e_sq, e_norm), ...] 或 [] (grad 模式下为空)
+            F_val: 本轮 F 值 (纯标量, 无 grad)
+            F_pred: tensor 或 None — 有 grad_fn 的 F (仅在 grad + return_pred_loss 时)
+        """
         L = self.num_sub_layers
-        z_det = [z.detach().requires_grad_(True) for z in z_by_layer]
+        z_det = [z.detach() for z in z_by_layer]
         seq_len = z_det[0].size(1)
+        B = z_det[0].size(0)
+        has_grad = torch.is_grad_enabled()
 
+        errors_ε = []
+        F_val = 0.0  # scalar, for logging
+        F_pred = None
 
-        # ── 计算所有预测和误差 ──
-        F = 0.0
-        # ponytail: 缓存 μ 值, 消除 error logging 中重复 predict (Phase A)
-        _μ_bu_cache, _μ_temp_cache, _μ_down_cache = [], [], []
+        μ_temp_all, μ_down_all = self._compute_batched_temporal_topdown(z_det, seq_len)
 
         for ℓ in range(1, L + 1):
-            # 自下而上: sublayer(z_{ℓ-1}) + residual
             μ_bu = self.predict(ℓ, z_det[ℓ - 1], pos_emb)
             μ_bu_res = μ_bu + z_det[ℓ - 1]
 
-            # 时序: W_temp(z_ℓ(t-1)) → z_ℓ(t), t=0 为零
-            # ponytail: cat 而非 in-place 赋值, 保持 autograd 图完整
-            if seq_len > 1:
-                z_prev_t = z_det[ℓ][:, :-1, :]
-                z_temp = self.temporal_proj[ℓ - 1](z_prev_t)
-                μ_temp = torch.cat([torch.zeros_like(z_det[ℓ][:, :1, :]), z_temp], dim=1)
-            else:
-                μ_temp = torch.zeros_like(z_det[ℓ])
-
-            # 自上而下: W_down(z_{ℓ+1}(t-1)) → z_ℓ(t), t=0 为零
-            if ℓ < L and seq_len > 1:
-                z_down_prev = z_det[ℓ + 1][:, :-1, :]
-                z_down = self.topdown_proj[ℓ - 1](z_down_prev)
-                μ_down = torch.cat([torch.zeros_like(z_det[ℓ][:, :1, :]), z_down], dim=1)
-            else:
-                μ_down = torch.zeros_like(z_det[ℓ])
-
-            # ponytail: 存入缓存
-            _μ_bu_cache.append(μ_bu_res)
-            _μ_temp_cache.append(μ_temp)
-            _μ_down_cache.append(μ_down)
+            μ_temp = μ_temp_all[ℓ - 1] if μ_temp_all is not None else torch.zeros_like(z_det[ℓ])
+            μ_down = μ_down_all[ℓ - 1] if (μ_down_all is not None and ℓ < L) else torch.zeros_like(z_det[ℓ])
 
             μ_total = μ_bu_res + μ_temp + μ_down
             ε = z_det[ℓ] - μ_total
 
-            # 带 padding mask 的误差 (可选)
+            # F_pred with grad (仅在 grad 模式下)
+            if has_grad and return_pred_loss:
+                π = precision_scales[ℓ - 1] if precision_scales is not None else 1.0
+                if F_pred is None:
+                    F_pred = 0.5 * π * (ε ** 2).sum()
+                else:
+                    F_pred = F_pred + 0.5 * π * (ε ** 2).sum()
+
+            # F_val for logging (始终无 grad)
             if padding_mask is not None:
                 mask = padding_mask.unsqueeze(-1).to(ε.dtype)
-                F = F + 0.5 * ((ε * mask) ** 2).sum()
+                F_val = F_val + 0.5 * ((ε * mask) ** 2).sum()
             else:
-                F = F + 0.5 * (ε ** 2).sum()
+                F_val = F_val + 0.5 * (ε ** 2).sum()
 
-        # ── 一次 backward 计算所有 ∇F_{z_ℓ} ──
-        z_vars = [z_det[ℓ] for ℓ in range(1, L + 1)]
-        grads = torch.autograd.grad(F, z_vars)
+            errors_ε.append(ε)
 
-        # ── 更新 z_ℓ ──
-        new_z = [z_by_layer[0]]  # z_0 固定
+        # 归一化
+        norm = B * seq_len
+        F_val = F_val / norm
+        if F_pred is not None:
+            F_pred = F_pred / norm
+
+        # 更新 z — 始终 detach 切断梯度流
+        new_z = [z_det[0]]
         errors_info = []
 
         for ℓ in range(1, L + 1):
-            new_z.append(z_by_layer[ℓ] - gamma * grads[ℓ - 1].detach())
-            if return_errors:
-                # ponytail: 从缓存读取 μ 值 (Phase A), 消除 36 次 predict / proj 调用
-                idx = ℓ - 1
-                ε = z_det[ℓ] - (_μ_bu_cache[idx] + _μ_temp_cache[idx] + _μ_down_cache[idx])
+            ε = errors_ε[ℓ - 1]
+            new_z.append((z_det[ℓ] - gamma * ε).detach())
+            if return_errors and not has_grad and not self._graph_capture_mode:
                 e_sq = (ε.detach() ** 2).mean().item()
                 e_norm = ε.detach().norm().item()
                 errors_info.append((e_sq, e_norm))
 
-
-        # ── 可选: 用更新后的 z (detach) 计算 weight loss ──
-        # ponytail: 消除独立 compute_spatiotemporal_loss 的冗余 forward
-        weight_loss = None
-        if return_pred_loss:
-            weight_loss = 0.0
-            z_new_det = [z.detach() for z in new_z]
-            for ℓ in range(1, L + 1):
-                π = precision_scales[ℓ - 1] if precision_scales is not None else 1.0
-                z_target = z_new_det[ℓ]
-                z_prev = z_new_det[ℓ - 1]
-
-                μ_bu = self.predict(ℓ, z_prev, pos_emb)
-                μ_bu_res = μ_bu + z_prev
-
-                if seq_len > 1:
-                    z_prev_t = z_target[:, :-1, :]
-                    z_temp = self.temporal_proj[ℓ - 1](z_prev_t)
-                    μ_temp = torch.cat([torch.zeros_like(z_target[:, :1, :]), z_temp], dim=1)
-                else:
-                    μ_temp = torch.zeros_like(z_target)
-
-                if ℓ < L and seq_len > 1:
-                    z_down_prev = z_new_det[ℓ + 1][:, :-1, :]
-                    z_down = self.topdown_proj[ℓ - 1](z_down_prev)
-                    μ_down = torch.cat([torch.zeros_like(z_target[:, :1, :]), z_down], dim=1)
-                else:
-                    μ_down = torch.zeros_like(z_target)
-
-                μ_total = μ_bu_res + μ_temp + μ_down
-                ε = z_target - μ_total
-
-                if padding_mask is not None:
-                    mask = padding_mask.unsqueeze(-1).to(ε.dtype)
-                    weight_loss = weight_loss + 0.5 * π * ((ε * mask) ** 2).sum()
-                else:
-                    weight_loss = weight_loss + 0.5 * π * (ε ** 2).sum()
-
-        F_val = F.item()
-
-        return new_z, errors_info, F_val, weight_loss
+        F_val_ret = F_val.detach().item() if has_grad else (F_val.item() if hasattr(F_val, 'item') else F_val)
+        return new_z, errors_info, F_val_ret, F_pred
 
     # ── 时空推理循环 ──────────────────────────────────────────
 
-    @torch.no_grad()
     def spatiotemporal_infer(self, z_by_layer, pos_emb, gamma=0.1, T=2, padding_mask=None,
                                return_errors=True, return_pred_loss=False,
                                precision_scales=None):
-        """T 步时空推理循环, 返回收敛后的 z 和历史."""
+        """T 步时空推理循环, 返回收敛后的 z 和 F_pred.
+
+        推理策略: 前 T-1 步纯 no_grad (快速), 最后一步启用 grad 累积 F_pred.
+        消除 compute_spatiotemporal_loss 的二次前向开销.
+
+        Returns:
+            z_by_layer: list[tensor] — 收敛后的 z (无 grad)
+            errors_hist: list of errors_info
+            F_hist: list of F_val scalars
+            F_pred: tensor or None — 有 grad_fn 的 F (仅 return_pred_loss=True)
+        """
         errors_hist = []
         F_hist = []
         F_pred = None
 
         for t in range(T):
-            do_pred = return_pred_loss and (t == T - 1)
-            z_by_layer, errors, F, Fp = self.spatiotemporal_infer_step(
-                z_by_layer, pos_emb, gamma, padding_mask,
-                return_errors=return_errors,
-                return_pred_loss=do_pred,
-                precision_scales=precision_scales,
-            )
-            errors_hist.append(errors)
-            F_hist.append(F)
-            if do_pred:
-                F_pred = Fp
+            is_last = (t == T - 1)
+            # 前 T-1 步 no_grad, 最后一步 grad (累积 F_pred)
+            if is_last and return_pred_loss:
+                z_by_layer, errors, F_val, F_pred = self.spatiotemporal_infer_step(
+                    z_by_layer, pos_emb, gamma, padding_mask,
+                    return_errors=False,  # grad 模式下不收集 errors (.item()不可用)
+                    return_pred_loss=True,
+                    precision_scales=precision_scales,
+                )
+                F_hist.append(F_val)
+                # errors_hist 沿用上一步 (或空)
+            else:
+                with torch.no_grad():
+                    z_by_layer, errors, F_val, _ = self.spatiotemporal_infer_step(
+                        z_by_layer, pos_emb, gamma, padding_mask,
+                        return_errors=return_errors,
+                        return_pred_loss=False,
+                        precision_scales=precision_scales,
+                    )
+                errors_hist.append(errors)
+                F_hist.append(F_val)
 
         return z_by_layer, errors_hist, F_hist, F_pred
 
@@ -660,6 +677,7 @@ class PCLocalDynamicMiniMind(PCDynamicMiniMind):
         self.model = PCLocalBackbone(config)
         self.config = config
         self.num_sub_layers = 2 * len(self.model.layers)  # 6 层 dilated conv → 12 子层
+        self._graph_capture_mode = False
         # 无 _init_rope! 无 freqs_cos/sin
 
         # ── 时序预测: z_ℓ(t-1) → z_ℓ(t) ──
