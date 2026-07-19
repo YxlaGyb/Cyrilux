@@ -1,673 +1,341 @@
-"""训练监控页 — 基于 maliang Canvas 的数据选择 / 配置预设 / 实时曲线 / 控制栏 / 日志."""
+"""训练页面 — 参数配置 + 数据集 + 实时图表 + 日志."""
 
 from __future__ import annotations
 
 import os
-import glob
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from typing import Optional
 
-import maliang
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                             QPushButton, QSplitter, QScrollArea,
+                             QGroupBox, QFormLayout, QLineEdit,
+                             QDoubleSpinBox, QSpinBox, QCheckBox,
+                             QComboBox, QProgressBar, QFrame, QSizePolicy,
+                             QMessageBox)
 
-from gui.theme import FONT_FAMILY, ThemeManager
-from gui.state import ExperimentState
+from gui.theme import HackerTheme
+from gui.state_bridge import ExperimentStateSignals
 from gui.widgets.realtime_chart import RealtimeChart
 from gui.widgets.log_viewer import LogViewer
-
-# ── 预设集 ──
-QUICK_PRESETS: dict[str, dict] = {
-    "tiny": {
-        "batch_size": "8", "hidden_size": "128", "num_hidden_layers": "2",
-        "lr": "3e-4", "epochs": "1", "max_seq_len": "64", "T_infer": "1",
-        "gamma": "0.1", "max_beta": "1.0", "grad_clip": "1.0",
-        "subset": "200",
-    },
-    "small": {
-        "batch_size": "24", "hidden_size": "256", "num_hidden_layers": "4",
-        "lr": "3e-4", "epochs": "1", "max_seq_len": "128", "T_infer": "2",
-        "gamma": "0.1", "max_beta": "2.0", "grad_clip": "1.0",
-        "subset": "0",
-    },
-    "medium": {
-        "batch_size": "48", "hidden_size": "512", "num_hidden_layers": "6",
-        "lr": "2e-4", "epochs": "2", "max_seq_len": "256", "T_infer": "3",
-        "gamma": "0.05", "max_beta": "3.0", "grad_clip": "0.5",
-        "subset": "0",
-    },
-}
-
-# 参数分组定义 (用于折叠的"高级参数")
-PARAM_GROUPS = [
-    ("基础参数", [
-        ("batch_size", "Batch Size"),
-        ("max_seq_len", "Max Seq Len"),
-        ("lr", "学习率"),
-        ("epochs", "Epochs"),
-        ("subset", "Subset"),
-        ("seed", "Seed"),
-        ("split_size", "Split Size"),
-    ]),
-    ("模型 / PC", [
-        ("hidden_size", "Hidden Size"),
-        ("num_hidden_layers", "层数"),
-        ("T_infer", "T Infer"),
-        ("gamma", "Gamma"),
-        ("max_beta", "Max Beta"),
-        ("max_beta_conv", "Max Beta Conv"),
-        ("grad_clip", "Grad Clip"),
-    ]),
-    ("多巴胺", [
-        ("dopamine_eta", "ETA"),
-        ("dopamine_beta", "Beta"),
-        ("dopamine_gamma", "Gamma"),
-    ]),
-    ("持续学习", [
-        ("replay_ratio", "Replay Ratio"),
-        ("bank_size", "Bank Size"),
-        ("sniff_interval", "Sniff Interval"),
-        ("repair_threshold", "Repair Threshold"),
-        ("repair_steps", "Repair Steps"),
-        ("eval_samples", "Eval Samples"),
-        ("n_prototypes", "N Prototypes"),
-        ("abstraction_replay_interval", "Abstraction Replay"),
-    ]),
-]
+from gui.widgets.metric_card import MetricCard
+from gui.worker import TrainingWorker
+from core.training import TrainingConfig
 
 
-class Page(maliang.Canvas):
-    """训练监控页面 (maliang Canvas)."""
+def _make_spin(lo: int, hi: int, val: int, name: str = "paramSpin") -> QSpinBox:
+    s = QSpinBox()
+    s.setRange(lo, hi)
+    s.setValue(val)
+    s.setObjectName(name)
+    return s
 
-    def __init__(self, parent, state: ExperimentState, app, **kw):
-        super().__init__(parent, expand="xy", **kw)
-        self.state = state
-        self.app = app
-        self.theme_mgr = state.theme_mgr
 
-        # 训练相关
-        self._trainer = None
-        self._running = False
-        self._paused = False
+class _ParamGroup(QGroupBox):
+    """可折叠参数组."""
 
-        # 延迟任务句柄
-        self._after_tokens: list[str] = []
+    def __init__(self, title: str, parent=None):
+        super().__init__(title, parent)
+        self.setCheckable(True)
+        self.setChecked(True)
+        self._form = QFormLayout(self)
+        self._form.setSpacing(4)
+        self._form.setContentsMargins(8, 20, 8, 8)
+        self._widgets: dict[str, QWidget] = {}
 
-        # 数据集文件列表
-        self._dataset_files: list[str] = []
-        self._dataset_vars: list[tk.BooleanVar] = []
+    def add_row(self, key: str, label: str, widget: QWidget, default: str = "") -> None:
+        self._widgets[key] = widget
+        self._form.addRow(label, widget)
 
-        # 高级参数展开状态
-        self._advanced_visible = False
-        self._param_widgets: dict[str, tuple[tk.StringVar, tk.Entry]] = {}
+    def get(self, key: str, default: str = "") -> str:
+        w = self._widgets.get(key)
+        if w is None:
+            return default
+        if isinstance(w, QLineEdit):
+            return w.text() or default
+        if isinstance(w, (QDoubleSpinBox, QSpinBox)):
+            return str(w.value())
+        if isinstance(w, QCheckBox):
+            return "1" if w.isChecked() else "0"
+        if isinstance(w, QComboBox):
+            return w.currentText() or default
+        return default
 
-        # 内部布局 Frame
-        p = self.theme_mgr.palette
-        self._inner = tk.Frame(self, bg=p.bg)
-        self._inner_id = self.create_window(0, 0, window=self._inner, anchor="nw")
-        self.bind("<Configure>", self._on_resize)
+    def set_val(self, key: str, val: str) -> None:
+        w = self._widgets.get(key)
+        if w is None:
+            return
+        if isinstance(w, QLineEdit):
+            w.setText(val)
+        elif isinstance(w, QDoubleSpinBox):
+            w.setValue(float(val))
+        elif isinstance(w, QSpinBox):
+            w.setValue(int(val))
+        elif isinstance(w, QCheckBox):
+            w.setChecked(val in ("1", "true", "True"))
+        elif isinstance(w, QComboBox):
+            idx = w.findText(val)
+            if idx >= 0:
+                w.setCurrentIndex(idx)
 
-        self._build()
+    def to_dict(self) -> dict[str, str]:
+        return {k: self.get(k) for k in self._widgets}
 
-        # 延迟扫描
-        tok = self.after(200, self._scan_dataset_files)
-        self._after_tokens.append(tok)
-        tok = self.after(300, self._refresh_checkpoints)
-        self._after_tokens.append(tok)
 
-    def _on_resize(self, event):
+class TrainingPage(QWidget):
+    """训练 — 参数/数据集/图表/日志."""
+
+    def __init__(self, bridge, theme: HackerTheme, signals: ExperimentStateSignals):
+        super().__init__()
+        self._bridge = bridge
+        self._theme = theme
+        self._signals = signals
+        self._worker: TrainingWorker | None = None
+        self._timeline: list[dict] = []
+        self._build_ui()
+        self._connect_signals()
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(6)
+
+        heading = QLabel(">>> 训练")
+        heading.setObjectName("accent")
+        outer.addWidget(heading)
+
+        # ── 主分割: 左参数 | 中-右图表 ──
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # ── 左: 可滚动参数面板 ──
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        param_panel = QWidget()
+        param_layout = QVBoxLayout(param_panel)
+        param_layout.setSpacing(6)
+        param_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 1) 模型参数
+        self._g_model = _ParamGroup("模型")
+        self._g_model.add_row("hidden_size", "hidden_size:", _make_spin(64, 1024, 256))
+        self._g_model.add_row("num_hidden_layers", "layers:", _make_spin(1, 24, 4))
+        self._g_model.add_row("use_moe", "use_moe:", QCheckBox())
+        param_layout.addWidget(self._g_model)
+
+        # 2) 训练参数
+        self._g_train = _ParamGroup("训练")
+        self._g_train.add_row("lr", "lr:", QLineEdit("0.001", objectName="paramInput"))
+        self._g_train.add_row("batch_size", "batch_size:", _make_spin(1, 512, 48))
+        self._g_train.add_row("epochs", "epochs:", _make_spin(1, 100, 3))
+        self._g_train.add_row("max_seq_len", "max_seq_len:", _make_spin(16, 2048, 128))
+        self._g_train.add_row("seed", "seed:", _make_spin(0, 999999, 42))
+        self._g_train.add_row("subset", "subset:", _make_spin(-1, 99999, -1))
+        self._g_train.add_row("grad_clip", "grad_clip:", QLineEdit("1.0", objectName="paramInput"))
+        param_layout.addWidget(self._g_train)
+
+        # 3) PC 参数
+        self._g_pc = _ParamGroup("PC (预测编码)")
+        self._g_pc.add_row("T_infer", "T_infer:", _make_spin(1, 64, 16))
+        self._g_pc.add_row("gamma", "gamma:", QLineEdit("0.1", objectName="paramInput"))
+        self._g_pc.add_row("max_beta", "max_beta:", QLineEdit("2.0", objectName="paramInput"))
+        param_layout.addWidget(self._g_pc)
+
+        # 4) 多巴胺参数
+        self._g_dopa = _ParamGroup("多巴胺")
+        self._g_dopa.add_row("dopamine_eta", "eta:", QLineEdit("1.0", objectName="paramInput"))
+        self._g_dopa.add_row("dopamine_beta", "beta:", QLineEdit("0.5", objectName="paramInput"))
+        self._g_dopa.add_row("dopamine_gamma", "gamma:", QLineEdit("0.3", objectName="paramInput"))
+        param_layout.addWidget(self._g_dopa)
+
+        # 5) CL 参数
+        self._g_cl = _ParamGroup("持续学习")
+        self._g_cl.add_row("replay_ratio", "replay_ratio:", _make_spin(1, 100, 5))
+        self._g_cl.add_row("bank_size", "bank_size:", _make_spin(100, 50000, 2000))
+        self._g_cl.add_row("sniff_interval", "sniff_interval:", _make_spin(10, 5000, 200))
+        param_layout.addWidget(self._g_cl)
+
+        param_layout.addStretch()
+        scroll.setWidget(param_panel)
+        main_splitter.addWidget(scroll)
+
+        # ── 右: 4 个图表 + 底栏 ──
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(6, 0, 0, 0)
+        right_layout.setSpacing(4)
+
+        # 数据集选择 & 输出目录
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("数据集:"))
+        self._dataset_combo = QComboBox()
+        self._dataset_combo.setObjectName("paramInput")
+        self._dataset_combo.setEditable(True)
+        self._dataset_combo.addItems([
+            "dataset/sft_t2t.jsonl", "dataset/sft_t2t_mini.jsonl",
+            "dataset/agent_rl.jsonl", "dataset/dpo.jsonl",
+            "dataset/pretrain_t2t.jsonl", "dataset/lora_identity.jsonl",
+        ])
+        top_row.addWidget(self._dataset_combo, 1)
+        top_row.addWidget(QLabel("输出:"))
+        self._out_dir_edit = QLineEdit("ola_out/out_train", objectName="paramInput")
+        top_row.addWidget(self._out_dir_edit, 1)
+        right_layout.addLayout(top_row)
+
+        # 4 个实时图表 (2x2 网格)
+        chart_grid = QHBoxLayout()
+        chart_left = QVBoxLayout()
+        self._chart_ce = RealtimeChart()
+        self._chart_ce.set_title("CE Loss")
+        chart_left.addWidget(self._chart_ce, 1)
+        self._chart_F = RealtimeChart()
+        self._chart_F.set_title("F (预测误差)")
+        chart_left.addWidget(self._chart_F, 1)
+        chart_grid.addLayout(chart_left)
+
+        chart_right = QVBoxLayout()
+        self._chart_D = RealtimeChart()
+        self._chart_D.set_title("D (多巴胺)")
+        chart_right.addWidget(self._chart_D, 1)
+        self._chart_lr = RealtimeChart()
+        self._chart_lr.set_title("LR")
+        chart_right.addWidget(self._chart_lr, 1)
+        chart_grid.addLayout(chart_right)
+        right_layout.addLayout(chart_grid, 1)
+
+        # ── 控制栏 + 进度 ──
+        ctrl_row = QHBoxLayout()
+        self._start_btn = QPushButton("▶ 开始")
+        self._start_btn.clicked.connect(self._start_training)
+        ctrl_row.addWidget(self._start_btn)
+        self._pause_btn = QPushButton("⏸ 暂停")
+        self._pause_btn.clicked.connect(self._toggle_pause)
+        self._pause_btn.setEnabled(False)
+        ctrl_row.addWidget(self._pause_btn)
+        self._stop_btn = QPushButton("⏹ 停止")
+        self._stop_btn.clicked.connect(self._stop_training)
+        self._stop_btn.setEnabled(False)
+        ctrl_row.addWidget(self._stop_btn)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setObjectName("progressBar")
+        self._progress_bar.setRange(0, 100)
+        ctrl_row.addWidget(self._progress_bar, 1)
+        right_layout.addLayout(ctrl_row)
+
+        # 日志
+        self._log = LogViewer()
+        right_layout.addWidget(self._log, 2)
+
+        main_splitter.addWidget(right_panel)
+        main_splitter.setSizes([320, 480])
+        outer.addWidget(main_splitter, 1)
+
+    def _connect_signals(self) -> None:
+        self._signals.config_changed.connect(self._on_config_changed)
+        self._signals.status_message.connect(self._log.info)
+
+    def _on_config_changed(self, key: str, value: str) -> None:
+        for g in (self._g_model, self._g_train, self._g_pc, self._g_dopa, self._g_cl):
+            g.set_val(key, value)
+
+    def _collect_config(self) -> TrainingConfig:
+        d = {}
+        for g in (self._g_model, self._g_train, self._g_pc, self._g_dopa, self._g_cl):
+            d.update(g.to_dict())
+        # dataset_path 不传给 TrainingConfig (单独通过 pipelines 传入)
+        d.pop("dataset_path", None)
+        return TrainingConfig(**{k: self._coerce(v) for k, v in d.items()})
+
+    @staticmethod
+    def _coerce(v: str | None):
+        if v is None:
+            return None
         try:
-            self.itemconfigure(self._inner_id, width=event.width, height=event.height)
-        except tk.TclError:
+            return int(v)
+        except ValueError:
             pass
-
-    def destroy(self):
-        """清理: 取消延迟任务 + 停止训练."""
-        for tok in self._after_tokens:
-            try:
-                self.after_cancel(tok)
-            except Exception:
-                pass
-        self._after_tokens.clear()
-        if self._trainer and self._trainer.is_running():
-            self._trainer.stop()
-        super().destroy()
-
-    # ═══════════════════════════════════════════════════════════════
-    # UI 构建
-    # ═══════════════════════════════════════════════════════════════
-
-    def _build(self):
-        p = self.theme_mgr.palette
-        inner = self._inner
-
-        inner.grid_rowconfigure(0, weight=0)  # title
-        inner.grid_rowconfigure(1, weight=1)  # main split
-        inner.grid_rowconfigure(2, weight=0)  # log
-        inner.grid_columnconfigure(0, weight=0)  # left config
-        inner.grid_columnconfigure(1, weight=1)  # right charts+ctrl
-
-        # 标题
-        tk.Label(inner, text="训练", font=(FONT_FAMILY, 16, "bold"),
-                 bg=p.bg, fg=p.fg, anchor="w").grid(row=0, column=0, columnspan=2,
-                                  sticky="ew", padx=20, pady=(16, 8))
-
-        # ── 左: 配置面板 ──
-        self._build_left_config(inner, p)
-
-        # ── 右: 实时监控 ──
-        self._build_monitor(inner, p)
-
-        # ── 底部全宽: 日志 ──
-        self._build_log(inner, p)
-
-    # ── 左: 配置面板 ──
-
-    def _build_left_config(self, inner, p):
-        container = tk.Frame(inner, width=320, bg=p.bg)
-        container.grid(row=1, column=0, sticky="nsw", padx=(20, 8), pady=(0, 8))
-        container.grid_propagate(False)
-
-        canvas = tk.Canvas(container, width=310, highlightthickness=0, bg=p.bg)
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        scrollable = tk.Frame(canvas, bg=p.bg)
-
-        scrollable.bind("<Configure>",
-                        lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scrollable, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        def _on_mousewheel(event):
-            try:
-                canvas.yview_scroll(-1 * (event.delta // 120), "units")
-            except tk.TclError:
-                pass
-
-        canvas.bind("<MouseWheel>", _on_mousewheel)
-        self._scroll_canvas = canvas
-
-        self._build_data_section(scrollable, p)
-        self._build_preset_section(scrollable, p)
-        self._build_advanced_section(scrollable, p)
-        self._build_template_buttons(scrollable, p)
-
-    def _build_data_section(self, parent, p):
-        gb = tk.LabelFrame(parent, text="数据与输出",
-                           font=(FONT_FAMILY, 10, "bold"),
-                           padx=8, pady=4, bg=p.bg, fg=p.fg)
-        gb.pack(fill=tk.X, padx=4, pady=4)
-
-        tk.Label(gb, text="数据集文件:", font=(FONT_FAMILY, 9),
-                 bg=p.bg, fg=p.fg, anchor="w").pack(fill=tk.X, pady=(4, 2))
-
-        list_frame = tk.Frame(gb, height=80, bg=p.bg)
-        list_frame.pack(fill=tk.X, padx=2, pady=2)
-        list_frame.pack_propagate(False)
-
-        self._dataset_canvas = tk.Canvas(list_frame, height=76,
-                                         highlightthickness=0, bg=p.bg)
-        ds_scroll = ttk.Scrollbar(list_frame, orient="vertical",
-                                  command=self._dataset_canvas.yview)
-        ds_inner = tk.Frame(self._dataset_canvas, bg=p.bg)
-
-        ds_inner.bind("<Configure>", lambda e: self._dataset_canvas.configure(
-            scrollregion=self._dataset_canvas.bbox("all")))
-        self._dataset_canvas.create_window((0, 0), window=ds_inner, anchor="nw")
-        self._dataset_canvas.configure(yscrollcommand=ds_scroll.set)
-
-        self._dataset_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ds_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self._dataset_inner = ds_inner
-
-        btn_row = tk.Frame(gb, bg=p.bg)
-        btn_row.pack(fill=tk.X, pady=(2, 4))
-        tk.Button(btn_row, text="刷新", command=self._scan_dataset_files,
-                  font=(FONT_FAMILY, 8), bg=p.card_bg, fg=p.fg).pack(side=tk.LEFT, padx=2)
-        self._ds_status = tk.Label(btn_row, text="扫描中...",
-                                   font=(FONT_FAMILY, 8), fg=p.fg_secondary, bg=p.bg)
-        self._ds_status.pack(side=tk.LEFT, padx=4)
-
-        out_row = tk.Frame(gb, bg=p.bg)
-        out_row.pack(fill=tk.X, pady=2)
-        tk.Label(out_row, text="输出目录:", font=(FONT_FAMILY, 9),
-                 bg=p.bg, fg=p.fg, width=9, anchor="w").pack(side=tk.LEFT)
-        self._out_dir_var = tk.StringVar(value=self.state.out_dir)
-        tk.Entry(out_row, textvariable=self._out_dir_var,
-                 font=(FONT_FAMILY, 9), width=14,
-                 bg=p.input_bg, fg=p.fg, insertbackground=p.fg).pack(side=tk.LEFT, padx=2)
-        tk.Button(out_row, text="浏览", font=(FONT_FAMILY, 8),
-                  bg=p.card_bg, fg=p.fg,
-                  command=self._browse_out_dir).pack(side=tk.LEFT)
-
-        ckpt_row = tk.Frame(gb, bg=p.bg)
-        ckpt_row.pack(fill=tk.X, pady=2)
-        tk.Label(ckpt_row, text="恢复检查点:", font=(FONT_FAMILY, 9),
-                 bg=p.bg, fg=p.fg, width=9, anchor="w").pack(side=tk.LEFT)
-        self._ckpt_var = tk.StringVar()
-        self._ckpt_combo = ttk.Combobox(ckpt_row, textvariable=self._ckpt_var,
-                                        font=(FONT_FAMILY, 8), width=20, state="readonly")
-        self._ckpt_combo.pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
-        self._ckpt_combo.bind("<<ComboboxSelected>>", self._on_ckpt_selected)
-
-    def _build_preset_section(self, parent, p):
-        gb = tk.LabelFrame(parent, text="快速预设",
-                           font=(FONT_FAMILY, 10, "bold"),
-                           padx=8, pady=4, bg=p.bg, fg=p.fg)
-        gb.pack(fill=tk.X, padx=4, pady=4)
-
-        preset_names = ["自定义"] + list(QUICK_PRESETS.keys())
-        self._preset_var = tk.StringVar(value="自定义")
-        combo = ttk.Combobox(gb, textvariable=self._preset_var,
-                             values=preset_names, font=(FONT_FAMILY, 9),
-                             state="readonly", width=16)
-        combo.pack(fill=tk.X, padx=2, pady=2)
-        combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
-
-        tk.Label(gb, text="选择预设后自动填入参数, 可继续在高级参数中微调",
-                 font=(FONT_FAMILY, 8), fg=p.fg_secondary, bg=p.bg,
-                 wraplength=260, anchor="w").pack(fill=tk.X, padx=2, pady=(0, 4))
-
-    def _build_advanced_section(self, parent, p):
-        self._adv_frame = tk.LabelFrame(parent, text="高级参数",
-                                        font=(FONT_FAMILY, 10, "bold"),
-                                        padx=8, pady=4, bg=p.bg, fg=p.fg)
-        self._adv_frame.pack(fill=tk.X, padx=4, pady=4)
-
-        toggle_row = tk.Frame(self._adv_frame, bg=p.bg)
-        toggle_row.pack(fill=tk.X)
-        self._toggle_btn = tk.Button(
-            toggle_row, text="展开 ▼", font=(FONT_FAMILY, 8),
-            command=self._toggle_advanced, padx=8, cursor="hand2",
-            bg=p.card_bg, fg=p.fg)
-        self._toggle_btn.pack(side=tk.RIGHT)
-
-        self._adv_content = tk.Frame(self._adv_frame, bg=p.bg)
-        self._adv_content_packed = False
-
-    def _toggle_advanced(self):
-        self._advanced_visible = not self._advanced_visible
-        if self._advanced_visible:
-            if not self._adv_content_packed:
-                p = self.theme_mgr.palette
-                self._build_adv_param_groups(self._adv_content, p)
-                self._adv_content_packed = True
-            self._adv_content.pack(fill=tk.X, pady=(4, 0))
-            self._toggle_btn.configure(text="收起 ▲")
-        else:
-            self._adv_content.pack_forget()
-            self._toggle_btn.configure(text="展开 ▼")
-
-    def _build_adv_param_groups(self, parent, p):
-        for group_name, fields in PARAM_GROUPS:
-            gb = tk.LabelFrame(parent, text=group_name,
-                               font=(FONT_FAMILY, 9, "bold"),
-                               padx=6, pady=2, bg=p.bg, fg=p.fg)
-            gb.pack(fill=tk.X, pady=2)
-
-            for key, label in fields:
-                row = tk.Frame(gb, bg=p.bg)
-                row.pack(fill=tk.X, pady=1)
-                tk.Label(row, text=label, font=(FONT_FAMILY, 8),
-                         bg=p.bg, fg=p.fg, width=14, anchor="w").pack(side=tk.LEFT)
-                var = tk.StringVar(value=self.state.config_get(key))
-                entry = tk.Entry(row, textvariable=var, font=(FONT_FAMILY, 8), width=10,
-                                 bg=p.input_bg, fg=p.fg, insertbackground=p.fg)
-                entry.pack(side=tk.RIGHT)
-                self._param_widgets[key] = (var, entry)
-
-    def _build_template_buttons(self, parent, p):
-        btn_row = tk.Frame(parent, bg=p.bg)
-        btn_row.pack(fill=tk.X, padx=4, pady=8)
-        tk.Button(btn_row, text="保存模板", command=self._save_template,
-                  font=(FONT_FAMILY, 9), bg=p.card_bg, fg=p.fg).pack(side=tk.LEFT, padx=2)
-        tk.Button(btn_row, text="加载模板", command=self._load_template,
-                  font=(FONT_FAMILY, 9), bg=p.card_bg, fg=p.fg).pack(side=tk.LEFT, padx=2)
-
-    # ── 右: 监控区 ──
-
-    def _build_monitor(self, inner, p):
-        right = tk.Frame(inner, bg=p.bg)
-        right.grid(row=1, column=1, sticky="nsew", padx=(8, 20), pady=(0, 8))
-        right.grid_rowconfigure(0, weight=1)
-        right.grid_rowconfigure(1, weight=1)
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_columnconfigure(1, weight=1)
-
-        # 4 个子 Canvas 占位作为 RealtimeChart 的 master
-        self._charts = {}
-        chart_configs = [
-            ("chart_ce", "CE Loss", "CE"),
-            ("chart_F", "Free Energy", "F"),
-            ("chart_D", "Dopamine", "D"),
-            ("chart_lr", "Learning Rate", "LR"),
-        ]
-        positions = [(0, 0), (0, 1), (1, 0), (1, 1)]
-        for (key, title, ylabel), (r, c) in zip(chart_configs, positions):
-            sub_canvas = tk.Canvas(right, highlightthickness=0, bg=p.bg)
-            sub_canvas.grid(row=r, column=c, sticky="nsew", padx=2, pady=2)
-            chart = RealtimeChart(sub_canvas, position=(0, 0),
-                                  size=(200, 150), title=title,
-                                  ylabel=ylabel, theme_mgr=self.theme_mgr)
-            chart.add_series(key)
-            self._charts[key] = chart
-
-        # ── 控制栏 ──
-        ctrl = tk.Frame(right, bg=p.bg)
-        ctrl.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-
-        self._btn_start = tk.Button(ctrl, text="开始训练", command=self._start,
-                                    font=(FONT_FAMILY, 10), bg="#4ade80",
-                                    fg="black", padx=12, pady=2)
-        self._btn_start.pack(side=tk.LEFT, padx=2)
-
-        self._btn_stop = tk.Button(ctrl, text="停止", command=self._stop,
-                                   font=(FONT_FAMILY, 10), state=tk.DISABLED,
-                                   bg="#f87171", fg="black", padx=12, pady=2)
-        self._btn_stop.pack(side=tk.LEFT, padx=2)
-
-        self._btn_pause = tk.Button(ctrl, text="暂停", command=self._pause,
-                                    font=(FONT_FAMILY, 10), state=tk.DISABLED,
-                                    bg=p.card_bg, fg=p.fg, padx=12, pady=2)
-        self._btn_pause.pack(side=tk.LEFT, padx=2)
-
-        self._progress = ttk.Progressbar(ctrl, mode="determinate", length=200)
-        self._progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-
-        self._step_var = tk.StringVar(value="0 / 0")
-        tk.Label(ctrl, textvariable=self._step_var,
-                 font=(FONT_FAMILY, 9), bg=p.bg, fg=p.fg).pack(side=tk.LEFT, padx=4)
-
-    # ── 日志 ──
-
-    def _build_log(self, inner, p):
-        """日志区域: tk.Canvas 占位 + 延迟创建 LogViewer."""
-        log_container = tk.Frame(inner, bg=p.bg, height=130)
-        log_container.grid(row=2, column=0, columnspan=2, sticky="nsew",
-                           padx=20, pady=(0, 8))
-        log_container.grid_propagate(False)
-
-        sub_canvas = tk.Canvas(log_container, highlightthickness=0, bg=p.bg)
-        sub_canvas.pack(fill=tk.BOTH, expand=True)
-
-        self._log_container = log_container
-        self._log_sub_canvas = sub_canvas
-        self._log_built = False
-        sub_canvas.bind("<Map>", self._build_log_delayed)
-
-    def _build_log_delayed(self, event=None):
-        if self._log_built:
-            return
-        self._log_built = True
-        c = self._log_sub_canvas
-        c.update_idletasks()
-        w = c.winfo_width() or 600
-        h = c.winfo_height() or 120
-        self._log = LogViewer(c, position=(0, 0), size=(w, h),
-                              theme_mgr=self.theme_mgr)
-
-    # ═══════════════════════════════════════════════════════════════
-    # 数据 / 检查点扫描
-    # ═══════════════════════════════════════════════════════════════
-
-    def _scan_dataset_files(self):
-        """扫描 dataset/ 目录下的 .jsonl 文件."""
-        self._ds_status.configure(text="扫描中...")
-        # 清空旧 checkbox
-        for w in self._dataset_inner.winfo_children():
-            w.destroy()
-        self._dataset_vars.clear()
-        self._dataset_files.clear()
-
-        files = sorted(glob.glob("dataset/*.jsonl"))
-        if not files:
-            # 也检查 datasets/
-            files = sorted(glob.glob("datasets/*.jsonl"))
-        if not files:
-            self._ds_status.configure(text="未找到数据集文件")
-            return
-
-        self._dataset_files = files
-        for fpath in files:
-            var = tk.BooleanVar(value=False)
-            fname = os.path.basename(fpath)
-            cb = tk.Checkbutton(self._dataset_inner, text=fname, variable=var,
-                                font=(FONT_FAMILY, 8), anchor="w",
-                                selectcolor="#1e1e2e")
-            cb.pack(fill=tk.X, padx=2, pady=1)
-            self._dataset_vars.append(var)
-
-        self._ds_status.configure(text=f"{len(files)} 个文件")
-
-    def _refresh_checkpoints(self):
-        """从 state 注册表刷新检查点下拉."""
-        registrations = self.state.checkpoint_registry
-        if not registrations:
-            self._ckpt_combo.configure(values=["(无)"])
-            self._ckpt_var.set("(无)")
-            return
-        labels = []
-        for e in registrations:
-            d = e.get("dir", "")
-            f = e.get("filename", "")
-            s = e.get("step", 0)
-            label = f"{d}/{f} (step {s})" if s else f"{d}/{f}"
-            labels.append(label)
-        self._ckpt_combo.configure(values=labels)
-        self._ckpt_var.set(labels[0] if labels else "(无)")
-
-    def _on_ckpt_selected(self, event=None):
-        idx = self._ckpt_combo.current()
-        if idx >= 0 and idx < len(self.state.checkpoint_registry):
-            entry = self.state.checkpoint_registry[idx]
-            self.state.current_model_path = entry["path"]
-
-    def _browse_out_dir(self):
-        d = filedialog.askdirectory(initialdir=self._out_dir_var.get() or ".")
-        if d:
-            self._out_dir_var.set(d)
-
-    # ═══════════════════════════════════════════════════════════════
-    # 预设
-    # ═══════════════════════════════════════════════════════════════
-
-    def _on_preset_selected(self, event=None):
-        name = self._preset_var.get()
-        if name == "自定义" or name not in QUICK_PRESETS:
-            return
-        preset = QUICK_PRESETS[name]
-        for key, val in preset.items():
-            self.state.config_set(key, val)
-            if key in self._param_widgets:
-                self._param_widgets[key][0].set(val)
-        self.app.set_status(f"预设 '{name}' 已应用")
-
-    # ═══════════════════════════════════════════════════════════════
-    # 配置同步 / 模板
-    # ═══════════════════════════════════════════════════════════════
-
-    def _sync_params(self):
-        """将界面参数同步到 state."""
-        for key, (var, _) in self._param_widgets.items():
-            self.state.config_set(key, var.get())
-
-    def _save_template(self):
-        from tkinter import simpledialog
-        name = simpledialog.askstring("保存模板", "模板名称:")
-        if name:
-            self._sync_params()
-            self.state.config_templates[name] = dict(self.state.config)
-            self.app.set_status(f"模板 '{name}' 已保存")
-
-    def _load_template(self):
-        if not self.state.config_templates:
-            self.app.set_status("暂无保存的模板")
-            return
-        from tkinter import simpledialog
-        names = list(self.state.config_templates.keys())
-        name = simpledialog.askstring("加载模板",
-                                      f"可用模板: {', '.join(names)}\n输入名称:")
-        if name and name in self.state.config_templates:
-            for key, val in self.state.config_templates[name].items():
-                self.state.config_set(key, val)
-                if key in self._param_widgets:
-                    self._param_widgets[key][0].set(val)
-            self.app.set_status(f"模板 '{name}' 已加载")
-
-    # ═══════════════════════════════════════════════════════════════
-    # ★ 修复2: ThreadedTrainer 控制
-    # ═══════════════════════════════════════════════════════════════
-
-    def _get_selected_datasets(self) -> list[tuple[str, str, int]]:
-        """获取选中的数据集文件列表 → [(task_id, path, max_samples), ...]."""
-        selected = []
-        for i, var in enumerate(self._dataset_vars):
-            if var.get():
-                fpath = self._dataset_files[i]
-                task_id = os.path.splitext(os.path.basename(fpath))[0]
-                subset = int(self.state.config_get("subset", "0"))
-                selected.append((task_id, fpath, subset))
-        return selected
-
-    def _start(self):
-        self._sync_params()
-
-        # ── 检查数据集 ──
-        pipelines = self._get_selected_datasets()
-        if not pipelines:
-            messagebox.showwarning("警告", "请先选择至少一个数据集文件")
-            return
-
-        # ── 检查输出目录 ──
-        out_dir = self._out_dir_var.get().strip()
-        if not out_dir:
-            messagebox.showwarning("警告", "请设置输出目录")
-            return
-
-        # ── 导入训练组件 (延迟避免循环) ──
-        from core.training import TrainingConfig
-        from core.threaded_trainer import ThreadedTrainer
-
-        # 构建配置
-        kwargs = self.state.config_to_kwargs()
-        kwargs["out_dir"] = out_dir
-        # 检查点恢复
-        ckpt = self.state.current_model_path
-        if ckpt and os.path.isfile(ckpt):
-            kwargs["checkpoint_path"] = ckpt
-
-        config = TrainingConfig(**kwargs)
-
-        # ── TkProgressCallback: 日志输出 ──
-        from core.threaded_trainer import TkProgressCallback
-        tk_cb = TkProgressCallback(self._log._text, root=self.app.root)
-
-        # ── 创建 Trainer ──
-        self._trainer = ThreadedTrainer(config, progress_callback=tk_cb)
-        self._trainer.set_task_pipelines(pipelines)
-
-        # 替换回调: 同时更新图表 + 进度条
-        def combined_cb(data: dict):
-            tk_cb(data)
-            try:
-                self.app.root.after(0, self._on_progress, data)
-            except Exception:
-                pass
-
-        self._trainer.callback = combined_cb
-
-        # ── UI 状态 ──
-        self._running = True
-        self._paused = False
-        self._btn_start.configure(state=tk.DISABLED, text="训练中...")
-        self._btn_stop.configure(state=tk.NORMAL)
-        self._btn_pause.configure(state=tk.NORMAL, text="暂停")
-
-        # 清空旧图表
-        for ch in self._charts.values():
-            ch.clear()
-
-        self._progress["value"] = 0
-        self._step_var.set("0 / 0")
-        self._log.info("=" * 50)
-        self._log.info("训练开始...")
-        self.app.set_status("训练运行中")
-
-        # ── 启动 ──
-        self._trainer.start()
-
-    def _stop(self):
-        if self._trainer:
-            self._trainer.stop()
-        self._running = False
-        self._btn_start.configure(state=tk.NORMAL, text="开始训练")
-        self._btn_stop.configure(state=tk.DISABLED)
-        self._btn_pause.configure(state=tk.DISABLED, text="暂停")
-        self._log.info("训练已停止")
-        self.app.set_status("就绪")
-
-    def _pause(self):
-        if not self._trainer:
-            return
-        if self._paused:
-            self._trainer.resume()
-            self._paused = False
-            self._btn_pause.configure(text="暂停")
-            self._log.info("▶ 训练已恢复")
-        else:
-            self._trainer.pause()
-            self._paused = True
-            self._btn_pause.configure(text="继续")
-            self._log.info("⏸ 训练已暂停")
-
-    def _on_progress(self, data: dict):
-        """在主线程中处理进度回调 (图表 / 进度条 / 步数)."""
         try:
-            if not self.winfo_exists():
-                return
-        except tk.TclError:
-            return
+            return float(v)
+        except ValueError:
+            pass
+        if v.lower() in ("true", "false"):
+            return v.lower() == "true"
+        return v
 
-        if data.get("type") == "progress":
+    def _start_training(self) -> None:
+        if self._worker and self._worker.isRunning():
+            QMessageBox.warning(self, "提示", "训练已在运行中")
+            return
+        cfg = self._collect_config()
+        subset = int(self._g_train.get("subset", "-1"))
+        pipelines = [
+            ("task_1", self._dataset_combo.currentText(),
+             subset if subset > 0 else 0),
+        ]
+        self._worker = TrainingWorker(cfg, pipelines)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.checkpoint_saved.connect(
+            lambda p: self._log.info(f"检查点已保存: {p}"))
+
+        self._timeline.clear()
+        for chart in (self._chart_ce, self._chart_F, self._chart_D, self._chart_lr):
+            chart.clear_series()
+
+        self._worker.start()
+        self._start_btn.setEnabled(False)
+        self._pause_btn.setEnabled(True)
+        self._stop_btn.setEnabled(True)
+        self._log.info("训练已启动")
+
+    def _on_progress(self, data: dict) -> None:
+        t = data.get("type", "")
+        if t == "progress":
             step = data.get("step", 0)
             total = data.get("total_steps", 1)
-            ce = data.get("ce_loss")
-            F_val = data.get("F")
-            D_val = data.get("D")
-            lr = data.get("lr")
+            self._progress_bar.setValue(int(step / total * 100) if total else 0)
+            self._chart_ce.append("ce", data.get("ce_loss", 0))
+            self._chart_F.append("F", data.get("F", 0))
+            self._chart_D.append("D", data.get("D", 0))
+            self._chart_lr.append("lr", data.get("lr", 0))
+        elif t == "log":
+            self._log.info(data.get("message", ""))
+        elif t == "phase":
+            self._log.info(f"▶ 阶段 {data.get('phase', '?')}")
+        elif t == "checkpoint":
+            self._log.ok(f"💾 检查点: {data.get('checkpoint_path', '')}")
+        elif t == "task_done":
+            self._log.ok(f"✔ 任务完成: {data.get('task_id', '')}")
+        elif t == "done":
+            self._log.ok("✔ 训练完成")
+        elif t == "error":
+            self._log.error(f"✖ 错误: {data.get('message', '')}")
 
-            # 图表
-            if ce is not None:
-                self._charts["chart_ce"].add_point("chart_ce", step, ce)
-                self._charts["chart_ce"].redraw()
-            if F_val is not None:
-                self._charts["chart_F"].add_point("chart_F", step, F_val)
-                self._charts["chart_F"].redraw()
-            if D_val is not None:
-                self._charts["chart_D"].add_point("chart_D", step, D_val)
-                self._charts["chart_D"].redraw()
-            if lr is not None:
-                self._charts["chart_lr"].add_point("chart_lr", step, lr)
-                self._charts["chart_lr"].redraw()
+    def _on_finished(self, result: dict) -> None:
+        self._start_btn.setEnabled(True)
+        self._pause_btn.setEnabled(False)
+        self._stop_btn.setEnabled(False)
+        self._progress_bar.setValue(100)
+        msg = result.get("message", "")
+        if result.get("status") == "ok":
+            self._log.ok(f"✔ {msg}")
+        else:
+            self._log.error(f"✖ {msg}")
 
-            # 进度条
-            if total > 0:
-                pct = min(step / total * 100, 100)
-                self._progress["value"] = pct
-            self._step_var.set(f"{step} / {total}")
+    def _toggle_pause(self) -> None:
+        if not self._worker:
+            return
+        if self._worker.is_paused():
+            self._worker.request_resume()
+            self._pause_btn.setText("⏸ 暂停")
+            self._log.info("恢复训练")
+        else:
+            self._worker.request_pause()
+            self._pause_btn.setText("▶ 恢复")
+            self._log.info("训练已暂停")
 
-        elif data.get("type") == "done":
-            self._running = False
-            self._btn_start.configure(state=tk.NORMAL, text="开始训练")
-            self._btn_stop.configure(state=tk.DISABLED)
-            self._btn_pause.configure(state=tk.DISABLED, text="暂停")
-            self._progress["value"] = 100
-            self.app.set_status("训练完成 ✅")
+    def _stop_training(self) -> None:
+        if self._worker:
+            self._worker.requestInterruption()
+            self._log.warn("⏹ 请求停止训练")
 
-        elif data.get("type") == "error":
-            self._running = False
-            self._btn_start.configure(state=tk.NORMAL, text="开始训练")
-            self._btn_stop.configure(state=tk.DISABLED)
-            self._btn_pause.configure(state=tk.DISABLED, text="暂停")
-            self.app.set_status("训练出错 ❌")
+    def on_theme_changed(self, theme) -> None:
+        self._theme = theme

@@ -1,360 +1,411 @@
 """
-virtuosov2 GUI 主窗口 — 导航框架 + 页面路由.
+骇客像素风主窗口 — 左导航 + ToolBar + ContentStack + StatusBar.
 
-布局:
-  ┌─ Title Bar ──────────────────────────────────────┐
-  │  virtuosov2 v0.2.0              [深色主题] [设置] │
-  ├──────────┬──────────────────────────────────────┤
-  │          │  BREADCRUMB                          │
-  │  NAV     ├──────────────────────────────────────┤
-  │  PANEL   │  CONTENT AREA                        │
-  │  200px   │  (当前页面)                           │
-  │          │                                      │
-  ├──────────┴──────────────────────────────────────┤
-  │  Status Bar                                     │
-  └─────────────────────────────────────────────────┘
-
-线程安全: 训练线程通过 root.after() 队列推送更新到主线程.
+启动:
+    from gui import launch_gui
+    launch_gui()
 """
 
 from __future__ import annotations
 
 import os
 import sys
-import tkinter as tk
-from tkinter import ttk, messagebox
-from typing import Optional
+import time
+from datetime import datetime
 
-import maliang
+from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QStackedWidget, QStatusBar, QFrame,
+    QSplitter, QSizePolicy,
+)
+from PyQt6.QtGui import QFont, QAction, QIcon, QPalette, QColor, QFontDatabase
 
-from gui.theme import ThemeManager, FONT_FAMILY, FONT_FAMILY_MONO, Theme
+from gui.theme import HackerTheme, FONT_FAMILY, FONT_SIZE_BASE
+from gui.state_bridge import ExperimentStateSignals, bridge_state
 from gui.state import ExperimentState
 
-# 页面导入 (延迟到 show_page 时, 避免循环依赖)
-_page_registry = {}
 
+# ═══════════════════════════════════════════════════════════════════
+# 导航项
+# ═══════════════════════════════════════════════════════════════════
 
-def _lazy_page(name: str):
-    """延迟导入并缓存页面类."""
-    if name in _page_registry:
-        return _page_registry[name]
-    module_map = {
-        "dashboard": "gui.pages.dashboard",
-        "training": "gui.pages.training",
-        "continual": "gui.pages.continual",
-        "evaluation": "gui.pages.evaluation",
-        "autonomous": "gui.pages.autonomous",
-        "data": "gui.pages.data_manager",
-        "checkpoints": "gui.pages.checkpoints",
-        "templates": "gui.pages.config_templates",
-    }
-    if name not in module_map:
-        raise ValueError(f"未知页面: {name}")
-    import importlib
-    mod = importlib.import_module(module_map[name])
-    cls = getattr(mod, "Page")
-    _page_registry[name] = cls
-    return cls
+NAV_ITEMS = [
+    ("ctrl",   "≡",  "控制台",     "dashboard"),
+    ("train",  "◈",  "训练",       "training"),
+    ("cl",     "⟁",  "持续学习",    "continual"),
+    ("eval",   "⌘",  "评估",       "evaluation"),
+    ("auto",   "⚡",  "自主运行",    "autonomous"),
+    ("data",   "⎔",  "数据管理",    "data_manager"),
+    ("ckpt",   "◉",  "检查点",     "checkpoints"),
+    ("config_templates", "☰",  "配置模板",    "config_templates"),
+]
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 主窗口
+# 左侧导航
 # ═══════════════════════════════════════════════════════════════════
 
 
-class MainWindow:
-    """应用主窗口."""
+class NavItem(QPushButton):
+    """单个导航按钮."""
 
-    def __init__(self, root: tk.Tk, state: ExperimentState, dpi_scale: float = 1.25):
-        self.root = root
-        self.state = state
-        self.theme_mgr = state.theme_mgr
+    def __init__(self, key: str, icon: str, label: str, parent=None):
+        super().__init__(parent)
+        self._key = key
+        self.setCheckable(True)
+        self.setFixedHeight(38)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setText(f"  {icon}  {label}")
+        self.setFont(QFont(FONT_FAMILY, 10))
+        self.setObjectName("navItem")
 
-        # DPI 感知
-        self._init_dpi(dpi_scale)
 
-        # 窗口配置
-        root.title("virtuosov2 v0.2.0")
-        root.geometry(size=(1280, 860))
-        root.minsize(1024, 720)
+class LeftNav(QWidget):
+    """左侧导航面板 — 220px 宽, 可折叠."""
 
-        # 当前页面跟踪
-        self._current_page: Optional[tk.Widget] = None
-        self._current_page_name: str = ""
+    active_changed = pyqtSignal(str)  # key
 
-        # 构建 UI
-        self._build_ui()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items: dict[str, NavItem] = {}
+        self._active_key: str | None = None
+        self._collapsed = False
+        self.setFixedWidth(220)
+        self.setObjectName("leftNav")
 
-        # 应用主题
-        self.theme_mgr.apply(root)
-        self.theme_mgr.on_toggle(self._on_theme_changed)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(8, 8, 8, 8)
+        self._layout.setSpacing(2)
 
-    # ── DPI ──
+        # 标题
+        title = QLabel("  NAV")
+        title.setFont(QFont(FONT_FAMILY, 9))
+        title.setObjectName("secondary")
+        title.setFixedHeight(24)
+        self._layout.addWidget(title)
 
-    def _init_dpi(self, dpi_scale: float):
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            try:
-                ctypes.windll.user32.SetProcessDPIAware()
-            except Exception:
-                pass
-        try:
-            self.root.tk.call("tk", "scaling", self.root.tk.call("tk", "scaling") * dpi_scale)
-        except Exception:
-            pass
+        # 分隔线
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFixedHeight(1)
+        sep.setObjectName("navSep")
+        self._layout.addWidget(sep)
+        self._layout.addSpacing(4)
 
-    # ── UI 构建 ──
+        # 导航按钮
+        for key, icon, label, _ in NAV_ITEMS:
+            btn = NavItem(key, icon, label)
+            btn.clicked.connect(lambda checked, k=key: self._on_click(k))
+            self._layout.addWidget(btn)
+            self._items[key] = btn
 
-    def _build_ui(self):
-        self.root.grid_rowconfigure(0, weight=0)  # title
-        self.root.grid_rowconfigure(1, weight=0)  # breadcrumb
-        self.root.grid_rowconfigure(2, weight=1)  # nav + content
-        self.root.grid_rowconfigure(3, weight=0)  # status
-        self.root.grid_columnconfigure(0, weight=0)  # nav
-        self.root.grid_columnconfigure(1, weight=1)  # content
+        self._layout.addStretch()
 
-        self._build_title_bar()
-        self._build_breadcrumb()
-        self._build_nav_panel()
-        self._build_content_area()
-        self._build_status_bar()
+        # 默认选中 (用 button_key 而非 page_key)
+        self.set_active("ctrl")
 
-        # 默认页
-        self.show_page("dashboard")
+    def _on_click(self, key: str) -> None:
+        self.set_active(key)
+        self.active_changed.emit(key)
 
-    def _build_title_bar(self):
-        p = self.theme_mgr.palette
-        frame = tk.Frame(self.root, height=40, bg=p.accent)
-        frame.grid(row=0, column=0, columnspan=2, sticky="ew")
-        frame.grid_propagate(False)
+    def set_active(self, key: str) -> None:
+        """切换活跃项."""
+        if self._active_key:
+            old = self._items.get(self._active_key)
+            if old:
+                old.setChecked(False)
+        self._active_key = key
+        btn = self._items.get(key)
+        if btn:
+            btn.setChecked(True)
 
-        tk.Label(
-            frame,
-            text="virtuosov2 v0.2.0",
-            font=(FONT_FAMILY, 13, "bold"),
-            bg=p.accent,
-            fg="#ffffff",
-        ).pack(side=tk.LEFT, padx=16, pady=8)
+    def toggle_collapse(self) -> None:
+        """折叠/展开."""
+        self._collapsed = not self._collapsed
+        w = 60 if self._collapsed else 220
+        self.setFixedWidth(w)
 
-        # 主题切换
-        self._theme_btn = tk.Label(
-            frame,
-            text=f"{self.theme_mgr.theme_name()}主题",
-            font=(FONT_FAMILY, 10),
-            bg=p.card_bg,
-            fg=p.fg,
-            cursor="hand2",
-            padx=10,
-            pady=2,
-        )
-        self._theme_btn.pack(side=tk.RIGHT, padx=8, pady=8)
-        self._theme_btn.bind("<Button-1>", lambda e: self._toggle_theme())
 
-    def _build_breadcrumb(self):
-        p = self.theme_mgr.palette
-        frame = tk.Frame(self.root, height=24, bg=p.bg)
-        frame.grid(row=1, column=0, columnspan=2, sticky="ew")
-        frame.grid_propagate(False)
+# ═══════════════════════════════════════════════════════════════════
+# ToolBar
+# ═══════════════════════════════════════════════════════════════════
 
-        self._breadcrumb_var = tk.StringVar(value="控制台")
-        tk.Label(
-            frame,
-            textvariable=self._breadcrumb_var,
-            font=(FONT_FAMILY, 9),
-            bg=p.bg,
-            fg=p.fg_secondary,
-        ).pack(side=tk.LEFT, padx=16, pady=2)
 
-    def _build_nav_panel(self):
-        p = self.theme_mgr.palette
-        frame = tk.Frame(self.root, width=180, bg=p.card_bg)
-        frame.grid(row=2, column=0, sticky="nsw")
-        frame.grid_propagate(False)
+class ToolBar(QWidget):
+    """顶栏 — 面包屑(当前页名) + 右侧主题切换."""
 
-        # 导航标题
-        tk.Label(
-            frame,
-            text="导航",
-            font=(FONT_FAMILY, 10, "bold"),
-            bg=p.card_bg,
-            fg=p.fg,
-            padx=16,
-            pady=8,
-        ).pack(fill=tk.X)
+    theme_toggled = pyqtSignal()
 
-        self._nav_buttons: dict[str, tk.Widget] = {}
-        nav_items = [
-            ("dashboard", "控制台"),
-            ("training", "训练"),
-            ("continual", "持续学习"),
-            ("evaluation", "评估"),
-            ("autonomous", "自主运行"),
-            ("data", "数据"),
-            ("checkpoints", "检查点"),
-            ("templates", "模板"),
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(40)
+        self.setObjectName("toolBar")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 16, 0)
+
+        self._breadcrumb = QLabel("控制台")
+        self._breadcrumb.setFont(QFont(FONT_FAMILY, 11))
+        self._breadcrumb.setObjectName("breadcrumb")
+        layout.addWidget(self._breadcrumb)
+
+        layout.addStretch()
+
+        self._theme_btn = QPushButton("☾")
+        self._theme_btn.setFixedSize(32, 28)
+        self._theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._theme_btn.clicked.connect(self.theme_toggled.emit)
+        layout.addWidget(self._theme_btn)
+
+    def set_title(self, title: str) -> None:
+        self._breadcrumb.setText(title)
+
+    def set_theme_icon(self, dark: bool) -> None:
+        self._theme_btn.setText("☀" if dark else "☾")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ContentStack
+# ═══════════════════════════════════════════════════════════════════
+
+
+class ContentStack(QStackedWidget):
+    """页面容器 — 支持 fade 切换 (通过 QTimer 分步透明)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("contentStack")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GPU 探测
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _probe_gpu() -> str:
+    """非阻塞探测 GPU 信息."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            return f"GPU: {name}  {mem:.0f}GB"
+        return "GPU: N/A"
+    except Exception:
+        return "GPU: N/A"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MainWindow
+# ═══════════════════════════════════════════════════════════════════
+
+
+class MainWindow(QMainWindow):
+    """骇客像素风主窗口."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("virtuosov2 — PC 局部动态小语言模型")
+        self.setMinimumSize(1200, 720)
+        self.resize(1440, 900)
+
+        # ── 主题 ──
+        self._theme = HackerTheme(dark=True)
+
+        # ── 状态桥接 ──
+        self._state = ExperimentState()
+        self._signals = ExperimentStateSignals()
+        self._bridge = bridge_state(self._state, self._signals)
+
+        # ── 中央控件 ──
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # 左侧导航
+        self._nav = LeftNav()
+        main_layout.addWidget(self._nav)
+
+        # 右侧内容区 (ToolBar + 页面 + StatusBar)
+        right_side = QVBoxLayout()
+        right_side.setContentsMargins(0, 0, 0, 0)
+        right_side.setSpacing(0)
+
+        self._toolbar = ToolBar()
+        right_side.addWidget(self._toolbar)
+
+        self._content = ContentStack()
+        right_side.addWidget(self._content, 1)
+
+        main_layout.addLayout(right_side, 1)
+
+        # ── 状态栏 ──
+        self._status = QStatusBar()
+        self.setStatusBar(self._status)
+        self._status_label = QLabel("就绪")
+        self._status_label.setObjectName("secondary")
+        self._status.addWidget(self._status_label, 1)
+
+        self._gpu_label = QLabel("GPU: 检测中...")
+        self._gpu_label.setObjectName("secondary")
+        self._status.addPermanentWidget(self._gpu_label)
+
+        # 时钟
+        self._clock_label = QLabel()
+        self._clock_label.setObjectName("secondary")
+        self._status.addPermanentWidget(self._clock_label)
+
+        # ── 信号连接 ──
+        self._nav.active_changed.connect(self._on_nav_change)
+        self._toolbar.theme_toggled.connect(self._toggle_theme)
+        self._signals.status_message.connect(self._status_label.setText)
+
+        # ── 初始化 ──
+        self._register_pages()
+        self._apply_theme()
+        self._nav.set_active("ctrl")
+        self._content.setCurrentIndex(0)
+
+        # ── 后初始化 ──
+        QTimer.singleShot(500, self._on_startup)
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._update_clock)
+        self._clock_timer.start(10000)
+        self._update_clock()
+
+    # ── 页面注册 ──
+
+    def _register_pages(self) -> None:
+        """注册 8 个页面到 ContentStack (逐页 try/except 兜底)."""
+        self._pages: dict[str, QWidget] = {}
+        _page_specs: list[tuple[str, str, tuple]] = [
+            ("dashboard", "gui.pages.dashboard", ("DashboardPage", self._bridge, self._theme)),
+            ("training",   "gui.pages.training",   ("TrainingPage", self._bridge, self._theme, self._signals)),
+            ("continual",  "gui.pages.continual",  ("ContinualPage", self._bridge, self._theme)),
+            ("evaluation", "gui.pages.evaluation", ("EvaluationPage", self._bridge, self._theme)),
+            ("autonomous", "gui.pages.autonomous", ("AutonomousPage", self._bridge, self._theme)),
+            ("data_manager","gui.pages.data_manager",("DataManagerPage", self._bridge, self._theme)),
+            ("checkpoints","gui.pages.checkpoints",("CheckpointsPage", self._bridge, self._theme)),
+            ("config_templates","gui.pages.config_templates",("ConfigTemplatesPage", self._bridge, self._theme)),
         ]
-        for name, label in nav_items:
-            btn = tk.Label(
-                frame,
-                text=label,
-                font=(FONT_FAMILY, 10),
-                bg=p.card_bg,
-                fg=p.fg_secondary,
-                padx=16,
-                pady=6,
-                cursor="hand2",
-                anchor="w",
-            )
-            btn.pack(fill=tk.X)
-            btn.bind("<Button-1>", lambda e, n=name: self.show_page(n))
-            self._nav_buttons[name] = btn
+        for page_key, mod_path, (cls_name, *args) in _page_specs:
+            try:
+                import importlib
+                mod = importlib.import_module(mod_path)
+                cls = getattr(mod, cls_name)
+                page = cls(*args)
+                self._pages[page_key] = page
+                self._content.addWidget(page)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                # 创建兜底 fallback 页面
+                fallback = QWidget()
+                fb_layout = QVBoxLayout(fallback)
+                err_label = QLabel(f"⚠ 页面加载失败: {cls_name}\n{exc}")
+                err_label.setObjectName("error")
+                fb_layout.addWidget(err_label)
+                self._pages[page_key] = fallback
+                self._content.addWidget(fallback)
 
-    def _build_content_area(self):
-        p = self.theme_mgr.palette
-        self._content_frame = maliang.Canvas(self.root, bg=p.bg, highlightthickness=0)
-        self._content_frame.grid(row=2, column=1, sticky="nsew", padx=(0, 1), pady=(0, 1))
-        self._content_frame.grid_rowconfigure(0, weight=1)
-        self._content_frame.grid_columnconfigure(0, weight=1)
+    # ── 导航切换 ──
 
-    def _build_status_bar(self):
-        p = self.theme_mgr.palette
-        frame = tk.Frame(self.root, height=24, bg=p.card_bg)
-        frame.grid(row=3, column=0, columnspan=2, sticky="ew")
-        frame.grid_propagate(False)
+    def _on_nav_change(self, key: str) -> None:
+        """导航项切换 → 更新面包屑 + 页面 (button_key → page_key 映射)."""
+        # button_key → page_key 映射
+        _btn_to_page = {k: p for k, _, _, p in NAV_ITEMS}
+        page_key = _btn_to_page.get(key, key)
+        # 面包屑
+        titles = {k: label for k, _, label, _ in NAV_ITEMS}
+        self._toolbar.set_title(titles.get(key, page_key))
+        # 页面切换
+        page_keys = list(self._pages.keys())
+        if page_key in page_keys:
+            self._content.setCurrentIndex(page_keys.index(page_key))
 
-        self._status_var = tk.StringVar(value="就绪")
-        tk.Label(
-            frame,
-            textvariable=self._status_var,
-            font=(FONT_FAMILY, 9),
-            bg=p.card_bg,
-            fg=p.fg_secondary,
-        ).pack(side=tk.LEFT, padx=16, pady=2)
+    # ── 主题切换 ──
 
-        # GPU 状态 (延迟探测, 不阻塞主线程)
-        self._gpu_var = tk.StringVar(value="GPU: 探测中...")
-        tk.Label(
-            frame,
-            textvariable=self._gpu_var,
-            font=(FONT_FAMILY, 9),
-            bg=p.card_bg,
-            fg=p.fg_secondary,
-        ).pack(side=tk.RIGHT, padx=16, pady=2)
-        self.root.after(500, self._probe_gpu)
+    def _toggle_theme(self) -> None:
+        self._theme.toggle()
+        self._apply_theme()
+        self._toolbar.set_theme_icon(self._theme.is_dark)
+        # 通知各页面
+        for page in self._pages.values():
+            if hasattr(page, "on_theme_changed"):
+                page.on_theme_changed(self._theme)
 
-    # ── 页面路由 ──
+    def _apply_theme(self) -> None:
+        qss = self._theme.qss()
+        self.setStyleSheet(qss)
+        self._toolbar.set_theme_icon(self._theme.is_dark)
 
-    def show_page(self, name: str):
-        """切换到指定页面."""
-        if name == self._current_page_name:
-            return
+    # ── 启动 ──
 
-        # 销毁当前页面
-        if self._current_page:
-            self._current_page.destroy()
-
-        # 更新面包屑
-        page_labels = {
-            "dashboard": "控制台",
-            "training": "训练",
-            "continual": "持续学习",
-            "evaluation": "评估",
-            "autonomous": "自主运行",
-            "data": "数据",
-            "checkpoints": "检查点",
-            "templates": "模板",
-        }
-        self._breadcrumb_var.set(f"首页 > {page_labels.get(name, name)}")
-
-        # 高亮导航
-        p = self.theme_mgr.palette
-        for n, btn in self._nav_buttons.items():
-            btn.configure(fg=p.fg if n == name else p.fg_secondary)
-
-        # 创建新页面
+    def _on_startup(self) -> None:
+        """启动后异步任务 (try/except 防止闪退)."""
         try:
-            PageCls = _lazy_page(name)
-            page = PageCls(self._content_frame, self.state, self)
-            page.grid(row=0, column=0, sticky="nsew")
-            self._current_page = page
-            self._current_page_name = name
-        except Exception as e:
+            # GPU 探测
+            gpu_info = _probe_gpu()
+            self._gpu_label.setText(gpu_info)
+            # 触发 dashboard 数据加载
+            if "dashboard" in self._pages:
+                page = self._pages["dashboard"]
+                if hasattr(page, "refresh"):
+                    page.refresh()
+        except Exception as exc:
             import traceback
             traceback.print_exc()
-            self._show_error_page(str(e))
-            # 重置状态防止重复销毁已失效的页面
-            self._current_page = None
-            self._current_page_name = None
+            self._status_label.setText(f"⚠ 启动加载异常: {exc}")
 
-    def _show_error_page(self, msg: str):
-        frame = ttk.Frame(self._content_frame, padding=40)
-        frame.grid(row=0, column=0, sticky="nsew")
-        ttk.Label(frame, text="页面加载失败", font=(FONT_FAMILY, 16)).pack()
-        ttk.Label(frame, text=msg, font=(FONT_FAMILY, 10)).pack(pady=8)
+    def _update_clock(self) -> None:
+        self._clock_label.setText(datetime.now().strftime("%H:%M:%S"))
 
-    # ── 主题 ──
+    # ── 属性 ──
 
-    def _toggle_theme(self):
-        self.theme_mgr.toggle()
-        p = self.theme_mgr.palette
-        self.root.configure(bg=p.bg)
-        self.theme_mgr.apply(self.root)
-        self._theme_btn.configure(text=f"{self.theme_mgr.theme_name()}主题")
+    @property
+    def bridge(self):
+        return self._bridge
 
-    def _on_theme_changed(self, theme: Theme):
-        pass  # handled in _toggle_theme
+    @property
+    def signals(self):
+        return self._signals
 
-    # ── GPU 探测 ──
-
-    def _probe_gpu(self):
-        """延迟探测 GPU 状态 (在事件循环中异步执行)."""
-        try:
-            import torch
-            if torch.cuda.is_available():
-                name = torch.cuda.get_device_name(0)[:24]
-                mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
-                self._gpu_var.set(f"GPU: {name} | {mem:.0f}GB")
-            else:
-                self._gpu_var.set("GPU: 未检测到")
-        except Exception:
-            self._gpu_var.set("GPU: --")
-
-    # ── 状态栏 ──
-
-    def set_status(self, text: str):
-        self._status_var.set(text)
-
-    def status_message(self, msg: str, timeout_ms: int = 5000):
-        """显示临时状态消息."""
-        prev = self._status_var.get()
-        self._status_var.set(msg)
-        if timeout_ms > 0:
-            self.root.after(timeout_ms, lambda: self._status_var.set(prev))
+    @property
+    def theme(self):
+        return self._theme
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 入口
+# 启动入口
 # ═══════════════════════════════════════════════════════════════════
 
 
-def launch_gui(dpi_scale: float = 1.25):
-    """启动 GUI 主窗口."""
-    root = maliang.Tk()
-    root.minsize(1024, 720)
+_APP: QApplication | None = None
 
-    state = ExperimentState()
-    MainWindow(root, state, dpi_scale)
 
-    def _on_close():
-        root.destroy()
-        os._exit(0)
+def _exception_hook(exc_type, exc_value, exc_tb):
+    """全局异常钩子 — 打印 traceback 到 stderr 防止 PyQt6 静默吞异常."""
+    import traceback
+    traceback.print_exception(exc_type, exc_value, exc_tb)
 
-    root.protocol("WM_DELETE_WINDOW", _on_close)
 
-    try:
-        root.mainloop()
-    except KeyboardInterrupt:
-        root.destroy()
-        os._exit(0)
+def launch_gui() -> None:
+    """启动 PyQt6 骇客像素风 GUI."""
+    sys.excepthook = _exception_hook
+
+    global _APP
+    if _APP is None:
+        _APP = QApplication(sys.argv)
+        _APP.setStyle("Fusion")
+        # 设置应用字体
+        font = QFont(FONT_FAMILY, FONT_SIZE_BASE)
+        _APP.setFont(font)
+
+    window = MainWindow()
+    window.show()
+
+    if _APP is not None:
+        _APP.exec()

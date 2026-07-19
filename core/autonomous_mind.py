@@ -30,8 +30,12 @@ from torch.utils.data import Dataset, DataLoader
 from model.pc_layers import PCLocalDynamicMiniMind
 from model.model_minimind import MiniMindConfig
 from model.pc_core import DopamineSignal
-from core.trainer_utils import get_lr, Logger, setup_seed
+from core.trainer_utils import Logger, setup_seed
 from core.globals import DEVICE_STR
+from model.local_updates import (
+    compute_all_hebbian_updates, apply_hebbian_updates,
+    compute_errors_by_layer, compute_modulators,
+)
 
 # 内在动机模块
 from continual.intrinsic_curiosity import IntrinsicCuriosityModule
@@ -58,10 +62,8 @@ DEFAULT_CFG = {
     # 训练
     'batch_size': 16,
     'max_seq_len': 128,
-    'lr': 1e-4,
     'gamma': 0.05,
     'T_infer': 1,
-    'grad_clip': 1.0,
 
     # 多巴胺
     'dopamine_eta': 1.0,
@@ -479,12 +481,6 @@ class AutonomousMind:
 
         self.model.train()
 
-        # ── 优化器 ──
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.cfg['lr'], betas=(0.9, 0.95), fused=True,
-        )
-
         # ── 子模块 ──
         self.dopamine = DopamineSignal(
             η=self.cfg['dopamine_eta'],
@@ -539,11 +535,6 @@ class AutonomousMind:
                     _fix_shapes(ckpt['model_state'], self.model.state_dict())
                     self.model.load_state_dict(ckpt['model_state'], strict=False)
                     self._log(f'Loaded checkpoint: {ckpt_path}')
-                    if 'optimizer_state' in ckpt and hasattr(self, 'optimizer'):
-                        try:
-                            self.optimizer.load_state_dict(ckpt['optimizer_state'])
-                        except Exception:
-                            pass
                     return True
                 except Exception as e:
                     self._log(f'Checkpoint load failed: {e}')
@@ -667,7 +658,7 @@ class AutonomousMind:
     # ══════════════════════════════════════════════════════════════
 
     def _play_step(self):
-        """一次 PLAY 训练步骤。"""
+        """一次 PLAY 训练步骤 — Hebbian。"""
         batch = self.replay_buffer.sample(self.cfg['batch_size'], self.device)
 
         if batch is None:
@@ -687,36 +678,53 @@ class AutonomousMind:
             return
 
         z_detached = [z.detach() for z in z_init]
-        _, errors_hist, F_hist, F_pred = self.model.spatiotemporal_infer(
+        _, _, F_hist, F_pred, ε_list = self.model.spatiotemporal_infer(
             z_detached, pos_emb,
             gamma=self.controller.current_gamma,
             T=self.cfg['T_infer'],
-            return_errors=True,
+            return_errors=False,
             return_pred_loss=True,
+            return_ε=True,
         )
 
         D = self.dopamine.update(F_pred.item())
         D = max(D, 0.01)
 
-        β_local = min(1.0, 0.1 + self.total_steps / 1000)
-        β_conv = min(0.5, self.total_steps / 2000)
-        β_local = β_local * (1.0 + self.cfg['dopamine_gamma'] * D)
-        β_conv = β_conv * (1.0 + self.cfg['dopamine_gamma'] * D)
+        # ── Hebbian 更新 ──
+        F_curr = F_pred.item()
+        F_prev = self._last_F if hasattr(self, '_last_F') and self._last_F is not None else F_curr
+        uncertainty = 1.0 - D
+        _, ACh, modulation = compute_modulators(F_curr, F_prev, uncertainty, self.cfg)
+        self._last_F = F_curr
 
-        ce_local_sum = ce_loss * (bsz * seq_len)
-        scale_local = (F_pred.detach() / (ce_local_sum.detach() + 1e-8)).clamp(0.1, 10.0)
-        total_loss = F_pred + β_local * scale_local * ce_local_sum
+        base_lr = self.cfg.get('hebbian_base_eta', 1e-4)
+        gamma_rpe = self.cfg.get('dopamine_gamma', 0.3)
 
-        self.optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-        trainable = [p for p in self.model.parameters()
-                     if p.requires_grad and p.grad is not None]
-        if trainable:
-            torch.nn.utils.clip_grad_norm_(trainable, self.cfg['grad_clip'])
-        current_lr = self.cfg['lr'] * (1.0 + self.cfg['dopamine_beta'] * D)
-        for pg in self.optimizer.param_groups:
-            pg['lr'] = current_lr
-        self.optimizer.step()
+        updates = {}
+        updates.update(compute_hebbian_temporal(ε_list, z_detached, modulation, base_lr, gamma_rpe))
+        updates.update(compute_hebbian_topdown(ε_list, z_detached, modulation, base_lr, gamma_rpe))
+
+        L = len(ε_list)
+        for ℓ in range(L):
+            block_idx = ℓ // 2
+            is_conv = (ℓ % 2 == 0)
+            block = self.model.model.layers[block_idx]
+            if is_conv:
+                dW_conv = compute_hebbian_conv(
+                    ε_list[ℓ], z_detached[ℓ],
+                    block.local_conv.weight, block.dilation,
+                    modulation, base_lr, gamma_rpe,
+                )
+                updates[f'model.layers.{block_idx}.local_conv.weight'] = dW_conv
+            else:
+                mlp_updates = compute_hebbian_swiglu(
+                    ε_list[ℓ], z_detached[ℓ], block.mlp,
+                    modulation, base_lr, gamma_rpe,
+                )
+                for k, v in mlp_updates.items():
+                    updates[f'model.layers.{block_idx}.mlp.{k}'] = v
+
+        apply_hebbian_updates(updates, self.model)
 
         self.replay_buffer.add_batch(byte_seq.detach(), labels.detach(), D=D)
 
@@ -728,7 +736,7 @@ class AutonomousMind:
             self._log(
                 f'[PLAY] Step {self.total_steps} | '
                 f'CE={ce_val:.4f} F={F_val:.1f} D={D:.3f} '
-                f'lr={current_lr:.2e} buf={self.replay_buffer.size}'
+                f'mod={modulation:.3f} buf={self.replay_buffer.size}'
             )
 
     # ══════════════════════════════════════════════════════════════
@@ -736,7 +744,7 @@ class AutonomousMind:
     # ══════════════════════════════════════════════════════════════
 
     def _sleep_step(self):
-        """SLEEP 离线巩固。"""
+        """SLEEP 离线巩固 — Hebbian。"""
         self._log(f'[SLEEP] 开始离线巩固 (buffer={self.replay_buffer.size})')
 
         replay_steps = min(50, self.replay_buffer.size // 4)
@@ -748,31 +756,60 @@ class AutonomousMind:
                 break
 
             byte_seq, labels = batch
-            bsz, seq_len = byte_seq.shape
+            seq_len = byte_seq.shape[1]
 
             try:
                 pos_emb = self.model.get_position_embeddings(seq_len, self.device)
                 z_init, ce_loss = self.model.forward_with_ce(byte_seq, labels, pos_emb)
 
                 z_detached = [z.detach() for z in z_init]
-                _, _, _, F_pred = self.model.spatiotemporal_infer(
+                _, _, _, F_pred, ε_list = self.model.spatiotemporal_infer(
                     z_detached, pos_emb,
                     gamma=self.controller.current_gamma * 0.5,
                     T=max(1, self.cfg['T_infer']),
                     return_errors=False,
                     return_pred_loss=True,
+                    return_ε=True,
                 )
 
                 D = self.dopamine.update(F_pred.item())
-                total_loss = F_pred + 0.5 * ce_loss
+                D = max(D, 0.01)
 
-                self.optimizer.zero_grad(set_to_none=True)
-                total_loss.backward()
-                trainable = [p for p in self.model.parameters()
-                             if p.requires_grad and p.grad is not None]
-                if trainable:
-                    torch.nn.utils.clip_grad_norm_(trainable, self.cfg['grad_clip'])
-                self.optimizer.step()
+                # ── Hebbian 更新 ──
+                F_curr = F_pred.item()
+                F_prev = self._last_F if hasattr(self, '_last_F') and self._last_F is not None else F_curr
+                uncertainty = 1.0 - D
+                _, ACh, modulation = compute_modulators(F_curr, F_prev, uncertainty, self.cfg)
+                self._last_F = F_curr
+
+                base_lr = self.cfg.get('hebbian_base_eta', 1e-4)
+                gamma_rpe = self.cfg.get('dopamine_gamma', 0.3)
+
+                updates = {}
+                updates.update(compute_hebbian_temporal(ε_list, z_detached, modulation, base_lr, gamma_rpe))
+                updates.update(compute_hebbian_topdown(ε_list, z_detached, modulation, base_lr, gamma_rpe))
+
+                L = len(ε_list)
+                for ℓ in range(L):
+                    block_idx = ℓ // 2
+                    is_conv = (ℓ % 2 == 0)
+                    block = self.model.model.layers[block_idx]
+                    if is_conv:
+                        dW_conv = compute_hebbian_conv(
+                            ε_list[ℓ], z_detached[ℓ],
+                            block.local_conv.weight, block.dilation,
+                            modulation, base_lr, gamma_rpe,
+                        )
+                        updates[f'model.layers.{block_idx}.local_conv.weight'] = dW_conv
+                    else:
+                        mlp_updates = compute_hebbian_swiglu(
+                            ε_list[ℓ], z_detached[ℓ], block.mlp,
+                            modulation, base_lr, gamma_rpe,
+                        )
+                        for k, v in mlp_updates.items():
+                            updates[f'model.layers.{block_idx}.mlp.{k}'] = v
+
+                apply_hebbian_updates(updates, self.model)
 
                 replay_losses.append(ce_loss.item())
 
@@ -803,7 +840,6 @@ class AutonomousMind:
                 os.makedirs(out_dir, exist_ok=True)
                 ckpt = {
                     'model_state': self.model.state_dict(),
-                    'optimizer_state': self.optimizer.state_dict(),
                     'controller_state': self.controller.to_dict(),
                     'total_steps': self.total_steps,
                     'lm_config': self.lm_config,

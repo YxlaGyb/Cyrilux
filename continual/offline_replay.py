@@ -2,29 +2,41 @@
 离线生成式自巩固 — 利用 PC 模型自身预测能力做自我回放.
 
 Phase 6 (Bonus): 在训练间隙, 让 PC 模型为 MemoryBank 中每个旧任务
-生成合成训练数据, 再以纯 CE loss 回放. 完全不需要原始数据源.
+生成合成训练数据. 完全不需要原始数据源.
 
 原理:
   1. 从 bank 取每个旧任务的 exemplar, 截取其前 8 字节作为 prompt
   2. 调用 generate_with_pc() 自回归生成后续字节流
-  3. 生成结果 → 标准的 (byte_tensor, label_tensor) → 纯 CE backward
+  3. 生成结果 → 标准的 (byte_tensor, label_tensor)
 
-Ponytail: 这是生成式回放的最简实现 — 每次生成只做一次前向解码.
+注意: 仅做生成 (inference), 不含任何 backward 训练.
+Hebbian 回放训练由 trainer._maybe_replay/_maybe_abstraction_replay 接管.
 """
 from __future__ import annotations
 
 import torch
-from torch import nn
 
 from continual.memory_bank import MemoryBank
+from continual.abstraction_bank import AbstractionBank
 
 
 class OfflineReplayer:
-    """PC 生成式自巩固回放器."""
+    """PC 生成式自巩固回放器 — 纯生成, 零 backward."""
 
-    def __init__(self, memory_bank: MemoryBank, model: nn.Module, world_model=None):
-        self.memory_bank = memory_bank
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        tokenizer=None,
+        memory_bank: MemoryBank = None,
+        abstraction_bank: AbstractionBank = None,
+        for_token_free: bool = True,
+        world_model=None,
+    ):
         self.model = model
+        self.tokenizer = tokenizer
+        self.memory_bank = memory_bank
+        self.abstraction_bank = abstraction_bank
+        self.for_token_free = for_token_free
         self.world_model = world_model
 
     # ── 质量过滤 ──────────────────────────────────────────────────
@@ -66,8 +78,8 @@ class OfflineReplayer:
         self,
         task_id: str,
         n_samples: int = 100,
-        max_new_tokens: int = 120,
-        temperature: float = 0.7,
+        max_length: int = 64,
+        temperature: float = 0.8,
         top_k: int = 20,
         prompt_len: int = 8,
         device: str = 'cuda:0',
@@ -115,7 +127,7 @@ class OfflineReplayer:
 
             generated = self.model.generate_with_pc(
                 prompt,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=max_length,
                 T_infer=0,
                 gamma=0.1,
                 temperature=eff_temp,
@@ -140,78 +152,3 @@ class OfflineReplayer:
             samples = self.filter_by_world_model(samples, device)
 
         return samples
-
-    def replay_generated(
-        self,
-        optimizer,
-        n_per_task: int = 100,
-        batch_size: int = 32,
-        temperature: float = 0.7,
-        device: str = 'cuda:0',
-    ) -> dict:
-        """对 MemoryBank 中所有任务生成并回放合成数据.
-
-        Returns: {task_id: avg_ce_loss_after_replay}
-        """
-        # 3c: 按世界模型 uncertainty 排序任务 — 更不确定的任务先回放更多
-        tasks = list(self.memory_bank.tasks)
-        if self.world_model is not None and len(tasks) > 1:
-            uncertainties = []
-            for tid in tasks:
-                buf = self.memory_bank._store.get(tid, [])
-                if buf:
-                    ex = buf[0]
-                    x = ex.byte_tensor.unsqueeze(0).to(device)
-                    pos = self.model.get_position_embeddings(x.size(-1), device)
-                    pos_emb = self.model.get_position_embeddings(x.size(-1), device)
-                    z_init, _ = self.model.forward_with_ce(
-                        x.float().unsqueeze(1), x.long(), pos_emb)
-                    z_top = z_init[-1].detach()
-                    ctx = torch.zeros(1, 5, device=device)
-                    _, unc = self.world_model(z_top, ctx)
-                    uncertainties.append((tid, unc.mean().item()))
-                else:
-                    uncertainties.append((tid, 0.5))
-            # 按 uncertainty 降序排列
-            uncertainties.sort(key=lambda x: -x[1])
-            tasks = [t[0] for t in uncertainties]
-
-        results = {}
-        for task_id in tasks:
-            # uncertainty 高的任务生成更多样本
-            eff_n = n_per_task
-            if self.world_model is not None and len(tasks) > 1:
-                for tid, unc in uncertainties:
-                    if tid == task_id:
-                        eff_n = int(n_per_task * (0.5 + unc))
-                        eff_n = max(n_per_task // 2, min(n_per_task * 2, eff_n))
-                        break
-
-            samples = self.generate_for_task(
-                task_id, n_samples=eff_n, temperature=temperature, device=device,
-            )
-            if not samples:
-                continue
-
-            total_loss = 0.0
-            n_batches = 0
-            for i in range(0, len(samples), batch_size):
-                batch = samples[i:i + batch_size]
-                byte_seq = torch.stack([s[0] for s in batch], dim=0).to(device)
-                labels = torch.stack([s[1] for s in batch], dim=0).to(device)
-                pos_emb = self.model.get_position_embeddings(byte_seq.size(1), device)
-                _, ce_loss = self.model.forward_with_ce(byte_seq, labels, pos_emb)
-
-                optimizer.zero_grad(set_to_none=True)
-                ce_loss.backward()
-                trainable = [p for p in self.model.parameters()
-                             if p.requires_grad and p.grad is not None]
-                if trainable:
-                    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-                optimizer.step()
-
-                total_loss += ce_loss.item()
-                n_batches += 1
-
-            results[task_id] = total_loss / max(n_batches, 1)
-        return results

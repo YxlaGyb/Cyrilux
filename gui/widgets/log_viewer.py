@@ -1,117 +1,75 @@
-"""结构化日志查看器 — 基于 tkinter.Text 嵌入 maliang Canvas."""
+"""
+日志查看器 — 带颜色标签的滚动文本区.
+支持按级别着色: INFO/灰色, WARN/黄, ERROR/红, 其他/绿.
+"""
 
 from __future__ import annotations
 
-import tkinter as tk
-from tkinter import font as tkfont
-from typing import Optional
+import re
 
-import maliang
-from gui.theme import FONT_FAMILY_MONO, ThemeManager
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor, QTextCursor
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPlainTextEdit
 
 
-class LogViewer:
-    """带颜色分级的日志查看器 (嵌入在 maliang Canvas 上)."""
+class LogViewer(QPlainTextEdit):
+    """语法高亮的日志查看器.
 
-    MAX_LINES = 500
+    用法:
+        log = LogViewer()
+        log.info("训练开始")
+        log.warn("学习率偏高")
+        log.error("CUDA OOM")
+    """
 
-    LEVELS = {
-        "DEBUG": ("log_debug", "#8080a0"),
-        "INFO": ("log_info", "#c0c0e0"),
-        "SUCCESS": ("log_success", "#4ade80"),
-        "WARN": ("log_warn", "#fbbf24"),
-        "WARNING": ("log_warn", "#fbbf24"),
-        "ERROR": ("log_error", "#f87171"),
+    _LEVEL_COLORS = {
+        "INFO":    "#7a9a7a",
+        "WARN":    "#ffb000",
+        "WARNING": "#ffb000",
+        "ERROR":   "#ff3333",
+        "DEBUG":   "#3a5a3a",
+        "OK":      "#00ff41",
+        "DONE":    "#00ff41",
     }
 
-    def __init__(self, master: maliang.Canvas,
-                 position: tuple[int, int],
-                 size: tuple[int, int],
-                 theme_mgr: Optional[ThemeManager] = None):
-        self._master = master
-        self._theme_mgr = theme_mgr
-        self._line_count = 0
+    def __init__(self, max_lines: int = 10000, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setObjectName("logViewer")
+        self.setMaximumBlockCount(max_lines)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setFont(__import__("PyQt6.QtGui", fromlist=["QFont"]).QFont("Consolas", 9))
 
-        p = theme_mgr.palette if theme_mgr else None
-        bg = p.card_bg if p else "#ffffff"
-        fg = p.fg if p else "#1a1a2e"
-        border = p.border if p else "#d0d0de"
+    def _append_colored(self, text: str, color: str) -> None:
+        self.moveCursor(QTextCursor.MoveOperation.End)
+        fmt = self.currentCharFormat()
+        fmt.setForeground(QColor(color))
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text + "\n", fmt)
+        self.ensureCursorVisible()
 
-        # Frame 嵌入 Canvas
-        self._frame = tk.Frame(master, bg=bg)
-        master.create_window(position[0], position[1],
-                             window=self._frame,
-                             width=size[0], height=size[1],
-                             anchor="nw")
+    def info(self, msg: str) -> None:
+        self._append_colored(f"[INFO] {msg}", self._LEVEL_COLORS["INFO"])
 
-        self._font = tkfont.Font(family=FONT_FAMILY_MONO, size=9)
-        self._text = tk.Text(self._frame, font=self._font, wrap=tk.WORD, state=tk.DISABLED,
-                             bg=bg, fg=fg, insertbackground=fg,
-                             border=0, highlightthickness=1, highlightbackground=border,
-                             padx=6, pady=4)
-        self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    def warn(self, msg: str) -> None:
+        self._append_colored(f"[WARN] {msg}", self._LEVEL_COLORS["WARN"])
 
-        sb = tk.Scrollbar(self._frame, command=self._text.yview)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._text.configure(yscrollcommand=sb.set)
+    def error(self, msg: str) -> None:
+        self._append_colored(f"[ERROR] {msg}", self._LEVEL_COLORS["ERROR"])
 
-        for level, (tag, color) in self.LEVELS.items():
-            self._text.tag_configure(tag, foreground=color)
-        self._text.tag_configure("timestamp", foreground="#606080")
+    def ok(self, msg: str) -> None:
+        self._append_colored(f"[OK] {msg}", self._LEVEL_COLORS["OK"])
 
-        self._menu = tk.Menu(self._text, tearoff=0)
-        self._menu.add_command(label="复制", command=self._copy_selection)
-        self._menu.add_command(label="清空", command=self.clear)
-        self._menu.add_command(label="全部复制", command=self._copy_all)
-        self._text.bind("<Button-3>", self._show_menu)
-        self._text.bind("<Control-c>", lambda e: self._copy_selection())
+    def write(self, msg: str) -> None:
+        """兼容 callback 接口: 自动检测级别."""
+        if not msg:
+            return
+        for level, color in self._LEVEL_COLORS.items():
+            if level in msg.upper()[:20]:
+                self._append_colored(msg.rstrip(), color)
+                return
+        self._append_colored(msg.rstrip(), "#d0e8d0")
 
-    def info(self, msg: str):
-        self._append("INFO", msg)
-
-    def success(self, msg: str):
-        self._append("SUCCESS", msg)
-
-    def warn(self, msg: str):
-        self._append("WARN", msg)
-
-    def error(self, msg: str):
-        self._append("ERROR", msg)
-
-    def debug(self, msg: str):
-        self._append("DEBUG", msg)
-
-    def clear(self):
-        self._text.configure(state=tk.NORMAL)
-        self._text.delete("1.0", tk.END)
-        self._line_count = 0
-        self._text.configure(state=tk.DISABLED)
-
-    def get_text(self) -> str:
-        return self._text.get("1.0", tk.END).strip()
-
-    def _append(self, level: str, msg: str):
-        tag = self.LEVELS.get(level, ("log_info", "#c0c0e0"))[0]
-        self._text.configure(state=tk.NORMAL)
-        if self._line_count >= self.MAX_LINES:
-            self._text.delete("1.0", "2.0 linestart")
-            self._line_count -= 1
-        self._text.insert(tk.END, msg + "\n", tag)
-        self._line_count += 1
-        self._text.configure(state=tk.DISABLED)
-        self._text.see(tk.END)
-
-    def _copy_selection(self):
-        try:
-            sel = self._text.selection_get()
-            self._frame.clipboard_clear()
-            self._frame.clipboard_append(sel)
-        except tk.TclError:
-            pass
-
-    def _copy_all(self):
-        self._frame.clipboard_clear()
-        self._frame.clipboard_append(self.get_text())
-
-    def _show_menu(self, e):
-        self._menu.tk_popup(e.x_root, e.y_root)
+    def clear_log(self) -> None:
+        self.clear()

@@ -1,224 +1,218 @@
-"""持续学习页 — 任务管线 + 遗忘矩阵 + 记忆浏览器."""
+"""持续学习页面 — 任务管线 + 遗忘矩阵 + Memory Bank."""
 
 from __future__ import annotations
 
 import os
 import json
-import tkinter as tk
-from tkinter import ttk, filedialog
 
-import maliang
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                             QPushButton, QSplitter, QTreeWidget,
+                             QTreeWidgetItem, QFrame, QGroupBox,
+                             QListWidget, QListWidgetItem, QMessageBox,
+                             QInputDialog, QSizePolicy)
 
-from gui.theme import FONT_FAMILY
-from gui.state import ExperimentState
-from gui.worker import async_task
+from gui.theme import HackerTheme
 from gui.widgets.forgetting_matrix import ForgettingMatrix
+from gui.widgets.log_viewer import LogViewer
+from gui.widgets.metric_card import MetricCard
 
 
-class Page(maliang.Canvas):
-    """持续学习页面 (maliang Canvas)."""
+TASK_COLORS = ["#00ff41", "#ffd700", "#00bfff", "#ff6b6b", "#da70d6"]
 
-    def __init__(self, parent, state: ExperimentState, app, **kw):
-        super().__init__(parent, expand="xy", **kw)
-        self.state = state
-        self.app = app
-        self.theme_mgr = state.theme_mgr
-        self._forgetting_data = []
 
-        p = self.theme_mgr.palette
-        self._inner = tk.Frame(self, bg=p.bg)
-        self._inner_id = self.create_window(0, 0, window=self._inner, anchor="nw")
-        self.bind("<Configure>", self._on_resize)
-        self._build()
+class ContinualPage(QWidget):
+    """持续学习 — 任务管线 + 遗忘热力图 + 记忆库."""
 
-    def _on_resize(self, event):
-        try:
-            self.itemconfigure(self._inner_id, width=event.width, height=event.height)
-        except tk.TclError:
-            pass
+    def __init__(self, bridge, theme: HackerTheme):
+        super().__init__()
+        self._bridge = bridge
+        self._theme = theme
+        self._tasks: list[dict] = []
+        self._build_ui()
+        self._load_forgetting_data()
 
-    def _build(self):
-        inner = self._inner
-        p = self.theme_mgr.palette
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(6)
 
-        inner.grid_rowconfigure(0, weight=0)  # title
-        inner.grid_rowconfigure(1, weight=1)  # main
-        inner.grid_columnconfigure(0, weight=1)
-        inner.grid_columnconfigure(1, weight=1)
+        heading = QLabel(">>> 持续学习")
+        heading.setObjectName("accent")
+        outer.addWidget(heading)
 
-        # 标题
-        tk.Label(inner, text="持续学习", font=(FONT_FAMILY, 16, "bold"),
-                 bg=p.bg, fg=p.fg, anchor="w").grid(row=0, column=0, columnspan=2,
-                                  sticky="ew", padx=20, pady=(16, 8))
+        splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # ── 左: 任务管线 ──
-        left = tk.Frame(inner, bg=p.bg)
-        left.grid(row=1, column=0, sticky="nsew", padx=(20, 8), pady=(0, 8))
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 4, 0)
 
-        tk.Label(left, text="任务管线", font=(FONT_FAMILY, 12, "bold"),
-                 bg=p.bg, fg=p.fg, anchor="w").pack(fill=tk.X)
+        left_layout.addWidget(QLabel("任务管线"))
+        self._task_tree = QTreeWidget()
+        self._task_tree.setHeaderLabel("任务 / 数据集 / 检查点")
+        self._task_tree.setAlternatingRowColors(False)
+        self._task_tree.setDragDropMode(
+            QTreeWidget.DragDropMode.InternalMove)
+        left_layout.addWidget(self._task_tree, 1)
 
-        self._task_tree = ttk.Treeview(left, columns=("path",), show="headings", height=8)
-        self._task_tree.heading("path", text="数据路径")
-        self._task_tree.column("path", width=280)
-        self._task_tree.pack(fill=tk.BOTH, expand=True, pady=4)
+        btn_row = QHBoxLayout()
+        self._add_task_btn = QPushButton("+ 添加任务")
+        self._add_task_btn.clicked.connect(self._add_task)
+        btn_row.addWidget(self._add_task_btn)
+        self._remove_task_btn = QPushButton("− 删除")
+        self._remove_task_btn.clicked.connect(self._remove_task)
+        btn_row.addWidget(self._remove_task_btn)
+        self._scan_btn = QPushButton("↻ 扫描遗忘")
+        self._scan_btn.clicked.connect(self._load_forgetting_data)
+        btn_row.addWidget(self._scan_btn)
+        left_layout.addLayout(btn_row)
 
-        btn_row = tk.Frame(left, bg=p.bg)
-        btn_row.pack(fill=tk.X, pady=2)
-        tk.Button(btn_row, text="添加任务", command=self._add_task,
-                  font=(FONT_FAMILY, 9), bg=p.card_bg, fg=p.fg).pack(side=tk.LEFT, padx=2)
-        tk.Button(btn_row, text="上移", command=self._move_up,
-                  font=(FONT_FAMILY, 9), bg=p.card_bg, fg=p.fg).pack(side=tk.LEFT, padx=2)
-        tk.Button(btn_row, text="下移", command=self._move_down,
-                  font=(FONT_FAMILY, 9), bg=p.card_bg, fg=p.fg).pack(side=tk.LEFT, padx=2)
-        tk.Button(btn_row, text="移除", command=self._remove_task,
-                  font=(FONT_FAMILY, 9), bg=p.card_bg, fg=p.fg).pack(side=tk.LEFT, padx=2)
+        splitter.addWidget(left_panel)
 
-        # ── 右: 遗忘矩阵 + 记忆浏览器 ──
-        right = tk.Frame(inner, bg=p.bg)
-        right.grid(row=1, column=1, sticky="nsew", padx=(8, 20), pady=(0, 8))
-        right.grid_rowconfigure(0, weight=1)
-        right.grid_rowconfigure(1, weight=1)
-        right.grid_columnconfigure(0, weight=1)
+        # ── 中: 遗忘矩阵 + 状态卡 ──
+        center_panel = QWidget()
+        center_layout = QVBoxLayout(center_panel)
+        center_layout.setContentsMargins(4, 0, 4, 0)
 
-        # 遗忘矩阵
-        matrix_frame = tk.Frame(right, bg=p.bg)
-        matrix_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
-        matrix_frame.grid_rowconfigure(1, weight=1)
-        matrix_frame.grid_columnconfigure(0, weight=1)
+        center_layout.addWidget(QLabel("遗忘矩阵 (Forgetting Heatmap)"))
+        self._fmat = ForgettingMatrix()
+        self._fmat.setMinimumWidth(280)
+        self._fmat.setMinimumHeight(280)
+        center_layout.addWidget(self._fmat, 2)
 
-        header_row = tk.Frame(matrix_frame, bg=p.bg)
-        header_row.grid(row=0, column=0, sticky="ew")
-        tk.Label(header_row, text="遗忘矩阵", font=(FONT_FAMILY, 12, "bold"),
-                 bg=p.bg, fg=p.fg, anchor="w").pack(side=tk.LEFT)
-        tk.Button(header_row, text="加载 JSON", command=self._load_forgetting_json,
-                  font=(FONT_FAMILY, 9), bg=p.card_bg, fg=p.fg).pack(side=tk.RIGHT)
+        # 状态卡片
+        card_row = QHBoxLayout()
+        self._card_mem = MetricCard("Memory Bank", "0", "存储的 exemplar 数量")
+        card_row.addWidget(self._card_mem)
+        self._card_abs = MetricCard("Abstraction Bank", "0", "抽象规则数")
+        card_row.addWidget(self._card_abs)
+        self._card_sniff = MetricCard("遗忘嗅探", "待命", "最后扫描结果")
+        card_row.addWidget(self._card_sniff)
+        center_layout.addLayout(card_row)
 
-        # ForgettingMatrix 用子 Canvas 占位
-        matrix_canvas = tk.Canvas(matrix_frame, highlightthickness=0, bg=p.bg)
-        matrix_canvas.grid(row=1, column=0, sticky="nsew")
-        self._matrix_canvas = matrix_canvas
-        self._matrix_built = False
-        matrix_canvas.bind("<Map>", self._build_forgetting_matrix)
+        splitter.addWidget(center_panel)
 
-        # 记忆浏览器 (标签页)
-        nb = ttk.Notebook(right)
-        nb.grid(row=1, column=0, sticky="nsew")
+        # ── 右: 详情日志 ──
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+        right_layout.addWidget(QLabel("遗忘日志"))
+        self._log_viewer = LogViewer()
+        right_layout.addWidget(self._log_viewer, 1)
 
-        # MemoryBank 标签
-        mem_frame = tk.Frame(nb, bg=p.bg)
-        nb.add(mem_frame, text="Memory Bank")
-        self._mem_tree = ttk.Treeview(mem_frame, columns=("task", "count", "score"),
-                                      show="headings", height=8)
-        self._mem_tree.heading("task", text="任务")
-        self._mem_tree.heading("count", text="Exemplar 数")
-        self._mem_tree.heading("score", text="多巴胺分数")
-        self._mem_tree.column("task", width=80)
-        self._mem_tree.column("count", width=100, anchor="e")
-        self._mem_tree.column("score", width=100, anchor="e")
-        self._mem_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        # 快速查看遗忘日志文件
+        self._view_flog_btn = QPushButton("📄 读取遗忘日志文件")
+        self._view_flog_btn.clicked.connect(self._load_forgetting_from_log)
+        right_layout.addWidget(self._view_flog_btn)
 
-        # AbstractionBank 标签
-        abs_frame = tk.Frame(nb, bg=p.bg)
-        nb.add(abs_frame, text="Abstraction Bank")
-        self._abs_label = tk.Label(abs_frame, text="原型数量: --", font=(FONT_FAMILY, 9),
-                                   bg=p.bg, fg=p.fg, anchor="w")
-        self._abs_label.pack(fill=tk.X, padx=8, pady=4)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([240, 360, 200])
+        outer.addWidget(splitter, 1)
 
-        # 嗅探状态
-        sniff_frame = tk.Frame(right, bg=p.bg)
-        sniff_frame.grid(row=2, column=0, sticky="ew", pady=(4, 0))
-        tk.Label(sniff_frame, text="嗅探状态:", font=(FONT_FAMILY, 9),
-                 bg=p.bg, fg=p.fg).pack(side=tk.LEFT)
-        self._sniff_var = tk.StringVar(value="正常")
-        tk.Label(sniff_frame, textvariable=self._sniff_var,
-                 font=(FONT_FAMILY, 9), bg=p.bg, fg="#4ade80").pack(side=tk.LEFT, padx=4)
-
-        # 自动加载遗忘日志 (延迟异步)
-        self.after(300, self._deferred_load_forgetting)
-
-    def _build_forgetting_matrix(self, event=None):
-        if self._matrix_built:
+    def _add_task(self) -> None:
+        name, ok = QInputDialog.getText(self, "添加任务", "任务名称:")
+        if not ok or not name.strip():
             return
-        self._matrix_built = True
-        c = self._matrix_canvas
-        c.update_idletasks()
-        w = c.winfo_width() or 400
-        h = c.winfo_height() or 200
-        self._forgetting_matrix = ForgettingMatrix(
-            c, position=(0, 0), size=(w, h), data=self._forgetting_data,
-            theme_mgr=self.theme_mgr)
-
-    def _add_task(self):
-        path = filedialog.askopenfilename(
-            title="选择数据集",
-            filetypes=[("JSONL", "*.jsonl"), ("所有文件", "*.*")],
-            initialdir="dataset",
-        )
-        if path:
-            tid = f"T{self._task_tree.get_children().__len__() + 1}"
-            self._task_tree.insert("", tk.END, values=(path,), iid=tid)
-            self.state.task_pipelines.append((tid, path))
-            self.app.status_message(f"已添加任务 {tid}")
-
-    def _remove_task(self):
-        sel = self._task_tree.selection()
-        if sel:
-            self._task_tree.delete(sel[0])
-            self.state.task_pipelines = [(t, p) for t, p in self.state.task_pipelines if t != sel[0]]
-
-    def _move_up(self):
-        sel = self._task_tree.selection()
-        if not sel:
+        ds, ok2 = QInputDialog.getText(self, "数据集", "数据集路径:", text="dataset/sft_t2t.jsonl")
+        if not ok2:
             return
-        idx = self._task_tree.index(sel[0])
-        if idx > 0:
-            self._task_tree.move(sel[0], "", idx - 1)
+        item = QTreeWidgetItem([name])
+        ds_item = QTreeWidgetItem([f"📄 {ds}"])
+        item.addChild(ds_item)
+        self._task_tree.addTopLevelItem(item)
+        self._task_tree.expandAll()
+        self._tasks.append({"name": name, "dataset": ds})
+        self._log_viewer.info(f"添加任务: {name} ({ds})")
 
-    def _move_down(self):
-        sel = self._task_tree.selection()
-        if not sel:
+    def _remove_task(self) -> None:
+        item = self._task_tree.currentItem()
+        if item is None:
             return
-        idx = self._task_tree.index(sel[0])
-        children = self._task_tree.get_children()
-        if idx < len(children) - 1:
-            self._task_tree.move(sel[0], "", idx + 1)
+        parent = item.parent()
+        top = parent if parent else item
+        root = self._task_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            if root.child(i) is top:
+                name = top.text(0)
+                root.removeChild(top)
+                self._tasks = [t for t in self._tasks if t["name"] != name]
+                self._log_viewer.info(f"删除任务: {name}")
+                return
 
-    def _load_forgetting_json(self):
-        path = filedialog.askopenfilename(
-            title="选择遗忘日志",
-            filetypes=[("JSON", "*.json"), ("所有文件", "*.*")],
-            initialdir="ola_out",
-        )
-        if path:
-            self._parse_forgetting_json(path)
-
-    def _deferred_load_forgetting(self):
-        """延迟启动异步加载遗忘日志."""
-        async_task(self, worker=self._load_worker,
-                   on_done=self._load_done,
-                   on_error=lambda e: self.app.status_message(f"遗忘日志加载失败", 3000))
-
-    def _load_worker(self):
-        """后台线程: 查找并读取遗忘日志 JSON."""
-        for candidate in [
-            "ola_out/out_continual_5task/forgetting_log.json",
-            "ola_out/out_hetero_pc/forgetting_log.json",
-            "ola_out/out_hetero_fast/forgetting_log.json",
-        ]:
-            if os.path.isfile(candidate):
-                with open(candidate, encoding="utf-8") as f:
-                    return json.load(f)
+    def _find_forgetting_log(self) -> str | None:
+        """在 ola_out 各子目录中查找 forgetting_log.json."""
+        base = "ola_out"
+        if not os.path.isdir(base):
+            return None
+        for d in sorted(os.listdir(base)):
+            fp = os.path.join(base, d, "forgetting_log.json")
+            if os.path.isfile(fp):
+                return fp
         return None
 
-    def _load_done(self, data):
-        """主线程: 更新遗忘矩阵."""
-        if data is None:
+    def _load_forgetting_data(self) -> None:
+        fp = self._find_forgetting_log()
+        if fp is None:
+            self._log_viewer.warn("未找到 forgetting_log.json")
+            self._card_sniff.set_value("无日志")
             return
+        self._load_forgetting_from_file(fp)
+
+    def _load_forgetting_from_log(self) -> None:
+        fp = self._find_forgetting_log()
+        if fp:
+            self._load_forgetting_from_file(fp)
+        else:
+            QMessageBox.information(self, "提示", "未找到 forgetting_log.json")
+
+    def _load_forgetting_from_file(self, fp: str) -> None:
         try:
-            self._forgetting_data = data
-            if hasattr(self, "_forgetting_matrix"):
-                self._forgetting_matrix.set_data(data)
-            self.app.status_message("遗忘矩阵已自动加载")
-        except tk.TclError:
-            pass
+            with open(fp, encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as e:
+            self._log_viewer.error(f"读取遗忘日志失败: {e}")
+            return
+
+        # 兼容顶层为 list 或 dict
+        if isinstance(raw, dict):
+            data = raw
+        elif isinstance(raw, list):
+            if raw and isinstance(raw[0], (int, float)):
+                data = {"matrix": [raw]}
+            elif raw and isinstance(raw[-1], dict):
+                data = raw[-1]
+            else:
+                data = {"matrix": raw}
+        else:
+            data = {}
+
+        matrix = data.get("matrix", data.get("forgetting_matrix", []))
+        if not matrix and "history" in data:
+            history = data["history"]
+            n = len(history)
+            if n > 0:
+                matrix = [[0.0] * n for _ in range(n)]
+                for i, h in enumerate(history):
+                    for j, val in enumerate(history):
+                        matrix[i][j] = abs(h.get(str(j), h.get(j, 0)))
+
+        labels = data.get("tasks", data.get("labels", []))
+        if not labels and matrix:
+            labels = [f"Task {i}" for i in range(len(matrix))]
+
+        if matrix:
+            self._fmat.set_data(matrix, labels)
+            self._log_viewer.ok(f"遗忘矩阵: {len(matrix)}×{len(matrix[0]) if isinstance(matrix[0], list) else 0}")
+
+        bank_size = data.get("bank_size", data.get("memory_bank", 0))
+        self._card_mem.set_value(str(bank_size))
+        abs_size = data.get("abstraction_size", data.get("abstraction_bank", 0))
+        self._card_abs.set_value(str(abs_size))
+        sniff = data.get("sniffer", data.get("anomaly_count", "待命"))
+        self._card_sniff.set_value(str(sniff))
+
+        self._log_viewer.info(f"遗忘日志来源: {fp}")
+
+    def on_theme_changed(self, theme) -> None:
+        self._theme = theme

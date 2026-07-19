@@ -67,7 +67,15 @@ def setup_seed(seed: int = 42):
 # ── 参数统计 ──
 
 def count_parameters(model: torch.nn.Module, trainable_only: bool = True) -> dict:
-    """统计模型参数。"""
+    """
+    旧名称, 保留向后兼容。
+    语义已改为 count_budget — 预算上限, 不代表模型当前有效容量。
+    """
+    return count_budget(model, trainable_only)
+
+
+def count_budget(model: torch.nn.Module, trainable_only: bool = True) -> dict:
+    """统计模型预算上限 (固定参数总数, 不代表有效容量)。"""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     non_trainable = total - trainable
@@ -78,3 +86,27 @@ def count_parameters(model: torch.nn.Module, trainable_only: bool = True) -> dic
         'trainable_M': trainable / 1e6,
         'non_trainable': non_trainable,
     }
+
+
+def effective_params(tensor: torch.Tensor, eps: float = 1e-4) -> int:
+    """统计张量中当前"有效"的参数数。
+
+    使用相对阈值: |w| > max(|w|) * eps 的权重计入有效参数。
+    eps=1e-4 意味着"至少是最大权重的 0.01%"。
+    Oja 的第二项 -ε^T·ε·W_old 会将弱连接推向零,
+    自然低于阈值 → 有效参数减少。
+    """
+    w = tensor.detach()
+    w_max = w.abs().max().item()
+    if w_max == 0:
+        return 0
+    return (w.abs() > w_max * eps).sum().item()
+
+
+def effective_capacity(model: torch.nn.Module, eps: float = 1e-4) -> float:
+    """统计模型当前有效参数数 (百万单位)。"""
+    total = 0
+    for p in model.parameters():
+        if p.requires_grad:
+            total += effective_params(p, eps)
+    return total / 1e6

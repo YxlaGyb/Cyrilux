@@ -65,9 +65,6 @@ def _build_pc_parser(subparser):
     """PC / 多巴胺参数。"""
     subparser.add_argument("--T-infer", type=int, default=2)
     subparser.add_argument("--gamma", type=float, default=0.1)
-    subparser.add_argument("--max-beta", type=float, default=2.0)
-    subparser.add_argument("--max-beta-conv", type=float, default=1.0)
-    subparser.add_argument("--grad-clip", type=float, default=1.0)
     subparser.add_argument("--dopamine-eta", type=float, default=1.0)
     subparser.add_argument("--dopamine-beta", type=float, default=0.5)
     subparser.add_argument("--dopamine-gamma", type=float, default=0.3)
@@ -87,19 +84,12 @@ def _build_cl_parser(subparser):
     return subparser
 
 
-def _build_opt_parser(subparser):
-    """加速参数: AMP / CUDA Graphs。"""
-    subparser.add_argument("--amp", action="store_true", default=False, help="启用 AMP bf16 (默认关)")
-    subparser.add_argument("--cuda-graphs", action="store_true", default=False, help="启用 CUDA Graph (实验性)")
-    return subparser
-
-
 def register_train_parser(subparsers):
     p = subparsers.add_parser("train", help="训练模型")
     _build_common_parser(p)
     _build_pc_parser(p)
     _build_cl_parser(p)
-    _build_opt_parser(p)
+
     p.add_argument("data", nargs="+", help="数据文件路径")
     p.add_argument(
         "--task-order",
@@ -130,9 +120,6 @@ def cmd_train(args):
         out_dir=args.out_dir,
         T_infer=args.T_infer,
         gamma=args.gamma,
-        max_beta=args.max_beta,
-        max_beta_conv=args.max_beta_conv,
-        grad_clip=args.grad_clip,
         dopamine_eta=args.dopamine_eta,
         dopamine_beta=args.dopamine_beta,
         dopamine_gamma=args.dopamine_gamma,
@@ -145,8 +132,6 @@ def cmd_train(args):
         n_prototypes=args.n_prototypes,
         abstraction_replay_interval=args.abstraction_replay_interval,
         save_interval=args.save_interval,
-        enable_amp=args.amp,
-        use_cuda_graphs=args.cuda_graphs,
     )
 
     # 任务流水线: 每个 task_id 对应一个数据文件
@@ -243,7 +228,6 @@ def register_auto_parser(subparsers):
     p.add_argument("--play-steps", type=int, default=100)
     p.add_argument("--sleep-interval", type=int, default=500)
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--gamma", type=float, default=0.05)
     p.add_argument("--T-infer", type=int, default=1)
     p.add_argument("--hidden-size", type=int, default=256)
@@ -261,7 +245,6 @@ def cmd_auto(args):
         "play_steps": args.play_steps,
         "sleep_interval": args.sleep_interval,
         "batch_size": args.batch_size,
-        "lr": args.lr,
         "gamma": args.gamma,
         "T_infer": args.T_infer,
         "data_dir": args.data_dir,
@@ -293,8 +276,8 @@ def cmd_gui(args):
 
 
 def launch_gui(dpi_scale: float = 1.25):
-    """启动 PyQt6 骇客像素风 GUI (委托到 gui_pyqt/ 包)."""
-    from gui_pyqt import launch_gui as _launch
+    """启动 PyQt6 骇客像素风 GUI."""
+    from gui import launch_gui as _launch
 
     _launch()
 

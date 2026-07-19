@@ -1,210 +1,198 @@
-"""数据管理页 — 文件浏览 / 预览 / 统计 / 工具."""
+"""数据管理页面 — FileBrowser + JSONL 预览 + 分割/转换/任务准备."""
 
 from __future__ import annotations
 
 import os
 import json
-import tkinter as tk
-from tkinter import ttk, filedialog
 
-import maliang
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                             QPushButton, QSplitter, QPlainTextEdit,
+                             QGroupBox, QSpinBox, QRadioButton,
+                             QFileDialog, QMessageBox)
 
-from gui.theme import FONT_FAMILY
-from gui.state import ExperimentState
-from gui.worker import async_task
+from gui.theme import HackerTheme
 from gui.widgets.file_browser import FileBrowser
 
 
-class Page(maliang.Canvas):
-    """数据管理页面 (maliang Canvas)."""
+class _JSONLPreview(QPlainTextEdit):
+    """JSONL 内容预览."""
 
-    def __init__(self, parent, state: ExperimentState, app, **kw):
-        super().__init__(parent, expand="xy", **kw)
-        self.state = state
-        self.app = app
-        self.theme_mgr = state.theme_mgr
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setObjectName("logViewer")
+        self.setFont(__import__("PyQt6.QtGui", fromlist=["QFont"]).QFont("Consolas", 9))
+        self.setMaximumBlockCount(5000)
+        self.setPlaceholderText("选择一个 .jsonl 文件预览内容...")
 
-        p = self.theme_mgr.palette
-        self._inner = tk.Frame(self, bg=p.bg)
-        self._inner_id = self.create_window(0, 0, window=self._inner, anchor="nw")
-        self.bind("<Configure>", self._on_resize)
-        self._build()
-
-    def _on_resize(self, event):
-        try:
-            self.itemconfigure(self._inner_id, width=event.width, height=event.height)
-        except tk.TclError:
-            pass
-
-    def _build(self):
-        inner = self._inner
-        p = self.theme_mgr.palette
-
-        inner.grid_rowconfigure(0, weight=0)  # title
-        inner.grid_rowconfigure(1, weight=1)  # browser + tabs
-        inner.grid_rowconfigure(2, weight=0)  # tools
-        inner.grid_columnconfigure(0, weight=1)
-
-        # 标题
-        tk.Label(inner, text="数据管理", font=(FONT_FAMILY, 16, "bold"),
-                 bg=p.bg, fg=p.fg, anchor="w").grid(row=0, column=0, sticky="ew",
-                                                      padx=20, pady=(16, 8))
-
-        # ── 文件浏览器 + 预览/统计 ──
-        main = tk.Frame(inner, bg=p.bg)
-        main.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 8))
-        main.grid_columnconfigure(0, weight=1)
-        main.grid_columnconfigure(1, weight=1)
-        main.grid_rowconfigure(0, weight=1)
-
-        # 文件浏览器 (外层 LabelFrame 内嵌 Canvas 容器)
-        browser_frame = tk.LabelFrame(main, text="文件", font=(FONT_FAMILY, 10, "bold"),
-                                      bg=p.bg, fg=p.fg, padx=4, pady=4)
-        browser_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-        browser_frame.grid_rowconfigure(0, weight=1)
-        browser_frame.grid_columnconfigure(0, weight=1)
-
-        browser_canvas = tk.Canvas(browser_frame, highlightthickness=0, bg=p.bg)
-        browser_canvas.grid(row=0, column=0, sticky="nsew")
-        self._browser_canvas = browser_canvas
-        self._browser_built = False
-        browser_canvas.bind("<Map>", lambda e: self._build_browser(browser_canvas))
-
-        # 右侧标签页
-        nb = ttk.Notebook(main)
-        nb.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
-
-        # 预览
-        preview_frame = tk.Frame(nb, bg=p.bg)
-        nb.add(preview_frame, text="预览")
-        self._preview_text = tk.Text(preview_frame, font=(FONT_FAMILY, 9),
-                                     wrap=tk.WORD, state=tk.DISABLED,
-                                     bg=p.input_bg, fg=p.fg, relief=tk.FLAT)
-        self._preview_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-
-        # 统计
-        stats_frame = tk.Frame(nb, bg=p.bg)
-        nb.add(stats_frame, text="统计")
-
-        self._stats_tree = ttk.Treeview(stats_frame, columns=("key", "value"),
-                                        show="headings", height=8)
-        self._stats_tree.heading("key", text="指标")
-        self._stats_tree.heading("value", text="数值")
-        self._stats_tree.column("key", width=100)
-        self._stats_tree.column("value", width=100, anchor="e")
-        self._stats_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-
-        # ── 工具面板 ──
-        tools = tk.LabelFrame(inner, text="工具", font=(FONT_FAMILY, 10, "bold"),
-                              bg=p.bg, fg=p.fg, padx=8, pady=4)
-        tools.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 8))
-
-        # 数据分割
-        split_frame = tk.Frame(tools, bg=p.bg)
-        split_frame.pack(fill=tk.X, pady=2)
-        tk.Label(split_frame, text="数据分割:", font=(FONT_FAMILY, 9),
-                 bg=p.bg, fg=p.fg).pack(side=tk.LEFT)
-        tk.Label(split_frame, text="Train:", font=(FONT_FAMILY, 9),
-                 bg=p.bg, fg=p.fg).pack(side=tk.LEFT, padx=(8, 2))
-        self._split_train = tk.Entry(split_frame, width=6,
-                                     bg=p.input_bg, fg=p.fg, relief=tk.FLAT)
-        self._split_train.insert(0, "0.8")
-        self._split_train.pack(side=tk.LEFT)
-        tk.Label(split_frame, text="Val:", font=(FONT_FAMILY, 9),
-                 bg=p.bg, fg=p.fg).pack(side=tk.LEFT, padx=(8, 2))
-        self._split_val = tk.Entry(split_frame, width=6,
-                                   bg=p.input_bg, fg=p.fg, relief=tk.FLAT)
-        self._split_val.insert(0, "0.1")
-        self._split_val.pack(side=tk.LEFT)
-        tk.Label(split_frame, text="Test:", font=(FONT_FAMILY, 9),
-                 bg=p.bg, fg=p.fg).pack(side=tk.LEFT, padx=(8, 2))
-        self._split_test = tk.Entry(split_frame, width=6,
-                                    bg=p.input_bg, fg=p.fg, relief=tk.FLAT)
-        self._split_test.insert(0, "0.1")
-        self._split_test.pack(side=tk.LEFT)
-        tk.Button(split_frame, text="执行分割", command=self._run_split,
-                  font=(FONT_FAMILY, 9), bg=p.card_bg, fg=p.fg).pack(side=tk.LEFT, padx=8)
-
-        # 格式转换 / 任务准备
-        btn_frame = tk.Frame(tools, bg=p.bg)
-        btn_frame.pack(fill=tk.X, pady=2)
-        tk.Button(btn_frame, text="格式转换", command=self._run_convert,
-                  font=(FONT_FAMILY, 9), bg=p.card_bg, fg=p.fg).pack(side=tk.LEFT, padx=2)
-        tk.Button(btn_frame, text="任务准备 (4task)", command=lambda: self._run_prepare("4task"),
-                  font=(FONT_FAMILY, 9), bg=p.card_bg, fg=p.fg).pack(side=tk.LEFT, padx=2)
-        tk.Button(btn_frame, text="任务准备 (Hetero)", command=lambda: self._run_prepare("hetero"),
-                  font=(FONT_FAMILY, 9), bg=p.card_bg, fg=p.fg).pack(side=tk.LEFT, padx=2)
-
-    def _build_browser(self, canvas: tk.Canvas):
-        if self._browser_built:
+    def load_file(self, path: str) -> None:
+        self.clear()
+        if not path or not os.path.isfile(path):
             return
-        self._browser_built = True
-        canvas.update_idletasks()
-        w = canvas.winfo_width() or 300
-        h = canvas.winfo_height() or 200
-        self._browser = FileBrowser(canvas, position=(0, 0),
-                                    size=(w, h), directory="dataset",
-                                    on_select=self._on_file_select,
-                                    theme_mgr=self.theme_mgr)
-
-    def _on_file_select(self, entry: dict):
-        """文件选中回调 — 异步预览/统计."""
-        path = entry.get("path", "")
-
-        # 显示加载中
-        self._preview_text.configure(state=tk.NORMAL)
-        self._preview_text.delete("1.0", tk.END)
-        self._preview_text.insert(tk.END, "加载中...")
-        self._preview_text.configure(state=tk.DISABLED)
-
-        for row in self._stats_tree.get_children():
-            self._stats_tree.delete(row)
-
-        async_task(self, worker=lambda: self._preview_worker(path),
-                   on_done=self._preview_done,
-                   on_error=self._preview_error)
-
-    def _preview_worker(self, path: str) -> tuple[list[str], int, int]:
-        """后台线程: 读取前5行 + 统计行数/大小."""
-        preview_lines = []
-        line_count = 0
-        with open(path, encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i < 5:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for i, line in enumerate(f):
+                    if i >= 200:
+                        self.appendPlainText("... (截断, 仅显示前 200 行)")
+                        break
                     try:
                         obj = json.loads(line)
-                        preview_lines.append(json.dumps(obj, ensure_ascii=False)[:200])
+                        pretty = json.dumps(obj, ensure_ascii=False, indent=2)
+                        self.appendPlainText(f"[{i}] {pretty[:500]}")
+                        if len(pretty) > 500:
+                            self.appendPlainText("  ... (截断)")
                     except json.JSONDecodeError:
-                        preview_lines.append(line[:200])
-                line_count += 1
-        size = os.path.getsize(path)
-        return preview_lines, line_count, size
+                        self.appendPlainText(f"[{i}] {line.rstrip()}")
+                    self.appendPlainText("—" * 40)
+        except Exception as e:
+            self.setPlainText(f"读取失败: {e}")
 
-    def _preview_done(self, result: tuple[list[str], int, int]):
-        """主线程: 更新预览和统计."""
-        preview_lines, line_count, size = result
 
-        self._preview_text.configure(state=tk.NORMAL)
-        self._preview_text.delete("1.0", tk.END)
-        for line in preview_lines:
-            self._preview_text.insert(tk.END, line + "\n")
-        self._preview_text.configure(state=tk.DISABLED)
+class DataManagerPage(QWidget):
+    """数据管理 — 浏览/预览/分割/转换/任务准备."""
 
-        self._stats_tree.insert("", tk.END, values=("行数", str(line_count)))
-        self._stats_tree.insert("", tk.END, values=("大小", f"{size / 1024:.1f} KB"))
+    def __init__(self, bridge, theme: HackerTheme):
+        super().__init__()
+        self._bridge = bridge
+        self._theme = theme
+        self._build_ui()
 
-    def _preview_error(self, exc: Exception):
-        """主线程: 显示错误."""
-        self._preview_text.configure(state=tk.NORMAL)
-        self._preview_text.delete("1.0", tk.END)
-        self._preview_text.insert(tk.END, f"无法读取: {exc}")
-        self._preview_text.configure(state=tk.DISABLED)
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(8)
 
-    def _run_split(self):
-        self.app.status_message("数据分割通过 CLI 执行: python main.py data split ...")
+        heading = QLabel(">>> 数据管理")
+        heading.setObjectName("accent")
+        outer.addWidget(heading)
 
-    def _run_convert(self):
-        self.app.status_message("格式转换通过 CLI 执行: python main.py data convert ...")
+        splitter = QSplitter(Qt.Orientation.Horizontal)
 
-    def _run_prepare(self, mode: str):
-        self.app.status_message(f"任务准备 ({mode}) 通过 CLI 执行: python main.py prepare ...")
+        # 左: 文件浏览器
+        fb_wrap = QWidget()
+        fb_layout = QVBoxLayout(fb_wrap)
+        fb_layout.setContentsMargins(0, 0, 0, 0)
+        fb_label = QLabel("数据集目录")
+        fb_label.setObjectName("secondary")
+        fb_layout.addWidget(fb_label)
+        self._file_browser = FileBrowser("dataset")
+        fb_layout.addWidget(self._file_browser, 1)
+        refresh_btn = QPushButton("↻ 刷新")
+        refresh_btn.clicked.connect(self._refresh_browser)
+        fb_layout.addWidget(refresh_btn)
+        splitter.addWidget(fb_wrap)
+
+        # 右: 预览 + 工具
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(8, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        preview_label = QLabel("内容预览")
+        preview_label.setObjectName("secondary")
+        right_layout.addWidget(preview_label)
+        self._preview = _JSONLPreview()
+        right_layout.addWidget(self._preview, 3)
+
+        # 工具面板
+        tool_group = QGroupBox("工具")
+        tool_layout = QVBoxLayout(tool_group)
+
+        split_row = QHBoxLayout()
+        split_row.addWidget(QLabel("分割大小:"))
+        self._split_size = QSpinBox()
+        self._split_size.setRange(100, 100000)
+        self._split_size.setValue(10000)
+        self._split_size.setObjectName("paramSpin")
+        split_row.addWidget(self._split_size)
+        self._split_btn = QPushButton("分割文件")
+        self._split_btn.clicked.connect(self._do_split)
+        split_row.addWidget(self._split_btn)
+        tool_layout.addLayout(split_row)
+
+        convert_row = QHBoxLayout()
+        self._convert_btn = QPushButton("转换文件 (jsonl→text)")
+        self._convert_btn.clicked.connect(self._do_convert)
+        convert_row.addWidget(self._convert_btn)
+        tool_layout.addLayout(convert_row)
+
+        prep_row = QHBoxLayout()
+        prep_row.addWidget(QLabel("准备任务:"))
+        self._prep_4task = QRadioButton("4-Task")
+        self._prep_4task.setChecked(True)
+        self._prep_hetero = QRadioButton("Hetero (5-Task)")
+        prep_row.addWidget(self._prep_4task)
+        prep_row.addWidget(self._prep_hetero)
+        self._prep_btn = QPushButton("运行")
+        self._prep_btn.clicked.connect(self._do_prepare)
+        prep_row.addWidget(self._prep_btn)
+        prep_row.addStretch()
+        tool_layout.addLayout(prep_row)
+
+        right_layout.addWidget(tool_group, 0)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([280, 520])
+        outer.addWidget(splitter, 1)
+
+        self._file_browser._tree.itemClicked.connect(self._on_file_clicked)
+
+    def _refresh_browser(self) -> None:
+        self._file_browser.load_directory("dataset")
+
+    def _on_file_clicked(self, item, column) -> None:
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        if path and path.endswith(".jsonl"):
+            self._preview.load_file(path)
+
+    def _do_split(self) -> None:
+        selected = self._file_browser.selected_paths()
+        jsonl_files = [p for p in selected if p.endswith(".jsonl")]
+        if not jsonl_files:
+            QMessageBox.information(self, "提示", "请先选择一个 .jsonl 文件")
+            return
+        from core.data_splitter import split_file
+        path = jsonl_files[0]
+        chunk_size = self._split_size.value()
+        try:
+            result = split_file(path, chunk_size=chunk_size)
+            QMessageBox.information(
+                self, "分割完成",
+                f"文件: {os.path.basename(path)}\n"
+                f"分块: {result['n_chunks']}\n"
+                f"总行数: {result['total_lines']}\n"
+                f"输出: {result['output_files']}")
+        except Exception as e:
+            QMessageBox.critical(self, "分割失败", str(e))
+
+    def _do_convert(self) -> None:
+        selected = self._file_browser.selected_paths()
+        jsonl_files = [p for p in selected if p.endswith(".jsonl")]
+        if not jsonl_files:
+            QMessageBox.information(self, "提示", "请先选择一个 .jsonl 文件")
+            return
+        from core.data_converter import convert_file
+        path = jsonl_files[0]
+        try:
+            out_path = convert_file(path)
+            QMessageBox.information(self, "转换完成", f"输出: {out_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "转换失败", str(e))
+
+    def _do_prepare(self) -> None:
+        from core.prepare_tasks import prepare_4tasks, prepare_hetero
+        try:
+            if self._prep_4task.isChecked():
+                result = prepare_4tasks()
+                label = "4-Task"
+            else:
+                result = prepare_hetero()
+                label = "Hetero"
+            summary = "\n".join(f"  {k}: {v}" for k, v in result.items())
+            QMessageBox.information(
+                self, f"{label} 完成", f"任务准备结果:\n{summary}")
+        except Exception as e:
+            QMessageBox.critical(self, "任务准备失败", f"{type(e).__name__}: {e}")
+
+    def on_theme_changed(self, theme) -> None:
+        self._theme = theme

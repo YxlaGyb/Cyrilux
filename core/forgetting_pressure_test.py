@@ -8,7 +8,7 @@ Phase 1: 无回放 (A→B→C→D 灾难性遗忘基线)
 Phase 2: MemoryBank + Sniffer 保护 (A→B→C→D 持续学习)
 输出: 4×4 CE 矩阵 (行=训练完第 i 个任务, 列=在第 j 个任务上的 CE)
 """
-import os, sys, json, math, time, argparse, re
+import os, sys, json, time, argparse
 
 import torch
 from torch.utils.data import DataLoader
@@ -16,9 +16,17 @@ from model.pc_layers import PCLocalDynamicMiniMind
 from model.model_minimind import MiniMindConfig
 from continual.memory_bank import MemoryBank
 from continual.forgetting_sniffer import ForgettingSniffer
-from core.trainer_utils import get_lr, setup_seed
+from core.trainer_utils import setup_seed
 from core.dataset import DualChannelDataset
 from core.globals import DEVICE_STR
+from model.local_updates import (
+    compute_modulators,
+    compute_hebbian_temporal,
+    compute_hebbian_topdown,
+    compute_hebbian_conv,
+    compute_hebbian_swiglu,
+    apply_hebbian_updates,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -31,12 +39,7 @@ def make_model(device):
     return model
 
 def make_optimizer(model, lr):
-    return torch.optim.AdamW(
-        list(model.temporal_proj.parameters()) +
-        list(model.topdown_proj.parameters()) +
-        [p for n, p in model.model.named_parameters() if p.requires_grad],
-        lr=lr, betas=(0.9, 0.95), fused=True,
-    )
+    return None
 
 def warmup(model, batch_size, seq_len, device):
     with torch.no_grad():
@@ -66,35 +69,66 @@ def evaluate(model, data_path, max_seq_len, batch_size, max_samples, device):
     return avg_ce
 
 
-def train_step(model, optim, bt, lt, device, base_lr, gs, total_steps):
-    """单步训练, 返回 loss + 更新后的 gs."""
+@torch.no_grad()
+def hebbian_step(model, bt, lt, device, base_lr, gamma_rpe, total_steps, cfg):
+    """单步 Hebbian 训练, 返回 CE + modulation."""
     bt, lt = bt.to(device), lt.to(device)
     pos = model.get_position_embeddings(bt.size(2), device)  # [bsz, 2, seq]
-    _, ce = model.forward_with_ce(bt, lt, pos)
-    optim.zero_grad(set_to_none=True)
-    ce.backward()
-    trainable = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
-    if trainable:
-        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-    lr = get_lr(gs, total_steps, base_lr)
-    for pg in optim.param_groups:
-        pg['lr'] = lr
-    optim.step()
-    return ce.item(), lr
+    z_init, ce = model.forward_with_ce(bt, lt, pos)
+
+    z_detached = [z.detach() for z in z_init]
+    _, _, _, F_pred, ε_list = model.spatiotemporal_infer(
+        z_detached, pos,
+        gamma=cfg.get('gamma', 0.05),
+        T=cfg.get('T_infer', 1),
+        return_errors=False,
+        return_pred_loss=True,
+        return_ε=True,
+    )
+
+    F_curr = F_pred.item()
+    F_prev = getattr(model, '_last_F', F_curr)
+    model._last_F = F_curr
+    uncertainty = 1.0
+    _, _, modulation = compute_modulators(F_curr, F_prev, uncertainty, cfg)
+
+    updates = {}
+    updates.update(compute_hebbian_temporal(ε_list, z_detached, modulation, base_lr, gamma_rpe))
+    updates.update(compute_hebbian_topdown(ε_list, z_detached, modulation, base_lr, gamma_rpe))
+
+    L = len(ε_list)
+    for ℓ in range(L):
+        block_idx = ℓ // 2
+        is_conv = (ℓ % 2 == 0)
+        block = model.model.layers[block_idx]
+        if is_conv:
+            dW = compute_hebbian_conv(ε_list[ℓ], z_detached[ℓ],
+                                       block.local_conv.weight, block.dilation,
+                                       modulation, base_lr, gamma_rpe)
+            updates[f'model.layers.{block_idx}.local_conv.weight'] = dW
+        else:
+            mlp_up = compute_hebbian_swiglu(ε_list[ℓ], z_detached[ℓ], block.mlp,
+                                             modulation, base_lr, gamma_rpe)
+            for k, v in mlp_up.items():
+                updates[f'model.layers.{block_idx}.mlp.{k}'] = v
+
+    apply_hebbian_updates(updates, model)
+    return ce.item(), modulation
 
 
 # ═══════════════════════════════════════════════════════════════════
 # Phase 1: 无回放基线 — A→B→C→D 顺序学习, 每步评估所有已知任务
 # ═══════════════════════════════════════════════════════════════════
 
-def run_phase1(model, optim, task_paths, epochs, max_seq_len, batch_size,
-               max_samples, device, base_lr, eval_every=1):
+def run_phase1(model, task_paths, epochs, max_seq_len, batch_size,
+               max_samples, device, base_lr, cfg):
     """
-    训练 A→B→...→N, 无回放.
+    训练 A→B→...→N, 纯 Hebbian.
     返回: matrix[n_tasks][n_tasks], matrix[i][j] = 训练完 i 后在任务 j 上的 CE.
     """
     n = len(task_paths)
     matrix = [[0.0] * n for _ in range(n)]
+    gamma_rpe = cfg.get('dopamine_gamma', 0.3)
 
     for i, path in enumerate(task_paths):
         ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
@@ -108,11 +142,11 @@ def run_phase1(model, optim, task_paths, epochs, max_seq_len, batch_size,
         for _ in range(epochs):
             for bt, lt in loader:
                 gs += 1
-                loss, lr = train_step(model, optim, bt, lt, device, base_lr, gs, total_steps)
+                loss, mod = hebbian_step(model, bt, lt, device, base_lr, gamma_rpe, total_steps, cfg)
                 if loss < best:
                     best = loss
                 if gs % 200 == 0:
-                    print(f'  [{name}] Step {gs}/{total_steps} CE={loss:.4f} lr={lr:.2e}')
+                    print(f'  [{name}] Step {gs}/{total_steps} CE={loss:.4f} mod={mod:.3f}')
         print(f'  [{name}] Done. Best CE={best:.4f}')
 
         # 评估所有已知任务
@@ -129,10 +163,10 @@ def run_phase1(model, optim, task_paths, epochs, max_seq_len, batch_size,
 # Phase 2: MemoryBank + Sniffer — A→B→C→D 带保护
 # ═══════════════════════════════════════════════════════════════════
 
-def run_phase2(model, optim, task_paths, epochs, max_seq_len, batch_size, max_samples, device,
-               threshold, repair_steps, check_interval, bank_size, n_exemplars, replay_ratio, base_lr):
+def run_phase2(model, task_paths, epochs, max_seq_len, batch_size, max_samples, device,
+               threshold, repair_steps, check_interval, bank_size, n_exemplars, replay_ratio, base_lr, cfg):
     """
-    训练 A→B→...→N 带 MemoryBank+Sniffer 保护.
+    训练 A→B→...→N 带 MemoryBank+Sniffer 保护, 纯 Hebbian.
     每学完一个任务, 收集 exemplars → bank.
     返回: matrix[n_tasks][n_tasks] (同上).
     """
@@ -143,12 +177,51 @@ def run_phase2(model, optim, task_paths, epochs, max_seq_len, batch_size, max_sa
         memory_bank=memory_bank, model=model,
         check_interval=check_interval, threshold=threshold, repair_steps=repair_steps,
     )
+    gamma_rpe = cfg.get('dopamine_gamma', 0.3)
 
+    # ── 辅助: Hebbian 回放步 ──
+    def _hebbian_replay(rb, rl):
+        seq_len = rb.size(2)
+        rp = model.get_position_embeddings(seq_len, device)
+        z_r, _ = model.forward_with_ce(rb, rl, rp)
+        z_det = [z.detach() for z in z_r]
+        _, _, _, F_pred, ε_list = model.spatiotemporal_infer(
+            z_det, rp,
+            gamma=cfg.get('gamma', 0.05),
+            T=cfg.get('T_infer', 1),
+            return_errors=False,
+            return_pred_loss=True,
+            return_ε=True,
+        )
+        F_curr = F_pred.item()
+        F_prev = getattr(model, '_last_F', F_curr)
+        model._last_F = F_curr
+        _, _, modulation = compute_modulators(F_curr, F_prev, 1.0, cfg)
+        updates = {}
+        updates.update(compute_hebbian_temporal(ε_list, z_det, modulation, base_lr, gamma_rpe))
+        updates.update(compute_hebbian_topdown(ε_list, z_det, modulation, base_lr, gamma_rpe))
+        L = len(ε_list)
+        for ℓ in range(L):
+            bidx = ℓ // 2
+            is_conv = (ℓ % 2 == 0)
+            blk = model.model.layers[bidx]
+            if is_conv:
+                dW = compute_hebbian_conv(ε_list[ℓ], z_det[ℓ], blk.local_conv.weight,
+                                           blk.dilation, modulation, base_lr, gamma_rpe)
+                updates[f'model.layers.{bidx}.local_conv.weight'] = dW
+            else:
+                mu = compute_hebbian_swiglu(ε_list[ℓ], z_det[ℓ], blk.mlp,
+                                             modulation, base_lr, gamma_rpe)
+                for k, v in mu.items():
+                    updates[f'model.layers.{bidx}.mlp.{k}'] = v
+        apply_hebbian_updates(updates, model)
+
+    # ── 主循环 ──
     for i, path in enumerate(task_paths):
-        name = chr(65 + i)  # A, B, C, D...
+        name = chr(65 + i)
 
         if i == 0:
-            # 第一个任务: 纯 CE 训练 (无保护)
+            # 第一个任务: 纯 Hebbian 训练 (无保护)
             print(f'\n--- [P2-{name}] {os.path.basename(path)} (首次, 无保护) ---')
             ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
             loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -158,11 +231,11 @@ def run_phase2(model, optim, task_paths, epochs, max_seq_len, batch_size, max_sa
             for _ in range(epochs):
                 for bt, lt in loader:
                     gs += 1
-                    loss, lr = train_step(model, optim, bt, lt, device, base_lr, gs, total_steps)
+                    loss, mod = hebbian_step(model, bt, lt, device, base_lr, gamma_rpe, total_steps, cfg)
                     if loss < best:
                         best = loss
                     if gs % 200 == 0:
-                        print(f'  [{name}] Step {gs}/{total_steps} CE={loss:.4f} lr={lr:.2e}')
+                        print(f'  [{name}] Step {gs}/{total_steps} CE={loss:.4f} mod={mod:.3f}')
             print(f'  [{name}] Done. Best CE={best:.4f}')
         else:
             # 后续任务: 带 MemoryBank 回放 + Sniffer 保护
@@ -178,7 +251,7 @@ def run_phase2(model, optim, task_paths, epochs, max_seq_len, batch_size, max_sa
                     gs += 1
 
                     # 主训练步
-                    loss, lr = train_step(model, optim, bt, lt, device, base_lr, gs, total_steps)
+                    loss, mod = hebbian_step(model, bt, lt, device, base_lr, gamma_rpe, total_steps, cfg)
                     if loss < best:
                         best = loss
 
@@ -188,38 +261,19 @@ def run_phase2(model, optim, task_paths, epochs, max_seq_len, batch_size, max_sa
                         if replay_ex:
                             rb = torch.stack([ex.byte_tensor for ex in replay_ex], dim=0).to(device)
                             rl = torch.stack([ex.label_tensor for ex in replay_ex], dim=0).to(device)
-                            rp = model.get_position_embeddings(rb.size(2), device)  # [bsz, 2, seq]
-                            _, rloss = model.forward_with_ce(rb, rl, rp)
-                            optim.zero_grad(set_to_none=True)
-                            rloss.backward()
-                            tr = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
-                            if tr:
-                                torch.nn.utils.clip_grad_norm_(tr, 1.0)
-                            ri_lr = get_lr(gs, total_steps, base_lr)
-                            for pg in optim.param_groups:
-                                pg['lr'] = ri_lr
-                            optim.step()
+                            _hebbian_replay(rb, rl)
 
                     # 遗忘嗅探
                     if sniffer.is_repairing or (gs % check_interval == 0 and gs > 0):
                         forgotten = sniffer.check(gs, device)
                         if forgotten:
-                            repair_lr = sniffer.repair_begin(optim, lr, device)
-                            print(f'    [Sniffer] FORGOTTEN: {forgotten} — repairing (LR={repair_lr:.2e})')
+                            print(f'    [Sniffer] FORGOTTEN: {forgotten} — repairing')
                             for _ in range(repair_steps):
                                 replay_data = sniffer.get_replay_batch(batch_size, device)
                                 if replay_data is None:
                                     break
                                 rb, rl = replay_data
-                                rp = model.get_position_embeddings(rb.size(2), device)  # [bsz, 2, seq]
-                                _, rloss = model.forward_with_ce(rb, rl, rp)
-                                optim.zero_grad(set_to_none=True)
-                                rloss.backward()
-                                tr = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
-                                if tr:
-                                    torch.nn.utils.clip_grad_norm_(tr, 1.0)
-                                optim.step()
-                            sniffer.repair_end(optim, lr)
+                                _hebbian_replay(rb, rl)
                             print(f'    [Sniffer] Repair complete')
 
                     if gs % 200 == 0:
@@ -407,6 +461,8 @@ def main():
     print(f'  Device: {device}')
     print()
 
+    cfg = {'dopamine_gamma': 0.3, 'gamma': 0.05, 'T_infer': 1}
+
     # ═══════════════════════════════════════════════════════════
     # Phase 1 — 无回放
     # ═══════════════════════════════════════════════════════════
@@ -415,14 +471,13 @@ def main():
     print('=' * 72)
     setup_seed(args.seed)
     m1 = make_model(device)
-    o1 = make_optimizer(m1, args.lr)
     n_params = sum(p.numel() for p in m1.parameters() if p.requires_grad)
     print(f'  Model: {n_params/1e6:.2f}M parameters')
     warmup(m1, args.batch_size, args.max_seq_len, device)
 
     t0 = time.time()
-    p1_matrix = run_phase1(m1, o1, task_paths, args.epochs, args.max_seq_len,
-                           args.batch_size, args.max_samples, device, args.lr)
+    p1_matrix = run_phase1(m1, task_paths, args.epochs, args.max_seq_len,
+                           args.batch_size, args.max_samples, device, args.lr, cfg)
     p1_time = time.time() - t0
     print_matrix('PHASE 1 CE 矩阵 (无回放)', p1_matrix, task_names, 'P1-')
     print(f'  Phase 1 耗时: {p1_time:.1f}s ({p1_time/60:.1f}min)')
@@ -435,14 +490,13 @@ def main():
     print('=' * 72)
     setup_seed(args.seed)
     m2 = make_model(device)
-    o2 = make_optimizer(m2, args.lr)
     warmup(m2, args.batch_size, args.max_seq_len, device)
 
     t0 = time.time()
-    p2_matrix = run_phase2(m2, o2, task_paths, args.epochs, args.max_seq_len,
+    p2_matrix = run_phase2(m2, task_paths, args.epochs, args.max_seq_len,
                            args.batch_size, args.max_samples, device,
                            args.threshold, args.repair_steps, args.check_interval,
-                           args.bank_size, args.exemplars, args.replay_ratio, args.lr)
+                           args.bank_size, args.exemplars, args.replay_ratio, args.lr, cfg)
     p2_time = time.time() - t0
     print_matrix('PHASE 2 CE 矩阵 (有回放)', p2_matrix, task_names, 'P2-')
     print(f'  Phase 2 耗时: {p2_time:.1f}s ({p2_time/60:.1f}min)')

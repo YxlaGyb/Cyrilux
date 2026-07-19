@@ -11,3 +11,9 @@ from .abstraction_bank import (
     compute_layer_importance,
 )
 from .world_model import LatentWorldModel
+from .neurogenesis import (
+    NeurogenesisController,
+    ActivationTracker,
+    ChannelPruner,
+    ChannelGrowth,
+)

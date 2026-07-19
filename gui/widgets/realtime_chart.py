@@ -1,114 +1,175 @@
-"""实时曲线图 — 基于 matplotlib FigureCanvasTkAgg 嵌入 maliang Canvas."""
+"""
+实时折线图组件 — 纯 QPainter 绘制, 无额外依赖.
+支持固定窗口滚动、多条曲线、网格、标签.
+"""
 
 from __future__ import annotations
 
-import tkinter as tk
-from typing import Optional
+import math
+from typing import Sequence
 
-import matplotlib
-import maliang
-
-matplotlib.use("TkAgg")
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
-from gui.theme import ThemeManager
+from PyQt6.QtCore import Qt, QRectF, QPointF, QTimer
+from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QFontMetrics
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
 
-class RealtimeChart:
-    """实时更新的 matplotlib 曲线组件 (嵌入 maliang Canvas)."""
+class RealtimeChart(QWidget):
+    """轻量实时折线图 — 支持 N 条曲线滚动更新.
 
-    def __init__(self, master: maliang.Canvas,
-                 position: tuple[int, int],
-                 size: tuple[int, int],
-                 title: str = "", ylabel: str = "",
-                 max_points: int = 500,
-                 theme_mgr: Optional[ThemeManager] = None):
-        self._master = master
-        self.title = title
-        self.ylabel = ylabel
-        self.max_points = max_points
-        self._theme_mgr = theme_mgr
+    用法:
+        chart = RealtimeChart(title="CE Loss", max_points=200)
+        chart.add_series("train", color="#00ff41")
+        chart.add_series("val",   color="#ffb000")
+        chart.append("train", 0.5)
+        chart.append("val", 0.6)
+    """
 
-        self._series: dict[str, tuple[list[float], list[float]]] = {}
-        self._colors = ["#7c5cfc", "#4ade80", "#fbbf24", "#f87171",
-                        "#60a5fa", "#c084fc", "#34d399", "#fb923c"]
+    def __init__(self, title: str = "", max_points: int = 200,
+                 y_range: tuple[float, float] | None = None,
+                 parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(160)
+        self.setObjectName("chartWidget")
 
-        p = theme_mgr.palette if theme_mgr else None
-        bg = p.card_bg if p else "#ffffff"
-        fg = p.fg if p else "#1a1a2e"
-        grid_c = p.border if p else "#e8e8f0"
-        line_c = p.border if p else "#d0d0de"
+        self._title = title
+        self._max_points = max_points
+        self._y_range = y_range  # (ymin, ymax), None=auto
+        self._series: dict[str, dict] = {}  # name -> {color, data: []}
+        self._margin = 8
 
-        self._frame = tk.Frame(master, bg=bg)
-        master.create_window(position[0], position[1],
-                             window=self._frame,
-                             width=size[0], height=size[1],
-                             anchor="nw")
+    def add_series(self, name: str, color: str = "#00ff41") -> None:
+        """添加一条曲线."""
+        if name not in self._series:
+            self._series[name] = {"color": color, "data": []}
 
-        self._fig = Figure(figsize=(size[0] / 100, size[1] / 100), dpi=100)
-        self._fig.patch.set_facecolor(bg)
+    def append(self, name: str, value: float) -> None:
+        """追加一个数据点."""
+        if name not in self._series:
+            self.add_series(name)
+        data = self._series[name]["data"]
+        data.append(value)
+        if len(data) > self._max_points:
+            data[:] = data[-self._max_points:]
+        self.update()
 
-        self._ax = self._fig.add_subplot(111)
-        self._ax.set_facecolor(bg)
-        self._ax.set_title(self.title, color=fg, fontsize=9, pad=4)
-        self._ax.set_ylabel(self.ylabel, color=fg, fontsize=8)
-        self._ax.tick_params(colors=fg, labelsize=7)
-        self._ax.grid(True, color=grid_c, linewidth=0.3)
-        self._ax.spines["top"].set_visible(False)
-        self._ax.spines["right"].set_visible(False)
-        for spine in self._ax.spines.values():
-            spine.set_color(line_c)
+    def extend(self, name: str, values: Sequence[float]) -> None:
+        """批量追加."""
+        if name not in self._series:
+            self.add_series(name)
+        data = self._series[name]["data"]
+        data.extend(values)
+        if len(data) > self._max_points:
+            data[:] = data[-self._max_points:]
+        self.update()
 
-        self._canvas = FigureCanvasTkAgg(self._fig, master=self._frame)
-        self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    def clear_series(self, name: str | None = None) -> None:
+        """清空指定或全部曲线."""
+        if name:
+            if name in self._series:
+                self._series[name]["data"].clear()
+        else:
+            for s in self._series.values():
+                s["data"].clear()
+        self.update()
 
-    def add_series(self, label: str):
-        if label not in self._series:
-            self._series[label] = ([], [])
+    def set_title(self, title: str) -> None:
+        """动态设置标题."""
+        self._title = title
+        self.update()
 
-    def add_point(self, label: str, x: float, y: float):
-        if label not in self._series:
-            self._series[label] = ([], [])
-        xs, ys = self._series[label]
-        xs.append(x)
-        ys.append(y)
-        if len(xs) > self.max_points:
-            xs.pop(0)
-            ys.pop(0)
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    def clear(self):
-        for label in self._series:
-            self._series[label] = ([], [])
-        self._redraw()
+        w, h = self.width(), self.height()
+        if w < 20 or h < 20:
+            painter.end()
+            return
 
-    def set_data(self, series_data: dict[str, tuple[list[float], list[float]]]):
-        self._series = series_data
-        self._redraw()
+        # 背景
+        bg = self.palette().window().color()
+        painter.fillRect(0, 0, w, h, bg)
 
-    def redraw(self):
-        self._redraw()
+        # 标题
+        if self._title:
+            painter.setPen(QColor(self.palette().text().color()))
+            title_font = QFont("Consolas", 9)
+            painter.setFont(title_font)
+            painter.drawText(4, 4, w - 8, 16,
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             self._title)
 
-    def _redraw(self):
-        self._ax.clear()
-        self._ax.set_title(self.title, fontsize=9, pad=4)
-        self._ax.set_ylabel(self.ylabel, fontsize=8)
+        # 绘图区
+        top = 22 if self._title else 8
+        left = 8
+        pw = w - 2 * left
+        ph = h - top - 8
+        if pw < 10 or ph < 10:
+            painter.end()
+            return
 
-        p = self._theme_mgr.palette if self._theme_mgr else None
-        fg = p.fg if p else "#1a1a2e"
-        legend_bg = p.card_bg if p else "#ffffff"
-        legend_edge = p.border if p else "#d0d0de"
+        # 收集所有数据找 y 范围
+        all_vals = []
+        for s in self._series.values():
+            all_vals.extend(s["data"])
+        if not all_vals:
+            painter.end()
+            return
 
-        for i, (label, (xs, ys)) in enumerate(self._series.items()):
-            if xs and ys:
-                color = self._colors[i % len(self._colors)]
-                self._ax.plot(xs, ys, label=label, color=color, linewidth=1.0, alpha=0.9)
+        if self._y_range:
+            y_min, y_max = self._y_range
+        else:
+            y_min = min(all_vals)
+            y_max = max(all_vals)
+            if y_max - y_min < 1e-8:
+                y_min -= 0.1
+                y_max += 0.1
+            pad = (y_max - y_min) * 0.1
+            y_min -= pad
+            y_max += pad
 
-        if self._series:
-            self._ax.legend(fontsize=6, loc="upper right",
-                            facecolor=legend_bg, edgecolor=legend_edge,
-                            labelcolor=fg)
-        self._ax.grid(True, linewidth=0.3, alpha=0.5)
-        self._ax.tick_params(labelsize=7)
-        self._fig.tight_layout()
-        self._canvas.draw_idle()
+        # 网格线
+        grid_pen = QPen(QColor(self.palette().mid().color()), 1)
+        n_grid = 4
+        for i in range(n_grid + 1):
+            gy = top + ph * i / n_grid
+            painter.setPen(grid_pen)
+            painter.drawLine(int(left), int(gy), int(left + pw), int(gy))
+            # 刻度标签
+            val = y_max - (y_max - y_min) * i / n_grid
+            painter.setPen(QColor(self.palette().text().color()))
+            label_font = QFont("Consolas", 7)
+            painter.setFont(label_font)
+            painter.drawText(QRectF(0, gy - 6, left - 2, 12),
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             f"{val:.2f}")
+
+        # 绘制曲线
+        for s_name, s_data in self._series.items():
+            data = s_data["data"]
+            if len(data) < 2:
+                continue
+            color = QColor(s_data["color"])
+            pen = QPen(color, 1.5)
+            painter.setPen(pen)
+
+            path = []
+            n = len(data)
+            for i, val in enumerate(data):
+                x = left + pw * i / max(n - 1, 1)
+                y = top + ph * (1 - (val - y_min) / (y_max - y_min))
+                # 钳位到绘图区
+                y = max(top, min(top + ph, y))
+                path.append(QPointF(x, y))
+
+            # 连线
+            for i in range(1, len(path)):
+                painter.drawLine(path[i - 1], path[i])
+
+            # 最后点高亮
+            if path:
+                painter.setBrush(color)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(path[-1], 3, 3)
+
+        painter.end()

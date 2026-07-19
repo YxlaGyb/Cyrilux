@@ -2,9 +2,86 @@
 Local Conv blocks — 替代 Transformer Attention 的纯局部操作。
 Ponytail: Conv1D(k=3, causal) + SwiGLU MLP, 接口兼容 MiniMindBlock。
 """
+import torch
 import torch.nn.functional as F
 from torch import nn
 from model.model_minimind import RMSNorm, FeedForward
+
+
+class SalienceGate(nn.Module):
+    """每通道可学习显著性门控。
+
+    每个隐藏维度维护一个可学习的 salience logit,
+    z_out = z * σ(logit / τ), 其中 σ 是 sigmoid。
+    温度 τ 控制门的硬度: τ → 0 时趋近离散 0/1。
+
+    EMA 追踪激活水平, 供神经发生控制器 (Phase C) 使用。
+
+    Config:
+        hidden_size: 隐藏维度
+        temperature: sigmoid 温度 (默认 0.1, 越低越硬)
+        init_open: 初始化为全开 (True) 或全关 (False)
+    """
+
+    def __init__(self, hidden_size: int, temperature: float = 0.1, init_open: bool = True):
+        super().__init__()
+        init_val = 5.0 if init_open else -5.0  # σ(5)≈0.993, σ(-5)≈0.007
+        self.logits = nn.Parameter(torch.full([hidden_size], init_val))
+        self.temperature = temperature
+
+        # EMA 追踪 (供 Phase C 神经发生控制器使用)
+        self.register_buffer('activation_ema', torch.zeros(hidden_size))
+        self.register_buffer('_step', torch.tensor(0, dtype=torch.long))
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """应用门控。训练时软门控 (可微), 推理时硬门控 (阈值 0.5)。
+
+        Args:
+            z: [*, hidden_size] 输入
+
+        Returns:
+            z_gated: [*, hidden_size] 门控输出
+        """
+        if self.training:
+            # 软门控: sigmoid, 可微
+            gate = torch.sigmoid(self.logits / self.temperature)
+        else:
+            # 硬门控: 阈值 0.5
+            gate = (torch.sigmoid(self.logits) > 0.5).to(z.dtype)
+
+        # 更新激活 EMA
+        if self.training:
+            with torch.no_grad():
+                # 对除最后一维外的所有维度求平均 → 每通道均值
+                act = z.abs().mean(dim=tuple(range(z.ndim - 1)))  # [hidden_size]
+                decay = 0.99
+                self.activation_ema.mul_(decay).add_(act * (1 - decay))
+                self._step += 1
+
+        return z * gate.view(1, 1, -1)
+
+    @torch.no_grad()
+    def get_gate_values(self) -> torch.Tensor:
+        """返回当前门控值 [hidden_size], 范围 (0,1)。"""
+        return torch.sigmoid(self.logits / self.temperature)
+
+    @torch.no_grad()
+    def get_active_ratio(self, threshold: float = 0.01) -> float:
+        """活性通道比例 (gate > threshold)。"""
+        return (self.get_gate_values() > threshold).float().mean().item()
+
+    @torch.no_grad()
+    def get_sparsity_loss(self, β: float = 0.01) -> torch.Tensor:
+        """门控稀疏正则损失: β · Σ(1 - σ(logits))²
+
+        鼓励 logits 要么很大 (全开) 要么很小 (全关), 避免中间态。
+        """
+        gate = torch.sigmoid(self.logits)
+        return β * ((1.0 - gate) ** 2).sum()
+
+    def extra_repr(self):
+        active = self.get_active_ratio()
+        return f'H={self.logits.size(0)}, τ={self.temperature}, active={active:.2%}'
 
 
 class LocalConvBlock(nn.Module):

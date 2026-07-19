@@ -1,85 +1,45 @@
-"""KPI 卡片组件 — 基于 maliang Widget + shapes/Text."""
+"""
+骇客像素风 Metric 卡片 — 带标签/值/可选的趋势指示.
+"""
 
 from __future__ import annotations
 
-from typing import Optional
-
-import maliang
-from maliang import shapes
-from maliang.core.virtual import Widget
-
-from gui.theme import FONT_FAMILY, ThemeManager
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QFrame, QVBoxLayout, QLabel
 
 
-class MetricCard:
-    """带标题/数值/增量/描述的可复用 KPI 卡片 (绘制在 maliang Widget 上)."""
+class MetricCard(QFrame):
+    """数值概览卡片: 标签 + 大号值 + 可选脚注."""
 
-    def __init__(self, master: maliang.Canvas,
-                 position: tuple[int, int],
-                 size: tuple[int, int],
-                 title: str = "", value: str = "--",
-                 delta: Optional[str] = None,
-                 delta_positive: Optional[bool] = None,
-                 subtitle: str = "",
-                 theme_mgr: Optional[ThemeManager] = None):
-        self._master = master
-        self._theme_mgr = theme_mgr
-        self._position = position
-        self._size = size
+    def __init__(self, label: str, value: str = "—", footnote: str = "",
+                 parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.Box)
+        self.setMinimumHeight(80)
+        self.setObjectName("metricCard")
 
-        p = theme_mgr.palette if theme_mgr else None
-        card_bg = p.card_bg if p else "#ffffff"
-        fg = p.fg if p else "#1a1a2e"
-        fg2 = p.fg_secondary if p else "#6b6b8a"
-        border = p.border if p else "#d0d0de"
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
 
-        # 创建虚拟 Widget 作为形状和文本的容器
-        self._widget = Widget(master, position=position, size=size)
+        self._label = QLabel(label)
+        self._label.setObjectName("secondary")
+        layout.addWidget(self._label)
 
-        # 卡片背景圆角矩形 (相对于 Widget 左上角)
-        # 注意: RoundedRectangle 内部 display() 硬编码了 outline="",
-        # 因此不能通过 kwargs 传 outline, 以免冲突。
-        shapes.RoundedRectangle(
-            self._widget,
-            relative_position=(0, 0),
-            size=size,
-            radius=8,
-            fill=card_bg,
-        )
+        self._value = QLabel(value)
+        self._value.setObjectName("accent")
+        self._value.setStyleSheet("font-size: 18pt; font-weight: bold;")
+        layout.addWidget(self._value)
 
-        # 标题 (相对于 Widget 左上角的偏移)
-        self._title = maliang.Text(
-            self._widget, relative_position=(12, 8),
-            text=title, fontsize=9, fill=fg,
-        )
+        self._footnote = QLabel(footnote)
+        self._footnote.setObjectName("dim")
+        if not footnote:
+            self._footnote.setVisible(False)
+        layout.addWidget(self._footnote)
 
-        # 数值
-        self._value_label = maliang.Text(
-            self._widget, relative_position=(12, 28),
-            text=value, fontsize=22, weight="bold", fill=fg,
-        )
+    def set_value(self, value: str) -> None:
+        self._value.setText(value)
 
-        # 增量行
-        if delta is not None:
-            delta_fg = "#4ade80" if delta_positive else "#f87171"
-            if delta_positive is None:
-                delta_fg = fg2
-            self._delta_label = maliang.Text(
-                self._widget, relative_position=(12, size[1] - 24),
-                text=delta, fontsize=9, fill=delta_fg,
-            )
-
-        # 副标题
-        if subtitle:
-            maliang.Text(
-                self._widget, relative_position=(12, size[1] - 12),
-                text=subtitle, fontsize=8, fill=fg2,
-            )
-
-    def set_value(self, value: str):
-        self._value_label.text = value
-
-    def set_delta(self, delta: str, positive: Optional[bool] = None):
-        """更新增量值."""
-        if hasattr(self, '_delta_label'):
-            self._delta_label.text = delta
+    def set_footnote(self, text: str) -> None:
+        self._footnote.setText(text)
+        self._footnote.setVisible(bool(text))

@@ -29,11 +29,8 @@ def training_options(
     dopamine_eta: float = typer.Option(1.0, "--dopamine-eta", help="Dopamine learning rate"),
     dopamine_beta: float = typer.Option(0.5, "--dopamine-beta", help="Dopamine 灵敏度"),
     dopamine_gamma: float = typer.Option(0.3, "--dopamine-gamma", help="Dopamine 衰减"),
-    enable_amp: bool = typer.Option(False, "--amp", help="启用 AMP bf16 (默认关)"),
-    use_cuda_graphs: bool = typer.Option(False, "--cuda-graphs", help="启用 CUDA Graph (实验性)"),
     out_dir: str = typer.Option("out_pc_unified", "--out-dir", "-o", help="输出目录"),
     save_interval: int = typer.Option(500, "--save-interval", help="保存间隔步数"),
-    grad_clip: float = typer.Option(1.0, "--grad-clip", help="梯度裁剪阈值"),
     use_abstraction_bank: bool = typer.Option(False, "--abstraction-bank/--no-abstraction-bank", help="启用抽象记忆库"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志"),
 ):
@@ -48,9 +45,8 @@ def training_options(
         enable_dopamine=enable_dopamine,
         dopamine_eta=dopamine_eta, dopamine_beta=dopamine_beta,
         dopamine_gamma=dopamine_gamma,
-        enable_amp=enable_amp, use_cuda_graphs=use_cuda_graphs,
         out_dir=out_dir, save_interval=save_interval, use_abstraction_bank=use_abstraction_bank,
-    ), grad_clip, verbose
+    ), verbose
 
 
 @app.callback(invoke_without_command=True)
@@ -73,21 +69,19 @@ def train_main(
     dopamine_eta: float = typer.Option(1.0, "--dopamine-eta", help="多巴胺学习率"),
     dopamine_beta: float = typer.Option(0.5, "--dopamine-beta", help="多巴胺灵敏度"),
     dopamine_gamma: float = typer.Option(0.3, "--dopamine-gamma", help="多巴胺衰减"),
-    enable_amp: bool = typer.Option(False, "--amp", help="启用 AMP fp16 (默认关: PC 自由能易溢出)"),
-    use_cuda_graphs: bool = typer.Option(False, "--cuda-graphs", help="启用 CUDA Graph (实验性)"),
     out_dir: str = typer.Option("out_pc_unified", "--out-dir", "-o", help="输出目录"),
     save_interval: int = typer.Option(500, "--save-interval", help="保存间隔"),
-    grad_clip: float = typer.Option(1.0, "--grad-clip", help="梯度裁剪"),
     use_abstraction_bank: bool = typer.Option(False, "--abstraction-bank/--no-abstraction-bank", help="抽象记忆库"),
     auto_phase2: bool = typer.Option(False, "--auto-phase2", help="训练后自动进入 Phase 2"),
     resume: bool = typer.Option(False, "--resume", help="从断点恢复"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志"),
 ):
-    """直接训练模式."""
+    """直接训练模式 (纯 Hebbian, 零反向传播)."""
     if ctx.invoked_subcommand is not None:
         return
 
-    from core.training import run_training_standalone, TrainingConfig
+    from core.training import TrainingLoop, TrainingConfig
+    from core.dataset import DualChannelDataset
 
     device = ctx.obj.get("device", DEVICE_STR)
     data_file_list = [resolve_path(f.strip()) for f in data_files.split(",") if f.strip()]
@@ -110,8 +104,6 @@ def train_main(
         dopamine_eta=dopamine_eta,
         dopamine_beta=dopamine_beta,
         dopamine_gamma=dopamine_gamma,
-        enable_amp=enable_amp,
-        use_cuda_graphs=use_cuda_graphs,
         out_dir=out_dir,
         save_interval=save_interval,
         use_abstraction_bank=use_abstraction_bank,
@@ -120,7 +112,15 @@ def train_main(
     print(f"Phase 1 训练 — {config.model_type}  hidden={config.hidden_size}  "
           f"layers={config.num_hidden_layers}  device={device}")
 
-    run_training_standalone(config, grad_clip=grad_clip, device=device, resume=resume, verbose=verbose)
+    # 构建任务管道
+    task_pipelines = []
+    for i, fp in enumerate(data_file_list):
+        tid = f"task_{i}"
+        ds = DualChannelDataset(fp, max_length=max_seq_len, max_samples=subset if subset else None)
+        task_pipelines.append((tid, ds))
+
+    loop = TrainingLoop(config)
+    loop.train(task_pipelines)
 
 
 @app.command()
@@ -132,11 +132,11 @@ def from_config(
     lr: Optional[float] = typer.Option(None, "--lr", help="覆盖学习率"),
     epochs: Optional[int] = typer.Option(None, "--epochs", "-e", help="覆盖训练轮数"),
     out_dir: Optional[str] = typer.Option(None, "--out-dir", "-o", help="覆盖输出目录"),
-    grad_clip: Optional[float] = typer.Option(None, "--grad-clip", help="覆盖梯度裁剪"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志"),
 ):
-    """从 JSON 配置文件加载参数并训练."""
-    from core.training import run_training_standalone, TrainingConfig
+    """从 JSON 配置文件加载参数并训练 (纯 Hebbian, 零反向传播)."""
+    from core.training import TrainingLoop, TrainingConfig
+    from core.dataset import DualChannelDataset
 
     device = ctx.obj.get("device", DEVICE_STR)
     cfg = load_config(config)
@@ -146,16 +146,16 @@ def from_config(
     train_cfg = cfg.get("training", {})
     pc_cfg = cfg.get("pc", {})
     dop_cfg = cfg.get("dopamine", {})
-    quant_cfg = cfg.get("quantize", {})
-    opt_cfg = cfg.get("optimization", {})
     out_cfg = cfg.get("output", {})
+
+    data_file_list = [resolve_path(f) for f in data_cfg.get("data_files", [])]
 
     config_obj = TrainingConfig(
         model_type=model_cfg.get("model_type", "pc_unified"),
         checkpoint_path=model_cfg.get("checkpoint_path"),
         hidden_size=model_cfg.get("hidden_size", 256),
         num_hidden_layers=model_cfg.get("num_hidden_layers", 4),
-        data_files=[resolve_path(f) for f in data_cfg.get("data_files", [])],
+        data_files=data_file_list,
         combined_training=data_cfg.get("combined_training", True),
         batch_size=batch_size or train_cfg.get("batch_size", 48),
         max_seq_len=train_cfg.get("max_seq_len", 128),
@@ -168,26 +168,36 @@ def from_config(
         dopamine_eta=dop_cfg.get("eta", 1.0),
         dopamine_beta=dop_cfg.get("beta", 0.5),
         dopamine_gamma=dop_cfg.get("gamma", 0.3),
-        enable_amp=opt_cfg.get("enable_amp", True),
-        use_cuda_graphs=opt_cfg.get("use_cuda_graphs", False),
         out_dir=out_cfg.get("out_dir", "out_pc_unified"),
         save_interval=out_cfg.get("save_interval", 500),
         use_abstraction_bank=model_cfg.get("use_abstraction_bank", False),
     )
 
-    _gc = grad_clip or train_cfg.get("grad_clip", 1.0)
     print(f"从配置启动训练: {config}")
-    run_training_standalone(config_obj, grad_clip=_gc, device=device, verbose=verbose)
+
+    # 构建任务管道
+    task_pipelines = []
+    for i, fp in enumerate(data_file_list):
+        tid = f"task_{i}"
+        ds = DualChannelDataset(fp, max_length=config_obj.max_seq_len,
+                                max_samples=config_obj.subset if config_obj.subset else None)
+        task_pipelines.append((tid, ds))
+
+    loop = TrainingLoop(config_obj)
+    loop.train(task_pipelines)
 
 
 @app.command()
 def resume(
     ctx: typer.Context,
     checkpoint: str = typer.Argument(..., help="检查点文件 (.pt)"),
+    batch_size: int = typer.Option(48, "--batch-size", "-b", help="批大小"),
+    max_seq_len: int = typer.Option(128, "--max-seq-len", help="最大序列长度"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志"),
 ):
-    """从检查点文件恢复训练."""
-    from core.training import run_training_standalone, TrainingConfig
+    """从检查点文件恢复训练 (纯 Hebbian, 零反向传播)."""
+    from core.training import TrainingLoop, TrainingConfig
+    from core.dataset import DualChannelDataset
 
     device = ctx.obj.get("device", DEVICE_STR)
     ckpt_path = resolve_path(checkpoint)
@@ -204,6 +214,29 @@ def resume(
         checkpoint_path=ckpt_path,
         out_dir=out_name,
         model_type="pc_unified",
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
     )
 
-    run_training_standalone(config, device=device, resume=True, verbose=verbose)
+    # 从检查点元数据推断数据文件
+    ckpt_data = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    data_files = []
+    if 'config' in ckpt_data and 'data_files' in ckpt_data['config']:
+        data_files = ckpt_data['config']['data_files']
+    if not data_files:
+        print("⚠ 检查点中无 data_files 信息, 请使用 `train` 命令指定数据")
+        # 创建空管道 — TrainingLoop 仍能加载模型权重
+        task_pipelines = []
+    else:
+        task_pipelines = []
+        for i, fp in enumerate(data_files):
+            tid = f"task_{i}"
+            resolved = resolve_path(fp)
+            ds = DualChannelDataset(resolved, max_length=max_seq_len, max_samples=None)
+            task_pipelines.append((tid, ds))
+
+    loop = TrainingLoop(config)
+    if task_pipelines:
+        loop.train(task_pipelines)
+    else:
+        print("Model loaded. 请提供数据文件继续训练.")

@@ -27,10 +27,8 @@ def autonomous(
 
     batch_size: int = typer.Option(16, "--batch-size", "-b", help="批大小"),
     max_seq_len: int = typer.Option(128, "--max-seq-len", help="最大序列长度"),
-    lr: float = typer.Option(1e-4, "--lr", help="学习率"),
     gamma: float = typer.Option(0.05, "--gamma", help="多巴胺折扣因子"),
     T_infer: int = typer.Option(1, "--T-infer", help="Inference time steps"),
-    grad_clip: float = typer.Option(1.0, "--grad-clip", help="梯度裁剪"),
 
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志"),
 ):
@@ -41,27 +39,27 @@ def autonomous(
     resolved_checkpoint = resolve_path(checkpoint) if checkpoint else None
     resolved_data_dir = resolve_path(data_dir)
 
-    mind = AutonomousMind(
-        checkpoint_path=resolved_checkpoint,
-        out_dir=out_dir,
-        data_dir=resolved_data_dir,
-        wake_steps=wake_steps,
-        play_steps=play_steps,
-        sleep_interval=sleep_interval,
-        batch_size=batch_size,
-        max_seq_len=max_seq_len,
-        lr=lr,
-        gamma=gamma,
-        T_infer=T_infer,
-        grad_clip=grad_clip,
-        verbose=verbose,
-    )
+    cfg = {
+        'out_dir': out_dir,
+        'data_dir': resolved_data_dir,
+        'wake_steps': wake_steps,
+        'play_steps': play_steps,
+        'sleep_interval': sleep_interval,
+        'batch_size': batch_size,
+        'max_seq_len': max_seq_len,
+        'gamma': gamma,
+        'T_infer': T_infer,
+    }
+    if resolved_checkpoint:
+        cfg['checkpoint'] = resolved_checkpoint
+
+    mind = AutonomousMind(cfg=cfg)
 
     print(f"Phase 2: 持续自主运行")
     print(f"  检查点: {checkpoint or '随机初始化'}")
     print(f"  数据: {resolved_data_dir}  输出: {out_dir}")
     print(f"  周期: WAKE={wake_steps}  PLAY={play_steps}  SLEEP interval={sleep_interval}")
-    print(f"  训练: batch={batch_size}  seq_len={max_seq_len}  lr={lr:.2e}")
+    print(f"  训练: batch={batch_size}  seq_len={max_seq_len}")
     print(f"  设备: {device}")
 
     mind.run()

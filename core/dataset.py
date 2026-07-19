@@ -134,7 +134,8 @@ class DualChannelDataset(Dataset):
         return len(self.dual_tensors)
 
     def __getitem__(self, index):
-        return self.dual_tensors[index].clone(), self.label_tensors[index].clone()
+        # 不再 clone() — 张量在 DataLoader 中会被正确复制到 GPU，clone 是冗余的 CPU 开销
+        return self.dual_tensors[index], self.label_tensors[index]
 
 
 def load_datasets(

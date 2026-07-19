@@ -1,137 +1,144 @@
-"""增强文件浏览器 — Treeview 嵌入 maliang Canvas."""
+"""
+文件浏览器 — 目录树 + 文件列表, 支持过滤和右键菜单.
+"""
 
 from __future__ import annotations
 
 import os
-import tkinter as tk
-from tkinter import ttk
-from typing import Callable, Optional
 
-import maliang
-from gui.theme import FONT_FAMILY_MONO, ThemeManager
-from gui.worker import async_task
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                             QLineEdit, QTreeWidget, QTreeWidgetItem,
+                             QMenu, QAbstractItemView, QApplication)
+from PyQt6.QtGui import QAction
 
 
-class FileBrowser:
-    """文件浏览器 (嵌入 maliang Canvas)."""
+class FileBrowser(QWidget):
+    """文件/目录浏览器.
 
-    def __init__(self, master: maliang.Canvas,
-                 position: tuple[int, int],
-                 size: tuple[int, int],
-                 directory: str = "dataset",
-                 on_select: Optional[Callable] = None,
-                 theme_mgr: Optional[ThemeManager] = None):
-        self._master = master
-        self.directory = directory
-        self.on_select_cb = on_select
-        self._theme_mgr = theme_mgr
-        self._entries: list[dict] = []
+    用法:
+        fb = FileBrowser()
+        fb.load_directory("dataset")  # 加载目录
+        fb.set_filter("*.jsonl")       # 只显示 jsonl
+        fb.file_selected.connect(callback)
+    """
 
-        p = theme_mgr.palette if theme_mgr else None
-        bg = p.card_bg if p else "#ffffff"
+    def __init__(self, root_path: str = ".", parent=None):
+        super().__init__(parent)
+        self._root_path = root_path
+        self._filter = "*"
+        self._show_hidden = False
 
-        # Frame 嵌入 Canvas
-        self._frame = tk.Frame(master, bg=bg)
-        master.create_window(position[0], position[1],
-                             window=self._frame,
-                             width=size[0], height=size[1],
-                             anchor="nw")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
 
-        self._frame.grid_rowconfigure(1, weight=1)
-        self._frame.grid_columnconfigure(0, weight=1)
+        # 路径栏
+        path_row = QHBoxLayout()
+        self._path_label = QLabel(root_path)
+        self._path_label.setObjectName("secondary")
+        path_row.addWidget(self._path_label, 1)
+        layout.addLayout(path_row)
 
-        # 工具栏
-        toolbar = tk.Frame(self._frame, bg=bg)
-        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        self._path_var = tk.StringVar(value=directory)
-        tk.Button(toolbar, text="浏览", command=self._browse_dir).pack(side=tk.RIGHT, padx=2)
-        tk.Button(toolbar, text="扫描", command=self.scan).pack(side=tk.RIGHT, padx=2)
-        e = tk.Entry(toolbar, textvariable=self._path_var, font=(FONT_FAMILY_MONO, 9))
-        e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # 树
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["名称", "大小", "修改时间"])
+        self._tree.setAlternatingRowColors(True)
+        self._tree.setRootIsDecorated(True)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._tree.setColumnWidth(0, 240)
+        self._tree.setColumnWidth(1, 80)
+        self._tree.customContextMenuRequested.connect(self._show_context_menu)
+        # 双击展开目录
+        self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        layout.addWidget(self._tree, 1)
 
-        # Treeview
-        cols = ("name", "size", "lines", "format")
-        self._tree = ttk.Treeview(self._frame, columns=cols, show="headings",
-                                  selectmode="browse", height=12)
-        self._tree.heading("name", text="文件名")
-        self._tree.heading("size", text="大小")
-        self._tree.heading("lines", text="行数")
-        self._tree.heading("format", text="格式")
-        self._tree.column("name", width=240, minwidth=120)
-        self._tree.column("size", width=80, anchor="e", minwidth=60)
-        self._tree.column("lines", width=60, anchor="e", minwidth=40)
-        self._tree.column("format", width=80, anchor="c", minwidth=60)
-        self._tree.grid(row=1, column=0, sticky="nsew")
-
-        sb = ttk.Scrollbar(self._frame, orient=tk.VERTICAL, command=self._tree.yview)
-        sb.grid(row=1, column=1, sticky="ns")
-        self._tree.configure(yscrollcommand=sb.set)
-        self._tree.bind("<<TreeviewSelect>>", self._on_select)
-
-        # 延迟扫描
-        self._frame.after(200, self.scan)
-
-    def scan(self):
-        for row in self._tree.get_children():
-            self._tree.delete(row)
-        self._entries = []
-        base = self._path_var.get()
-        if not os.path.isdir(base):
+    def load_directory(self, path: str) -> None:
+        """加载指定目录."""
+        self._root_path = path
+        self._path_label.setText(os.path.abspath(path))
+        self._tree.clear()
+        if not os.path.isdir(path):
             return
-        async_task(self._frame, worker=lambda: self._scan_worker(base),
-                   on_done=self._scan_done)
-
-    def _scan_worker(self, base: str) -> list[dict]:
-        entries = []
-        for fname in sorted(os.listdir(base)):
-            fpath = os.path.join(base, fname)
-            if not os.path.isfile(fpath):
+        try:
+            items = sorted(os.listdir(path))
+        except PermissionError:
+            return
+        for name in items:
+            if not self._show_hidden and name.startswith("."):
                 continue
-            try:
-                size_kb = os.path.getsize(fpath) / 1024
-                ext = os.path.splitext(fname)[1].lower()
-                lines = self._count_lines(fpath, ext)
-                entries.append({
-                    "name": fname, "path": fpath,
-                    "size_kb": size_kb, "lines": lines, "ext": ext,
-                })
-            except OSError:
-                pass
-        return entries
+            full = os.path.join(path, name)
+            if os.path.isdir(full):
+                item = QTreeWidgetItem([name + "/", "", ""])
+                item.setData(0, Qt.ItemDataRole.UserRole, full)
+                item.setChildIndicatorPolicy(
+                    QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
+            elif self._filter == "*" or name.endswith(self._filter.replace("*", "")):
+                size = self._format_size(os.path.getsize(full))
+                mtime = self._format_time(os.path.getmtime(full))
+                item = QTreeWidgetItem([name, size, mtime])
+                item.setData(0, Qt.ItemDataRole.UserRole, full)
+            else:
+                continue
+            self._tree.addTopLevelItem(item)
 
-    def _scan_done(self, entries: list[dict]):
-        try:
-            self._entries = entries
-            total_size = 0
-            for e in entries:
-                size_kb = e["size_kb"]
-                size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
-                total_size += size_kb
-                fmt = e["ext"][1:].upper() if e["ext"] else "未知"
-                self._tree.insert("", tk.END, values=(e["name"], size_str, e["lines"], fmt))
-        except tk.TclError:
-            pass
+    def set_filter(self, pattern: str) -> None:
+        """设置文件过滤器 (如 *.jsonl, *.pt)."""
+        self._filter = pattern
+        self.load_directory(self._root_path)
 
-    def _count_lines(self, fpath: str, ext: str) -> int:
-        try:
-            if ext in (".jsonl", ".txt"):
-                with open(fpath, encoding="utf-8") as f:
-                    return sum(1 for _ in f)
-            return 0
-        except Exception:
-            return 0
+    def selected_paths(self) -> list[str]:
+        """获取当前选中项路径列表."""
+        paths = []
+        for item in self._tree.selectedItems():
+            p = item.data(0, Qt.ItemDataRole.UserRole)
+            if p:
+                paths.append(p)
+        return paths
 
-    def _browse_dir(self):
-        from tkinter import filedialog
-        d = filedialog.askdirectory(initialdir=self._path_var.get())
-        if d:
-            self._path_var.set(d)
-            self.scan()
+    # ── 内部 ──
 
-    def _on_select(self, e):
-        sel = self._tree.selection()
-        if sel:
-            idx = self._tree.index(sel[0])
-            if idx < len(self._entries):
-                if self.on_select_cb:
-                    self.on_select_cb(self._entries[idx])
+    def _on_item_double_clicked(self, item, column) -> None:
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        if path and os.path.isdir(path):
+            self.load_directory(path)
+
+    def _show_context_menu(self, pos) -> None:
+        menu = QMenu(self)
+        # 只在选中项时显示操作
+        selected = self._tree.selectedItems()
+        if selected:
+            copy_name = QAction("复制名称", self)
+            copy_path = QAction("复制路径", self)
+            copy_name.triggered.connect(lambda: self._copy_text(selected[0].text(0)))
+            copy_path.triggered.connect(
+                lambda: self._copy_text(selected[0].data(0, Qt.ItemDataRole.UserRole) or ""))
+            menu.addAction(copy_name)
+            menu.addAction(copy_path)
+            menu.addSeparator()
+        refresh = QAction("刷新", self)
+        refresh.triggered.connect(lambda: self.load_directory(self._root_path))
+        menu.addAction(refresh)
+        menu.exec(self._tree.viewport().mapToGlobal(pos))
+
+    @staticmethod
+    def _copy_text(text: str) -> None:
+        from PyQt6.QtCore import QMimeData
+        clip = QApplication.clipboard()
+        mime = QMimeData()
+        mime.setText(text)
+        clip.setMimeData(mime)
+
+    @staticmethod
+    def _format_size(size: int) -> str:
+        for unit in ["B", "KB", "MB", "GB"]:
+            if size < 1024:
+                return f"{size}{unit}"
+            size //= 1024
+        return f"{size}TB"
+
+    @staticmethod
+    def _format_time(t: float) -> str:
+        from datetime import datetime
+        return datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")

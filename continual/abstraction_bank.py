@@ -653,6 +653,44 @@ class AbstractionBank:
         self._store.clear()
         self._store_by_concept.clear()
 
+    def sample_replay_batch(
+        self,
+        batch_size: int = 16,
+        device: str = 'cuda:0',
+    ):
+        """从原始存储(非原型)采样一批 z_states, 用于 Hebbian 回放.
+
+        Returns:
+            (z_init_batch, seq_len) | None
+            z_init_batch: list[tensor] — 13 层 z stack [B, S, H]
+            seq_len: int
+        """
+        all_entries: List[dict] = []
+        for store in [self._store, self._store_by_concept]:
+            for group_key in store:
+                all_entries.extend(store[group_key])
+
+        if not all_entries:
+            return None
+
+        n = min(batch_size, len(all_entries))
+        idx = torch.randperm(len(all_entries))[:n].tolist()
+        chosen = [all_entries[i] for i in idx]
+
+        # 取第一项的 seq_len (假设 batch 内一致)
+        seq_len = chosen[0]['seq_len']
+
+        # stack z_states: 每个 entry 有 13 个 [1, S, H] 层
+        z_stack = []
+        for layer_idx in range(13):
+            layer_tensors = []
+            for entry in chosen:
+                z = entry['z_states'][layer_idx].to(device)  # [1, S, H]
+                layer_tensors.append(z)
+            z_stack.append(torch.cat(layer_tensors, dim=0))  # [B, S, H]
+
+        return z_stack, seq_len
+
     def __len__(self):
         return self.total_prototypes
 

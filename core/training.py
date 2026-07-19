@@ -30,8 +30,8 @@ from tqdm import tqdm
 
 from model.pc_layers import PCLocalDynamicMiniMind
 from model.model_minimind import MiniMindConfig
-from model.pc_core import DopamineSignal
-from core.trainer_utils import get_lr, setup_seed, count_parameters
+from model.pc_core import DopamineSignal, compute_uncertainty
+from core.trainer_utils import setup_seed, count_budget
 from core.dataset import DualChannelDataset
 from core.globals import DEVICE
 
@@ -42,7 +42,6 @@ from continual.offline_replay import OfflineReplayer
 from continual.abstraction_bank import (
     AbstractionBank,
     AbstractionSniffer,
-    VariationalReplayer,
     compute_layer_importance,
 )
 from continual.world_model import LatentWorldModel
@@ -56,6 +55,8 @@ from continual.memory_gating import MemoryGate
 from continual.attractor_landscape import AttractorLandscape
 from continual.consolidation_pipeline import ConsolidationPipeline, ContinuousBuffer
 from continual.deep_sleep import SleepEngine
+from continual.neurogenesis import NeurogenesisController
+from model.local_updates import BCMState
 
 # ─── 回调类型 ─────────────────────────────────────────────────────
 ProgressCallback = Callable[[dict], None]
@@ -85,26 +86,54 @@ class TrainingConfig:
     epochs: int = 1
     subset: int = 0           # 0 = 全量
     seed: int = 42
-    grad_clip: float = 1.0
     split_size: int = 0       # 0 = 不分块, >0 = 每块样本数 (GUI 传入)
 
     # PC 时空推理
     T_infer: int = 2
     gamma: float = 0.1
-    max_beta: float = 2.0
-    max_beta_conv: float = 1.0
-    ema_lambda: float = 0.001
+
+    # 时间预测损失 (temp_loss): 驱动 backbone 产出自预测的 z
+    enable_temp_loss: bool = True
+    temp_loss_weight: float = 0.1
 
     # 多巴胺
     dopamine_eta: float = 1.0
     dopamine_beta: float = 0.5
     dopamine_gamma: float = 0.3
 
-    # AMP — 全程 fp16 不需要 AMP
-    enable_amp: bool = False
+    # Hebbian 模式超参
+    hebbian_base_eta: float = 1e-5             # 基础 Hebbian 学习率 η
+    hebbian_lambda_decay: int = 5000           # τ_λ, decoder 约束退火衰减常数
+    hebbian_lambda_min: float = 0.01           # λ_min, decoder 约束永不归零
+    hebbian_infer_T: int = 3                   # 专用推理步数
+    hebbian_ach_beta_0: float = 0.0            # ACh 偏置 β₀
 
-    # CUDA Graphs
-    use_cuda_graphs: bool = False           # CUDA Graph 录制 (实验性, 需固定 seq_len)
+    # Oja 规则 (权重自组织)
+    oja_alpha: float = 0.05                    # Oja 衰减系数 (0=禁用)
+    oja_eta: float = 0.05                      # Oja 独立学习率 (不绑定 Hebbian η)
+    oja_adaptive: bool = True                  # 自适应 oja (按层范数自动缩放)
+
+    # 误差归一化 (生物发放率约束)
+    ε_rms_target: float = 1.0                  # ε 目标 RMS (模拟发放率上限)
+
+    # 突触归一化 (Synaptic Normalization)
+    synaptic_normalize: bool = True            # 是否应用 per-neuron L2 归一化
+    synaptic_target_norm: float = 0.0          # 目标 L2 范数 (0=auto: sqrt(fan_in))
+
+    # Salience Gating (结构自组织)
+    enable_salience_gating: bool = True        # 启用门控
+    salience_temperature: float = 0.1          # 门控温度 (越低越硬)
+    salience_reg_weight: float = 0.001         # 稀疏正则权重 β
+    salience_gate_lr: float = 1e-3             # 门控 logits 学习率 (直接 SGD)
+
+    # 神经发生 (Neurogenesis / 结构自组织)
+    enable_neurogenesis: bool = True             # 启用通道剪枝+生长
+    neurogenesis_prune_interval: int = 100       # 剪枝间隔 (步)
+    neurogenesis_grow_interval: int = 300        # 生长间隔 (步)
+    neurogenesis_prune_threshold_act: float = 0.001  # 激活 EMA 剪枝阈值
+    neurogenesis_prune_threshold_gate: float = 0.05  # Gate 值剪枝阈值
+    neurogenesis_grow_error_threshold: float = 2.0   # 生长触发误差
+    neurogenesis_max_grow_per_step: int = 8          # 单步最大生长通道数
 
     # 持续学习
     replay_ratio: int = 5           # 每 N 步插入 1 步回放
@@ -165,7 +194,7 @@ class TrainingConfig:
     sleep_completion_steps: int = 20
     sleep_noise_steps: int = 20
     sleep_competitive_steps: int = 10
-    sleep_lr_scale: float = 0.5
+    # (grad_clip and lr_scale removed — Hebbian updates have internal protection)
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_') and k != 'progress_callback'}
@@ -183,10 +212,7 @@ class TrainingLoop:
 
         # 延迟初始化 (在 train() 中创建)
         self.model: Optional[PCLocalDynamicMiniMind] = None
-        self.optimizer: Optional[torch.optim.Optimizer] = None
-        self.world_model_optimizer: Optional[torch.optim.Optimizer] = None
         self.dopamine: Optional[DopamineSignal] = None
-        self.scaler: Optional[torch.cuda.amp.GradScaler] = None
         self._orig_forward = None
         self.world_model: Optional[LatentWorldModel] = None
 
@@ -214,7 +240,6 @@ class TrainingLoop:
         self.global_step = 0
         self.prev_precision_scales = None
         self.ema_z = None
-        self._graph_capture_mode: bool = False  # CUDA Graph 录制标志
         self.forgetting_log: list[dict] = []
         self._last_world_surprise: float = 0.0
         self._last_world_mode: str = 'full'
@@ -222,6 +247,10 @@ class TrainingLoop:
         self._surprise_buffer: list[float] = []
         self._current_task_id: str = ''
         self._trained_tasks: list[str] = []
+
+        # 上一步 F_total (用于多巴胺调制)
+        self._last_F_bp: float = float('inf')
+        self._global_F_hist: list[float] = []         # 全局 F 历史
 
         # 7a: WM 滚动指标
         self._wm_metrics: dict[str, list[float]] = {
@@ -237,9 +266,14 @@ class TrainingLoop:
         self._novelty_boost_steps: int = 0
         self._novelty_surprise_injected: float = 0.0
 
+        # ── BCM 滑动阈值 (生物可塑性平衡) ──
+        self.bcm_state = BCMState(n_layers=24, tau=0.01).to(self.device)
+
+        # ── NaN 回退状态 (初始权重快照, 用于 NaN 恢复) ──
+        self._fallback_state: Optional[dict] = None
+
         # ── 内在动机模块 ──
         self.icm: Optional[IntrinsicCuriosityModule] = None
-        self.icm_optimizer: Optional[torch.optim.Optimizer] = None
         self.concept_discovery: Optional[ConceptDiscovery] = None
         self.memory_gate: Optional[MemoryGate] = None
         self._icm_output: Optional[dict] = None
@@ -278,8 +312,8 @@ class TrainingLoop:
         )
         model = PCLocalDynamicMiniMind(lm_cfg).half()
 
-        # 编译 (Windows 无 Triton, 跳过 torch.compile)
-        if hasattr(torch, 'compile') and sys.platform != 'win32':
+        # 编译 (reduce-overhead 内含 CUDA Graph 加速)
+        if hasattr(torch, 'compile'):
             self._orig_forward = model.forward_with_ce
             try:
                 model.forward_with_ce = torch.compile(self._orig_forward, mode='reduce-overhead')
@@ -289,15 +323,6 @@ class TrainingLoop:
                 self._log(f'torch.compile 失败 (已忽略): {e}')
 
         return model
-
-    def _build_optimizer(self):
-        return torch.optim.AdamW(
-            list(self.model.temporal_proj.parameters()) +
-            list(self.model.topdown_proj.parameters()) +
-            [p for n, p in self.model.model.named_parameters() if p.requires_grad],
-            lr=self.cfg.lr, betas=(0.9, 0.95), fused=True,
-            weight_decay=0.1,
-        )
 
     def warmup(self):
         """吸收 cudnn benchmark 首步算法搜索延迟 + 预热世界模型。"""
@@ -384,325 +409,297 @@ class TrainingLoop:
 
     # ── 单步训练 ──
 
+    # ── 单步训练: 零反向传播, 纯 Hebbian 更新 ──
+
     def train_step(self, byte_seq: torch.Tensor, labels: torch.Tensor) -> dict:
+        """执行 6 阶段 bp_free 训练: 零 autograd, 纯局部 Hebbian.
+
+        Phase 0: 数据准备
+        Phase 1: init_z (no_grad)
+        Phase 2: PC 推理 (T 步, no_grad) → ε_by_layer
+        Phase 3: 计算调制信号 (D, ACh, π, λ)
+        Phase 4: Decoder 目标计算
+        Phase 5: Hebbian 更新 (W.data.add_)
+        Phase 6: 日志 + 诊断
+
+        Returns:
+            dict: 同 train_step 格式, 兼容后续持续学习管道
         """
-        执行 5 阶段单步训练 (PC 完整路径 + bf16 AMP + 多巴胺三通道调制)。
+        from model.local_updates import (
+            compute_modulators, compute_precision_scales,
+            compute_all_hebbian_updates, apply_hebbian_updates,
+            compute_errors_by_layer, compute_lambda,
+        )
 
-        Phase 1:  forward_with_ce  (共享前向, 有梯度)
-        Phase 2:  spatiotemporal_infer (PC 推理 T 步)
-        Phase 3:  F_pred (重算预测误差, 多巴胺精度加权)
-        Phase 4:  多巴胺调制 (D → π/β/lr)
-        Phase 5:  backward + step (AMP scaler)
-
-        Returns: {'ce_val', 'F_val', 'D', 'lr', 'π', ...}
-        """
-        bsz, _, seq_len = byte_seq.shape
-        self.global_step += 1
-
-        # ── 前向 ──
+        # ── Phase 0: 数据准备 ──
+        seq_len = byte_seq.size(-1)
+        bsz = byte_seq.size(0)
         pos_emb = self.model.get_position_embeddings(seq_len, self.device)
 
-        # ═══ 完整 PC 路径: Phase 1-5 ═══
-        with torch.amp.autocast('cuda', dtype=torch.float16, enabled=self.cfg.enable_amp):
-            z_init, ce_loss = self.model.forward_with_ce(byte_seq, labels, pos_emb)
+        # ── Phase 1: init_z (no_grad) ──
+        with torch.no_grad():
+            z_init = self.model.init_z(byte_seq)  # list[tensor, L+1]
 
-            z_init_det = [z.detach() for z in z_init]
+        # ── temp_loss 诊断 (no_grad, 仅日志) ──
+        bp_temp_loss = 0.0
+        bp_temp_by_layer = []
+        if hasattr(self.model, 'temporal_proj') and seq_len > 1:
+            n_layers = len(self.model.temporal_proj)
+            for ℓ in range(n_layers):
+                z_ℓ = z_init[ℓ + 1]
+                if z_ℓ.size(1) > 1:
+                    tl = 0.5 * (self.model.temporal_proj[ℓ](z_ℓ[:, :-1, :]) - z_ℓ[:, 1:, :]).pow(2).mean()
+                    bp_temp_by_layer.append(tl.item())
+                    bp_temp_loss += tl.item()
+            if n_layers > 0 and bp_temp_by_layer:
+                bp_temp_loss /= n_layers
 
-            # World model can gate the next update into full-precision inference
-            # or a lightweight update when the latent transition is already stable.
-            world_loss = None
-            surprise = 0.0
-            update_mode = 'full'
-            wm_state_tensor = None
-            wm_ctx = None
-            if self.cfg.enable_world_model and self.world_model is not None:
-                wm_state_tensor = z_init_det[-1].detach()
+        # ── Phase 2: PC 推理 (no_grad, T 步) ──
+        # 从 F 历史算 uncertainty → ACh
+        uncertainty = compute_uncertainty(self._global_F_hist, window=10)
+        ACh = float(torch.sigmoid(torch.tensor(-uncertainty + self.cfg.hebbian_ach_beta_0)).item())
+
+        with torch.no_grad():
+            z_conv, errors_hist, F_hist, _, ε_list = self.model.spatiotemporal_infer(
+                z_init, pos_emb,
+                gamma=self.cfg.gamma,
+                T=self.cfg.hebbian_infer_T,
+                return_errors=True,
+                return_pred_loss=False,
+                ach_value=ACh,
+                return_ε=True,
+            )
+
+        F_curr = F_hist[-1] if F_hist else 0.0
+
+        # ── Phase 3: 调制信号 ──
+        D, ACh_val, modulation = compute_modulators(
+            F_curr, self._last_F_bp, uncertainty, self.cfg)
+        λ = compute_lambda(self.global_step, self.cfg.hebbian_lambda_decay,
+                           self.cfg.hebbian_lambda_min)
+
+        π_list = compute_precision_scales(ε_list, ACh_val, D, self.cfg)
+
+        # ── Phase 4: Decoder 目标 ──
+        # 使用 onehot 编码的 next_byte
+        if labels is not None and seq_len > 1:
+            target_onehot = nn.functional.one_hot(
+                labels[:, 1:].long().clamp(0, 255), num_classes=256).float()
+        else:
+            target_onehot = None
+
+        # ── Phase 5: Hebbian 更新 (零 autograd) ──
+        with torch.no_grad():
+            oja_alpha = getattr(self.cfg, 'oja_alpha', 0.05)
+            syn_norm = getattr(self.cfg, 'synaptic_normalize', True)
+            syn_target = getattr(self.cfg, 'synaptic_target_norm', 0.0)
+            updates = compute_all_hebbian_updates(
+                ε_list, z_init, byte_seq, self.model, self.cfg,
+                D=D, ACh=ACh_val, modulation=modulation, λ=λ,
+                decoder=self.model.decoder,
+                target_byte_embed=target_onehot,
+                oja_alpha=oja_alpha, bcm_state=self.bcm_state, verbose=True,
+            )
+            apply_hebbian_updates(updates, self.model,
+                                  synaptic_normalize=syn_norm,
+                                  target_norm=syn_target)
+
+        # ── Phase 5.6: 神经发生 (Neurogenesis Controller) ──
+        neuro_stats = {'n_pruned': 0, 'n_resurrected': 0, 'n_split': 0, 'active_ratio': 1.0}
+        if (self.cfg.enable_neurogenesis and hasattr(self, 'neurogenesis')
+                and self.neurogenesis is not None):
+            neuro_stats = self.neurogenesis.step(
+                model=self.model, ε_list=ε_list, global_step=self.global_step,
+            )
+
+        # ── Phase 5.5: Salience Gate 更新 (直接 SGD, 零 autograd) ──
+        if self.cfg.enable_salience_gating and hasattr(self.model, 'salience_gates'):
+            with torch.no_grad():
+                β = self.cfg.salience_reg_weight
+                η_gate = self.cfg.salience_gate_lr
+                for gate in self.model.salience_gates:
+                    # L_gate = β · Σ(1 - σ(logits))²
+                    gate_sig = torch.sigmoid(gate.logits)
+                    sparsity_loss = β * ((1.0 - gate_sig) ** 2).sum()
+                    # 直接 SGD: ∇L = -2β · (1 - σ) · σ · (1 - σ) ... 
+                    # 简化: dL/d_logit = -2β · (1 - σ) · σ · (1 - σ)
+                    # 但 sigmoid 的导数是 σ·(1-σ), 所以:
+                    # dL/d_logit = -2β · (1-σ) · σ · (1-σ) 
+                    grad = -2.0 * β * (1.0 - gate_sig) * gate_sig * (1.0 - gate_sig)
+                    gate.logits -= η_gate * grad
+
+        # ── Phase 6: 日志 + 诊断 ──
+        self._last_F_bp = F_curr
+        self._global_F_hist.append(F_curr)
+
+        # CE 诊断 (no_grad, 仅用于日志)
+        with torch.no_grad():
+            ce_diag = self.model.compute_ce_loss(z_conv, labels).item()
+            # 解码器损失诊断 (z_L[:-1] → next_byte)
+            if target_onehot is not None:
+                z_L = z_conv[-1]
+                z_dec = z_L[:, :-1, :].float() if z_L.size(1) > 1 else z_L.float()
+                dec_pred = nn.functional.linear(z_dec, self.model.decoder.weight.float())
+                dec_loss = nn.functional.mse_loss(dec_pred, target_onehot).item()
+            else:
+                dec_loss = 0.0
+
+        # 世界模型 (no_grad 推理, 零 backward)
+        world_loss_val = None
+        surprise = 0.0
+        if self.cfg.enable_world_model and self.world_model is not None:
+            with torch.no_grad():
+                wm_state = z_init[-1].detach()
+                wm_next = z_conv[-1].detach()
                 wm_ctx = self._build_world_model_context(bsz)
-                _, uncertainty = self.world_model(wm_state_tensor, wm_ctx)
-                surprise = uncertainty.detach().mean().item()
-                # nan 保护
-                if surprise != surprise or not (0.0 <= surprise <= 1.0):
-                    surprise = 0.5
-                if surprise < self.cfg.world_model_surprise_threshold:
-                    update_mode = 'light'
+                _, wm_uncertainty = self.world_model(wm_state, wm_ctx)
+                surprise = wm_uncertainty.detach().mean().item()
+                wl = self.world_model.loss(wm_state, wm_next, wm_ctx)
+                world_loss_val = wl.item()
+            # 世界模型不再 backward, 仅保留推理评估 surprise
 
-            # Compute the predictive-coding loop first; the world model only short-circuits
-            # when the latent transition is already known to be stable, while still feeding
-            # into the same dopamine and replay machinery.
-            if update_mode == 'full':
-                z_converged, errors_hist, F_hist, F_pred = self.model.spatiotemporal_infer(
-                    z_init_det, pos_emb, gamma=self.cfg.gamma, T=self.cfg.T_infer,
-                    return_errors=True, return_pred_loss=True,
-                    precision_scales=self.prev_precision_scales,
-                )
-                target_metric = F_pred
-            else:
-                z_converged = z_init_det
-                errors_hist = []
-                F_hist = []
-                F_pred = ce_loss
-                target_metric = ce_loss
-
-            # 世界模型损失：预测 z_init → z_converged 的 dynamics，而非自编码
-            if wm_state_tensor is not None and wm_ctx is not None:
-                if update_mode == 'full':
-                    next_target = z_converged[-1].detach()
-                else:
-                    next_target = z_init_det[-1].detach()
-                world_loss = self.world_model.loss(wm_state_tensor, next_target, wm_ctx)
-
-            # Phase 4: 多巴胺调制
-            D = self.dopamine.update(target_metric.item() if hasattr(target_metric, 'item') else float(target_metric))
-            β_local = min(self.cfg.max_beta,
-                          0.1 + self.global_step / max(self._total_steps, 1) * (self.cfg.max_beta - 0.1))
-            β_conv = min(self.cfg.max_beta_conv,
-                         0.0 + self.global_step / max(self._total_steps, 1) * self.cfg.max_beta_conv)
-            β_local = β_local * (1.0 + self.cfg.dopamine_gamma * D)
-            β_conv = β_conv * (1.0 + self.cfg.dopamine_gamma * D)
-
-            # 精度调制 π (基于最后一步误差)
-            last_errors = errors_hist[-1] if errors_hist else []
-            if last_errors:
-                err_norms_t = torch.tensor([e[1] for e in last_errors], device=self.device)
-                max_err = err_norms_t.max() + 1e-8
-                π_list = 1.0 + self.cfg.dopamine_eta * D * (err_norms_t / max_err)
-                self.prev_precision_scales = π_list.detach().cpu().tolist()
-            else:
-                self.prev_precision_scales = None
-
-            # 三路合并
-            ce_local_sum = ce_loss * (bsz * seq_len)
-            ce_conv_sum = ce_loss * (bsz * seq_len)
-            if update_mode == 'full':
-                scale_local = (F_pred.detach() / (ce_local_sum.detach() + 1e-8)).clamp(0.1, 10.0)
-                scale_conv = (F_pred.detach() / (ce_conv_sum.detach() + 1e-8)).clamp(0.1, 10.0)
-                total_loss = F_pred + β_local * scale_local * ce_local_sum \
-                                    + β_conv * scale_conv * ce_conv_sum
-                if world_loss is not None:
-                    total_loss = total_loss + self.cfg.world_model_loss_weight * world_loss
-            else:
-                total_loss = ce_loss
-
-            # ── ICM 内在动机 ──
-            icm_loss = torch.tensor(0.0, device=self.device)
-            if self.cfg.enable_intrinsic_motivation and self.icm is not None:
-                # 构建 action embedding (简单: z_t+1 - z_t)
-                z_curr = z_converged[-1].detach()  # [B, seq, hidden]
-                z_prev = z_init_det[-1].detach()
-                action_embed = (z_curr - z_prev).mean(dim=1)  # [B, hidden] → [B, icm_action_dim]
+        # ICM 内在动机 (no_grad 推理, 零 backward)
+        icm_loss_val = 0.0
+        if self.cfg.enable_intrinsic_motivation and self.icm is not None:
+            with torch.no_grad():
+                z_curr = z_conv[-1].detach()
+                z_prev = z_init[-1].detach()
+                action_embed = (z_curr - z_prev).mean(dim=1)
                 if action_embed.size(-1) > self.cfg.icm_action_dim:
                     action_embed = action_embed[:, :self.cfg.icm_action_dim]
                 elif action_embed.size(-1) < self.cfg.icm_action_dim:
                     pad = torch.zeros(bsz, self.cfg.icm_action_dim - action_embed.size(-1), device=self.device)
                     action_embed = torch.cat([action_embed, pad], dim=-1)
-
                 icm_output = self.icm.forward(z_prev, z_curr)
-                # nan 保护: 替换 ICM 输出中的异常值
-                safe_icm = {}
-                for k, v in icm_output.items():
-                    if isinstance(v, torch.Tensor) and v.numel() == 1:
-                        val = v.item()
-                        safe_icm[k] = 0.0 if (val != val or abs(val) > 1e6) else val
-                    elif isinstance(v, (int, float)):
-                        safe_icm[k] = 0.0 if (v != v or abs(v) > 1e6) else v
-                    else:
-                        safe_icm[k] = v
-                icm_output.update(safe_icm)
-                self._icm_output = {}
-                for k, v in icm_output.items():
-                    if isinstance(v, torch.Tensor) and v.numel() == 1:
-                        self._icm_output[k] = v.item()
-                    elif isinstance(v, (int, float)):
-                        self._icm_output[k] = v
+                self._icm_output = {k: (v.item() if isinstance(v, torch.Tensor) and v.numel() == 1 else v)
+                                   for k, v in icm_output.items()}
+                icm_loss_val = (self.cfg.icm_forward_weight * self._icm_output.get('pred_loss', 0.0) +
+                               self.cfg.icm_inverse_weight * self._icm_output.get('inverse_loss', 0.0) +
+                               self.cfg.icm_contrastive_weight * self._icm_output.get('contrastive_loss', 0.0))
+            # 概念发现 (仅观察, 零 backward)
+            if self.concept_discovery is not None:
+                info_gain = self._icm_output.get('information_gain', 0.0)
+                self.concept_discovery.observe(z_curr[0:1].detach(), intrinsic_value=info_gain)
 
-                # ICM 损失组合
-                icm_loss = (self.cfg.icm_forward_weight * icm_output['pred_loss'] +
-                            self.cfg.icm_inverse_weight * icm_output['inverse_loss'] +
-                            self.cfg.icm_contrastive_weight * icm_output.get('contrastive_loss', 0.0))
-                total_loss = total_loss + icm_loss
+        # ── 持续巩固管道 ──
+        if self.consolidation_pipeline is not None:
+            sample_z = [z[0:1].detach() for z in z_conv]
+            sample_byte = byte_seq[0].detach()
+            sample_label = labels[0].detach()
+            sample_task = self._current_task_id
+            sample_concept = ''
+            if self.concept_discovery is not None and len(self.concept_discovery.concept_ids) > 0:
+                sample_concept = self.concept_discovery.concept_ids[-1]
+            self.consolidation_pipeline.observe(
+                z_states=sample_z, byte_tensor=sample_byte, label_tensor=sample_label,
+                task_id=sample_task, concept_id=sample_concept,
+                information_gain=self._icm_output.get('information_gain', 0.0) if self._icm_output else 0.0,
+                dopamine_score=D, step=self.global_step,
+            )
 
-                # 概念发现 + 记忆门控
-                if self.concept_discovery is not None:
-                    info_gain = self._icm_output.get('information_gain', 0.0)
-                    # observe 需要 [1, seq, D], 取第一个样本
-                    self.concept_discovery.observe(
-                        z_curr[0:1].detach(),
-                        intrinsic_value=info_gain,
-                    )
-
-                # ── 持续巩固管道: 观察当前经验 (Phase B) ──
-                if self.consolidation_pipeline is not None:
-                    # 取第一个样本的 z_states 入 buffer
-                    sample_z = [z[0:1].detach() for z in z_converged]
-                    sample_byte = byte_seq[0:1].detach()
-                    sample_label = labels[0:1].detach()
-                    sample_task = self._current_task_id
-                    sample_concept = ''
-                    if self.concept_discovery is not None and len(self.concept_discovery.concept_ids) > 0:
-                        # 最近分配的概念 ID
-                        sample_concept = self.concept_discovery.concept_ids[-1]
-                    self.consolidation_pipeline.observe(
-                        z_states=sample_z,
-                        byte_tensor=sample_byte,
-                        label_tensor=sample_label,
-                        task_id=sample_task,
-                        concept_id=sample_concept,
-                        information_gain=self._icm_output.get('information_gain', 0.0),
-                        dopamine_score=D,
-                        step=self.global_step,
-                    )
-
-        # Phase 5: backward
-        self.optimizer.zero_grad(set_to_none=True)
-        if self.world_model_optimizer is not None:
-            self.world_model_optimizer.zero_grad(set_to_none=True)
-        if self.icm_optimizer is not None:
-            self.icm_optimizer.zero_grad(set_to_none=True)
-        # fp32 backward: 模型权重保持 fp16, 梯度用 fp32 计算防溢出
-        total_loss.float().backward()
-        current_lr = get_lr(self.global_step, self._total_steps, self.cfg.lr)
-        current_lr = current_lr * (1.0 + self.cfg.dopamine_beta * D)
-        # ── 公共后处理 (梯度裁剪 + lr 调度 + 参数更新) ──
-        trainable = [p for p in self.model.parameters() if p.requires_grad and p.grad is not None]
-        if trainable:
-            torch.nn.utils.clip_grad_norm_(trainable, self.cfg.grad_clip)
-
-        for pg in self.optimizer.param_groups:
-            pg['lr'] = current_lr
-        if self.world_model_optimizer is not None:
-            wm_lr = get_lr(self.global_step, self._total_steps, self.cfg.lr) * 0.1
-            for pg in self.world_model_optimizer.param_groups:
-                pg['lr'] = wm_lr
-        if self.icm_optimizer is not None:
-            icm_lr = max(get_lr(self.global_step, self._total_steps, self.cfg.lr) * 0.05, 5e-5)
-            for pg in self.icm_optimizer.param_groups:
-                pg['lr'] = icm_lr
-
-        self.optimizer.step()
-        if self.world_model_optimizer is not None:
-            self.world_model_optimizer.step()
-        if self.icm_optimizer is not None:
-            self.icm_optimizer.step()
-
+        # ── 结果 ──
         self._last_world_surprise = surprise
-        self._last_world_mode = update_mode
+        self._last_world_mode = 'full'
         self._last_D = D
-        # 内在动机统计
-        if self._icm_output:
-            for k in ['pred_loss', 'inverse_loss', 'information_gain', 'uncertainty']:
-                self._intrinsic_stats[k].append(self._icm_output.get(k, 0.0))
-            if self.concept_discovery:
-                self._intrinsic_stats['n_concepts'].append(self.concept_discovery.n_concepts)
-        F_final = F_hist[-1] if F_hist else 0.0
-        F_val = F_pred.item() if F_pred is not None else ce_loss.item()
-        scale_local_val = scale_local.item() if 'scale_local' in locals() else 1.0
-        scale_conv_val = scale_conv.item() if 'scale_conv' in locals() else 1.0
-        icm_loss_val = icm_loss.item() if isinstance(icm_loss, torch.Tensor) else 0.0
+        lr_used = self.cfg.hebbian_base_eta * modulation
 
-        # ── Bits-Per-Byte ──
+        # BPB 诊断
         L = self.model.num_sub_layers
-        if F_pred is not None:
-            F_pred_val = F_pred.item()
-            ce_val = ce_loss.item()
-            # F_pred 是 L 层平均: 总预测能量/位置 = F_pred * L
-            # CE 是逐字节交叉熵 (nats/byte)
-            # BPB = (F_pred*L + CE) / ln2  (bits/byte)
-            bpb = (F_pred_val * L + ce_val) / _LOG2
-            bpb_pred = (F_pred_val * L) / _LOG2  # 纯预测压缩部分
-        else:
-            bpb = ce_loss.item() / _LOG2
-            bpb_pred = 0.0
+        bpb_pred = (F_curr * L) / _LOG2
+        bpb_total = (F_curr * L + max(ce_diag, 1e-8)) / _LOG2
 
         result = {
-            'ce_val': ce_loss.item(),
-            'F_val': F_val,
-            'F_final': F_final,
+            'ce_val': ce_diag,
+            'F_val': F_curr,
+            'F_final': F_curr,
             'F_hist': F_hist,
             'errors_hist': errors_hist,
-            'bpb': bpb,
+            'bpb': bpb_total,
             'bpb_pred': bpb_pred,
+            'temp_loss_val': bp_temp_loss,
+            'temp_by_layer': bp_temp_by_layer,
             'D': D,
-            'lr': current_lr,
-            'β_local': β_local,
-            'β_conv': β_conv,
-            'scale_local': scale_local_val,
-            'scale_conv': scale_conv_val,
-            'π': self.prev_precision_scales,
-            'phase': 'full',
+            'lr': lr_used,
+            'β_local': 0.0,
+            'β_conv': 0.0,
+            'scale_local': 1.0,
+            'scale_conv': 1.0,
+            'π': π_list,
+            'phase': 'bp_free',
             'world_surprise': surprise,
-            'world_loss': world_loss.item() if world_loss is not None else None,
-            'update_mode': update_mode,
+            'world_loss': world_loss_val,
+            'update_mode': 'full',
             'icm_loss': icm_loss_val,
+            'ACh': ACh_val,
+            'λ': λ,
+            'uncertainty': uncertainty,
+            'decoder_loss': dec_loss,
         }
         if self._icm_output:
             for k in ['pred_loss', 'inverse_loss', 'information_gain', 'uncertainty']:
                 result[f'icm_{k}'] = self._icm_output.get(k, 0.0)
         result['error_ratio'] = getattr(self.model, '_last_error_ratio', 1.0)
+
+        # 门控自组织统计
+        if self.cfg.enable_salience_gating and hasattr(self.model, 'salience_gates'):
+            gs = self.model.get_gate_stats()
+            result['gate_active_ratio'] = gs['active_ratio']
+            result['gate_n_active'] = gs['n_active']
+            result['gate_n_total'] = gs['n_total']
+        # 神经发生统计
+        if self.cfg.enable_neurogenesis:
+            result['neuro_n_pruned'] = neuro_stats.get('n_pruned', 0)
+            result['neuro_n_resurrected'] = neuro_stats.get('n_resurrected', 0)
+            result['neuro_n_split'] = neuro_stats.get('n_split', 0)
+            result['neuro_active_ratio'] = neuro_stats.get('active_ratio', 1.0)
         return result
 
-    # ── CUDA Graph 单步 (纯 GPU, 无 .item / CPU sync) ───────
+    # ── Hebbian 辅助: 对任意数据运行 Hebbian 更新 ──
 
-    def _graph_train_step(self, byte_seq: torch.Tensor, labels: torch.Tensor,
-                          precision_scales, world_model_context: torch.Tensor | None = None) -> dict:
-        """GPU-only train_step, 适合 CUDA Graph capture/replay。
-
-        与 train_step 的区别:
-            - 无 .item() / CPU sync
-            - 无 dopamine.update() (在 graph 外执行)
-            - 无 optimizer.step() / scaler.step() (在 graph 外执行)
-            - 无梯度裁剪 (clip_grad_norm 涉及 CPU sync)
-            - 无 lr_schedule / π 计算
-            - 无 F_hist / errors_hist 收集
-            - precision_scales 直接传入 tensor
-
-        Returns:
-            dict: 'total_loss' (tensor), 'F_pred' (tensor), 'ce_loss' (tensor),
-                  'world_loss' (tensor), 'world_surprise' (tensor)
-        """
-        bsz, _, seq_len = byte_seq.shape
-        self.global_step += 1
+    def _hebbian_update_on_data(self, byte_seq: Optional[torch.Tensor] = None,
+                                 labels: Optional[torch.Tensor] = None,
+                                 z_init=None):
+        """对 (byte_seq, labels) 或直接用预计算 z_init 执行一次纯 Hebbian 权重更新."""
+        if z_init is not None:
+            seq_len = z_init[0].size(1)
+        elif byte_seq is not None:
+            seq_len = byte_seq.size(-1)
+        else:
+            return
 
         pos_emb = self.model.get_position_embeddings(seq_len, self.device)
 
-        with torch.amp.autocast('cuda', dtype=torch.float16, enabled=self.cfg.enable_amp):
-            # ── Phase 1: forward_with_ce ──
-            z_init, ce_loss = self.model.forward_with_ce(byte_seq, labels, pos_emb)
-            z_init_det = [z.detach() for z in z_init]
+        if z_init is None and byte_seq is not None:
+            z_init, _ = self.model.forward_with_ce(byte_seq, labels, pos_emb)
 
-            # ── Phase 2-3: spatiotemporal_infer + F_pred ──
-            z_converged, _, _, F_pred = self.model.spatiotemporal_infer(
-                z_init_det, pos_emb, gamma=self.cfg.gamma, T=self.cfg.T_infer,
-                return_errors=False, return_pred_loss=True,
-                precision_scales=precision_scales,
+        if byte_seq is None:
+            byte_seq = torch.zeros(1, 2, seq_len, device=self.device, dtype=torch.long)
+
+        uncertainty = compute_uncertainty(self._global_F_hist, window=10)
+        ACh = float(torch.sigmoid(torch.tensor(-uncertainty + self.cfg.hebbian_ach_beta_0)).item())
+        with torch.no_grad():
+            z_conv, errors_hist, _, _, ε_list = self.model.spatiotemporal_infer(
+                z_init, pos_emb, gamma=self.cfg.gamma, T=self.cfg.hebbian_infer_T,
+                return_errors=True, return_pred_loss=False, ach_value=ACh, return_ε=True,
             )
-
-            # ── 世界模型 (图形内，纯张量操作) ──
-            world_loss = torch.tensor(0.0, device=self.device)
-            world_surprise = torch.tensor(0.0, device=self.device)
-            if self.cfg.enable_world_model and self.world_model is not None and world_model_context is not None:
-                state_tensor = z_init_det[-1].detach()
-                next_target = z_converged[-1].detach()
-                _, uncertainty = self.world_model(state_tensor, world_model_context)
-                wl = self.world_model.loss(state_tensor, next_target, world_model_context)
-                world_loss = self.cfg.world_model_loss_weight * wl
-                world_surprise = uncertainty.detach().mean()
-
-            # ── Phase 4 (简化): 无 D, 仅合并 loss ──
-            total_loss = ce_loss + F_pred + world_loss
-
-        # ── Phase 5: backward ──
-        self.optimizer.zero_grad(set_to_none=True)
-        if self.world_model_optimizer is not None:
-            self.world_model_optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-
-        return {
-            'total_loss': total_loss.detach(),
-            'F_pred': F_pred.detach() if F_pred is not None else torch.tensor(0.0, device=self.device),
-            'ce_loss': ce_loss.detach(),
-            'world_loss': world_loss.detach(),
-            'world_surprise': world_surprise.detach(),
-        }
+        F_curr = errors_hist[-1][0][1] if errors_hist and errors_hist[-1] else 0.0
+        D, ACh_val, modulation = compute_modulators(F_curr, self._last_F_bp, uncertainty, self.cfg)
+        λ = compute_lambda(self.global_step, self.cfg.hebbian_lambda_decay, self.cfg.hebbian_lambda_min)
+        π_list = compute_precision_scales(ε_list, ACh_val, D, self.cfg)
+        with torch.no_grad():
+            oja_alpha = getattr(self.cfg, 'oja_alpha', 0.05)
+            syn_norm = getattr(self.cfg, 'synaptic_normalize', True)
+            syn_target = getattr(self.cfg, 'synaptic_target_norm', 0.0)
+            updates = compute_all_hebbian_updates(
+                ε_list, z_init, byte_seq, self.model, self.cfg,
+                D=D, ACh=ACh_val, modulation=modulation, λ=λ,
+                decoder=self.model.decoder,
+                target_byte_embed=None,
+                oja_alpha=oja_alpha, bcm_state=self.bcm_state, verbose=False,
+            )
+            apply_hebbian_updates(updates, self.model,
+                                  synaptic_normalize=syn_norm,
+                                  target_norm=syn_target)
 
     # ── 持续学习: 记忆回放 ──
 
@@ -726,29 +723,15 @@ class TrainingLoop:
 
         replay_byte = torch.stack([ex.byte_tensor for ex in replay_ex], dim=0).to(self.device)
         replay_label = torch.stack([ex.label_tensor for ex in replay_ex], dim=0).to(self.device)
-        replay_pos = self.model.get_position_embeddings(replay_byte.size(-1), self.device)
 
-        _, replay_loss = self.model.forward_with_ce(replay_byte, replay_label, replay_pos)
-        self.optimizer.zero_grad(set_to_none=True)
-        replay_loss.float().backward()
-        _rp_has_inf = False
-        for p in self.model.parameters():
-            if p.grad is not None:
-                if torch.isinf(p.grad).any() or torch.isnan(p.grad).any():
-                    _rp_has_inf = True
-                    break
-        if not _rp_has_inf:
-            trainable_rp = [p for p in self.model.parameters() if p.requires_grad and p.grad is not None]
-            if trainable_rp:
-                torch.nn.utils.clip_grad_norm_(trainable_rp, self.cfg.grad_clip)
-            self.optimizer.step()
-        else:
-            self.optimizer.zero_grad(set_to_none=True)
+        # Hebbian 回放: 正向 + 推理 → 局部 Hebbian 更新
+        self._hebbian_update_on_data(replay_byte, replay_label)
 
-        # 5a: 刷新被回放样本的 transition_surprise 和 replay_priority
+        # 刷新被回放样本的 transition_surprise 和 replay_priority
         if self.cfg.enable_world_model and self.world_model is not None:
             with torch.no_grad():
-                z_rp, _ = self.model.forward_with_ce(replay_byte, replay_label, replay_pos)
+                pos_emb = self.model.get_position_embeddings(replay_byte.size(-1), self.device)
+                z_rp, _ = self.model.forward_with_ce(replay_byte, replay_label, pos_emb)
                 z_top = z_rp[-1].detach()
                 ctx = self._build_world_model_context(replay_byte.size(0))
                 _, uncertainty = self.world_model(z_top, ctx)
@@ -757,7 +740,6 @@ class TrainingLoop:
                 ex.transition_surprise = new_surprise
                 ex.replay_priority = max(ex.dopamine_score, 0.1) + max(new_surprise, 0.0) + ex.intrinsic_value
         elif self.cfg.enable_intrinsic_motivation and self.icm is not None:
-            # ICM 刷新 replay_priority
             if self._icm_output:
                 info_gain = self._icm_output.get('information_gain', 0.0)
                 for ex in replay_ex:
@@ -768,18 +750,13 @@ class TrainingLoop:
         if gs % self.cfg.abstraction_replay_interval != 0:
             return
 
-        r_loss = self.abstraction_bank.replay_loss(
-            self.model, batch_size=16, device=self.device,
-            pos_emb=(None, None),
-        )
-        if r_loss is not None:
-            self.optimizer.zero_grad(set_to_none=True)
-            r_loss.backward()
-            trainable_rp = [p for p in self.model.parameters() if p.requires_grad and p.grad is not None]
-            if trainable_rp:
-                torch.nn.utils.clip_grad_norm_(trainable_rp, self.cfg.grad_clip)
-            self.optimizer.step()
-            self._log(f'[AbstractionBank] Replay step {gs}: loss={r_loss.item():.4f}')
+        # 从 AbstractionBank 获取回放数据并执行 Hebbian 更新
+        replay_data = self.abstraction_bank.sample_replay_batch(
+            batch_size=16, device=self.device)
+        if replay_data is not None:
+            z_batch, _seqlen = replay_data
+            self._hebbian_update_on_data(z_init=z_batch)
+            self._log(f'[AbstractionBank] Hebbian replay step {gs}')
 
         # 定时 consolidate
         if gs % (self.cfg.abstraction_replay_interval * 5) == 0:
@@ -793,9 +770,7 @@ class TrainingLoop:
         if not forgotten:
             return
 
-        current_lr = self.optimizer.param_groups[0]['lr']
-        repair_lr = self.sniffer.repair_begin(self.optimizer, current_lr, self.device)
-        self._log(f'[Sniffer] FORGOTTEN: {forgotten} — repair LR={repair_lr:.2e}')
+        self._log(f'[Sniffer] FORGOTTEN: {forgotten} — Hebbian repair')
 
         # 世界模型 surprise 调制修复强度
         wm_factor = 1.0
@@ -803,10 +778,10 @@ class TrainingLoop:
         if self.cfg.enable_world_model and self.world_model is not None:
             wm_surprise = self._last_world_surprise
             if wm_surprise > self.cfg.world_model_surprise_threshold:
-                wm_factor = 1.0 + min(wm_surprise, 1.0)  # max 2x
+                wm_factor = 1.0 + min(wm_surprise, 1.0)
                 strategy = 'world_model'
             else:
-                wm_factor = max(0.5, 1.0 - wm_surprise * 2)  # min 0.5x
+                wm_factor = max(0.5, 1.0 - wm_surprise * 2)
 
         effective_steps = max(1, int(self.cfg.repair_steps * wm_factor))
         self._log(f'[Sniffer]  wm_surprise={self._last_world_surprise:.3f} '
@@ -818,37 +793,17 @@ class TrainingLoop:
             if replay_data is None:
                 break
             rp_byte, rp_label = replay_data
-            rp_pos = self.model.get_position_embeddings(rp_byte.size(-1), self.device)
-            z_init, rp_loss = self.model.forward_with_ce(rp_byte, rp_label, rp_pos)
+            self._hebbian_update_on_data(rp_byte, rp_label)
 
-            # 世界模型损失加入修复梯度（帮助模型同时修复 latent dynamics）
-            if self.cfg.enable_world_model and self.world_model is not None:
-                with torch.no_grad():
-                    z_lat = z_init[-1].detach()
-                wm_ctx = self._build_world_model_context(rp_byte.size(0))
-                wl = self.world_model.loss(z_lat, z_lat, wm_ctx)
-                rp_loss = rp_loss + self.cfg.world_model_loss_weight * wl
-
-            self.optimizer.zero_grad(set_to_none=True)
-            rp_loss.backward()
-            trainable_rp = [p for p in self.model.parameters() if p.requires_grad and p.grad is not None]
-            if trainable_rp:
-                torch.nn.utils.clip_grad_norm_(trainable_rp, self.cfg.grad_clip)
-            self.optimizer.step()
-
-        self.sniffer.repair_end(self.optimizer, current_lr)
-        self._log(f'[Sniffer] Repair complete — LR restored to {current_lr:.2e}')
+        self._log(f'[Sniffer] Hebbian repair complete')
 
     def _maybe_sniff_abstraction(self):
         drifted = self.abstraction_sniffer.check(self.global_step, self.device, pos_emb=(None, None))
         if not drifted:
             return
 
-        current_lr = self.optimizer.param_groups[0]['lr']
-        repair_lr = self.abstraction_sniffer.repair_begin(self.optimizer, current_lr)
-        self._log(f'[AbstractionSniffer] DRIFT detected: {drifted} — repair LR={repair_lr:.2e}')
+        self._log(f'[AbstractionSniffer] DRIFT detected: {drifted} — Hebbian repair')
 
-        # 世界模型 surprise 调制修复强度
         wm_factor = 1.0
         if self.cfg.enable_world_model and self.world_model is not None:
             wm_surprise = self._last_world_surprise
@@ -862,30 +817,14 @@ class TrainingLoop:
                   f'factor={wm_factor:.2f} steps={effective_steps}')
 
         for _ in range(effective_steps):
-            r_loss = self.abstraction_bank.replay_loss(
-                self.model, batch_size=16, device=self.device,
-                pos_emb=(None, None),
-            )
-            if r_loss is None:
+            replay_data = self.abstraction_bank.sample_replay_batch(
+                batch_size=16, device=self.device)
+            if replay_data is None:
                 break
-            # 世界模型损失加入抽象修复梯度
-            if self.cfg.enable_world_model and self.world_model is not None:
-                proto_batch = self.abstraction_sniffer.get_replay_batch(4, self.device)
-                if proto_batch:
-                    z_protos, imp = proto_batch
-                    z_top = z_protos[-1].mean(dim=1, keepdim=True)
-                    ctx = self._build_world_model_context(z_top.size(0))
-                    wl = self.world_model.loss(z_top, z_top, ctx)
-                    r_loss = r_loss + self.cfg.world_model_loss_weight * wl
-            self.optimizer.zero_grad(set_to_none=True)
-            r_loss.backward()
-            trainable_rp = [p for p in self.model.parameters() if p.requires_grad and p.grad is not None]
-            if trainable_rp:
-                torch.nn.utils.clip_grad_norm_(trainable_rp, self.cfg.grad_clip)
-            self.optimizer.step()
+            z_batch, _seqlen = replay_data
+            self._hebbian_update_on_data(z_init=z_batch)
 
-        self.abstraction_sniffer.repair_end(self.optimizer, current_lr)
-        self._log(f'[AbstractionSniffer] Repair complete — LR restored')
+        self._log(f'[AbstractionSniffer] Hebbian repair complete')
 
     # ── 任务完成处理 ──
 
@@ -1030,7 +969,6 @@ class TrainingLoop:
         phases = ['completion', 'noise', 'competitive']
         results = self.sleep_engine.run(
             model=self.model,
-            optimizer=self.optimizer,
             memory_bank=self.memory_bank,
             abstraction_bank=self.abstraction_bank,
             device=self.device,
@@ -1105,7 +1043,6 @@ class TrainingLoop:
             'epoch': epoch,
             'step': self.global_step,
             'model_state': self.model.state_dict(),
-            'optimizer_state': self.optimizer.state_dict(),
             'lm_config': MiniMindConfig(
                 hidden_size=self.cfg.hidden_size,
                 num_hidden_layers=self.cfg.num_hidden_layers,
@@ -1117,7 +1054,6 @@ class TrainingLoop:
             ckpt['world_model_state'] = self.world_model.state_dict()
         if self.cfg.enable_intrinsic_motivation and self.icm is not None:
             ckpt['icm_state'] = self.icm.state_dict()
-            ckpt['icm_optimizer_state'] = self.icm_optimizer.state_dict() if self.icm_optimizer else None
         if metrics:
             ckpt.update(metrics)
         ckpt['memory_bank'] = self.memory_bank.state_dict()
@@ -1171,37 +1107,50 @@ class TrainingLoop:
 
         # 创建模型
         self.model = self._build_model().to(self.device)
-        self._log(f'Model: {count_parameters(self.model)["trainable_M"]:.2f}M trainable params')
+        budget = count_budget(self.model)
+        # 保存初始权重快照用于 NaN 恢复 (CPU, 仅保存一次)
+        self._fallback_state = {
+            k: v.detach().clone().cpu() for k, v in self.model.state_dict().items()
+        }
+        self._log(f'NaN fallback snapshot saved ({len(self._fallback_state)} tensors on CPU)')
+        self._log(f'Model: capacity budget {budget["trainable_M"]:.2f}M — effective capacity evolves during training')
+
+        # ── 神经发生控制器 (结构自组织: 剪枝+生长) ──
+        if self.cfg.enable_neurogenesis:
+            self.neurogenesis = NeurogenesisController(
+                hidden_size=self.cfg.hidden_size,
+                prune_interval=self.cfg.neurogenesis_prune_interval,
+                grow_interval=self.cfg.neurogenesis_grow_interval,
+                prune_threshold_act=self.cfg.neurogenesis_prune_threshold_act,
+                prune_threshold_gate=self.cfg.neurogenesis_prune_threshold_gate,
+                grow_error_threshold=self.cfg.neurogenesis_grow_error_threshold,
+                max_grow_per_step=self.cfg.neurogenesis_max_grow_per_step,
+            )
+            self._log('Neurogenesis controller enabled (prune+grow)')
+        else:
+            self.neurogenesis = None
 
         # 世界模型必须在 checkpoint 加载之前初始化，否则 world_model_state 无处加载
-        self.graph_trainer: Optional['CUDAGraphTrainer'] = None
+        # ── 世界模型 (推理评估用, 零 backward) ──
         if self.cfg.enable_world_model:
             self.world_model = LatentWorldModel(
                 input_dim=self.cfg.hidden_size,
                 hidden_dim=self.cfg.world_model_hidden_dim,
                 context_dim=self.cfg.world_model_context_dim,
             ).to(self.device)
-            self.world_model_optimizer = torch.optim.AdamW(
-                self.world_model.parameters(),
-                lr=max(self.cfg.lr * 0.1, 1e-4),
-                betas=(0.9, 0.95),
-                weight_decay=0.1,
-            )
-            self._log('Latent world model enabled')
+            # 零 backward: world_model 不再 Adam 训练
+            self.world_model_optimizer = None
+            self._log('Latent world model enabled (inference-only)')
 
-        # ── 内在动机模块 ──
+        # ── 内在动机模块 (推理评估用, 零 backward) ──
         if self.cfg.enable_intrinsic_motivation:
             self.icm = IntrinsicCuriosityModule(
                 input_dim=self.cfg.hidden_size,
                 action_embed_dim=self.cfg.icm_action_dim,
                 hidden_dim=self.cfg.icm_hidden_dim,
             ).to(self.device)
-            self.icm_optimizer = torch.optim.AdamW(
-                self.icm.parameters(),
-                lr=max(self.cfg.lr * 0.05, 5e-5),
-                betas=(0.9, 0.95),
-                weight_decay=0.1,
-            )
+            # 零 backward: ICM 不再 Adam 训练
+            self.icm_optimizer = None
             self.concept_discovery = ConceptDiscovery(
                 initial_threshold=self.cfg.concept_threshold_init,
                 min_threshold=self.cfg.concept_threshold_min,
@@ -1241,10 +1190,11 @@ class TrainingLoop:
                 pattern_completion_steps=self.cfg.sleep_completion_steps,
                 noise_broadening_steps=self.cfg.sleep_noise_steps,
                 competitive_steps=self.cfg.sleep_competitive_steps,
-                lr_scale=self.cfg.sleep_lr_scale,
-                grad_clip=self.cfg.grad_clip,
                 T_infer_sleep=max(1, self.cfg.T_infer // 2),
                 gamma_sleep=self.cfg.gamma * 0.5,
+                hebbian_base_eta=self.cfg.hebbian_base_eta,
+                hebbian_lambda_min=self.cfg.hebbian_lambda_min,
+                dopamine_gamma=self.cfg.dopamine_gamma,
             )
             self._log(f'Deep sleep engine enabled')
 
@@ -1260,8 +1210,6 @@ class TrainingLoop:
                 self.model.load_state_dict(ckpt)
             self._log(f'Resumed from checkpoint: {self.cfg.checkpoint_path}')
 
-        # 优化器
-        self.optimizer = self._build_optimizer()
         self.dopamine = DopamineSignal(η=self.cfg.dopamine_eta, threshold=0.0)
 
         # Sniffer 绑定 model
@@ -1271,13 +1219,6 @@ class TrainingLoop:
 
         # 预热
         self.warmup()
-
-        # CUDA Graphs 录制 (需 warmup 后, 确保 cudnn 算法固定)
-        if self.cfg.use_cuda_graphs and self.device.type == 'cuda':
-            from core.cuda_graphs import CUDAGraphTrainer
-            self.graph_trainer = CUDAGraphTrainer(self, warmup_steps=10)
-            self.graph_trainer.capture()
-            self._log('CUDA Graphs captured')
 
         # 训练循环
         trained_tasks: list[str] = []
@@ -1293,7 +1234,8 @@ class TrainingLoop:
                 task_ds = loader.dataset
             else:
                 loader = DataLoader(task_ds, batch_size=self.cfg.batch_size,
-                                    shuffle=True, num_workers=0, pin_memory=True)
+                                    shuffle=True, num_workers=4, pin_memory=True,
+                                    persistent_workers=True)
 
             # 8a+8b: 新任务 novelty 加速 + WM reset
             if self.cfg.enable_world_model:
@@ -1321,62 +1263,14 @@ class TrainingLoop:
                     byte_seq = byte_seq.to(self.device, non_blocking=True)
                     labels = labels.to(self.device, non_blocking=True)
 
-                    if self.graph_trainer is not None and self.graph_trainer.is_captured():
-                        # ── CUDA Graph 模式 ──
-                        # 构建世界模型上下文
-                        wm_context = None
-                        if self.cfg.enable_world_model and self.world_model is not None:
-                            wm_context = self._build_world_model_context(byte_seq.size(0))
+                    # ── 纯局部学习模式 (零反向传播) ──
+                    m = self.train_step(byte_seq, labels)
 
-                        g_out = self.graph_trainer.replay(
-                            byte_seq, labels,
-                            self.prev_precision_scales,
-                            wm_context,
-                        )
-                        # Graph 外: optimizer.step + scaler + dopamine
-                        trainable = [p for p in self.model.parameters()
-                                     if p.requires_grad and p.grad is not None]
-                        if trainable:
-                            torch.nn.utils.clip_grad_norm_(trainable, self.cfg.grad_clip)
-
-                        current_lr = get_lr(self.global_step, self._total_steps, self.cfg.lr)
-                        D = self.dopamine.update(g_out['F_pred'].item())
-                        current_lr = current_lr * (1.0 + self.cfg.dopamine_beta * D)
-                        for pg in self.optimizer.param_groups:
-                            pg['lr'] = current_lr
-
-                        self.optimizer.step()
-                        # 世界模型优化器 (图形外)
-                        if self.world_model_optimizer is not None:
-                            # 世界模型的梯度来自 graph 中 total_loss.backward()
-                            wm_trainable = [p for p in self.world_model.parameters()
-                                            if p.grad is not None]
-                            if wm_trainable:
-                                torch.nn.utils.clip_grad_norm_(wm_trainable, self.cfg.grad_clip)
-                            self.world_model_optimizer.step()
-
-                        w_surprise = g_out['world_surprise'].item()
-                        self._last_world_surprise = w_surprise
-                        self._last_world_mode = 'full'  # graph mode 始终走完整 PC 推理
-                        m = {
-                            'ce_val': g_out['ce_loss'].item(),
-                            'F_val': g_out['F_pred'].item(),
-                            'F_final': g_out['F_pred'].item(),
-                            'F_hist': [],
-                            'errors_hist': [],
-                            'D': D,
-                            'lr': current_lr,
-                            'β_local': 0.0,
-                            'β_conv': 0.0,
-                            'scale_local': 1.0,
-                            'scale_conv': 1.0,
-                            'π': None,
-                            'phase': 'graph',
-                            'world_surprise': w_surprise,
-                        }
-                    else:
-                        # ── 标准模式 ──
-                        m = self.train_step(byte_seq, labels)
+                    # ── 跳过因 NaN 跳过的步 ──
+                    if m.get('skipped', False):
+                        if 'world_surprise' not in m:
+                            m['world_surprise'] = 0.0
+                        continue
 
                     # ── ICM / Concept / Gate 后处理 ──
                     if self.cfg.enable_intrinsic_motivation and self.icm is not None:
@@ -1479,6 +1373,7 @@ class TrainingLoop:
                     postfix = {
                         'CE': f'{m["ce_val"]:.4f}',
                         'F': f'{m["F_final"]:.1f}',
+                        'TL': f'{m.get("temp_loss_val", 0.0):.4f}',
                         'BPB': f'{m.get("bpb", 0.0):.2f}',
                         'D': f'{m["D"]:.3f}',
                         'W': f'{m.get("world_surprise", 0.0):.3f}',
@@ -1487,14 +1382,14 @@ class TrainingLoop:
                         postfix['IG'] = f'{self._icm_output.get("information_gain", 0.0):.4f}'
                         if self.concept_discovery:
                             postfix['C'] = f'{self.concept_discovery.n_concepts}'
-                    pbar.set_postfix(**postfix)
-
-                    # 进度回调 (每步通知 GUI)
+                    if self.global_step % 5 == 0 or self.global_step <= 3:
+                        pbar.set_postfix(**postfix)
                     callback_dict = {
                         'type': 'progress', 'step': self.global_step,
                         'total_steps': self._total_steps,
                         'ce_loss': m["ce_val"],
                         'F': m["F_final"],
+                        'temp_loss': m.get('temp_loss_val', 0.0),
                         'BPB': m.get('bpb', 0.0),
                         'bpb_pred': m.get('bpb_pred', 0.0),
                         'D': m["D"],
@@ -1520,6 +1415,7 @@ class TrainingLoop:
                     if self.global_step % 100 == 0 and self.global_step > 0:
                         log = (f'[Step {self.global_step}/{self._total_steps}] '
                                f'F={m["F_final"]:.1f} CE={m["ce_val"]:.4f} '
+                               f'TL={m.get("temp_loss_val", 0.0):.4f} '
                                f'BPB={m.get("bpb", 0.0):.2f} '
                                f'D={m["D"]:.3f} lr={m["lr"]:.2e} '
                                f'W={m.get("world_surprise", 0.0):.3f}')
@@ -1567,7 +1463,7 @@ class TrainingLoop:
                 ig_mean = (sum(self._intrinsic_stats['information_gain'][-500:]) /
                            max(len(self._intrinsic_stats['information_gain'][-500:]), 1))
                 self._log(f'[Intrinsic Stats] IG_mean_500={ig_mean:.4f}, '
-                          f'n_concepts_peak={max(self._intrinsic_stats.get("n_concepts", [0]))}')
+                          f'n_concepts_peak={max(self._intrinsic_stats.get("n_concepts") or [0])}')
             if self.memory_gate is not None:
                 gate_stats = self.memory_gate.get_stats()
                 self._log(f'[MemoryGate] threshold_low={gate_stats["threshold_low"]:.4f}, '
@@ -1612,7 +1508,7 @@ class TrainingLoop:
         if self.cfg.enable_world_model and self.cfg.full_sleep_after_all:
             self._full_sleep_phase(task_pipelines)
 
-        # ── 保存 unified_final.pt (已是 fp16, 直接保存) ──
+        # ── 保存 unified_final.pt ──
         self.model.cpu()
         fp = os.path.join(out_dir, 'unified_final.pt')
         torch.save(self.model.state_dict(), fp)

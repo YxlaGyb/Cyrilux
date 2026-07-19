@@ -18,6 +18,7 @@ from torch import nn
 from model.model_minimind import precompute_freqs_cis
 from model.pc_backbone import PCBackbone
 from model.pc_backbone_local import PCLocalBackbone
+from model.local_blocks import SalienceGate
 
 
 # ── 自适应精度噪声 (生物神经元膜电位噪声) ──────────────
@@ -31,27 +32,30 @@ class AdaptiveNeuralNoise(nn.Module):
     每个隐藏维度（神经元）维护 EMA 激活均值，噪声标准差正比于均值。
     高激活神经元自动获得更多噪声 → fp16 下不会累积到溢出值。
     低激活神经元几乎不受影响（噪声很小）。
+
+    v2: 支持 step_interval，每 N 步执行一次噪声注入，减少 CUDA 随机数生成开销。
     """
 
-    def __init__(self, hidden_dim: int, base_noise: float = 3e-5, ema_decay: float = 0.999):
+    def __init__(self, hidden_dim: int, base_noise: float = 3e-5, ema_decay: float = 0.999,
+                 step_interval: int = 1):
         super().__init__()
         self.base_noise = base_noise
         self.ema_decay = ema_decay
         self.hidden_dim = hidden_dim
+        self.step_interval = max(1, step_interval)
+        self._step_counter = 0
         self.register_buffer('_running_std', torch.zeros(hidden_dim) + base_noise)
         self.register_buffer('_running_mean', torch.zeros(hidden_dim))
 
     def forward(self, z: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
-        """注入自适应噪声。
-
-        Args:
-            z: [B, S, D] 激活张量 (fp16)
-            alpha: 噪声缩放系数
-        Returns:
-            z + noise (与 z 同 dtype)
-        """
+        """注入自适应噪声。每 step_interval 步执行一次，其余步直接返回 z。"""
         if not self.training or not torch.is_grad_enabled():
             return z
+
+        self._step_counter += 1
+        if self._step_counter % self.step_interval != 0:
+            return z
+
         with torch.no_grad():
             act_mean = z.abs().mean(dim=(0, 1))  # [D], 当前批次的每维度均值
             self._running_mean.mul_(self.ema_decay).add_(act_mean * (1 - self.ema_decay))
@@ -379,15 +383,19 @@ class PCDynamicMiniMind(nn.Module):
     # ── 批量化 temporal/topdown (Phase E) ────────────────────
 
     def _compute_batched_temporal_topdown(self, z_list, seq_len):
-        """批量化 temporal/topdown 预测 (fp32 安全)."""
+        """批量化 temporal/topdown 预测 (fp32 安全). 使用缓存权重避免每步 torch.stack 分配。"""
         L = self.num_sub_layers
         if seq_len <= 1:
             return None, None
 
         # 全部提升到 fp32 防 bmm 溢出
-        z_sub = torch.stack(z_list[1:], dim=0).float()  # [L, B, S, H]
+        z_sub = torch.stack(z_list[1:], dim=0).float()  # [L, B, S, H]  — z 仍需 stack
         B, H = z_sub.size(1), z_sub.size(3)
-        W_temp = torch.stack([p.weight.float() for p in self.temporal_proj])  # [L, H, H]
+
+        # 使用缓存的 stack 权重，避免每步 torch.stack([p.weight.float() ...])
+        W_temp = getattr(self, '_cached_temporal_w', None)
+        if W_temp is None:
+            W_temp = torch.stack([p.weight.float() for p in self.temporal_proj])  # [L, H, H]
         z_flat = z_sub[:, :, :-1, :].reshape(L, -1, H)
         μ_temp_flat = torch.bmm(z_flat, W_temp)  # [L, B*(S-1), H] fp32
         μ_temp = μ_temp_flat.reshape(L, B, -1, H)  # fp32
@@ -396,7 +404,9 @@ class PCDynamicMiniMind(nn.Module):
 
         if L > 1:
             z_down = torch.stack(z_list[2:], dim=0).float()  # [L-1, B, S, H]
-            W_down = torch.stack([p.weight.float() for p in self.topdown_proj])
+            W_down = getattr(self, '_cached_topdown_w', None)
+            if W_down is None:
+                W_down = torch.stack([p.weight.float() for p in self.topdown_proj])
             z_down_flat = z_down[:, :, :-1, :].reshape(L - 1, -1, H)
             μ_down_flat = torch.bmm(z_down_flat, W_down)
             μ_down = μ_down_flat.reshape(L - 1, B, -1, H)  # fp32
@@ -441,8 +451,8 @@ class PCDynamicMiniMind(nn.Module):
             F_pred: tensor 或 None — 有 grad_fn 的 F (仅在 grad + return_pred_loss 时)
         """
         L = self.num_sub_layers
-        # ── 全部提升到 fp32 防溢出 ──
-        z_det = [z.detach().float() for z in z_by_layer]
+        # ── z 保持 fp16 (原生格式), 仅在 per_pos_gain / predict 内提升到 fp32 ──
+        z_det = [z.detach() for z in z_by_layer]  # no .float() — keep fp16
         seq_len = z_det[0].size(1)
         B = z_det[0].size(0)
         has_grad = torch.is_grad_enabled()
@@ -455,13 +465,13 @@ class PCDynamicMiniMind(nn.Module):
 
         for ℓ in range(1, L + 1):
             μ_bu = self.predict(ℓ, z_det[ℓ - 1], pos_emb, fp32_out=True)
-            μ_bu_res = μ_bu + z_det[ℓ - 1]
+            μ_bu_res = μ_bu + z_det[ℓ - 1].float()  # promote to fp32 for addition
 
-            μ_temp = μ_temp_all[ℓ - 1] if μ_temp_all is not None else torch.zeros_like(z_det[ℓ])
-            μ_down = μ_down_all[ℓ - 1] if (μ_down_all is not None and ℓ < L) else torch.zeros_like(z_det[ℓ])
+            μ_temp = μ_temp_all[ℓ - 1] if μ_temp_all is not None else torch.zeros_like(z_det[ℓ]).float()
+            μ_down = μ_down_all[ℓ - 1] if (μ_down_all is not None and ℓ < L) else torch.zeros_like(z_det[ℓ]).float()
 
             μ_total = μ_bu_res + μ_temp + μ_down
-            ε = z_det[ℓ] - μ_total
+            ε = z_det[ℓ].float() - μ_total
             # ── 归一化 ε: F_pred 也基于相对误差, 消除 z 绝对尺度影响 ──
             ε_abs_mean = ε.abs().mean(dim=-1, keepdim=True) + 1.0
             ε_norm = ε / ε_abs_mean
@@ -494,7 +504,7 @@ class PCDynamicMiniMind(nn.Module):
             per_pos_gain = 1.0 + 0.3 * per_pos_mag / (per_pos_mag.mean(dim=-1, keepdim=True) + 1e-8)
             per_pos_gain = per_pos_gain.clamp(max=10.0)  # fp32
 
-        # 更新 z — 始终 detach 切断梯度流, 保持 fp32 防止溢出
+        # 更新 z — 始终 detach 切断梯度流, 输出保持 fp16 (原生格式)
         new_z = [z_det[0]]
         errors_info = []
 
@@ -503,25 +513,27 @@ class PCDynamicMiniMind(nn.Module):
             ε_abs_mean = ε.abs().mean(dim=-1, keepdim=True) + 1.0
             ε_norm = ε / ε_abs_mean
             dz = gamma * ε_norm * per_pos_gain
-            new_z.append((z_det[ℓ] - dz).detach())
+            # fp16 安全: 截断到 [-1e4, 1e4] 防止 .half() 溢出到 Inf
+            z_fp32 = (z_det[ℓ].float() - dz).detach()
+            z_clamped = z_fp32.clamp(-1e4, 1e4)
+            new_z.append(z_clamped.half())
             if return_errors and not has_grad and not self._graph_capture_mode:
                 e_sq = (ε.detach().float() ** 2).mean().item()
                 e_norm = ε.detach().float().norm().item()
                 errors_info.append((e_sq, e_norm))
 
-        # ── 自适应精度噪声 (生物膜电位噪声模拟, 仅训练时) ──
-        if has_grad and hasattr(self, 'adaptive_noise') and self.training:
-            for ℓ in range(1, len(new_z)):
-                new_z[ℓ] = self.adaptive_noise[ℓ - 1](new_z[ℓ], alpha=0.5)
-
-        F_val_ret = F_val.detach().item() if has_grad else (F_val.item() if hasattr(F_val, 'item') else F_val)
+        if getattr(self, '_graph_capture_mode', False):
+            F_val_ret = F_val.detach()  # tensor 形式 (CUDA Graph capture 禁止 .item())
+        else:
+            F_val_ret = F_val.detach().item() if has_grad else (F_val.item() if hasattr(F_val, 'item') else F_val)
         return new_z, errors_info, F_val_ret, F_pred
 
     # ── 时空推理循环 ──────────────────────────────────────────
 
     def spatiotemporal_infer(self, z_by_layer, pos_emb, gamma=0.1, T=2, padding_mask=None,
                                return_errors=True, return_pred_loss=False,
-                               precision_scales=None):
+                               precision_scales=None, ach_value=0.5,
+                               return_ε=False):
         """T 步时空推理循环, 返回收敛后的 z 和 F_pred.
 
         推理策略: 前 T-1 步纯 no_grad (快速), 最后一步启用 grad 累积 F_pred.
@@ -532,35 +544,51 @@ class PCDynamicMiniMind(nn.Module):
         error_ratio < 1 (误差跌)→ γ↓ 微调.
         存储 self._last_error_ratio 供外部读取 (训练循环用).
 
+        Args:
+            ach_value: ACh 调制值 (∈ (0,1)), 影响 gamma_eff = gamma · (1 + 0.3·ACh)
+            return_ε: True 时额外返回 ε_by_layer (用于 bp_free Hebbian 更新)
+
         Returns:
             z_by_layer: list[tensor] — 收敛后的 z (无 grad)
             errors_hist: list of errors_info
             F_hist: list of F_val scalars
             F_pred: tensor or None — 有 grad_fn 的 F (仅 return_pred_loss=True)
+            如果 return_ε=True, 追加 ε_by_layer: list[tensor, L] — 各层误差
         """
         errors_hist = []
         F_hist = []
         F_pred = None
         self._last_error_ratio = 1.0
 
+        # ── 预缓存 Conv1D fp32 权重，消除 predict() 中 24×/步的冗余 allocate ──
+        self._build_conv_fp32_cache()
         for t in range(T):
             # ── 误差比率调制 γ: error_ratio>1→加速, <1→微调 ──
             if t > 0 and len(F_hist) >= 2:
                 error_ratio = (F_hist[-1] + 1e-8) / (F_hist[-2] + 1e-8)
                 # fp16 稳定性: error_ratio 无限增长 → gamma_eff 爆炸 → z 更新 NaN
-                error_ratio = min(error_ratio, 10.0)
+                if getattr(self, '_graph_capture_mode', False):
+                    error_ratio = torch.clamp(error_ratio, max=10.0)
+                else:
+                    error_ratio = min(error_ratio, 10.0)
                 self._last_error_ratio = error_ratio
                 gamma_eff = gamma * (0.5 + error_ratio)
                 # gamma_eff 上限防 fp16 溢出
-                gamma_eff = min(gamma_eff, 10.0)
+                if getattr(self, '_graph_capture_mode', False):
+                    gamma_eff = torch.clamp(gamma_eff, max=10.0)
+                else:
+                    gamma_eff = min(gamma_eff, 10.0)
             else:
                 gamma_eff = gamma
 
             is_last = (t == T - 1)
+            # γ 受 ACh 调制: gamma_eff *= (1 + 0.3·ACh)
+            gamma_eff_ach = gamma_eff * (1.0 + 0.3 * ach_value)
+
             # 前 T-1 步 no_grad, 最后一步 grad (累积 F_pred)
             if is_last and return_pred_loss:
                 z_by_layer, errors, F_val, F_pred = self.spatiotemporal_infer_step(
-                    z_by_layer, pos_emb, gamma_eff, padding_mask,
+                    z_by_layer, pos_emb, gamma_eff_ach, padding_mask,
                     return_errors=False,
                     return_pred_loss=True,
                     precision_scales=precision_scales,
@@ -569,7 +597,7 @@ class PCDynamicMiniMind(nn.Module):
             else:
                 with torch.no_grad():
                     z_by_layer, errors, F_val, _ = self.spatiotemporal_infer_step(
-                        z_by_layer, pos_emb, gamma_eff, padding_mask,
+                        z_by_layer, pos_emb, gamma_eff_ach, padding_mask,
                         return_errors=return_errors,
                         return_pred_loss=False,
                         precision_scales=precision_scales,
@@ -577,6 +605,39 @@ class PCDynamicMiniMind(nn.Module):
                 errors_hist.append(errors)
                 F_hist.append(F_val)
 
+        # ── 如果请求 ε_by_layer, 从收敛 z 重算 ε (no_grad) ──
+        if return_ε:
+            with torch.no_grad():
+                L = self.num_sub_layers
+                z_det = [z.detach() for z in z_by_layer]
+                seq_len = z_det[0].size(1) if len(z_det) > 0 else 0
+                device = z_det[0].device if len(z_det) > 0 else 'cpu'
+                pos_emb_local = self.get_position_embeddings(seq_len, device)
+                ε_list = []
+                self._build_conv_fp32_cache()
+                for ℓ in range(1, L + 1):
+                    z_target = z_det[ℓ].float()
+                    z_prev = z_det[ℓ - 1].float()
+                    μ_bu = self.predict(ℓ, z_prev, pos_emb_local, fp32_out=True)
+                    μ_bu_res = μ_bu + z_prev
+                    if seq_len > 1:
+                        z_t_in = z_target[:, :-1, :]
+                        z_t_out = self.temporal_proj[ℓ - 1](z_t_in.float())
+                        μ_temp = torch.cat([torch.zeros_like(z_target[:, :1, :]), z_t_out], dim=1)
+                    else:
+                        μ_temp = torch.zeros_like(z_target)
+                    if ℓ < L and seq_len > 1:
+                        z_d_in = z_det[ℓ + 1][:, :-1, :]
+                        z_d_out = self.topdown_proj[ℓ - 1](z_d_in.float())
+                        μ_down = torch.cat([torch.zeros_like(z_target[:, :1, :]), z_d_out], dim=1)
+                    else:
+                        μ_down = torch.zeros_like(z_target)
+                    μ_total = μ_bu_res + μ_temp + μ_down
+                    ε_list.append((z_target - μ_total).float())
+            self._clear_conv_fp32_cache()
+            return z_by_layer, errors_hist, F_hist, F_pred, ε_list
+
+        self._clear_conv_fp32_cache()
         return z_by_layer, errors_hist, F_hist, F_pred
 
     # ── 权重更新损失 (纯预测误差) ─────────────────────────────
@@ -691,7 +752,11 @@ class PCDynamicMiniMind(nn.Module):
                     传 labels 时返回 scalar CE loss
         """
         h_top = self.model.norm(z_by_layer[self.num_sub_layers])
-        logits = self.model.lm_head(h_top)
+        if hasattr(self, '_cached_lm_head_w') and self._cached_lm_head_w is not None:
+            logits = F.linear(h_top.float(), self._cached_lm_head_w)
+        else:
+            # 模型参数为 fp16 时 (生产环境 .half()), lm_head(h_top) 天然匹配
+            logits = self.model.lm_head(h_top)
         if labels is None:
             return logits  # generation mode: [bsz, seq, vocab]
         shift_logits = logits[..., :-1, :].contiguous()
@@ -739,7 +804,8 @@ class PCDynamicMiniMind(nn.Module):
 class FP32SafeLinear(nn.Linear):
     """Linear 层包装: forward 时自动将权重提升到输入 dtype, 防 fp16 溢出."""
     def forward(self, x):
-        return F.linear(x, self.weight.float(), self.bias.float() if self.bias is not None else None)
+        w = self.weight.float()
+        return F.linear(x.to(dtype=w.dtype), w, self.bias.float() if self.bias is not None else None)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -774,69 +840,119 @@ class PCLocalDynamicMiniMind(PCDynamicMiniMind):
             for _ in range(self.num_sub_layers - 1)
         ])
 
-        # ── 自适应精度噪声: 每子层一个噪声注入器 ──
+        # ── 自适应精度噪声: 每子层一个噪声注入器, step_interval=4 减少随机数生成 ──
         self.adaptive_noise = nn.ModuleList([
-            AdaptiveNeuralNoise(config.hidden_size, base_noise=3e-5)
+            AdaptiveNeuralNoise(config.hidden_size, base_noise=3e-5, step_interval=4)
             for _ in range(self.num_sub_layers)
         ])
+
+        # ── Decoder 外部约束: z_L → next_byte 预测 ──
+        # 用于 bp_free 训练模式 (λ·‖decoder(z_L) - next_byte‖²)
+        # hybrid 模式下不使用
+        self.decoder = nn.Linear(config.hidden_size, 256, bias=False)
+
+        # ── Salience Gates (结构自组织) ──
+        # 每子层一个 gate, 共 2L 个 (conv_out + mlp_out per block)
+        self.salience_gates = nn.ModuleList([
+            SalienceGate(config.hidden_size, temperature=0.1, init_open=True)
+            for _ in range(self.num_sub_layers)
+        ])
+
+        # ── fp32 权重缓存（消除前向中反复 .float() 转换）──
+        # 这些缓存会在 _refresh_all_fp32_cache 中填充，训练步前调用一次
+        self._cached_byte_proj_w = None       # fp32
+        self._cached_lm_head_w = None         # fp32
+        self._cached_local_conv_w: dict = {}  # block_idx -> fp32
+        self._cached_temporal_w = None        # [L, H, H] fp32
+        self._cached_topdown_w = None         # [L-1, H, H] fp32
+        self._cache_built = False
+
+    def _refresh_all_fp32_cache(self):
+        """一次性刷新所有 fp32 权重缓存。在训练步前调用，避免 .float() 重复分配。"""
+        # byte_proj
+        self._cached_byte_proj_w = self.model.byte_proj.weight.float()
+        # lm_head
+        self._cached_lm_head_w = self.model.lm_head.weight.float()
+        # local_conv (按 block_idx)
+        for block_idx, block in enumerate(self.model.layers):
+            self._cached_local_conv_w[block_idx] = block.local_conv.weight.float()
+        # temporal_proj stack
+        self._cached_temporal_w = torch.stack([p.weight.float() for p in self.temporal_proj])
+        # topdown_proj stack
+        if self.num_sub_layers > 1:
+            self._cached_topdown_w = torch.stack([p.weight.float() for p in self.topdown_proj])
+        self._cache_built = True
+
+    def _clear_all_fp32_cache(self):
+        """清除所有 fp32 缓存，节省显存。"""
+        self._cached_byte_proj_w = None
+        self._cached_lm_head_w = None
+        self._cached_local_conv_w.clear()
+        self._cached_temporal_w = None
+        self._cached_topdown_w = None
+        self._cache_built = False
 
     def get_position_embeddings(self, seq_len, device, start_pos=0):
         """局部 Conv 不需要位置编码, 返回 None 占位."""
         return (None, None)
 
     def init_z(self, byte_seq):
-        """前向传播初始化 z — 字节→连续波→dilated conv. 全程 fp32 防溢出."""
+        """前向传播初始化 z — 字节→连续波→dilated conv. 使用 fp32 缓存避免重复 .float()。"""
+        self._refresh_all_fp32_cache()
         z = []
-        # fp32 Conv1d: 字节输入 + 权重提升到 fp32, 输出保持 fp32
         x = nn.functional.pad(byte_seq.float(), (12, 0))
-        h = F.conv1d(x, self.model.byte_proj.weight.float()).transpose(1, 2)  # fp32
+        h = F.conv1d(x, self._cached_byte_proj_w).transpose(1, 2)  # fp32
         z.append(h)
 
-        for block in self.model.layers:
+        for block_idx, block in enumerate(self.model.layers):
             # Conv sub-layer (dilation-aware causal pad, fp32)
             res = h
             d = block.dilation
             h = nn.functional.pad(block.input_layernorm(h), (0, 0, 2 * d, 0))
             h32 = F.conv1d(
                 h.transpose(1, 2).float(),
-                block.local_conv.weight.float(),
+                self._cached_local_conv_w[block_idx],
                 bias=None, stride=1, padding=0, dilation=d, groups=1,
             ).transpose(1, 2)
-            h = h32 + res
+            h = self.salience_gates[2 * block_idx](h32)  # ← Conv gate
+            h = h + res
             z.append(h)
 
             # MLP sub-layer
             res = h
             h = block.mlp(block.post_attention_layernorm(h))
+            h = self.salience_gates[2 * block_idx + 1](h)  # ← MLP gate
             h = h + res
             z.append(h)
 
         return z  # len = 2L + 1 = 13
 
     def forward_with_ce(self, byte_seq, labels, pos_emb):
-        """梯度启用的前向 (字节→连续波→dilated conv), 返回 fp32 z + CE loss."""
+        """梯度启用的前向 (字节→连续波→dilated conv), 使用 fp32 缓存。"""
+        self._refresh_all_fp32_cache()
         z = []
-        # fp32 Conv1d: 输入+权重提升到 fp32, 输出转回 fp16
         x = nn.functional.pad(byte_seq.float(), (12, 0))
-        h = F.conv1d(x, self.model.byte_proj.weight.float()).transpose(1, 2)  # fp32
+        h = F.conv1d(x, self._cached_byte_proj_w).transpose(1, 2)  # fp32
         z.append(h)
 
-        for block in self.model.layers:
+        for block_idx, block in enumerate(self.model.layers):
             # Conv sub-layer (dilation-aware causal pad, fp32)
             res = h
             d = block.dilation
             h = nn.functional.pad(block.input_layernorm(h), (0, 0, 2 * d, 0))
             h32 = F.conv1d(
                 h.transpose(1, 2).float(),
-                block.local_conv.weight.float(),
+                self._cached_local_conv_w[block_idx],
                 bias=None, stride=1, padding=0, dilation=d, groups=1,
             ).transpose(1, 2)
-            h = h32 + res
+            h = self.salience_gates[2 * block_idx](h32)  # ← Conv gate
+            h = h + res
             z.append(h)
 
             # MLP sub-layer (FeedForward 内部 fp32)
             res = h
             h = block.mlp(block.post_attention_layernorm(h))
+            h = self.salience_gates[2 * block_idx + 1](h)  # ← MLP gate
             h = h + res
             z.append(h)
 
@@ -845,9 +961,9 @@ class PCLocalDynamicMiniMind(PCDynamicMiniMind):
             for ℓ in range(1, len(z)):
                 z[ℓ] = self.adaptive_noise[ℓ - 1](z[ℓ], alpha=1.0)
 
-        # CE from top layer (lm_head 提升到 fp32 匹配 fp32 z)
+        # CE from top layer (使用缓存的 lm_head fp32)
         h_top = self.model.norm(z[-1])
-        logits = F.linear(h_top, self.model.lm_head.weight.float())
+        logits = F.linear(h_top, self._cached_lm_head_w)
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous().long()
         ce_loss = nn.functional.cross_entropy(
@@ -858,11 +974,19 @@ class PCLocalDynamicMiniMind(PCDynamicMiniMind):
         )
         return z, ce_loss
 
+    def _build_conv_fp32_cache(self):
+        """预计算所有 Conv1D 的 fp32 权重缓存。训练步前调用一次，避免重复 allocate。"""
+        if not self._cache_built:
+            self._refresh_all_fp32_cache()
+
+    def _clear_conv_fp32_cache(self):
+        """清除 fp32 缓存。"""
+        self._clear_all_fp32_cache()
+
     def predict(self, layer_idx, z_prev, pos_emb, fp32_out=False):
         """计算 μ_bu = sublayer_ℓ(z_prev) (不含残差), Conv 版.
 
-        Args:
-            fp32_out: True 时返回 fp32 (推理步使用), False 时返回 fp16 (默认).
+        使用 _cached_local_conv_w 避免重复 .float() 转换。
         """
         block_idx = (layer_idx - 1) // 2
         is_conv_or_attn = (layer_idx - 1) % 2 == 0
@@ -872,15 +996,50 @@ class PCLocalDynamicMiniMind(PCDynamicMiniMind):
             # Conv1D (dilation-aware causal pad, fp32 安全)
             d = block.dilation
             h = nn.functional.pad(block.input_layernorm(z_prev), (0, 0, 2 * d, 0))
+            conv_w = self._cached_local_conv_w.get(block_idx)
+            if conv_w is None:
+                conv_w = block.local_conv.weight.float()
             h32 = F.conv1d(
                 h.transpose(1, 2).float(),
-                block.local_conv.weight.float(),
+                conv_w,
                 bias=None, stride=1, padding=0, dilation=d, groups=1,
             ).transpose(1, 2)
             return h32 if fp32_out else h32.half()
         else:
             return block.mlp(block.post_attention_layernorm(z_prev))
     # ponytail: generate_with_pc 继承自 PCDynamicMiniMind
+
+    # ── Salience Gate 工具 ──────────────────────────────────────
+
+    def get_gate_sparsity_loss(self, β: float = 0.001) -> torch.Tensor:
+        """所有 SalienceGate 的稀疏正则损失之和。
+
+        L_gate = β · Σ_gate Σ_c (1 - σ(logit_c))²
+        鼓励 gate 要么全开要么全关, 避免中间模糊态。
+        """
+        device = next(self.parameters()).device
+        if not hasattr(self, 'salience_gates') or not self.salience_gates:
+            return torch.tensor(0.0, device=device)
+        total = torch.tensor(0.0, device=device)
+        for gate in self.salience_gates:
+            total = total + gate.get_sparsity_loss(β=β)
+        return total
+
+    @torch.no_grad()
+    def get_gate_stats(self) -> dict:
+        """返回所有 gate 的活性统计。"""
+        if not hasattr(self, 'salience_gates') or not self.salience_gates:
+            return {'active_ratio': 1.0, 'n_active': 0, 'n_total': 0}
+        active_list = [g.get_active_ratio() for g in self.salience_gates]
+        total = len(self.salience_gates) * self.config.hidden_size
+        n_active = sum(self.config.hidden_size for g in self.salience_gates
+                       if g.get_active_ratio() > 0.5)
+        return {
+            'active_ratio': sum(active_list) / len(active_list),
+            'n_active': n_active,
+            'n_total': total,
+            'per_layer': active_list,
+        }
 
 # ── Checkpoint 工具 ────────────────────────────────────────────────
 

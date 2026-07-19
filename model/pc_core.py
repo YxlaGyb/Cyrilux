@@ -3,6 +3,7 @@ Predictive Coding 核心：节点管理、自由能、多巴胺。
 Ponytail: 最小结构，够用就行。
 """
 import torch
+import math
 
 
 class PCNode:
@@ -64,13 +65,23 @@ class DopamineSignal:
         self.F_prev = float('inf')
         self.F_history = []
 
-    def update(self, F_current):
-        """计算多巴胺 D"""
-        ΔF = F_current - self.F_prev
+    def update(self, F_current, beta=0.5):
+        """计算多巴胺 D (RPE 公式).
+
+        D = sigmoid(β · (F_prev - F_curr))
+          F_prev > F_curr (自由能下降) → D → 1 (正奖赏)
+          F_prev < F_curr (自由能上升) → D → 0 (负奖赏)
+
+        NaN/Inf 防护: 异常输入返回中性值 (D=0.5), 不污染内部状态.
+        """
+        if F_current != F_current or not math.isfinite(F_current):
+            return 0.5  # 中性多巴胺, 不更新状态
+        if self.F_prev == float('inf'):
+            self.F_prev = F_current * 1.1  # 首次: 确保 F_prev > F_curr
+        δ = self.F_prev - F_current
         self.F_history.append(F_current)
         self.F_prev = F_current
-        # D ∈ (0, 1), 自由能下降越多 D 越大
-        D = torch.sigmoid(torch.tensor(-ΔF)).item()
+        D = torch.sigmoid(torch.tensor(beta * δ)).item()
         return D
 
     def modulate_precision(self, D, layer_error_norm):
@@ -84,3 +95,29 @@ class DopamineSignal:
     def gate_learning(self, D):
         """当 D < threshold 时冻结学习"""
         return D >= self.threshold
+
+
+def compute_uncertainty(F_hist, window=10):
+    """从自由能历史计算不确定度.
+
+    uncertainty = tanh(var(F_window) / (mean(F_window) + 1e-8))
+    近期 F 波动越大 → uncertainty 越高.
+
+    Args:
+        F_hist: list[float] — 自由能历史
+        window: int — 滑动窗口大小
+
+    Returns:
+        uncertainty: float ∈ [0, 1)
+    """
+    if len(F_hist) < 3:
+        return 0.5  # 冷启动: 中等不确定度
+    window = min(window, len(F_hist))
+    recent = F_hist[-window:]
+    mean_F = sum(recent) / window
+    if mean_F < 1e-8:
+        return 0.0
+    var_F = sum((f - mean_F) ** 2 for f in recent) / window
+    cv = (var_F ** 0.5) / mean_F  # 变异系数
+    # tanh 映射到 [0, 1)
+    return float(torch.tanh(torch.tensor(cv * 3.0)).item())
