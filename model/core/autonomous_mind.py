@@ -30,7 +30,7 @@ import torch
 # 内在动机模块
 from model.continual.concept_discovery import ConceptDiscovery
 from model.core.globals import DEVICE_STR
-from model.core.trainer_utils import Logger
+from pkg.utils.trainer_utils import Logger
 from model.model_cyrene import CyreneConfig
 from model.pc.local_updates import (
     apply_hebbian_updates,

@@ -18,7 +18,7 @@ from pkg.gui.widgets.realtime_chart import RealtimeChart
 from pkg.gui.widgets.log_viewer import LogViewer
 from pkg.gui.widgets.metric_card import MetricCard
 from pkg.gui.worker import TrainingWorker
-from model.core.training import TrainingConfig
+from model.core.train import TrainingConfig
 
 
 def _make_spin(lo: int, hi: int, val: int, name: str = "paramSpin") -> QSpinBox:

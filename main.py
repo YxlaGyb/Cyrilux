@@ -24,17 +24,17 @@ sys.path.insert(0, ROOT_DIR)  # 仅用于 main.py 自身能被执行
 import torch
 
 from model.core.autonomous_mind import DEFAULT_CFG, AutonomousMind
-from model.core.data_converter import convert_file, scan_dataset_dir
-from model.core.data_splitter import split_directory, split_file
+from pkg.utils.data_converter import convert_file, scan_dataset_dir
+from pkg.utils.data_splitter import split_directory, split_file
 from model.core.evaluation import (
     create_eval_loader,
     load_with_remap,
     run_full_evaluation,
 )
-from model.core.prepare_tasks import prepare_4tasks, prepare_hetero
-from model.core.threaded_trainer import run_training_standalone
-from model.core.trainer_utils import Logger, setup_seed
-from model.core.training import TrainingConfig
+from pkg.utils.prepare_tasks import prepare_4tasks, prepare_hetero
+from pkg.utils.threaded_trainer import run_training_standalone
+from pkg.utils.trainer_utils import Logger, setup_seed
+from model.core.train import TrainingConfig
 from model.model_cyrene import CyreneConfig
 from model.pc.pc_layers import CyrenePC
 

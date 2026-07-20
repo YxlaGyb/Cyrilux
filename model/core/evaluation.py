@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from model.core.dataset import DualChannelDataset
-from model.core.trainer_utils import Logger
+from pkg.utils.trainer_utils import Logger
 
 
 def _resolve_pos(pos_emb, seq_len, device):

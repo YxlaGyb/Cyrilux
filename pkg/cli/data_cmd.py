@@ -19,7 +19,7 @@ def convert(
     max_samples: Optional[int] = typer.Option(None, "--max-samples", "-n", help="最大样本数"),
 ):
     """转换数据格式: conversations/chosen-rejected → text."""
-    from model.core.data_converter import convert_file
+    from pkg.utils.data_converter import convert_file
 
     input_path = resolve_path(input)
     if not os.path.exists(input_path):
@@ -58,7 +58,7 @@ def split(
         output_dir = os.path.join(os.path.dirname(input_path), f"{base}_split")
     output_dir = resolve_path(output_dir)
 
-    from model.core.data_splitter import split_file
+    from pkg.utils.data_splitter import split_file
 
     result = split_file(
         input_path, output_dir,
@@ -81,7 +81,7 @@ def scan(
     directory: Optional[str] = typer.Argument(None, help="数据集目录 (默认: datasets/)"),
 ):
     """扫描数据集目录，统计 JSONL 文件."""
-    from model.core.data_converter import scan_dataset_dir
+    from pkg.utils.data_converter import scan_dataset_dir
 
     scan_dir = resolve_path(directory or "datasets")
     if not os.path.exists(scan_dir):

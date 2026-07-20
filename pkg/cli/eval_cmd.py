@@ -20,7 +20,7 @@ def all(
     import torch
 
     from model.core.evaluation import run_full_evaluation
-    from model.core.trainer_utils import setup_seed
+    from pkg.utils.trainer_utils import setup_seed
     from model.model_cyrene import CyreneConfig
     from model.pc.pc_layers import CyrenePC
 
@@ -57,7 +57,7 @@ def language(
     import torch
 
     from model.core.evaluation import create_eval_loader, run_full_evaluation
-    from model.core.trainer_utils import setup_seed
+    from pkg.utils.trainer_utils import setup_seed
     from model.model_cyrene import CyreneConfig
     from model.pc.pc_layers import CyrenePC
 

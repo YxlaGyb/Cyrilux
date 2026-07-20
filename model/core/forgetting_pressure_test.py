@@ -19,7 +19,7 @@ from model.continual.forgetting_sniffer import ForgettingSniffer
 from model.continual.memory_bank import MemoryBank
 from model.core.dataset import DualChannelDataset
 from model.core.globals import DEVICE_STR
-from model.core.trainer_utils import setup_seed
+from pkg.utils.trainer_utils import setup_seed
 from model.model_cyrene import CyreneConfig
 from model.pc.local_updates import (
     apply_hebbian_updates,

@@ -17,7 +17,7 @@ def four_task(
     seed: int = typer.Option(42, "--seed", "-s", help="随机种子"),
 ):
     """按领域切分 4 个任务数据集 (A/B/C/D)."""
-    from model.core.prepare_tasks import prepare_4tasks
+    from pkg.utils.prepare_tasks import prepare_4tasks
 
     print("准备 4 任务数据")
     prepare_4tasks(subset=subset, seed=seed)
@@ -29,8 +29,8 @@ def hetero(
     ctx: typer.Context,
 ):
     """异构数据集统一格式转换."""
-    from model.core.prepare_tasks import prepare_hetero_tasks
+    from pkg.utils.prepare_tasks import prepare_hetero
 
     print("异构数据格式转换")
-    prepare_hetero_tasks()
+    prepare_hetero()
     print("✓ 异构数据转换完成")

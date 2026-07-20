@@ -151,7 +151,7 @@ class DataManagerPage(QWidget):
         if not jsonl_files:
             QMessageBox.information(self, "提示", "请先选择一个 .jsonl 文件")
             return
-        from model.core.data_splitter import split_file
+        from pkg.utils.data_splitter import split_file
         path = jsonl_files[0]
         chunk_size = self._split_size.value()
         try:
@@ -171,7 +171,7 @@ class DataManagerPage(QWidget):
         if not jsonl_files:
             QMessageBox.information(self, "提示", "请先选择一个 .jsonl 文件")
             return
-        from model.core.data_converter import convert_file
+        from pkg.utils.data_converter import convert_file
         path = jsonl_files[0]
         try:
             out_path = convert_file(path)
@@ -180,7 +180,7 @@ class DataManagerPage(QWidget):
             QMessageBox.critical(self, "转换失败", str(e))
 
     def _do_prepare(self) -> None:
-        from model.core.prepare_tasks import prepare_4tasks, prepare_hetero
+        from pkg.utils.prepare_tasks import prepare_4tasks, prepare_hetero
         try:
             if self._prep_4task.isChecked():
                 result = prepare_4tasks()

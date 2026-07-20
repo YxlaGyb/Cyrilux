@@ -4,7 +4,7 @@
 在独立线程中运行 TrainingLoop，通过回调推送进度到 GUI。
 
 用法:
-    from model.core.threaded_trainer import ThreadedTrainer, TkProgressCallback
+    from pkg.utils.threaded_trainer import ThreadedTrainer, TkProgressCallback
 
     trainer = ThreadedTrainer(config, progress_callback=TkProgressCallback(text_widget))
     trainer.start()
@@ -20,9 +20,9 @@ from typing import Optional
 import torch
 from torch.utils.data import DataLoader
 
-from model.core.training import TrainingLoop, TrainingConfig
+from model.core.train import TrainingLoop, TrainingConfig
 from model.core.dataset import DualChannelDataset, load_datasets
-from model.core.trainer_utils import Logger
+from pkg.utils.trainer_utils import Logger
 
 
 # ─── Tkinter 进度回调 ──────────────────────────────────────────

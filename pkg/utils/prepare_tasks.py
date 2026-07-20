@@ -8,7 +8,7 @@
      任务映射: a=agent_rl_math, b=lora_medical, c=lora_exam, d=rlaif, e=agent_rl
 
 用法:
-  from model.core.prepare_tasks import prepare_4tasks, prepare_hetero
+  from pkg.utils.prepare_tasks import prepare_4tasks, prepare_hetero
 """
 import os, json, random
 from pathlib import Path

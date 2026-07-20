@@ -80,7 +80,7 @@ def train_main(
     if ctx.invoked_subcommand is not None:
         return
 
-    from model.core.training import TrainingLoop, TrainingConfig
+    from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
 
     device = ctx.obj.get("device", DEVICE_STR)
@@ -135,7 +135,7 @@ def from_config(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志"),
 ):
     """从 JSON 配置文件加载参数并训练 (纯 Hebbian, 零反向传播)."""
-    from model.core.training import TrainingLoop, TrainingConfig
+    from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
 
     device = ctx.obj.get("device", DEVICE_STR)
@@ -196,7 +196,7 @@ def resume(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志"),
 ):
     """从检查点文件恢复训练 (纯 Hebbian, 零反向传播)."""
-    from model.core.training import TrainingLoop, TrainingConfig
+    from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
 
     device = ctx.obj.get("device", DEVICE_STR)

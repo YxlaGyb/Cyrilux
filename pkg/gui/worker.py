@@ -29,8 +29,8 @@ from model.core.evaluation import (
     load_with_remap,
     run_full_evaluation,
 )
-from model.core.threaded_trainer import ThreadedTrainer
-from model.core.training import TrainingConfig
+from pkg.utils.threaded_trainer import ThreadedTrainer
+from model.core.train import TrainingConfig
 from model.model_cyrene import CyreneConfig
 from model.pc.pc_layers import CyrenePC
 

@@ -7,7 +7,7 @@
   - 支持分割后自动转换格式 (conversations→text)
 """
 import os, json, math, argparse
-from model.core.data_converter import convert_sample
+from pkg.utils.data_converter import convert_sample
 
 
 def split_file(input_path: str, output_dir: str, chunk_size: int = 1000,
