@@ -20,10 +20,10 @@ import os, sys, json, argparse
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT_DIR)  # 仅用于 main.py 自身能被执行
 
-from core.trainer_utils import setup_seed, Logger
-from core.training import TrainingLoop, TrainingConfig
-from core.threaded_trainer import ThreadedTrainer, run_training_standalone
-from core.evaluation import (
+from model.core.trainer_utils import setup_seed, Logger
+from model.core.training import TrainingLoop, TrainingConfig
+from model.core.threaded_trainer import ThreadedTrainer, run_training_standalone
+from model.core.evaluation import (
     compute_perplexity,
     generate_text,
     eval_self_supervised,
@@ -31,10 +31,10 @@ from core.evaluation import (
     create_eval_loader,
     run_full_evaluation,
 )
-from core.autonomous_mind import AutonomousMind, DEFAULT_CFG
-from core.data_splitter import split_file, split_directory
-from core.data_converter import scan_dataset_dir, convert_file
-from core.prepare_tasks import prepare_4tasks, prepare_hetero
+from model.core.autonomous_mind import AutonomousMind, DEFAULT_CFG
+from model.core.data_splitter import split_file, split_directory
+from model.core.data_converter import scan_dataset_dir, convert_file
+from model.core.prepare_tasks import prepare_4tasks, prepare_hetero
 from model.pc_layers import PCLocalDynamicMiniMind, load_pc_checkpoint
 from model.model_minimind import MiniMindConfig
 
@@ -277,7 +277,7 @@ def cmd_gui(args):
 
 def launch_gui(dpi_scale: float = 1.25):
     """启动 PyQt6 骇客像素风 GUI."""
-    from gui import launch_gui as _launch
+    from pkg.gui import launch_gui as _launch
 
     _launch()
 

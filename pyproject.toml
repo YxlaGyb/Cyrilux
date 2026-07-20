@@ -19,15 +19,17 @@ dependencies = [
 ]
 
 [project.scripts]
-virtuoso = "cli.app:app"
+virtuoso = "pkg.cli.app:app"
 
 [tool.setuptools.packages.find]
 include = [
-    "cli", "cli.*",
-    "core", "core.*",
+    "pkg", "pkg.*",
     "model", "model.*",
-    "continual", "continual.*",
     "dataset", "dataset.*",
+    "pkg.cli", "pkg.cli.*",
+    "pkg.gui", "pkg.gui.*",
+    "model.core", "model.core.*",
+    "model.continual", "model.continual.*",
 ]
 
 
