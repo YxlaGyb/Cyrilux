@@ -9,3 +9,4 @@ out*
 /docs
 *.egg-info
 /.vscode
+test*

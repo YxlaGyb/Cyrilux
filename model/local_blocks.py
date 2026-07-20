@@ -5,7 +5,83 @@ Ponytail: Conv1D(k=3, causal) + SwiGLU MLP, 接口兼容 MiniMindBlock。
 import torch
 import torch.nn.functional as F
 from torch import nn
-from model.model_minimind import RMSNorm, FeedForward
+from model.model_minimind import MiniMindConfig, RMSNorm, FeedForward, _ACT2FN
+
+
+class LateralInhibition(nn.Module):
+    """侧向抑制模块 — 生物启发的跨层竞争机制。
+
+    高误差层抑制相邻层的误差信号，模拟生物神经网络中
+    活跃神经元抑制邻居的侧向抑制现象。效果:
+      - 锐化误差对比度 (高ε更强, 低ε更弱)
+      - 促进层间专业化 (避免所有层学习相似特征)
+      - 加速收敛 (减少冗余表示)
+
+    Args:
+        num_layers: PC 子层数 (默认 12)
+        k: 每个抑制层影响的邻居半径 (默认 3)
+        inhibition_strength: 抑制强度 (0=无抑制, 1=完全抑制)
+    """
+
+    def __init__(self, num_layers: int = 12, k: int = 3,
+                 inhibition_strength: float = 0.1):
+        super().__init__()
+        self.num_layers = num_layers
+        self.k = min(k, num_layers // 2)  # 对称半径
+        self.inhibition_strength = inhibition_strength
+
+        # 抑制权重核: Gaussian 形状, 中心为零, 邻域为正
+        kernel = torch.zeros(2 * self.k + 1)
+        for i in range(2 * self.k + 1):
+            dist = abs(i - self.k)
+            if dist == 0:
+                kernel[i] = 0.0  # 不自抑制
+            else:
+                kernel[i] = torch.exp(torch.tensor(-dist ** 2 / (2 * (self.k / 2) ** 2)))
+        # 归一化使抑制总和 = 1
+        kernel = kernel / (kernel.sum() + 1e-8)
+        self.register_buffer('_inhibition_kernel', kernel)
+
+    def forward(self, ε_list):
+        """应用侧向抑制到误差列表。
+
+        Args:
+            ε_list: list[Tensor], 每层误差 [B, S, H] 或 [B, S, H, F]
+
+        Returns:
+            ε_inhibited: list[Tensor], 抑制后的误差
+        """
+        if self.inhibition_strength <= 0 or self.num_layers <= 2:
+            return ε_list
+
+        L = len(ε_list)
+        device = ε_list[0].device
+
+        # 1) 计算每层误差范数 → [L]
+        norms = torch.tensor([ε.float().norm().item() for ε in ε_list], device=device)
+
+        # 2) 对范数进行 softmax 归一化 → 竞争权重
+        w = F.softmax(norms / (norms.mean() + 1e-8), dim=0)
+
+        # 3) 用事先计算的核做 1D 卷积 → 邻域抑制信号
+        w_pad = F.pad(w.unsqueeze(0).unsqueeze(0),  # [1, 1, L]
+                      pad=(self.k, self.k), mode='replicate')
+        # 显式 float() 确保与 w_pad 类型一致 (模型 .half() 后 buffer 为 fp16)
+        kernel = self._inhibition_kernel.float().view(1, 1, -1).to(device)
+        inhibition = F.conv1d(w_pad, kernel)[0, 0]  # [L]
+
+        # 4) 从原始 ε 中减去抑制信号
+        ε_inhibited = []
+        for ℓ, ε in enumerate(ε_list):
+            inh_factor = self.inhibition_strength * inhibition[ℓ]
+            ε_mod = ε * (1.0 - inh_factor)
+            ε_inhibited.append(ε_mod)
+
+        return ε_inhibited
+
+    def extra_repr(self):
+        return (f'L={self.num_layers}, k={self.k}, '
+                f'inhibition={self.inhibition_strength:.2f}')
 
 
 class SalienceGate(nn.Module):
@@ -112,7 +188,9 @@ class LocalConvBlock(nn.Module):
 
         # ── MLP 子层 (SwiGLU, 与 MiniMindBlock 相同) ──
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config)
+        # 使用融合 gate+up 的 MLP (Phase 6: 减少 33% matmul 调用)
+        use_fused = getattr(config, 'use_fused_mlp', True)
+        self.mlp = FusedFeedForward(config) if use_fused else FeedForward(config)
 
     def forward(self, hidden_states, position_embeddings=None, **kwargs):
         """前向: Conv → residual → MLP → residual
@@ -144,3 +222,38 @@ class LocalConvBlock(nn.Module):
 
     def extra_repr(self):
         return f'layer_id={self.layer_id}, conv={self.local_conv}'
+
+class FusedFeedForward(nn.Module):
+    """Fused SwiGLU MLP — 将 gate_proj + up_proj 合并为单次 matmul.
+
+    标准 SwiGLU:
+      gate = gate_proj(x)   # [B, S, H] → [B, S, inter]
+      up   = up_proj(x)     # [B, S, H] → [B, S, inter]
+      out  = silu(gate) * up
+      y    = down_proj(out) # [B, S, inter] → [B, S, H]
+
+    融合后:
+      fused = gate_up_proj(x)  # [B, S, H] → [B, S, 2*inter]
+      gate, up = fused.split(inter, dim=-1)
+      out = silu(gate) * up
+      y   = down_proj(out)
+
+    减少 1 次 matmul / 前向, 33% MLP 计算量减少。
+    """
+
+    def __init__(self, config: MiniMindConfig, intermediate_size: int = None):
+        super().__init__()
+        intermediate_size = intermediate_size or config.intermediate_size
+        # 融合 gate + up 为一个更大的权重矩阵
+        self.gate_up_proj = nn.Linear(config.hidden_size, 2 * intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+        self.act_fn = _ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        """fp32 前向 — 显式权重提升防 silu 溢出."""
+        w_gu = self.gate_up_proj.weight.float()
+        w_d = self.down_proj.weight.float()
+        x32 = x.float()
+        fused = F.linear(x32, w_gu)  # [B, S, 2*inter]
+        gate, up = fused.chunk(2, dim=-1)
+        return F.linear(self.act_fn(gate) * up, w_d).to(x.dtype)

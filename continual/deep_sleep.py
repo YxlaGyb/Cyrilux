@@ -57,6 +57,9 @@ class SleepEngine:
         self.hebbian_lambda_min = hebbian_lambda_min
         self.dopamine_gamma = dopamine_gamma
 
+        # ── Stride 加速 ──
+        self.stride: int = 1
+
         # BCM 滑动阈值 (慢速 tau=0.005 适合离线巩固)
         self.bcm_state = BCMState(n_layers=num_sub_layers, tau=0.005)
 
@@ -74,12 +77,20 @@ class SleepEngine:
                       labels: torch.Tensor, device: str):
         """对 (byte_seq, labels) 执行一次纯 Hebbian 权重更新 (零 backward)。
 
-        流程:
-          1. forward_with_ce → z_init (起始潜在变量)
-          2. spatiotemporal_infer → z_conv, ε_list (收敛 + 局部预测误差)
-          3. compute_all_hebbian_updates → ΔW (基于 ε 的 Hebbian 更新)
-          4. apply_hebbian_updates → 权重写入
+        Args:
+            byte_seq: [B, 2, S] 字节输入
+            labels: [B, S] 标签
+            stride: 序列下采样步长 (>1 时沿时间维降采样)
         """
+        # ── Stride 下采样 ──
+        stride = self.stride
+        if stride > 1:
+            seq_len_full = byte_seq.size(-1)
+            indices = torch.arange(0, seq_len_full, stride, device=byte_seq.device)
+            byte_seq = byte_seq[:, :, indices]
+            if labels is not None:
+                labels = labels[:, indices]
+
         seq_len = byte_seq.size(-1)
         pos_emb = model.get_position_embeddings(seq_len, device)
         z_init, _ = model.forward_with_ce(byte_seq, labels, pos_emb)

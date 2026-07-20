@@ -55,6 +55,7 @@ from continual.memory_gating import MemoryGate
 from continual.attractor_landscape import AttractorLandscape
 from continual.consolidation_pipeline import ConsolidationPipeline, ContinuousBuffer
 from continual.deep_sleep import SleepEngine
+from continual.hippocampus_buffer import HippocampusBuffer
 from continual.neurogenesis import NeurogenesisController
 from model.local_updates import BCMState
 
@@ -77,6 +78,7 @@ class TrainingConfig:
     hidden_size: int = 256
     num_hidden_layers: int = 4
     use_moe: bool = False
+    vocab_size: int = 256           # 字节级默认 256; 词元级可覆盖
     checkpoint_path: Optional[str] = None  # 从 checkpoint 恢复
 
     # 训练
@@ -102,14 +104,14 @@ class TrainingConfig:
     dopamine_gamma: float = 0.3
 
     # Hebbian 模式超参
-    hebbian_base_eta: float = 1e-5             # 基础 Hebbian 学习率 η
+    hebbian_base_eta: float = 3e-4             # 基础 Hebbian 学习率 (原 3e-6→3e-4, 提升 100×)
     hebbian_lambda_decay: int = 5000           # τ_λ, decoder 约束退火衰减常数
     hebbian_lambda_min: float = 0.01           # λ_min, decoder 约束永不归零
-    hebbian_infer_T: int = 3                   # 专用推理步数
+    hebbian_infer_T: int = 3                   # PC 推理步数 (原 1→3, 更好表示)
     hebbian_ach_beta_0: float = 0.0            # ACh 偏置 β₀
 
     # Oja 规则 (权重自组织)
-    oja_alpha: float = 0.05                    # Oja 衰减系数 (0=禁用)
+    oja_alpha: float = 0.05                    # Oja 衰减系数 (per-sample 更新, 与 temporal/topdown 一致)
     oja_eta: float = 0.05                      # Oja 独立学习率 (不绑定 Hebbian η)
     oja_adaptive: bool = True                  # 自适应 oja (按层范数自动缩放)
 
@@ -117,7 +119,7 @@ class TrainingConfig:
     ε_rms_target: float = 1.0                  # ε 目标 RMS (模拟发放率上限)
 
     # 突触归一化 (Synaptic Normalization)
-    synaptic_normalize: bool = True            # 是否应用 per-neuron L2 归一化
+    synaptic_normalize: bool = False           # 禁用 — 与增强 Hebbian 更新冲突
     synaptic_target_norm: float = 0.0          # 目标 L2 范数 (0=auto: sqrt(fan_in))
 
     # Salience Gating (结构自组织)
@@ -134,6 +136,9 @@ class TrainingConfig:
     neurogenesis_prune_threshold_gate: float = 0.05  # Gate 值剪枝阈值
     neurogenesis_grow_error_threshold: float = 2.0   # 生长触发误差
     neurogenesis_max_grow_per_step: int = 8          # 单步最大生长通道数
+
+    # Phase 7b: 降频 (consolidation/ICM/WM 不必每步执行)
+    consolidation_pipeline_interval: int = 5          # 巩固管道 tick/force 检查间隔 (步)
 
     # 持续学习
     replay_ratio: int = 5           # 每 N 步插入 1 步回放
@@ -174,6 +179,30 @@ class TrainingConfig:
 
     # 回调
     progress_callback: Optional[ProgressCallback] = None
+
+    # Phase 1: 依赖阈值发放 (自然稀疏替代 hardcoded top-k)
+    act_threshold_init: float = 0.3           # per-channel 阈值初始值
+    act_target_ratio: float = 0.20            # 目标活跃率 ~20%
+    act_ema_decay: float = 0.999              # 激活分布 EMA 衰减
+    act_homeo_rate: float = 0.02              # 稳态可塑性调节步长
+    act_energy_cost: float = 0.5              # β·N_active 能量代价 (Phase 3: F += β·active_ratio)
+
+    # Phase 2: 突触竞争 — per-weight-row WTA (模拟 ~1% 突触增强率)
+    synaptic_competition_k: int = 8           # 每行胜者数 (0=禁用, ≈hidden*0.01)
+    synaptic_competition_use_abs: bool = False  # False=按代数值, True=按绝对值竞争
+
+    # Phase 4: 稀疏外积 — 仅计算活跃突触前通道 (替代全矩阵再归零)
+    sparse_outer_k: int = 32                  # 保留的活跃突触前通道数 (0=禁用, ≈hidden*0.04)
+    hebbian_eps_gate: float = 0.0             # ε 门控阈值 (0=禁用, >0=跳过 ‖ε‖<阈值的层)
+
+    # 推理控制
+    infer_adaptive_T: bool = True             # 自适应推理终止 (收敛后提前结束)
+    infer_convergence_threshold: float = 0.05 # F 相对变化阈值 (5%)
+    infer_patience: int = 2                   # 连续收敛步数
+    infer_min_T: int = 1                      # 最小推理步数 · 生物单次传播
+
+    # Stride 回放
+    replay_stride: int = 4                    # 回放时序列下采样步长 (1=无下采样, 4=减4倍)
 
     # Sleep / Consolidation
     sleep_consolidation: bool = True          # 6a: 任务后 WM 驱动合并
@@ -242,6 +271,7 @@ class TrainingLoop:
         self.ema_z = None
         self.forgetting_log: list[dict] = []
         self._last_world_surprise: float = 0.0
+        self._last_world_loss: Optional[float] = None
         self._last_world_mode: str = 'full'
         self._F_trend_buffer: list[float] = []
         self._surprise_buffer: list[float] = []
@@ -290,6 +320,9 @@ class TrainingLoop:
         self.consolidation_pipeline: Optional[ConsolidationPipeline] = None
         self.sleep_engine: Optional[SleepEngine] = None
 
+        # ── 海马体快速缓冲 (Phase 3b) ──
+        self.hippocampus = HippocampusBuffer(capacity=200, min_info_gain=0.03)
+
     # ── 环境初始化 ──
 
     def _setup_environment(self):
@@ -309,11 +342,21 @@ class TrainingLoop:
             hidden_size=self.cfg.hidden_size,
             num_hidden_layers=self.cfg.num_hidden_layers,
             use_moe=self.cfg.use_moe,
+            vocab_size=self.cfg.vocab_size,
         )
         model = PCLocalDynamicMiniMind(lm_cfg).half()
 
-        # 编译 (reduce-overhead 内含 CUDA Graph 加速)
-        if hasattr(torch, 'compile'):
+        # ── Phase 1: 依赖阈值发放参数注入 ──
+        model._act_ema_decay = self.cfg.act_ema_decay
+        model._act_target_ratio = self.cfg.act_target_ratio
+        model._act_homeo_rate = self.cfg.act_homeo_rate
+        model._act_energy_cost = self.cfg.act_energy_cost
+        # 覆盖初始阈值 (重填 buffer)
+        init_th = torch.ones(model.num_sub_layers, model.config.hidden_size) * self.cfg.act_threshold_init
+        model.register_buffer('_act_threshold', init_th)
+
+        # 编译 (需要 CUDA + Triton; 否则退化为 CPU inductor 需 MSVC)
+        if hasattr(torch, 'compile') and self.device.type == 'cuda' and hasattr(torch, 'triton'):
             self._orig_forward = model.forward_with_ce
             try:
                 model.forward_with_ce = torch.compile(self._orig_forward, mode='reduce-overhead')
@@ -321,6 +364,16 @@ class TrainingLoop:
             except Exception as e:
                 model.forward_with_ce = self._orig_forward
                 self._log(f'torch.compile 失败 (已忽略): {e}')
+
+        # Phase 7c: 编译 PC 推理热路径 (需要 CUDA + Triton; Windows 无 Triton 时会退化为 CPU inductor 需 MSVC)
+        if hasattr(torch, 'compile') and self.device.type == 'cuda' and hasattr(torch, 'triton'):
+            try:
+                model._spatiotemporal_infer_step = torch.compile(
+                    model._spatiotemporal_infer_step, mode='reduce-overhead',
+                )
+                self._log('torch.compile → _spatiotemporal_infer_step 启用')
+            except Exception as e:
+                self._log(f'torch.compile → _spatiotemporal_infer_step 失败: {e}')
 
         return model
 
@@ -440,19 +493,23 @@ class TrainingLoop:
         with torch.no_grad():
             z_init = self.model.init_z(byte_seq)  # list[tensor, L+1]
 
-        # ── temp_loss 诊断 (no_grad, 仅日志) ──
+        # ── temp_loss 诊断 (no_grad, clamp=100 防 9e9 日志) ──
         bp_temp_loss = 0.0
         bp_temp_by_layer = []
         if hasattr(self.model, 'temporal_proj') and seq_len > 1:
             n_layers = len(self.model.temporal_proj)
+            tl_acc = torch.tensor(0.0, device=self.device)
+            tl_list: list[torch.Tensor] = []
             for ℓ in range(n_layers):
                 z_ℓ = z_init[ℓ + 1]
                 if z_ℓ.size(1) > 1:
                     tl = 0.5 * (self.model.temporal_proj[ℓ](z_ℓ[:, :-1, :]) - z_ℓ[:, 1:, :]).pow(2).mean()
-                    bp_temp_by_layer.append(tl.item())
-                    bp_temp_loss += tl.item()
-            if n_layers > 0 and bp_temp_by_layer:
-                bp_temp_loss /= n_layers
+                    tl_clamped = tl.clamp(max=100.0)
+                    tl_list.append(tl_clamped)
+                    tl_acc = tl_acc + tl_clamped
+            if n_layers > 0 and tl_list:
+                bp_temp_loss = (tl_acc / n_layers).item()
+                bp_temp_by_layer = [t.item() for t in tl_list]
 
         # ── Phase 2: PC 推理 (no_grad, T 步) ──
         # 从 F 历史算 uncertainty → ACh
@@ -468,6 +525,11 @@ class TrainingLoop:
                 return_pred_loss=False,
                 ach_value=ACh,
                 return_ε=True,
+                adaptive_T=self.cfg.infer_adaptive_T,
+                convergence_threshold=self.cfg.infer_convergence_threshold,
+                patience=self.cfg.infer_patience,
+                min_T=self.cfg.infer_min_T,
+                skip_bottom_up=True,  # Phase 5: 复用 init_z 的预测值, 跳过冗余 predict()
             )
 
         F_curr = F_hist[-1] if F_hist else 0.0
@@ -497,6 +559,7 @@ class TrainingLoop:
                 ε_list, z_init, byte_seq, self.model, self.cfg,
                 D=D, ACh=ACh_val, modulation=modulation, λ=λ,
                 decoder=self.model.decoder,
+                lm_head=self.model.model.lm_head,
                 target_byte_embed=target_onehot,
                 oja_alpha=oja_alpha, bcm_state=self.bcm_state, verbose=True,
             )
@@ -548,41 +611,51 @@ class TrainingLoop:
         world_loss_val = None
         surprise = 0.0
         if self.cfg.enable_world_model and self.world_model is not None:
-            with torch.no_grad():
-                wm_state = z_init[-1].detach()
-                wm_next = z_conv[-1].detach()
-                wm_ctx = self._build_world_model_context(bsz)
-                _, wm_uncertainty = self.world_model(wm_state, wm_ctx)
-                surprise = wm_uncertainty.detach().mean().item()
-                wl = self.world_model.loss(wm_state, wm_next, wm_ctx)
-                world_loss_val = wl.item()
+            if self.global_step % self.cfg.consolidation_pipeline_interval == 0:
+                with torch.no_grad():
+                    wm_state = z_init[-1].detach()
+                    wm_next = z_conv[-1].detach()
+                    wm_ctx = self._build_world_model_context(bsz)
+                    _, wm_uncertainty = self.world_model(wm_state, wm_ctx)
+                    surprise = wm_uncertainty.detach().mean().item()
+                    wl = self.world_model.loss(wm_state, wm_next, wm_ctx)
+                    world_loss_val = wl.item()
+                self._last_world_surprise = surprise
+                self._last_world_loss = world_loss_val
+            else:
+                surprise = self._last_world_surprise
+                world_loss_val = getattr(self, '_last_world_loss', None)
             # 世界模型不再 backward, 仅保留推理评估 surprise
 
         # ICM 内在动机 (no_grad 推理, 零 backward)
         icm_loss_val = 0.0
         if self.cfg.enable_intrinsic_motivation and self.icm is not None:
-            with torch.no_grad():
-                z_curr = z_conv[-1].detach()
-                z_prev = z_init[-1].detach()
-                action_embed = (z_curr - z_prev).mean(dim=1)
-                if action_embed.size(-1) > self.cfg.icm_action_dim:
-                    action_embed = action_embed[:, :self.cfg.icm_action_dim]
-                elif action_embed.size(-1) < self.cfg.icm_action_dim:
-                    pad = torch.zeros(bsz, self.cfg.icm_action_dim - action_embed.size(-1), device=self.device)
-                    action_embed = torch.cat([action_embed, pad], dim=-1)
-                icm_output = self.icm.forward(z_prev, z_curr)
-                self._icm_output = {k: (v.item() if isinstance(v, torch.Tensor) and v.numel() == 1 else v)
-                                   for k, v in icm_output.items()}
-                icm_loss_val = (self.cfg.icm_forward_weight * self._icm_output.get('pred_loss', 0.0) +
-                               self.cfg.icm_inverse_weight * self._icm_output.get('inverse_loss', 0.0) +
-                               self.cfg.icm_contrastive_weight * self._icm_output.get('contrastive_loss', 0.0))
-            # 概念发现 (仅观察, 零 backward)
-            if self.concept_discovery is not None:
-                info_gain = self._icm_output.get('information_gain', 0.0)
-                self.concept_discovery.observe(z_curr[0:1].detach(), intrinsic_value=info_gain)
+            if self.global_step % self.cfg.consolidation_pipeline_interval == 0:
+                with torch.no_grad():
+                    z_curr = z_conv[-1].detach()
+                    z_prev = z_init[-1].detach()
+                    action_embed = (z_curr - z_prev).mean(dim=1)
+                    if action_embed.size(-1) > self.cfg.icm_action_dim:
+                        action_embed = action_embed[:, :self.cfg.icm_action_dim]
+                    elif action_embed.size(-1) < self.cfg.icm_action_dim:
+                        pad = torch.zeros(bsz, self.cfg.icm_action_dim - action_embed.size(-1), device=self.device)
+                        action_embed = torch.cat([action_embed, pad], dim=-1)
+                    icm_output = self.icm.forward(z_prev, z_curr)
+                    self._icm_output = {k: (v.item() if isinstance(v, torch.Tensor) and v.numel() == 1 else v)
+                                       for k, v in icm_output.items()}
+                    icm_loss_val = (self.cfg.icm_forward_weight * self._icm_output.get('pred_loss', 0.0) +
+                                   self.cfg.icm_inverse_weight * self._icm_output.get('inverse_loss', 0.0) +
+                                   self.cfg.icm_contrastive_weight * self._icm_output.get('contrastive_loss', 0.0))
+                # 概念发现 (仅观察, 零 backward)
+                if self.concept_discovery is not None:
+                    info_gain = self._icm_output.get('information_gain', 0.0)
+                    self.concept_discovery.observe(z_curr[0:1].detach(), intrinsic_value=info_gain)
+            else:
+                self._icm_output = None
+                icm_loss_val = 0.0
 
         # ── 持续巩固管道 ──
-        if self.consolidation_pipeline is not None:
+        if self.consolidation_pipeline is not None and self.global_step % self.cfg.consolidation_pipeline_interval == 0:
             sample_z = [z[0:1].detach() for z in z_conv]
             sample_byte = byte_seq[0].detach()
             sample_label = labels[0].detach()
@@ -598,7 +671,6 @@ class TrainingLoop:
             )
 
         # ── 结果 ──
-        self._last_world_surprise = surprise
         self._last_world_mode = 'full'
         self._last_D = D
         lr_used = self.cfg.hebbian_base_eta * modulation
@@ -652,20 +724,43 @@ class TrainingLoop:
             result['neuro_n_resurrected'] = neuro_stats.get('n_resurrected', 0)
             result['neuro_n_split'] = neuro_stats.get('n_split', 0)
             result['neuro_active_ratio'] = neuro_stats.get('active_ratio', 1.0)
+
+        # ── Phase 3c: 海马体缓冲写入 ──
+        info_gain = self._icm_output.get('information_gain', 0.0) if self._icm_output else 0.0
+        if info_gain > self.hippocampus.min_info_gain:
+            self.hippocampus.add(
+                z_states=z_conv, byte_tensor=byte_seq[0].detach(),
+                label_tensor=labels[0].detach(),
+                info_gain=info_gain, step=self.global_step,
+            )
+
         return result
 
     # ── Hebbian 辅助: 对任意数据运行 Hebbian 更新 ──
 
     def _hebbian_update_on_data(self, byte_seq: Optional[torch.Tensor] = None,
                                  labels: Optional[torch.Tensor] = None,
-                                 z_init=None):
-        """对 (byte_seq, labels) 或直接用预计算 z_init 执行一次纯 Hebbian 权重更新."""
+                                 z_init=None, stride: int = 1):
+        """对 (byte_seq, labels) 或直接用预计算 z_init 执行一次纯 Hebbian 权重更新.
+
+        Args:
+            stride: 序列下采样步长 (>1 时沿时间维降采样, 减少计算量)
+        """
         if z_init is not None:
             seq_len = z_init[0].size(1)
         elif byte_seq is not None:
             seq_len = byte_seq.size(-1)
         else:
             return
+
+        # ── Stride 下采样: 沿时间维降采样以加速 ──
+        if stride > 1 and byte_seq is not None:
+            # byte_seq: [B, 2, S] → 沿 S 维下采样
+            indices = torch.arange(0, seq_len, stride, device=byte_seq.device)
+            byte_seq = byte_seq[:, :, indices]
+            if labels is not None:
+                labels = labels[:, indices]
+            seq_len = byte_seq.size(-1)
 
         pos_emb = self.model.get_position_embeddings(seq_len, self.device)
 
@@ -694,6 +789,7 @@ class TrainingLoop:
                 ε_list, z_init, byte_seq, self.model, self.cfg,
                 D=D, ACh=ACh_val, modulation=modulation, λ=λ,
                 decoder=self.model.decoder,
+                lm_head=self.model.model.lm_head,
                 target_byte_embed=None,
                 oja_alpha=oja_alpha, bcm_state=self.bcm_state, verbose=False,
             )
@@ -706,6 +802,26 @@ class TrainingLoop:
     def _maybe_replay(self):
         if self.memory_bank.total <= 0:
             return
+
+        # ── 海马体快速回放 (Phase 3c) ──
+        # 以 replay_ratio * 2 的间隔从 hippocampus 加权采样回放
+        if (self.hippocampus.size > 0
+                and self.global_step % (self.cfg.replay_ratio * 2) == 0
+                and not (self.sniffer.is_repairing
+                         if hasattr(self.sniffer, 'is_repairing') else False)):
+            hc_batch = self.hippocampus.sample_for_replay(
+                self.cfg.batch_size // 4, device=self.device)
+            if hc_batch is not None:
+                replay_byte_hc, replay_label_hc = hc_batch
+                # 将 byte: [B, S] → [B, 2, S] 格式 (DualChannelDataset)
+                replay_byte_hc = torch.stack([
+                    replay_byte_hc.float(),
+                    torch.full_like(replay_byte_hc, 2.0, dtype=torch.float,
+                                    device=self.device),
+                ], dim=1)
+                self._hebbian_update_on_data(replay_byte_hc, replay_label_hc,
+                                             stride=self.cfg.replay_stride)
+
         if self.global_step % self.cfg.replay_ratio != 0:
             return
         if self.sniffer.is_repairing:
@@ -724,8 +840,9 @@ class TrainingLoop:
         replay_byte = torch.stack([ex.byte_tensor for ex in replay_ex], dim=0).to(self.device)
         replay_label = torch.stack([ex.label_tensor for ex in replay_ex], dim=0).to(self.device)
 
-        # Hebbian 回放: 正向 + 推理 → 局部 Hebbian 更新
-        self._hebbian_update_on_data(replay_byte, replay_label)
+        # Hebbian 回放: 正向 + 推理 → 局部 Hebbian 更新 (带 stride 加速)
+        self._hebbian_update_on_data(replay_byte, replay_label,
+                                     stride=self.cfg.replay_stride)
 
         # 刷新被回放样本的 transition_surprise 和 replay_priority
         if self.cfg.enable_world_model and self.world_model is not None:
@@ -1272,13 +1389,16 @@ class TrainingLoop:
                             m['world_surprise'] = 0.0
                         continue
 
+                    # ── 步数递增 (修复: 原来缺失) ──
+                    self.global_step += 1
+
                     # ── ICM / Concept / Gate 后处理 ──
                     if self.cfg.enable_intrinsic_motivation and self.icm is not None:
                         # 概念 consolidation (每 500 步)
                         if self.global_step % 500 == 0 and self.concept_discovery is not None:
                             self.concept_discovery.consolidate()
-                        # 记忆门控自适应 (每 adaptation_window 步)
-                        if self.memory_gate is not None:
+                        # 记忆门控自适应 (每 consolidation_pipeline_interval 步 Phase 7b)
+                        if self.memory_gate is not None and self.global_step % self.cfg.consolidation_pipeline_interval == 0:
                             self.memory_gate.adapt_thresholds()
                         # ICM reset (每任务, 在任务切换时处理)
 
@@ -1328,18 +1448,18 @@ class TrainingLoop:
                     self._maybe_sniff_forgetting()
                     # 抽象漂移检测
                     self._maybe_sniff_abstraction()
-                    # 持续巩固管道: 调度 (Phase B)
-                    if self.consolidation_pipeline is not None:
-                        current_error_ratio = m.get('error_ratio', 1.0)
-                        # nan 保护: 替换 nan 为 1.0 (保持现状)
-                        if isinstance(current_error_ratio, float) and (current_error_ratio != current_error_ratio):
-                            current_error_ratio = 1.0
+                    # 持续巩固管道: 调度 (Phase B)  — Phase 7b: interval 降频
+                    if self.consolidation_pipeline is not None and self.global_step % self.cfg.consolidation_pipeline_interval == 0:
+                        current_D = m.get('D', 0.0)
+                        # nan 保护: 替换 nan 为 0.0 (保持中立)
+                        if isinstance(current_D, float) and (current_D != current_D):
+                            current_D = 0.0
 
-                        # 累积误差比率窗口 → 低误差持续 → 强制巩固
-                        self._error_ratio_window = getattr(self, '_error_ratio_window', [])
-                        self._error_ratio_window.append(current_error_ratio)
-                        if len(self._error_ratio_window) > 30:
-                            self._error_ratio_window.pop(0)
+                        # 累积多巴胺窗口 → 高 D 持续 → 强制巩固
+                        self._dopamine_window = getattr(self, '_dopamine_window', [])
+                        self._dopamine_window.append(current_D)
+                        if len(self._dopamine_window) > 30:
+                            self._dopamine_window.pop(0)
 
                         tick_result = {'triggered': None}
                         try:
@@ -1347,23 +1467,23 @@ class TrainingLoop:
                                 self.global_step, self.model,
                                 self.memory_bank, self.abstraction_bank,
                                 device=self.device,
-                                error_ratio=current_error_ratio,
+                                dopamine_score=current_D,
                             )
                         except Exception as pipe_err:
                             self._log(f'[Pipeline] tick 忽略异常: {pipe_err}')
                         if tick_result.get('triggered') and self.global_step % 500 == 0:
                             self._log(f'[Pipeline] {tick_result["triggered"]}')
 
-                        # 低误差稳定状态 → 强制巩固
-                        mean_er = sum(self._error_ratio_window) / len(self._error_ratio_window)
-                        if mean_er < 0.95 and len(self._error_ratio_window) >= 20:
+                        # 高 D 稳定状态 → 强制巩固
+                        mean_D = sum(self._dopamine_window) / len(self._dopamine_window)
+                        if mean_D > 0.70 and len(self._dopamine_window) >= 20:
                             try:
                                 force_result = self.consolidation_pipeline.force_consolidate(
                                     self.global_step, self.model,
                                     self.memory_bank, self.abstraction_bank,
                                     device=self.device,
                                 )
-                                self._error_ratio_window.clear()
+                                self._dopamine_window.clear()
                             except Exception as pipe_err:
                                 self._log(f'[Pipeline] force_consolidate 忽略异常: {pipe_err}')
                             if force_result['triggered'] and self.global_step % 500 == 0:

@@ -139,6 +139,9 @@ class ConsolidationPipeline:
         self._last_memory_write: int = 0
         self._last_abstraction_write: int = 0
 
+        # Stride 加速
+        self.stride: int = 1
+
         # 统计
         self.stats: dict = {
             'n_memory_writes': 0,
@@ -184,13 +187,13 @@ class ConsolidationPipeline:
         memory_bank,
         abstraction_bank,
         device: str = 'cuda:0',
-        error_ratio: Optional[float] = None,
+        dopamine_score: Optional[float] = None,
     ) -> Dict[str, any]:
         """每步调用 — 检查是否需要触发写入或 SLEEP。
 
-        误差比率 (error_ratio) 来自 PC 推理循环的自组织信号:
-        error_ratio > 1 = 新奇/不稳定, 推迟巩固;
-        error_ratio < 1 = 熟悉/稳定, 适合巩固.
+        多巴胺 D (RPE) 来自 PC 推理循环的自组织信号:
+        D → 1 = 自由能快速下降 = 稳定状态, 适合巩固;
+        D → 0 = 自由能上升 = 新奇/不稳定, 推迟巩固.
 
         Returns:
             {'triggered': str | None, 'stats': dict}
@@ -217,7 +220,7 @@ class ConsolidationPipeline:
         # ── 睡眠检查 (误差比率驱动) ──
         if (step - self._last_sleep_check) >= self.sleep_check_interval:
             self._last_sleep_check = step
-            need_sleep = self._check_sleep_needed(abstraction_bank, error_ratio)
+            need_sleep = self._check_sleep_needed(abstraction_bank, dopamine_score)
             if need_sleep:
                 self.stats['n_sleep_requests'] += 1
                 result['triggered'] = 'sleep_needed'
@@ -255,6 +258,16 @@ class ConsolidationPipeline:
 
         n_total = 0
         for tid, entries in by_task.items():
+            # ── Stride 下采样 ──
+            if self.stride > 1:
+                entries_subsampled = []
+                for bt, lt, ds, ig, iv, cid in entries:
+                    idx = torch.arange(0, bt.size(-1), self.stride, device=bt.device)
+                    bt_s = bt[..., idx]
+                    lt_s = lt[..., idx] if lt is not None else lt
+                    entries_subsampled.append((bt_s, lt_s, ds, ig, iv, cid))
+                entries = entries_subsampled
+
             pairs = [(e[0], e[1]) for e in entries]
             d_scores = [e[2] for e in entries]
             info_gains = [e[3] for e in entries]
@@ -302,6 +315,11 @@ class ConsolidationPipeline:
 
         n_total = 0
         for tid, group in by_task.items():
+            # ── Stride 下采样 z_states ──
+            if self.stride > 1:
+                for s in group:
+                    s.z_states = [z[..., ::self.stride] for z in s.z_states]
+
             z_states_list = [s.z_states for s in group]
             avg_d = sum(s.dopamine_score for s in group) / len(group)
             avg_ig = sum(s.information_gain for s in group) / len(group)
@@ -332,26 +350,26 @@ class ConsolidationPipeline:
 
     # ── 内部: 睡眠调度 ────────────────────────────────────────────────
 
-    def _check_sleep_needed(self, abstraction_bank, error_ratio: Optional[float] = None) -> bool:
+    def _check_sleep_needed(self, abstraction_bank, dopamine_score: Optional[float] = None) -> bool:
         """检查是否需要深度睡眠。
 
-        使用误差比率: error_ratio < 1.0 (误差持续下降) → 稳定状态 → 适合巩固.
-        error_ratio 来自 PC 推理循环的自组织信号, 无需人工阈值.
+        使用多巴胺 D (RPE): D → 1 (自由能快速下降) → 稳定状态 → 适合巩固.
+        D 与 error_ratio 正相关 (都在 F 快速下降时触发), 但无需多步推理.
         """
         if abstraction_bank.total_prototypes < 4:
             return False
 
-        if error_ratio is not None:
-            # 误差持续下降 → 表示空间收敛 → 触发睡眠巩固
-            self.stats['last_error_ratio'] = error_ratio
-            need_sleep = error_ratio < 0.95
+        if dopamine_score is not None:
+            # D 高 → 自由能快速下降 → 表示空间收敛 → 触发睡眠巩固
+            self.stats['last_dopamine_score'] = dopamine_score
+            need_sleep = dopamine_score > 0.70
             self.stats['last_sleep_decision'] = {
-                'error_ratio': error_ratio,
+                'dopamine_score': dopamine_score,
                 'need_sleep': need_sleep,
             }
             return need_sleep
 
-        return False  # 无 error_ratio 时, 不由 pipeline 触发睡眠
+        return False  # 无 dopamine_score 时, 不由 pipeline 触发睡眠
 
     def force_consolidate(
         self,
