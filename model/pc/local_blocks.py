@@ -1,11 +1,11 @@
-"""
-Local Conv blocks — 替代 Transformer Attention 的纯局部操作。
-Ponytail: Conv1D(k=3, causal) + SwiGLU MLP, 接口兼容 MiniMindBlock。
+"""Local Conv blocks — 纯局部 Conv1D 操作。
+Conv1D(k=3, causal) + SwiGLU MLP, 接口兼容 CyreneBackbone。
 """
 import torch
 import torch.nn.functional as F
 from torch import nn
-from model.model_minimind import MiniMindConfig, RMSNorm, FeedForward, _ACT2FN
+
+from model.model_cyrene import _ACT2FN, CyreneConfig, FeedForward, RMSNorm
 
 
 class LateralInhibition(nn.Module):
@@ -163,7 +163,7 @@ class SalienceGate(nn.Module):
 class LocalConvBlock(nn.Module):
     """纯局部 Conv 块: Conv1D → residual → SwiGLU MLP → residual
 
-    接口与 MiniMindBlock 兼容:
+    接口与 CyreneBackbone 的 LocalConvBlock 兼容:
       .input_layernorm, .local_conv (替代 .self_attn),
       .post_attention_layernorm, .mlp
 
@@ -186,9 +186,8 @@ class LocalConvBlock(nn.Module):
             kernel_size=3, padding=0, dilation=dilation, bias=False,
         )
 
-        # ── MLP 子层 (SwiGLU, 与 MiniMindBlock 相同) ──
+        # ── MLP 子层 (SwiGLU) ──
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # 使用融合 gate+up 的 MLP (Phase 6: 减少 33% matmul 调用)
         use_fused = getattr(config, 'use_fused_mlp', True)
         self.mlp = FusedFeedForward(config) if use_fused else FeedForward(config)
 
@@ -201,7 +200,7 @@ class LocalConvBlock(nn.Module):
 
         Returns:
             hidden_states: [bsz, seq_len, hidden_size]
-            None: 接口兼容 MiniMindBlock (past_kv placeholder)
+            None: 接口兼容 CyreneBlock (past_kv placeholder)
         """
         # ── Conv 子层 ──
         residual = hidden_states
@@ -241,7 +240,7 @@ class FusedFeedForward(nn.Module):
     减少 1 次 matmul / 前向, 33% MLP 计算量减少。
     """
 
-    def __init__(self, config: MiniMindConfig, intermediate_size: int = None):
+    def __init__(self, config: CyreneConfig, intermediate_size: int = None):
         super().__init__()
         intermediate_size = intermediate_size or config.intermediate_size
         # 融合 gate + up 为一个更大的权重矩阵

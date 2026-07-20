@@ -1,5 +1,4 @@
-"""
-统一训练循环 — PC 时空推理 + 多巴胺调制 + fp16 原生训练。
+"""统一训练循环 — PC 时空推理 + 多巴胺调制 + fp16 原生训练。
 
 用法:
     from model.core.training import TrainingLoop, TrainingConfig
@@ -15,10 +14,11 @@
   Phase 4: Dopamine.update(F) → D  ← 3 级调制 (precision / beta / lr)
   Phase 5: backward + step         ← lr 调制
 """
-import os, sys, json, math, warnings
-from dataclasses import dataclass, field
-from typing import Optional, Callable
-from pathlib import Path
+import json
+import math
+import os
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 # 常数
 _LOG2 = math.log(2)
@@ -28,36 +28,44 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from model.pc_layers import PCLocalDynamicMiniMind
-from model.model_minimind import MiniMindConfig
-from model.pc_core import DopamineSignal, compute_uncertainty
-from model.core.trainer_utils import setup_seed, count_budget
-from model.core.dataset import DualChannelDataset
-from model.core.globals import DEVICE
-
-# 持续学习模块
-from model.continual.memory_bank import MemoryBank
-from model.continual.forgetting_sniffer import ForgettingSniffer
-from model.continual.offline_replay import OfflineReplayer
 from model.continual.abstraction_bank import (
     AbstractionBank,
     AbstractionSniffer,
     compute_layer_importance,
 )
-from model.continual.world_model import LatentWorldModel
-
-# 内在动机模块
-from model.continual.intrinsic_curiosity import IntrinsicCuriosityModule
-from model.continual.concept_discovery import ConceptDiscovery
-from model.continual.memory_gating import MemoryGate
 
 # 吸引子景观 + 持续巩固 + 深度睡眠
 from model.continual.attractor_landscape import AttractorLandscape
-from model.continual.consolidation_pipeline import ConsolidationPipeline, ContinuousBuffer
+from model.continual.concept_discovery import ConceptDiscovery
+from model.continual.consolidation_pipeline import (
+    ConsolidationPipeline,
+)
 from model.continual.deep_sleep import SleepEngine
+from model.continual.forgetting_sniffer import ForgettingSniffer
 from model.continual.hippocampus_buffer import HippocampusBuffer
+
+# 内在动机模块
+from model.continual.intrinsic_curiosity import IntrinsicCuriosityModule
+
+# 持续学习模块
+from model.continual.memory_bank import MemoryBank
+from model.continual.memory_gating import MemoryGate
 from model.continual.neurogenesis import NeurogenesisController
-from model.local_updates import BCMState
+from model.continual.offline_replay import OfflineReplayer
+from model.continual.world_model import LatentWorldModel
+from model.core.globals import DEVICE
+from model.core.trainer_utils import count_budget, setup_seed
+from model.model_cyrene import CyreneConfig
+from model.pc.local_updates import (
+    BCMState,
+    apply_hebbian_updates,
+    compute_all_hebbian_updates,
+    compute_lambda,
+    compute_modulators,
+    compute_precision_scales,
+)
+from model.pc.pc_core import DopamineSignal, compute_uncertainty
+from model.pc.pc_layers import CyrenePC
 
 # ─── 回调类型 ─────────────────────────────────────────────────────
 ProgressCallback = Callable[[dict], None]
@@ -240,7 +248,7 @@ class TrainingLoop:
         self._setup_environment()
 
         # 延迟初始化 (在 train() 中创建)
-        self.model: Optional[PCLocalDynamicMiniMind] = None
+        self.model: Optional['CyrenePC'] = None
         self.dopamine: Optional[DopamineSignal] = None
         self._orig_forward = None
         self.world_model: Optional[LatentWorldModel] = None
@@ -337,14 +345,12 @@ class TrainingLoop:
         if self.cfg.progress_callback:
             self.cfg.progress_callback({'type': 'log', 'message': message})
 
-    def _build_model(self) -> PCLocalDynamicMiniMind:
-        lm_cfg = MiniMindConfig(
+    def _build_model(self) -> 'CyrenePC':
+        lm_cfg = CyreneConfig(
             hidden_size=self.cfg.hidden_size,
             num_hidden_layers=self.cfg.num_hidden_layers,
-            use_moe=self.cfg.use_moe,
-            vocab_size=self.cfg.vocab_size,
         )
-        model = PCLocalDynamicMiniMind(lm_cfg).half()
+        model = CyrenePC(lm_cfg).half()
 
         # ── Phase 1: 依赖阈值发放参数注入 ──
         model._act_ema_decay = self.cfg.act_ema_decay
@@ -478,10 +484,12 @@ class TrainingLoop:
         Returns:
             dict: 同 train_step 格式, 兼容后续持续学习管道
         """
-        from model.local_updates import (
-            compute_modulators, compute_precision_scales,
-            compute_all_hebbian_updates, apply_hebbian_updates,
-            compute_errors_by_layer, compute_lambda,
+        from model.pc.local_updates import (
+            apply_hebbian_updates,
+            compute_all_hebbian_updates,
+            compute_lambda,
+            compute_modulators,
+            compute_precision_scales,
         )
 
         # ── Phase 0: 数据准备 ──
@@ -551,6 +559,7 @@ class TrainingLoop:
             target_onehot = None
 
         # ── Phase 5: Hebbian 更新 (零 autograd) ──
+        hebb_diag = {}
         with torch.no_grad():
             oja_alpha = getattr(self.cfg, 'oja_alpha', 0.05)
             syn_norm = getattr(self.cfg, 'synaptic_normalize', True)
@@ -566,6 +575,13 @@ class TrainingLoop:
             apply_hebbian_updates(updates, self.model,
                                   synaptic_normalize=syn_norm,
                                   target_norm=syn_target)
+            # 提取 Hebbian 诊断 (供上层用 tqdm.write 输出)
+            hebb_diag = {
+                'avg_growth': updates.pop('_diag_avg_growth', None),
+                'n_inf': updates.pop('_diag_n_inf', None),
+                'n_params': updates.pop('_diag_n_params', None),
+                'oja_alpha': updates.pop('_diag_oja_alpha', None),
+            }
 
         # ── Phase 5.6: 神经发生 (Neurogenesis Controller) ──
         neuro_stats = {'n_pruned': 0, 'n_resurrected': 0, 'n_split': 0, 'active_ratio': 1.0}
@@ -724,6 +740,10 @@ class TrainingLoop:
             result['neuro_n_resurrected'] = neuro_stats.get('n_resurrected', 0)
             result['neuro_n_split'] = neuro_stats.get('n_split', 0)
             result['neuro_active_ratio'] = neuro_stats.get('active_ratio', 1.0)
+
+        # Hebbian 诊断 (由 compute_all_hebbian_updates 收集)
+        if hebb_diag.get('avg_growth') is not None:
+            result['hebb_diag'] = hebb_diag
 
         # ── Phase 3c: 海马体缓冲写入 ──
         info_gain = self._icm_output.get('information_gain', 0.0) if self._icm_output else 0.0
@@ -912,7 +932,7 @@ class TrainingLoop:
             rp_byte, rp_label = replay_data
             self._hebbian_update_on_data(rp_byte, rp_label)
 
-        self._log(f'[Sniffer] Hebbian repair complete')
+        self._log('[Sniffer] Hebbian repair complete')
 
     def _maybe_sniff_abstraction(self):
         drifted = self.abstraction_sniffer.check(self.global_step, self.device, pos_emb=(None, None))
@@ -941,7 +961,7 @@ class TrainingLoop:
             z_batch, _seqlen = replay_data
             self._hebbian_update_on_data(z_init=z_batch)
 
-        self._log(f'[AbstractionSniffer] Hebbian repair complete')
+        self._log('[AbstractionSniffer] Hebbian repair complete')
 
     # ── 任务完成处理 ──
 
@@ -1160,7 +1180,7 @@ class TrainingLoop:
             'epoch': epoch,
             'step': self.global_step,
             'model_state': self.model.state_dict(),
-            'lm_config': MiniMindConfig(
+            'lm_config': CyreneConfig(
                 hidden_size=self.cfg.hidden_size,
                 num_hidden_layers=self.cfg.num_hidden_layers,
                 use_moe=self.cfg.use_moe,
@@ -1212,8 +1232,7 @@ class TrainingLoop:
     # ── 主训练循环 ──
 
     def train(self, task_pipelines: list[tuple[str, torch.utils.data.Dataset, Optional[DataLoader]]]):
-        """
-        主训练入口。
+        """主训练入口。
 
         Args:
             task_pipelines: [(task_id, dataset, loader_override?), ...]
@@ -1278,7 +1297,7 @@ class TrainingLoop:
                 target_storage_ratio=self.cfg.gate_target_storage,
                 target_high_value_ratio=self.cfg.gate_target_high,
             )
-            self._log(f'Intrinsic motivation enabled (ICM + Concept + Gate)')
+            self._log('Intrinsic motivation enabled (ICM + Concept + Gate)')
 
         # ── 吸引子景观 + 持续巩固管道 (Phase A-C) ──
         if self.cfg.enable_consolidation_pipeline:
@@ -1298,7 +1317,7 @@ class TrainingLoop:
                 abstraction_batch_size=16,
                 num_sub_layers=12,
             )
-            self._log(f'Consolidation pipeline enabled')
+            self._log('Consolidation pipeline enabled')
 
         # ── 深度 SLEEP 引擎 (Phase F) ──
         if self.cfg.enable_deep_sleep:
@@ -1313,7 +1332,7 @@ class TrainingLoop:
                 hebbian_lambda_min=self.cfg.hebbian_lambda_min,
                 dopamine_gamma=self.cfg.dopamine_gamma,
             )
-            self._log(f'Deep sleep engine enabled')
+            self._log('Deep sleep engine enabled')
 
         # 从 checkpoint 恢复
         if self.cfg.checkpoint_path:
@@ -1374,7 +1393,8 @@ class TrainingLoop:
             for epoch in range(self.cfg.epochs):
                 pbar = tqdm(loader,
                             desc=f'Task {task_id} Epoch {epoch + 1}/{self.cfg.epochs}',
-                            unit='step', dynamic_ncols=True, ascii=True)
+                            unit='step', dynamic_ncols=True,
+                            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}')
 
                 for byte_seq, labels in pbar:
                     byte_seq = byte_seq.to(self.device, non_blocking=True)
@@ -1391,6 +1411,16 @@ class TrainingLoop:
 
                     # ── 步数递增 (修复: 原来缺失) ──
                     self.global_step += 1
+
+                    # ── Hebbian 诊断输出 (每 50 步, 不破坏进度条) ──
+                    hebb = m.get('hebb_diag')
+                    if hebb is not None and self.global_step % 50 == 0:
+                        pbar.write(
+                            f'  [Hebb] oja_α={hebb["oja_alpha"]:.4f} | '
+                            f'mean|ΔW|={hebb["avg_growth"]:.6f} | '
+                            f'updates={hebb["n_params"]}'
+                            + (f' | ⚠ {hebb["n_inf"]} inf跳过' if hebb['n_inf'] > 0 else '')
+                        )
 
                     # ── ICM / Concept / Gate 后处理 ──
                     if self.cfg.enable_intrinsic_motivation and self.icm is not None:
@@ -1489,12 +1519,10 @@ class TrainingLoop:
                             if force_result['triggered'] and self.global_step % 500 == 0:
                                 self._log(f'[Pipeline] force:{force_result["triggered"]}')
 
-                    # 进度条
+                    # 进度条 (精简 postfix: 只留核心指标)
                     postfix = {
                         'CE': f'{m["ce_val"]:.4f}',
                         'F': f'{m["F_final"]:.1f}',
-                        'TL': f'{m.get("temp_loss_val", 0.0):.4f}',
-                        'BPB': f'{m.get("bpb", 0.0):.2f}',
                         'D': f'{m["D"]:.3f}',
                         'W': f'{m.get("world_surprise", 0.0):.3f}',
                     }
@@ -1502,8 +1530,7 @@ class TrainingLoop:
                         postfix['IG'] = f'{self._icm_output.get("information_gain", 0.0):.4f}'
                         if self.concept_discovery:
                             postfix['C'] = f'{self.concept_discovery.n_concepts}'
-                    if self.global_step % 5 == 0 or self.global_step <= 3:
-                        pbar.set_postfix(**postfix)
+                    pbar.set_postfix(**postfix)
                     callback_dict = {
                         'type': 'progress', 'step': self.global_step,
                         'total_steps': self._total_steps,
@@ -1554,7 +1581,11 @@ class TrainingLoop:
                             log += (f' | WM: TE={(te[-1] if te else 0):.4f} '
                                     f'U={(sum(uq[-100:])/max(len(uq[-100:]),1)):.4f} '
                                     f'FP={(fp[-1] if fp else 0):.3f}')
-                        self._log(log)
+                        # CLI: 通过 tqdm.write 不破坏进度条; GUI: 走回调
+                        if self.cfg.progress_callback:
+                            self._log(log)
+                        else:
+                            pbar.write(log)
 
                     # 检查点 (save_interval=0 时不保存中间检查点)
                     if self.cfg.save_interval > 0 and (self.global_step % self.cfg.save_interval == 0 or self.global_step == 1):

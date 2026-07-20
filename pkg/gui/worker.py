@@ -1,5 +1,4 @@
-"""
-后台 Worker 线程 — 将 core.* 模块封装为 PyQt6 QThread.
+"""后台 Worker 线程 — 将 core.* 模块封装为 PyQt6 QThread.
 
 4 种 Worker 类型:
   - TrainingWorker:  训练 (ThreadedTrainer)
@@ -18,22 +17,22 @@
 
 from __future__ import annotations
 
-import os
-import json
-import time
 import glob
-import traceback
-from typing import Any
+import json
+import os
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from model.core.training import TrainingConfig
+from model.core.autonomous_mind import DEFAULT_CFG, AutonomousMind
+from model.core.evaluation import (
+    create_eval_loader,
+    load_with_remap,
+    run_full_evaluation,
+)
 from model.core.threaded_trainer import ThreadedTrainer
-from model.core.evaluation import run_full_evaluation, create_eval_loader, load_with_remap
-from model.core.autonomous_mind import AutonomousMind, DEFAULT_CFG
-from model.pc_layers import PCLocalDynamicMiniMind
-from model.model_minimind import MiniMindConfig
-
+from model.core.training import TrainingConfig
+from model.model_cyrene import CyreneConfig
+from model.pc.pc_layers import CyrenePC
 
 # ═══════════════════════════════════════════════════════════════════
 # 工具: 进度回调 → pyqtSignal 适配器
@@ -158,12 +157,11 @@ class EvalWorker(QThread):
             import torch
 
             self.log.emit(f"加载模型: {self._ckpt}")
-            lm_cfg = MiniMindConfig(
+            lm_cfg = CyreneConfig(
                 hidden_size=self._hidden_size,
                 num_hidden_layers=self._num_layers,
-                use_moe=False,
             )
-            model = PCLocalDynamicMiniMind(lm_cfg)
+            model = CyrenePC(lm_cfg)
             model = load_with_remap(model, self._ckpt)
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             model = model.to(device)
@@ -235,10 +233,9 @@ class AutonomousWorker(QThread):
             "T_infer": T_infer,
             "data_dir": data_dir,
         }
-        self._lm_cfg = MiniMindConfig(
+        self._lm_cfg = CyreneConfig(
             hidden_size=hidden_size,
             num_hidden_layers=num_layers,
-            use_moe=False,
         )
         self._mind: AutonomousMind | None = None
 

@@ -1,5 +1,4 @@
-"""
-多任务灾难性遗忘压力测试 — 无回放 vs MemoryBank+Sniffer 4×4 CE 矩阵.
+"""多任务灾难性遗忘压力测试 — 无回放 vs MemoryBank+Sniffer 4×4 CE 矩阵.
 
 用法:
   virtuoso test forgetting ...
@@ -8,34 +7,37 @@ Phase 1: 无回放 (A→B→C→D 灾难性遗忘基线)
 Phase 2: MemoryBank + Sniffer 保护 (A→B→C→D 持续学习)
 输出: 4×4 CE 矩阵 (行=训练完第 i 个任务, 列=在第 j 个任务上的 CE)
 """
-import os, sys, json, time, argparse
+import argparse
+import os
+import sys
+import time
 
 import torch
 from torch.utils.data import DataLoader
-from model.pc_layers import PCLocalDynamicMiniMind
-from model.model_minimind import MiniMindConfig
-from model.continual.memory_bank import MemoryBank
+
 from model.continual.forgetting_sniffer import ForgettingSniffer
-from model.core.trainer_utils import setup_seed
+from model.continual.memory_bank import MemoryBank
 from model.core.dataset import DualChannelDataset
 from model.core.globals import DEVICE_STR
-from model.local_updates import (
-    compute_modulators,
-    compute_hebbian_temporal,
-    compute_hebbian_topdown,
+from model.core.trainer_utils import setup_seed
+from model.model_cyrene import CyreneConfig
+from model.pc.local_updates import (
+    apply_hebbian_updates,
     compute_hebbian_conv,
     compute_hebbian_swiglu,
-    apply_hebbian_updates,
+    compute_hebbian_temporal,
+    compute_hebbian_topdown,
+    compute_modulators,
 )
-
+from model.pc.pc_layers import CyrenePC
 
 # ═══════════════════════════════════════════════════════════════════
 # 工具函数
 # ═══════════════════════════════════════════════════════════════════
 
 def make_model(device):
-    cfg = MiniMindConfig(hidden_size=256, num_hidden_layers=4, use_moe=False)
-    model = PCLocalDynamicMiniMind(cfg).to(device)
+    cfg = CyreneConfig(hidden_size=256, num_hidden_layers=4)
+    model = CyrenePC(cfg).to(device)
     return model
 
 def make_optimizer(model, lr):
@@ -122,8 +124,7 @@ def hebbian_step(model, bt, lt, device, base_lr, gamma_rpe, total_steps, cfg):
 
 def run_phase1(model, task_paths, epochs, max_seq_len, batch_size,
                max_samples, device, base_lr, cfg):
-    """
-    训练 A→B→...→N, 纯 Hebbian.
+    """训练 A→B→...→N, 纯 Hebbian.
     返回: matrix[n_tasks][n_tasks], matrix[i][j] = 训练完 i 后在任务 j 上的 CE.
     """
     n = len(task_paths)
@@ -165,8 +166,7 @@ def run_phase1(model, task_paths, epochs, max_seq_len, batch_size,
 
 def run_phase2(model, task_paths, epochs, max_seq_len, batch_size, max_samples, device,
                threshold, repair_steps, check_interval, bank_size, n_exemplars, replay_ratio, base_lr, cfg):
-    """
-    训练 A→B→...→N 带 MemoryBank+Sniffer 保护, 纯 Hebbian.
+    """训练 A→B→...→N 带 MemoryBank+Sniffer 保护, 纯 Hebbian.
     每学完一个任务, 收集 exemplars → bank.
     返回: matrix[n_tasks][n_tasks] (同上).
     """
@@ -274,7 +274,7 @@ def run_phase2(model, task_paths, epochs, max_seq_len, batch_size, max_samples, 
                                     break
                                 rb, rl = replay_data
                                 _hebbian_replay(rb, rl)
-                            print(f'    [Sniffer] Repair complete')
+                            print('    [Sniffer] Repair complete')
 
                     if gs % 200 == 0:
                         print(f'  [{name}] Step {gs}/{total_steps} CE={loss:.4f} bank={memory_bank.total}')
@@ -378,9 +378,9 @@ def print_conclusion(p1_matrix, p2_matrix, task_names):
         print('    ⚠️ 保护机制对新任务学习有轻微影响')
 
     if all_clear:
-        print(f'\n  🎉 总体结论: MemoryBank+Sniffer 成功防止了多任务顺序学习中的灾难性遗忘!')
+        print('\n  🎉 总体结论: MemoryBank+Sniffer 成功防止了多任务顺序学习中的灾难性遗忘!')
     else:
-        print(f'\n  ⚠️ 总体结论: 保护部分有效, 但部分任务仍有遗忘, 建议微调 --threshold/--repair-steps')
+        print('\n  ⚠️ 总体结论: 保护部分有效, 但部分任务仍有遗忘, 建议微调 --threshold/--repair-steps')
 
 
 # ═══════════════════════════════════════════════════════════════════

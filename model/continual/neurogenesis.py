@@ -1,5 +1,4 @@
-"""
-神经发生控制器 — 结构自组织 (Phase C).
+"""神经发生控制器 — 结构自组织 (Phase C).
 
 基于 SalienceGate 的活性追踪 + 剪枝 + 生长, 实现动态网络结构调整。
 所有操作不物理删除权重, 只通过 gate logits 控制通道活性。
@@ -14,10 +13,10 @@
   - 分裂时复制活跃通道权重乘以 0.5 + 噪声到 dormant 通道
   - 生长间隔 > 剪枝间隔, 防止振荡
 """
+from typing import List, Tuple
+
 import torch
-import torch.nn.functional as F
 from torch import nn
-from typing import List, Optional, Tuple
 
 
 class ActivationTracker:
@@ -146,7 +145,7 @@ class ChannelGrowth:
         """执行生长, 返回 (n_resurrected, n_split)。
 
         Args:
-            model: PCLocalDynamicMiniMind 实例
+            model: CyrenePC 实例
             gates: salience_gates ModuleList
             tracker: ActivationTracker
             ε_list: 每层预测误差列表 [ε₁, ε₂, ..., ε_L], 每个 [B,S,H]
@@ -298,7 +297,7 @@ class NeurogenesisController:
         """每一步调用的入口。
 
         Args:
-            model: PCLocalDynamicMiniMind 实例 (需有 salience_gates 属性)
+            model: CyrenePC 实例 (需有 salience_gates 属性)
             ε_list: 每层预测误差
             global_step: 当前训练步
 

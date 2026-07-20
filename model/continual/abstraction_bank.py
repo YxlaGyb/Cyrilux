@@ -1,5 +1,4 @@
-"""
-抽象记忆银行 — PC 表示空间中的原型压缩 + 表示级回放 + 吸引子检测.
+"""抽象记忆银行 — PC 表示空间中的原型压缩 + 表示级回放 + 吸引子检测.
 
 核心转变:
   MemoryBank 存"模型见过什么"(原始字节),
@@ -13,13 +12,11 @@
 """
 from __future__ import annotations
 
-import math
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 # 工具: 层重要性计算
 
@@ -37,7 +34,7 @@ def compute_layer_importance(
 
     Args:
         z_conv: PC 收敛后的全层表示 [13] × [1, seq, hidden]
-        model: PCLocalDynamicMiniMind
+        model: CyrenePC
         pos_emb: (None, None) — 局部 Conv 模型无位置编码
         dopamine_D: 当前多巴胺信号 D ∈ [0, 1]
         eta: 精度调制强度
@@ -95,8 +92,7 @@ def _kmeans_cosine(
     max_iter: int = 20,
     tol: float = 1e-4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Cosine-distance k-means 聚类.
+    """Cosine-distance k-means 聚类.
 
     Args:
         points: [N, d] float tensor

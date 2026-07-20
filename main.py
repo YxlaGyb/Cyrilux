@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-virtuosov2 v0.2.0 — 统一入口
+"""virtuosov2 v0.2.0 — 统一入口
 
 用法:
     uv run python main.py gui          # Tkinter 桌面训练 GUI
@@ -14,30 +13,30 @@ virtuosov2 v0.2.0 — 统一入口
     uv run python main.py auto --help
 """
 
-import os, sys, json, argparse
+import argparse
+import os
+import sys
 
 # ── 包导入 ────────────────────────────────────────────────────────
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT_DIR)  # 仅用于 main.py 自身能被执行
 
-from model.core.trainer_utils import setup_seed, Logger
-from model.core.training import TrainingLoop, TrainingConfig
-from model.core.threaded_trainer import ThreadedTrainer, run_training_standalone
+import torch
+
+from model.core.autonomous_mind import DEFAULT_CFG, AutonomousMind
+from model.core.data_converter import convert_file, scan_dataset_dir
+from model.core.data_splitter import split_directory, split_file
 from model.core.evaluation import (
-    compute_perplexity,
-    generate_text,
-    eval_self_supervised,
-    load_with_remap,
     create_eval_loader,
+    load_with_remap,
     run_full_evaluation,
 )
-from model.core.autonomous_mind import AutonomousMind, DEFAULT_CFG
-from model.core.data_splitter import split_file, split_directory
-from model.core.data_converter import scan_dataset_dir, convert_file
 from model.core.prepare_tasks import prepare_4tasks, prepare_hetero
-from model.pc_layers import PCLocalDynamicMiniMind, load_pc_checkpoint
-from model.model_minimind import MiniMindConfig
-
+from model.core.threaded_trainer import run_training_standalone
+from model.core.trainer_utils import Logger, setup_seed
+from model.core.training import TrainingConfig
+from model.model_cyrene import CyreneConfig
+from model.pc.pc_layers import CyrenePC
 
 # ═══════════════════════════════════════════════════════════════════
 # 子命令: 训练
@@ -178,12 +177,11 @@ def cmd_eval(args):
     setup_seed(42)
 
     # 加载模型
-    lm_cfg = MiniMindConfig(
+    lm_cfg = CyreneConfig(
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_layers,
-        use_moe=False,
     )
-    model = PCLocalDynamicMiniMind(lm_cfg)
+    model = CyrenePC(lm_cfg)
     model = load_with_remap(model, args.checkpoint)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -249,10 +247,9 @@ def cmd_auto(args):
         "T_infer": args.T_infer,
         "data_dir": args.data_dir,
     }
-    lm_cfg = MiniMindConfig(
+    lm_cfg = CyreneConfig(
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_layers,
-        use_moe=False,
     )
     mind = AutonomousMind(lm_config=lm_cfg, cfg=cfg)
     mind.run_forever()

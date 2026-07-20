@@ -285,10 +285,10 @@ def run_training_standalone(config: TrainingConfig, task_specs: list = None):
         task_specs: [(task_id, data_path_or_ds, max_samples?), ...]
     """
     import sys
-    mgr = ThreadedTrainer(config, progress_callback=lambda x: print(
-        f'[{x.get("type","?")}] {x.get("message","")}' 
+    mgr = ThreadedTrainer(config, progress_callback=lambda x: (
+        print(f'[{x.get("type","?")}] {x.get("message","")}')
         if x.get('type') in ('log', 'phase', 'checkpoint', 'done', 'error')
-        else f'[Step {x.get("step","?")}/{x.get("total_steps","?")}] CE={x.get("ce_loss",0):.4f} F={x.get("F",0):.1f} D={x.get("D",0):.3f}'
+        else None  # progress 类型由 tqdm 承担, 不 print
     ))
 
     if task_specs:

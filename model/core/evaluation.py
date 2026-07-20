@@ -1,5 +1,4 @@
-"""
-统一评估模块 — Perplexity + 自监督指标 + 文本生成。
+"""统一评估模块 — Perplexity + 自监督指标 + 文本生成。
 
 从 eval_pc_language.py 和 eval_all.py 合并。
 
@@ -10,15 +9,11 @@
         load_with_remap,
     )
 """
-import os, sys, math, json, warnings
-from typing import Optional, Tuple
+import math
 
 import torch
 from torch.utils.data import DataLoader
 
-from model.pc_layers import PCDynamicMiniMind, PCLocalDynamicMiniMind, load_pc_checkpoint
-from model.pc_backbone_local import PCLocalBackbone
-from model.model_minimind import MiniMindConfig
 from model.core.dataset import DualChannelDataset
 from model.core.trainer_utils import Logger
 
@@ -31,8 +26,7 @@ def _resolve_pos(pos_emb, seq_len, device):
 
 
 def load_with_remap(model, ckpt_path, device='cpu'):
-    """
-    加载检查点并处理 key 重映射。
+    """加载检查点并处理 key 重映射。
     旧版 checkpoint 使用 model.model.xxx 键名, 当前代码为 model.xxx。
     自动处理 byte_proj Conv1d 输入通道数变化 (1→2)。
     """
@@ -65,8 +59,7 @@ def load_with_remap(model, ckpt_path, device='cpu'):
 
 @torch.no_grad()
 def compute_perplexity(pc_model, loader, pos_emb, gamma=0.1, T=2, max_batches=20):
-    """
-    计算 Perplexity = exp(mean CE loss)。
+    """计算 Perplexity = exp(mean CE loss)。
 
     Args:
         pc_model: PC 模型
@@ -125,8 +118,7 @@ def compute_perplexity(pc_model, loader, pos_emb, gamma=0.1, T=2, max_batches=20
 @torch.no_grad()
 def generate_text(pc_model, prompt, max_new_tokens=50,
                   gamma=0.1, temperature=0.8, top_k=20):
-    """
-    字节级自回归文本生成。
+    """字节级自回归文本生成。
 
     使用模型内置的 generate_with_pc 方法 (纯前向, 无 PC 推理)。
 
@@ -156,8 +148,7 @@ def generate_text(pc_model, prompt, max_new_tokens=50,
 @torch.no_grad()
 def generate_text_manual(pc_model, prompt, pos_emb, max_new=50,
                          gamma=0.1, T=2, temp=0.8, top_k=20):
-    """
-    手动字节级自回归生成 (支持 PC 推理)。
+    """手动字节级自回归生成 (支持 PC 推理)。
 
     与 generate_text 不同, 此函数在每步生成时执行 PC 推理。
 
@@ -208,8 +199,7 @@ def generate_text_manual(pc_model, prompt, pos_emb, max_new=50,
 
 @torch.no_grad()
 def eval_self_supervised(pc_model, loader, pos_emb, gamma=0.1, T=2, max_batches=20):
-    """
-    自监督评估: 5 维度指标。
+    """自监督评估: 5 维度指标。
 
     返回:
         dict {
@@ -280,8 +270,7 @@ def eval_self_supervised(pc_model, loader, pos_emb, gamma=0.1, T=2, max_batches=
 
 @torch.no_grad()
 def eval_ppl(pc_model, loader, pos_emb, gamma=0.1, T=2, max_batches=20):
-    """
-    PPL 评估 (与 eval_all 兼容)。
+    """PPL 评估 (与 eval_all 兼容)。
 
     Returns:
         (ppl, avg_loss)
@@ -342,8 +331,7 @@ def run_full_evaluation(
     max_batches=20,
     prompts=None,
 ):
-    """
-    运行完整评估 (自监督 + PPL + 生成)。
+    """运行完整评估 (自监督 + PPL + 生成)。
 
     Args:
         models: dict {name: (model, pos_emb)}

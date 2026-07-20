@@ -1,13 +1,11 @@
-"""
-MiniMind PC 层扩展：每子层添加 predict()，管理所有 z 节点。
-Ponytail: 不修改 model_minimind.py，只做包装。
+"""Cyrene PC 层：每子层添加 predict()，管理所有 z 节点。
 
-将 L 个 MiniMindBlock 展开为 2L 个子层节点：
-  z_0 = embed(input_ids)          # 固定 (感觉输入)
-  z_1 = Attn₁(LN(z_0)) + z_0      # Block 1 Attention 输出
-  z_2 = FFN₁(LN(z_1)) + z_1       # Block 1 FFN 输出
+将 L 个 LocalConvBlock 展开为 2L 个子层节点：
+  z_0 = byte_proj(input)           # 固定 (感觉输入)
+  z_1 = Conv₁(LN(z_0)) + z_0       # Block 1 Conv 输出
+  z_2 = MLP₁(LN(z_1)) + z_1        # Block 1 MLP 输出
   …
-  z_{2L} = FFN_L(LN(...)) + ...   # Block L FFN 输出
+  z_{2L} = MLP_L(LN(...)) + ...    # Block L MLP 输出
 
 子层 ℓ 的预测: μ_ℓ = sublayer_ℓ(LN(z_{ℓ-1})) + z_{ℓ-1}
 误差: ε_ℓ = z_ℓ - μ_ℓ
@@ -15,11 +13,9 @@ Ponytail: 不修改 model_minimind.py，只做包装。
 import torch
 import torch.nn.functional as F
 from torch import nn
-from model.model_minimind import precompute_freqs_cis
-from model.pc_backbone import PCBackbone
-from model.pc_backbone_local import PCLocalBackbone
-from model.local_blocks import LateralInhibition, SalienceGate
 
+from model.pc.local_blocks import LateralInhibition, SalienceGate
+from model.pc.pc_backbone_local import CyreneBackbone
 
 # ── 自适应精度噪声 (生物神经元膜电位噪声) ──────────────
 
@@ -74,232 +70,28 @@ def _utf8_ce_weight(device='cpu'):
     return w
 
 
-class PCMiniMind(nn.Module):
-    """MiniMind + 预测编码包装。"""
-
-    def __init__(self, config):
-        super().__init__()
-        self.model = PCBackbone(config)
-        self.config = config
-        self.num_sub_layers = 2 * config.num_hidden_layers
-        self._init_rope()
-
-    def _init_rope(self):
-        freqs_cos, freqs_sin = precompute_freqs_cis(
-            dim=self.config.head_dim, end=self.config.max_position_embeddings,
-            rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling,
-        )
-        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
-        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
-
-    def get_position_embeddings(self, seq_len, device, start_pos=0):
-        return (
-            self.freqs_cos[start_pos:start_pos + seq_len].to(device),
-            self.freqs_sin[start_pos:start_pos + seq_len].to(device),
-        )
-
-    # ── 前向初始化 ─────────────────────────────────────────────
-
-    @torch.no_grad()
-    def init_z(self, input_ids):
-        """前向传播初始化所有 z 节点。"""
-        bsz, seq_len = input_ids.shape
-        pos = self.get_position_embeddings(seq_len, input_ids.device)
-        z = []
-
-        h = self.model.embed_tokens(input_ids)
-        z.append(h)  # z_0, 固定
-
-        for block in self.model.layers:
-            res = h
-            h = block.self_attn(block.input_layernorm(h), pos)[0]
-            h = h + res
-            z.append(h)
-
-            res = h
-            h = block.mlp(block.post_attention_layernorm(h))
-            h = h + res
-            z.append(h)
-
-        return z  # len = 2L + 1
-
-    # ── 单子层预测 ────────────────────────────────────────────
-
-    def predict(self, layer_idx, z_prev, pos_emb):
-        """计算 μ = sublayer_ℓ(z_prev) (不含残差)。
-
-        layer_idx ∈ [1..2L], 1=Attn₁, 2=FFN₁, 3=Attn₂, …
-        """
-        block_idx = (layer_idx - 1) // 2
-        is_attn = (layer_idx - 1) % 2 == 0
-        block = self.model.layers[block_idx]
-
-        if is_attn:
-            return block.self_attn(block.input_layernorm(z_prev), pos_emb)[0]
-        else:
-            return block.mlp(block.post_attention_layernorm(z_prev))
-
-    # ── 单步推理 ──────────────────────────────────────────────
-
-    def infer_step(self, z, pos_emb, gamma, labels=None):
-        """单步 PC 推理：自由能梯度下降更新 z 节点。
-
-        ∇F_zℓ = ε_ℓ - Jᵀ_{ℓ+1} ε_{ℓ+1}
-        ∇F_zL = ε_L + ∂CE/∂z_L  (顶层含输出误差)
-        z_ℓ ← z_ℓ - γ · ∇F_zℓ
-
-        返回 (new_z, errors_info)
-          errors_info: [(e_sq, e_norm), ...] ℓ=1..L
-        """
-        L = self.num_sub_layers
-        z_det = [zi.detach().requires_grad_(True) for zi in z]
-
-        # 计算所有 μ_ℓ (含残差)
-        μ_res = [None]
-        for ℓ in range(1, L + 1):
-            μ = self.predict(ℓ, z_det[ℓ - 1], pos_emb)
-            μ_res.append(μ + z_det[ℓ - 1])
-
-        # ── 顶层输出梯度 ∂CE/∂z_L ──
-        ce_grad = 0
-        if labels is not None:
-            h_top = self.model.norm(z_det[L])
-            logits = self.model.lm_head(h_top)
-            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
-            ce_loss = nn.functional.cross_entropy(
-                x.float().view(-1, x.size(-1)), y.view(-1), ignore_index=-100,
-            )
-            ce_grad, = torch.autograd.grad(ce_loss, z_det[L])
-
-        # ── 合并计算所有 Jᵀε (一次 backward 替代 7 次) ──
-        # Jᵀ_{ℓ+1}ε_{ℓ+1} = ε_{ℓ+1} · ∂μ_res[ℓ+1]/∂z_ℓ
-        jt_loss = 0.0
-        for ℓ in range(1, L):
-            ε_up = (z_det[ℓ + 1] - μ_res[ℓ + 1]).detach()
-            jt_loss = jt_loss + (ε_up * μ_res[ℓ + 1]).sum()
-        jt_grads = torch.autograd.grad(jt_loss, [z_det[ℓ] for ℓ in range(1, L)])
-        # jt_grads[ℓ-1] = Jᵀ_{ℓ+1}ε_{ℓ+1}
-
-        # ── 更新所有 z_ℓ ──
-        new_z = [z[0]]
-        errors_info = []
-
-        for ℓ in range(1, L + 1):
-            ε = z_det[ℓ] - μ_res[ℓ]
-            e_sq = (ε.detach() ** 2).mean().item()
-            e_norm = ε.detach().norm().item()
-            errors_info.append((e_sq, e_norm))
-
-            if ℓ < L:
-                grad_F = ε - jt_grads[ℓ - 1]
-            else:
-                grad_F = ε + ce_grad  # 顶层: 预测误差 + 输出误差
-
-            new_z.append(z[ℓ] - gamma * grad_F.detach())
-
-        return new_z, errors_info
-
-    # ── 权重更新 ──────────────────────────────────────────────
-
-    def compute_pc_loss(self, z, pos_emb, labels, input_ids=None):
-        """计算总 PC 能量 F (用于 backward)。
-
-        F = CE(model.forward(input_ids), labels) + Σ_{ℓ=1}^{L} ½·‖z_ℓ - μ_ℓ(z_{ℓ-1})‖²
-
-        CE 通过完整前向传播 (梯度流经所有层)，预测误差约束表示接近收敛的 z 值。
-        z 被 detach (固定为收敛值)，梯度只通过子层参数传播。
-        """
-        L = self.num_sub_layers
-        z_det = [zi.detach() for zi in z]
-
-        # 预测误差: 约束权重使子层预测接近收敛后的 z
-        pred_energy = 0.0
-        for ℓ in range(1, L + 1):
-            z_target = z_det[ℓ]
-            z_prev = z_det[ℓ - 1]
-            μ = self.predict(ℓ, z_prev, pos_emb)
-            μ_res = μ + z_prev
-            pred_energy = pred_energy + 0.5 * ((z_target - μ_res) ** 2).sum()
-
-        # 输出能量: CE 通过完整前向传播 (所有层都收 CE 梯度)
-        if input_ids is not None:
-            _, ce_loss = self.model(input_ids=input_ids, labels=labels)
-        else:
-            # fallback: 只用 z_L 算 CE (旧路径)
-            h = self.model.norm(z_det[L])
-            logits = self.model.lm_head(h)
-            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
-            ce_loss = nn.functional.cross_entropy(
-                x.float().view(-1, x.size(-1)), y.view(-1), ignore_index=-100,
-            )
-
-        total_energy = pred_energy + ce_loss
-        return total_energy
-
-    # ── 输出/验证 ─────────────────────────────────────────────
-
-    @torch.no_grad()
-    def compute_loss(self, z, labels):
-        """计算 CE loss (验证用)。"""
-        h = self.model.norm(z[self.num_sub_layers])
-        logits = self.model.lm_head(h)
-        x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
-        return nn.functional.cross_entropy(
-            x.float().view(-1, x.size(-1)), y.view(-1), ignore_index=-100,
-        ).item()
-
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PCDynamicMiniMind — 时空预测编码
+# BaseCyrenePC — 时空预测编码基类
 # 每层节点做三维局部预测: 自下而上 + 时序 + 自上而下
 # F = Σ ½·‖ε_ℓ(t)‖²  (纯预测误差, 无 CE, 无 token loss)
 # ═══════════════════════════════════════════════════════════════════════════
 
-class PCDynamicMiniMind(nn.Module):
-    """时空预测编码 MiniMind。
+class BaseCyrenePC(nn.Module):
+    """时空预测编码基类。
 
     核心转变: "预测下一个 token" → "预测下一个神经状态"
     每层 z_ℓ(t) 收三路预测后合并为 μ_total, 误差 ε = z - μ_total 驱动学习。
 
+    子类 (CyrenePC) 负责创建具体 backbone 并重写 init_z / predict / forward_with_ce / get_position_embeddings。
+    此类仅提供共享的时空推理框架方法。
+
     时间维度: z_by_layer[ℓ] = [bsz, seq_len, hidden_size], ℓ=0..L
-    - ℓ=0: embed (固定, 感觉输入)
+    - ℓ=0: 字节映射输出 (固定, 感觉输入)
     - ℓ=1..L: 子层输出 (变量, 推理时更新)
     """
 
-    def __init__(self, config):
-        super().__init__()
-        self.model = PCBackbone(config)
-        self.config = config
-        self.num_sub_layers = 2 * config.num_hidden_layers
-        self._init_rope()
-
-        # ── 时序预测: z_ℓ(t-1) → z_ℓ(t) ──
-        self.temporal_proj = nn.ModuleList([
-            nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-            for _ in range(self.num_sub_layers)
-        ])  # index ℓ-1 → sub-layer ℓ, ℓ=1..L
-
-        # ── 自上而下预测: z_{ℓ+1}(t-1) → z_ℓ(t) ──
-        self.topdown_proj = nn.ModuleList([
-            nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-            for _ in range(self.num_sub_layers - 1)
-        ])  # index ℓ-1 → sub-layer ℓ from ℓ+1, ℓ=1..L-1
-
-    def _init_rope(self):
-        freqs_cos, freqs_sin = precompute_freqs_cis(
-            dim=self.config.head_dim, end=self.config.max_position_embeddings,
-            rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling,
-        )
-        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
-        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
-
-    def get_position_embeddings(self, seq_len, device, start_pos=0):
-        return (
-            self.freqs_cos[start_pos:start_pos + seq_len].to(device),
-            self.freqs_sin[start_pos:start_pos + seq_len].to(device),
-        )
-
-    # ── 初始化 (复用 PCMiniMind.init_z) ───────────────────────
+    # __init__ 由子类负责 — CyrenePC 直接调用 nn.Module.__init__(self)
 
     @torch.no_grad()
     def init_z_seq(self, input_ids):
@@ -309,76 +101,8 @@ class PCDynamicMiniMind(nn.Module):
         """
         return self.init_z(input_ids)
 
-    def init_z(self, input_ids):
-        """前向传播初始化所有 z 节点。"""
-        bsz, seq_len = input_ids.shape
-        pos = self.get_position_embeddings(seq_len, input_ids.device)
-        z = []
-
-        h = self.model.embed_tokens(input_ids)
-        z.append(h)  # z_0, 固定
-
-        for block in self.model.layers:
-            res = h
-            h = block.self_attn(block.input_layernorm(h), pos)[0]
-            h = h + res
-            z.append(h)
-
-            res = h
-            h = block.mlp(block.post_attention_layernorm(h))
-            h = h + res
-            z.append(h)
-
-        return z  # len = 2L + 1
-
-    # ── 带梯度的前向 + CE (用于混合训练) ────────────────────
-
-    def forward_with_ce(self, input_ids, labels, pos_emb):
-        """梯度启用的前向: 返回 z_by_layer + CE loss.
-
-        Returns:
-            z_init: list[tensor, L+1], 每层表示 (有梯度)
-            ce_loss: scalar tensor, 交叉熵损失 (梯度流遍 backbone + lm_head)
-        """
-        z = []
-        h = self.model.embed_tokens(input_ids)
-        z.append(h)
-
-        for block in self.model.layers:
-            res = h
-            h = block.self_attn(block.input_layernorm(h), pos_emb)[0]
-            h = h + res
-            z.append(h)
-
-            res = h
-            h = block.mlp(block.post_attention_layernorm(h))
-            h = h + res
-            z.append(h)
-
-        # CE from top layer
-        h_top = self.model.norm(z[-1])
-        logits = self.model.lm_head(h_top)
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        ce_loss = nn.functional.cross_entropy(
-            shift_logits.float().view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
-        return z, ce_loss
-
-    # ── 单子层预测 (复用 PCMiniMind.predict) ──────────────────
-
-    def predict(self, layer_idx, z_prev, pos_emb):
-        """计算 μ_bu = sublayer_ℓ(z_prev) (不含残差)."""
-        block_idx = (layer_idx - 1) // 2
-        is_attn = (layer_idx - 1) % 2 == 0
-        block = self.model.layers[block_idx]
-
-        if is_attn:
-            return block.self_attn(block.input_layernorm(z_prev), pos_emb)[0]
-        else:
-            return block.mlp(block.post_attention_layernorm(z_prev))
+    # init_z, forward_with_ce, predict, get_position_embeddings
+    # 由子类 (CyrenePC) 实现
 
     # ── 批量化 temporal/topdown (Phase E) ────────────────────
 
@@ -902,20 +626,20 @@ class FP32SafeLinear(nn.Linear):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PCLocalDynamicMiniMind — 纯局部 Conv 版
+# CyrenePC — 纯局部 Conv 版
 # ═══════════════════════════════════════════════════════════════════
 
-class PCLocalDynamicMiniMind(PCDynamicMiniMind):
-    """纯局部 Conv 版 PCDynamicMiniMind — 去离散化字节输入.
+class CyrenePC(BaseCyrenePC):
+    """纯局部 Conv 版 CyrenePC — 字节连续波输入.
 
     用 Conv1D(k=13) 字节连续波输入 + 6 层 Dilated Conv1D(k=3, d=1,2,4,8,16,32) 替代全局 self-attention.
     无 RoPE, 无 tokenizer, 无 Embedding 表.
     """
 
     def __init__(self, config):
-        # 绕过 PCDynamicMiniMind.__init__ (它创建 PCBackbone + RoPE)
+        # 绕过 BaseCyrenePC.__init__ (由子类自己初始化)
         nn.Module.__init__(self)
-        self.model = PCLocalBackbone(config)
+        self.model = CyreneBackbone(config)
         self.config = config
         self.num_sub_layers = 2 * len(self.model.layers)  # 6 层 dilated conv → 12 子层
         self._graph_capture_mode = False
@@ -1124,7 +848,7 @@ class PCLocalDynamicMiniMind(PCDynamicMiniMind):
             return h32 if fp32_out else h32.half()
         else:
             return block.mlp(block.post_attention_layernorm(z_prev))
-    # ponytail: generate_with_pc 继承自 PCDynamicMiniMind
+    # generate_with_pc 继承自 BaseCyrenePC
 
     # ── Salience Gate 工具 ──────────────────────────────────────
 
@@ -1160,14 +884,11 @@ class PCLocalDynamicMiniMind(PCDynamicMiniMind):
 
 # ── Checkpoint 工具 ────────────────────────────────────────────────
 
-def load_pc_checkpoint(model, ckpt_path, device='cpu'):
-    """加载旧 checkpoint（含 model.model. 前缀）到 PCBackbone 模型。
-
-    旧 checkpoint 的 model_state 中 backbone 权重前缀为 model.model.xxx，
-    新 PCBackbone 使用 model.xxx。本函数自动做前缀映射。
+def load_cyrene_checkpoint(model, ckpt_path, device='cpu'):
+    """加载 checkpoint 到 CyrenePC 模型.
 
     Args:
-        model: PCMiniMind 或 PCDynamicMiniMind 实例
+        model: CyrenePC 或 BaseCyrenePC 实例
         ckpt_path: checkpoint 文件路径
         device: 加载设备
 
@@ -1179,16 +900,10 @@ def load_pc_checkpoint(model, ckpt_path, device='cpu'):
     model_state = ckpt.get('model_state', ckpt)
 
     sd = model.state_dict()
-    mapped = {}
-    for k in model_state:
-        # model.model.xxx → model.xxx
-        new_k = k.replace('model.model.', 'model.', 1) if k.startswith('model.model.') else k
-        mapped[new_k] = k
-
     loaded = 0
-    for new_k, old_k in mapped.items():
-        if new_k in sd and model_state[old_k].shape == sd[new_k].shape:
-            sd[new_k].copy_(model_state[old_k])
+    for k in model_state:
+        if k in sd and model_state[k].shape == sd[k].shape:
+            sd[k].copy_(model_state[k])
             loaded += 1
 
     return loaded, len(sd)

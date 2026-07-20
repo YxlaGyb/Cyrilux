@@ -1,5 +1,4 @@
-"""
-局部 Hebbian 学习引擎 — 大脑式自监督更新规则。
+"""局部 Hebbian 学习引擎 — 大脑式自监督更新规则。
 
 纯 PyTorch，零 autograd 依赖。所有更新直接通过 W.data.add_() 完成。
 核心公式:
@@ -14,10 +13,10 @@
 权重更新: ΔW_ℓ = η_eff · ε_ℓ · activity_pre^T  (Hebbian)
 """
 import math
-import torch
-import torch.nn.functional as F
 from typing import Optional
 
+import torch
+import torch.nn.functional as F
 
 # ═══════════════════════════════════════════════════════════════════
 #  Phase 4: 稀疏外积 — 仅计算活跃突触前通道的 ΔW
@@ -122,7 +121,7 @@ def compute_errors_by_layer(z_by_layer, model) -> tuple:
 
     Args:
         z_by_layer: list[tensor] — 收敛后的 z (含 z_0)
-        model: PCLocalDynamicMiniMind 实例
+        model: CyrenePC 实例
 
     Returns:
         ε_list: list[tensor, L] — 各层 ε_ℓ, [B, S, H], fp32
@@ -665,7 +664,7 @@ def compute_all_hebbian_updates(ε_list, z_init, byte_seq, model, cfg,
         ε_list: list[tensor, L] — 各层误差 (已由活性门控自然稀疏化)
         z_init: list[tensor, L+1] — 推理开始时的 z
         byte_seq: [B, 2, S] 字节输入
-        model: PCLocalDynamicMiniMind 实例
+        model: CyrenePC 实例
         cfg: TrainingConfig
         D: 多巴胺值
         ACh: 乙酰胆碱值
@@ -816,7 +815,7 @@ def compute_all_hebbian_updates(ε_list, z_init, byte_seq, model, cfg,
             updates[name] = _apply_synaptic_competition(
                 updates[name], k=competition_k, use_abs=use_abs)
 
-    # 8) 诊断日志: 权重变化幅度 & Oja 衰减统计
+    # 8) 诊断日志: 权重变化幅度 & Oja 衰减统计 (存入 dict, 供外部用 tqdm.write 输出)
     if verbose:
         total_growth = 0.0
         n_params = 0
@@ -830,11 +829,10 @@ def compute_all_hebbian_updates(ε_list, z_init, byte_seq, model, cfg,
             total_growth += dW_norm
             n_params += 1
         avg_growth = total_growth / max(n_params, 1)
-        if oja_alpha > 0:
-            print(f"[Hebb] oja_α={oja_alpha:.4f} | "
-                  f"mean|ΔW|={avg_growth:.6f} | "
-                  f"L={L} updates={n_params}"
-                  + (f" | ⚠ {n_inf} inf跳过" if n_inf > 0 else ""))
+        updates['_diag_avg_growth'] = avg_growth
+        updates['_diag_n_inf'] = n_inf
+        updates['_diag_n_params'] = n_params
+        updates['_diag_oja_alpha'] = float(oja_alpha)
 
     return updates
 
@@ -855,7 +853,7 @@ def apply_hebbian_updates(updates: dict, model, grad_clip: float = 1.0,
 
     Args:
         updates: dict[param_name → ΔW tensor]
-        model: PCLocalDynamicMiniMind 实例
+        model: CyrenePC 实例
         grad_clip: 梯度裁剪阈值 (基于 ΔW 范数)
         synaptic_normalize: 是否应用突触归一化 (per-neuron L2)
         target_norm: 目标 L2 范数 (0=auto: sqrt(fan_in))
@@ -924,11 +922,10 @@ class BCMState:
 
     def __init__(self, n_layers: int = 24, tau: float = 0.01,
                  theta_init: Optional[float] = None):
-        """
-        Args:
-            n_layers: 子层数 (默认 24, 对应 12 个 LocalConvBlock)
-            tau: 滑动阈值更新率 (0.01 ≈ 100 步时间常数; 0.005 用于慢速巩固)
-            theta_init: 初始阈值 (默认 1.0, 与 RMS 目标对齐)
+        """Args:
+        n_layers: 子层数 (默认 24, 对应 12 个 LocalConvBlock)
+        tau: 滑动阈值更新率 (0.01 ≈ 100 步时间常数; 0.005 用于慢速巩固)
+        theta_init: 初始阈值 (默认 1.0, 与 RMS 目标对齐)
         """
         self.tau = tau
         self.n_layers = n_layers

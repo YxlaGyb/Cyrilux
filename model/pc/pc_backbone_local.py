@@ -1,33 +1,24 @@
-"""
-纯局部 Conv 骨干网络 — 替代 PCBackbone (无 HuggingFace/Attention/RoPE)。
+"""纯局部 Conv 骨干网络 — 替代旧 Transformer 骨干 (无 HuggingFace/Attention/RoPE)。
 Ponytail: Conv1D(k=3, causal) + SwiGLU MLP, 零位置编码。
 """
 import torch
 import torch.nn.functional as F
 from torch import nn
-from model.model_minimind import MiniMindConfig, RMSNorm
-from model.local_blocks import LocalConvBlock
+
+from model.model_cyrene import CyreneConfig, RMSNorm
+from model.pc.local_blocks import LocalConvBlock
 
 
-class PCLocalBackbone(nn.Module):
-    """纯局部 Conv 骨干网络, 替代 PCBackbone.
+class CyreneBackbone(nn.Module):
+    """纯局部 Conv 骨干网络.
 
     内部结构:
-      embed_tokens → layers (LocalConvBlock × L) → norm (RMSNorm) → lm_head
+      byte_proj → layers (LocalConvBlock × L) → norm (RMSNorm) → lm_head
 
-    与 PCBackbone 接口兼容:
-      forward_with_hidden(input_ids, pos_emb=None, ...) → (logits, hidden_states[2L+1])
-      forward(input_ids, labels, ...) → (logits, loss)
-      generate(input_ids, ...) → generated_ids
-      get_position_embeddings(...) → (None, None)  # 无 RoPE
-
-    关键差异:
-      - 无 RoPE / freqs_cos / freqs_sin
-      - 无 self-attention
-      - pos_emb 参数保留但不使用 (接口兼容)
+    无 RoPE / self-attention / Embedding.
     """
 
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: CyreneConfig):
         super().__init__()
         self.config = config
 

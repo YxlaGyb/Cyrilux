@@ -21,7 +21,7 @@ from typing import List, Tuple, Optional, Dict
 import torch
 import torch.nn.functional as F
 
-from model.local_updates import (
+from model.pc.local_updates import (
     compute_all_hebbian_updates,
     apply_hebbian_updates,
     BCMState,

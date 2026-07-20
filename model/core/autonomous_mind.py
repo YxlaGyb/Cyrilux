@@ -1,5 +1,4 @@
-"""
-持续自主运行 — AutonomousMind
+"""持续自主运行 — AutonomousMind
 
 无限循环: WAKE → PLAY → SLEEP, 永不停止.
 
@@ -19,29 +18,30 @@ MetaController:
     mind = AutonomousMind(model, lm_config)
     mind.run_forever()
 """
-import os, json, math, time, random, threading, traceback
-from pathlib import Path
-from typing import Optional, Callable
+import json
+import os
+import threading
+import time
+import traceback
+from typing import Callable, Optional
 
 import torch
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
-
-from model.pc_layers import PCLocalDynamicMiniMind
-from model.model_minimind import MiniMindConfig
-from model.pc_core import DopamineSignal
-from model.core.trainer_utils import Logger, setup_seed
-from model.core.globals import DEVICE_STR
-from model.local_updates import (
-    compute_all_hebbian_updates, apply_hebbian_updates,
-    compute_errors_by_layer, compute_modulators,
-)
 
 # 内在动机模块
-from model.continual.intrinsic_curiosity import IntrinsicCuriosityModule
 from model.continual.concept_discovery import ConceptDiscovery
-from model.continual.memory_gating import MemoryGate
-
+from model.core.globals import DEVICE_STR
+from model.core.trainer_utils import Logger
+from model.model_cyrene import CyreneConfig
+from model.pc.local_updates import (
+    apply_hebbian_updates,
+    compute_hebbian_conv,
+    compute_hebbian_swiglu,
+    compute_hebbian_temporal,
+    compute_hebbian_topdown,
+    compute_modulators,
+)
+from model.pc.pc_core import DopamineSignal
+from model.pc.pc_layers import CyrenePC
 
 # ═══════════════════════════════════════════════════════════════════
 # 默认配置
@@ -96,8 +96,7 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ═══════════════════════════════════════════════════════════════════
 
 class CuriositySampler:
-    """
-    基于模型自身熵的好奇心驱动采样器.
+    """基于模型自身熵的好奇心驱动采样器.
 
     策略:
       - 从 replay buffer 采样 prompt 种子
@@ -105,7 +104,7 @@ class CuriositySampler:
       - 计算生成序列的 entropy (预测不确定性)
       - 高 entropy → 高好奇心 → 优先用于 PLAY 训练
     """
-    def __init__(self, model: PCLocalDynamicMiniMind, cfg: dict):
+    def __init__(self, model: 'CyrenePC', cfg: dict):
         self.model = model
         self.cfg = cfg
         self.device = next(model.parameters()).device
@@ -114,8 +113,7 @@ class CuriositySampler:
         self.max_new = cfg.get('gen_max_new', 64)
 
     def sample(self, prompt_bytes: torch.Tensor, n_generations: int = 4) -> list:
-        """
-        从 prompt 种子生成多样化的 continuation.
+        """从 prompt 种子生成多样化的 continuation.
 
         参数:
           prompt_bytes: [seq_len] uint8 tensor
@@ -182,8 +180,7 @@ class CuriositySampler:
         return unique / max(tokens.numel(), 1)
 
     def batch_generate(self, prompts: list, n_per_prompt: int = 2) -> list:
-        """
-        批量生成。
+        """批量生成。
 
         返回:
           [(generated_bytes, entropy, prompt_idx), ...]
@@ -202,8 +199,7 @@ class CuriositySampler:
 # ═══════════════════════════════════════════════════════════════════
 
 class ExperienceReplayBuffer:
-    """
-    FIFO 经验回放缓冲区.
+    """FIFO 经验回放缓冲区.
 
     每条经验 = (byte_seq, byte_label, dopamine_score)
     采样策略: dopamine_weighted → 高 D 的样本更可能被回放.
@@ -251,8 +247,7 @@ class ExperienceReplayBuffer:
 # ═══════════════════════════════════════════════════════════════════
 
 class MetaController:
-    """
-    调度 WAKE / PLAY / SLEEP 阶段, 检测高原, 动态调整参数.
+    """调度 WAKE / PLAY / SLEEP 阶段, 检测高原, 动态调整参数.
 
     阶段状态机:
       IDLE → WAKE (生成) → PLAY (训练) → (每 sleep_interval) → SLEEP (巩固) → IDLE
@@ -348,8 +343,7 @@ class MetaController:
 # ═══════════════════════════════════════════════════════════════════
 
 class DataRotator:
-    """
-    在 dataset/ 目录下轮换读取 jsonl 文件, 持续提供新鲜数据.
+    """在 dataset/ 目录下轮换读取 jsonl 文件, 持续提供新鲜数据.
     支持格式检测 (conversations → text 自动转换).
     """
     def __init__(self, data_dir: str, max_seq_len: int = 128, max_samples: int = 200):
@@ -449,18 +443,17 @@ class DataRotator:
 # ═══════════════════════════════════════════════════════════════════
 
 class AutonomousMind:
-    """
-    持续自主运行核心 — 永不停止的 WAKE → PLAY → SLEEP 循环.
+    """持续自主运行核心 — 永不停止的 WAKE → PLAY → SLEEP 循环.
 
     用法:
-        model = PCLocalDynamicMiniMind(lm_config)
+        model = CyrenePC(lm_config)
         mind = AutonomousMind(model, lm_config)
         mind.run_forever()   # 无限循环, 永不返回
     """
     def __init__(
         self,
-        model: PCLocalDynamicMiniMind = None,
-        lm_config: MiniMindConfig = None,
+        model: 'CyrenePC' = None,
+        lm_config: 'CyreneConfig' = None,
         cfg: dict = None,
         log_callback: Callable = None,
     ):
@@ -470,13 +463,13 @@ class AutonomousMind:
         self._stop_flag = threading.Event()
 
         # ── 创建 / 加载模型 ──
-        self.lm_config = lm_config or MiniMindConfig(
-            hidden_size=256, num_hidden_layers=4, use_moe=False,
+        self.lm_config = lm_config or CyreneConfig(
+            hidden_size=256, num_hidden_layers=4,
         )
         if model is not None:
             self.model = model.to(self.device)
         else:
-            self.model = PCLocalDynamicMiniMind(self.lm_config).to(self.device)
+            self.model = CyrenePC(self.lm_config).to(self.device)
             self._try_load_checkpoint()
 
         self.model.train()
@@ -501,7 +494,7 @@ class AutonomousMind:
         self.last_save_step = 0
         self._gen_prompts_cache = []
 
-        self._log(f'🧠 AutonomousMind 初始化完成')
+        self._log('🧠 AutonomousMind 初始化完成')
         self._log(f'   Device: {self.device}')
         self._log(f'   Params: {sum(p.numel() for p in self.model.parameters() if p.requires_grad) / 1e6:.2f}M')
         self._log(f'   Config: {json.dumps(self.cfg, indent=2)}')
@@ -558,8 +551,7 @@ class AutonomousMind:
     # ══════════════════════════════════════════════════════════════
 
     def run_forever(self):
-        """
-        无限循环: 永不返回.
+        """无限循环: 永不返回.
         所有异常都被捕获, 确保持续运行.
         """
         self._log('🚀 进入持续运行模式 — 永不停止')
@@ -821,7 +813,7 @@ class AutonomousMind:
             avg_loss = sum(replay_losses) / len(replay_losses)
             self._log(f'[SLEEP] 巩固完成: {len(replay_losses)} 步, avg_CE={avg_loss:.4f}')
 
-        self._log(f'[SLEEP] 轮换外部数据源')
+        self._log('[SLEEP] 轮换外部数据源')
         self.data_rotator = DataRotator(
             self.cfg['data_dir'],
             max_seq_len=self.cfg['max_seq_len'],
