@@ -26,6 +26,13 @@ from .sparse_projections import (
     SparseTopdown,
     SparseLMHead,
 )
+from .neuromodulation import (
+    compute_uncertainty,
+    compute_dopamine,
+    compute_ach,
+    combine_modulation,
+    compute_precision_scales,
+)
 
 __all__ = [
     # neuron_pool
@@ -56,4 +63,10 @@ __all__ = [
     "SparseTemporalSelf",
     "SparseTopdown",
     "SparseLMHead",
+    # neuromodulation
+    "compute_uncertainty",
+    "compute_dopamine",
+    "compute_ach",
+    "combine_modulation",
+    "compute_precision_scales",
 ]

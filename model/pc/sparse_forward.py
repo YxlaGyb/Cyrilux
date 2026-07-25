@@ -181,7 +181,8 @@ def hebbian_step(pool: NeuronPool, neuron_id: int,
         raise KeyError(f"neuron_id {neuron_id} 不存在")
 
     weight_delta = 0.0
-    η_eff = eta * dopamine
+    π = getattr(neuron, 'π', 1.0)
+    η_eff = eta * dopamine * π
 
     for syn_id in neuron.in_synapses:
         syn = pool.synapses.get(syn_id)

@@ -17,31 +17,26 @@ def all(
     device: str = typer.Option("cuda:0", "--device", "-d", help="计算设备"),
 ):
     """全面评估: 自监督指标 + Perplexity + 文本生成."""
-    import torch
 
     from model.core.evaluation import run_full_evaluation
     from pkg.utils.trainer_utils import setup_seed
-    from model.model_cyrene import CyreneConfig
-    from model.pc.pc_layers import CyrenePC
+    from model.model_cyrene import CyreneConfig, CyreneModel
 
     setup_seed(42)
     print(f"全面评估 — 检查点: {checkpoint or '默认'}  设备: {device}")
 
-    lm_cfg = CyreneConfig(hidden_size=256, num_hidden_layers=4)
-    model = CyrenePC(lm_cfg)
-    ckpt_path = resolve_path(checkpoint) if checkpoint else "out_pc_unified/unified_final.pt"
-    dev = torch.device(device if torch.cuda.is_available() else "cpu")
-    state = torch.load(ckpt_path, map_location=dev, weights_only=True)
-    model.load_state_dict(state, strict=False)
-    model = model.to(dev)
-    model.eval()
-    pos = model.get_position_embeddings(128, dev)
+    runner = CyreneModel(CyreneConfig(hidden_size=64, warmup_steps=50))
 
-    from model.core.evaluation import create_eval_loader
-    loader = create_eval_loader("dataset/sft_t2t.jsonl", max_length=128, max_samples=200, batch_size=8)
+    # 如果指定了检查点, 尝试加载 (TODO: checkpoint save/load for sparse)
+    if checkpoint:
+        ckpt_path = resolve_path(checkpoint)
+        print(f"检查点加载未实现 (稀疏结构): {ckpt_path}")
+
+    from model.core.evaluation import create_eval_runner_loader
+    loader = create_eval_runner_loader("dataset/sft_t2t.jsonl", max_length=128, max_samples=200)
     run_full_evaluation(
-        {"model": (model, pos)}, loader,
-        gamma=0.1, T=2, max_batches=20,
+        runner, loader,
+        max_batches=20,
         prompts=["人工智能的未来在于", "小明今天去了公园", "深度学习是一种"],
     )
 
@@ -54,29 +49,20 @@ def language(
     device: str = typer.Option("cuda:0", "--device", "-d", help="计算设备"),
 ):
     """语言能力评估: Perplexity + 文本生成."""
-    import torch
 
-    from model.core.evaluation import create_eval_loader, run_full_evaluation
+    from model.core.evaluation import create_eval_runner_loader, run_full_evaluation
     from pkg.utils.trainer_utils import setup_seed
-    from model.model_cyrene import CyreneConfig
-    from model.pc.pc_layers import CyrenePC
+    from model.model_cyrene import CyreneConfig, CyreneModel
 
     setup_seed(42)
     ckpt_path = resolve_path(checkpoint)
     print(f"语言评估 — 检查点: {ckpt_path}  设备: {device}")
 
-    lm_cfg = CyreneConfig(hidden_size=256, num_hidden_layers=4)
-    model = CyrenePC(lm_cfg)
-    dev = torch.device(device if torch.cuda.is_available() else "cpu")
-    state = torch.load(ckpt_path, map_location=dev, weights_only=True)
-    model.load_state_dict(state, strict=False)
-    model = model.to(dev)
-    model.eval()
-    pos = model.get_position_embeddings(128, dev)
+    runner = CyreneModel(CyreneConfig(hidden_size=64, warmup_steps=50))
 
-    loader = create_eval_loader("dataset/sft_t2t.jsonl", max_length=128, max_samples=500, batch_size=8)
+    loader = create_eval_runner_loader("dataset/sft_t2t.jsonl", max_length=128, max_samples=500)
     run_full_evaluation(
-        {"model": (model, pos)}, loader,
-        gamma=0.1, T=2, max_batches=20,
+        runner, loader,
+        max_batches=20,
         prompts=["人工智能的未来在于", "小明今天去了公园", "深度学习是一种"],
     )

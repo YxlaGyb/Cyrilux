@@ -111,6 +111,19 @@ class SparseTemporalSelf:
     def __contains__(self, neuron_id: int) -> bool:
         return neuron_id in self._weights
 
+    def state_dict(self) -> dict:
+        """返回可序列化的状态字典。"""
+        return {
+            "_weights": dict(self._weights),
+            "init_scale": self.init_scale,
+        }
+
+    def load_state_dict(self, sd: dict):
+        """从状态字典恢复。"""
+        self._weights.clear()
+        self._weights.update(sd["_weights"])
+        self.init_scale = sd.get("init_scale", self.init_scale)
+
     def get_stats(self) -> dict:
         ws = list(self._weights.values())
         return {
@@ -255,6 +268,24 @@ class SparseTopdown:
 
     def __len__(self) -> int:
         return len(self._weights)
+
+    def state_dict(self) -> dict:
+        """返回可序列化的状态字典 (tuple key → string key)。"""
+        return {
+            "_weights": {f"{k[0]},{k[1]}": v for k, v in self._weights.items()},
+            "connection_density": self.connection_density,
+            "init_scale": self.init_scale,
+        }
+
+    def load_state_dict(self, sd: dict):
+        """从状态字典恢复 (string key → tuple key)。"""
+        self._weights.clear()
+        for k_str, v in sd["_weights"].items():
+            parts = k_str.split(",")
+            key = (int(parts[0]), int(parts[1]))
+            self._weights[key] = v
+        self.connection_density = sd.get("connection_density", self.connection_density)
+        self.init_scale = sd.get("init_scale", self.init_scale)
 
     def get_stats(self) -> dict:
         ws = list(self._weights.values())
@@ -425,6 +456,24 @@ class SparseLMHead:
 
     def __len__(self) -> int:
         return len(self._weights)
+
+    def state_dict(self) -> dict:
+        """返回可序列化的状态字典 (tuple key → string key)。"""
+        return {
+            "_weights": {f"{k[0]},{k[1]}": v for k, v in self._weights.items()},
+            "connections_per_logit": self.connections_per_logit,
+            "init_scale": self.init_scale,
+        }
+
+    def load_state_dict(self, sd: dict):
+        """从状态字典恢复 (string key → tuple key)。"""
+        self._weights.clear()
+        for k_str, v in sd["_weights"].items():
+            parts = k_str.split(",")
+            key = (int(parts[0]), int(parts[1]))
+            self._weights[key] = v
+        self.connections_per_logit = sd.get("connections_per_logit", self.connections_per_logit)
+        self.init_scale = sd.get("init_scale", self.init_scale)
 
     def get_stats(self) -> dict:
         ws = list(self._weights.values())

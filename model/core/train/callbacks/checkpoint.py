@@ -8,7 +8,6 @@ import os
 import torch
 
 from model.core.train.callback_base import CallbackBase
-from model.model_cyrene import CyreneConfig
 
 
 class CheckpointCallback(CallbackBase):
@@ -51,13 +50,9 @@ class CheckpointCallback(CallbackBase):
     def on_fit_end(self, loop, task_pipelines):
         """全部任务结束时保存 unified_final.pt."""
         self.out_dir = os.path.join(os.getcwd(), loop.cfg.out_dir)
-        # 保存 unified_final.pt
-        loop.model.cpu()
         fp = os.path.join(self.out_dir, "unified_final.pt")
-        torch.save(loop.model.state_dict(), fp)
-        loop._log(
-            f"unified_final saved → {fp} ({os.path.getsize(fp) // 1024 // 1024}MB)"
-        )
+        loop.runner.save(fp)
+        loop._log(f"unified_final saved → {fp}")
 
     # ── 内部 ────────────────────────────────────────────────
 
@@ -71,12 +66,8 @@ class CheckpointCallback(CallbackBase):
         ckpt = {
             "epoch": epoch,
             "step": loop.global_step,
-            "model_state": loop.model.state_dict(),
-            "lm_config": CyreneConfig(
-                hidden_size=loop.cfg.hidden_size,
-                num_hidden_layers=loop.cfg.num_hidden_layers,
-                use_moe=loop.cfg.use_moe,
-            ),
+            "model_type": "CyreneModel",
+            "runner_state": loop.runner.get_state(),
             "config": loop.cfg.to_dict(),
         }
         if loop.cfg.enable_world_model and loop.world_model is not None:
@@ -85,8 +76,10 @@ class CheckpointCallback(CallbackBase):
             ckpt["icm_state"] = loop.icm.state_dict()
         if metrics:
             ckpt.update(metrics)
-        ckpt["memory_bank"] = loop.memory_bank.state_dict()
-        ckpt["abstraction_bank"] = loop.abstraction_bank.state_dict()
+        if loop.memory_bank is not None:
+            ckpt["memory_bank"] = loop.memory_bank.state_dict()
+        if loop.abstraction_bank is not None:
+            ckpt["abstraction_bank"] = loop.abstraction_bank.state_dict()
         if loop.sleep_engine is not None:
             ckpt["sleep_engine"] = loop.sleep_engine.state_dict()
         if task_id:

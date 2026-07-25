@@ -170,7 +170,7 @@ class ChannelGrowth:
         """执行生长, 返回 (n_resurrected, n_split)。
 
         Args:
-            model: CyrenePC 实例
+            model: StreamRunner 实例
             gates: salience_gates ModuleList
             tracker: ActivationTracker
             ε_list: 每层预测误差列表 [ε₁, ε₂, ..., ε_L], 每个 [B,S,H]
@@ -242,7 +242,6 @@ class ChannelGrowth:
         c_idx: int,
     ):
         """复活指定通道: 随机化其权重 + 打开 gate。"""
-        H = gates[g_idx].logits.size(0)
         block_idx = g_idx // 2
         is_conv = g_idx % 2 == 0
 
@@ -275,7 +274,6 @@ class ChannelGrowth:
         dst_c: int,
     ):
         """分裂: 复制源通道权重 * 0.5 + noise 到目标通道。"""
-        H = gates[g_idx].logits.size(0)
         block_idx = g_idx // 2
         is_conv = g_idx % 2 == 0
 
@@ -330,7 +328,7 @@ class NeurogenesisController:
         """每一步调用的入口。
 
         Args:
-            model: CyrenePC 实例 (需有 salience_gates 属性)
+            model: StreamRunner 实例 (需有 salience_gates 属性)
             ε_list: 每层预测误差
             global_step: 当前训练步
 

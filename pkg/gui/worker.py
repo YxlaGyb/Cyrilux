@@ -24,15 +24,9 @@ import os
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from model.core.autonomous_mind import DEFAULT_CFG, AutonomousMind
-from model.core.evaluation import (
-    create_eval_loader,
-    load_with_remap,
-    run_full_evaluation,
-)
 from pkg.utils.threaded_trainer import ThreadedTrainer
 from model.core.train import TrainingConfig
-from model.model_cyrene import CyreneConfig
-from model.pc.pc_layers import CyrenePC
+from model.model_cyrene import CyreneConfig, CyreneModel, create_cyrene
 
 # ═══════════════════════════════════════════════════════════════════
 # 工具: 进度回调 → pyqtSignal 适配器
@@ -150,38 +144,30 @@ class EvalWorker(QThread):
         self._max_batches = max_batches
         self._gamma = gamma
         self._T = T
-        self._prompts = prompts or ["人工智能的未来在于", "小明今天去了公园，他看到", "深度学习是一种"]
+        self._prompts = prompts or ["人工智能的未来在于", "小明今天去了公园"]
 
     def run(self) -> None:
         try:
-            import torch
 
-            self.log.emit(f"加载模型: {self._ckpt}")
-            lm_cfg = CyreneConfig(
-                hidden_size=self._hidden_size,
-                num_hidden_layers=self._num_layers,
-            )
-            model = CyrenePC(lm_cfg)
-            model = load_with_remap(model, self._ckpt)
-            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-            model = model.to(device)
-            model.eval()
+            self.log.emit(f"CyreneModel: h_size={self._hidden_size}, layers={self._num_layers}")
+            cfg = CyreneConfig(hidden_size=self._hidden_size, warmup_steps=50)
+            model = CyreneModel(cfg)
+            if self._num_layers > 0:
+                model.add_hidden_layer(n_neurons=self._hidden_size * 2)
+            model.warmup(10)
 
             self.log.emit(f"加载数据: {self._data}")
-            loader = create_eval_loader(
+            from model.core.evaluation import create_eval_runner_loader
+            loader = create_eval_runner_loader(
                 self._data,
                 max_length=self._max_seq_len,
                 max_samples=self._max_samples,
-                batch_size=self._batch_size,
+                batch_size=1,
             )
-            pos = model.get_position_embeddings(self._max_seq_len, device)
 
-            models_dict = {"model": (model, pos)}
+            from model.core.evaluation import run_full_evaluation
             results = run_full_evaluation(
-                models_dict,
-                loader,
-                gamma=self._gamma,
-                T=self._T,
+                model, loader,
                 max_batches=self._max_batches,
                 prompts=self._prompts,
             )
@@ -233,16 +219,17 @@ class AutonomousWorker(QThread):
             "T_infer": T_infer,
             "data_dir": data_dir,
         }
-        self._lm_cfg = CyreneConfig(
-            hidden_size=hidden_size,
-            num_hidden_layers=num_layers,
-        )
+        self._model_cfg = CyreneConfig(hidden_size=hidden_size, num_hidden_layers=num_layers)
         self._mind: AutonomousMind | None = None
 
     def run(self) -> None:
         try:
+            self.log.emit("创建 CyreneModel...")
+            model = create_cyrene(self._model_cfg)
+            model.warmup(20)
+
             self.log.emit("启动持续自主运行...")
-            self._mind = AutonomousMind(lm_config=self._lm_cfg, cfg=self._cfg)
+            self._mind = AutonomousMind(runner=model, cfg=self._cfg)
 
             # 每步检查中断
             original_step = self._mind._step

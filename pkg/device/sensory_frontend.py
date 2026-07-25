@@ -17,11 +17,36 @@ import torch.nn.functional as F
 from torch import nn
 
 
+class DopamineGateRMSNorm(nn.Module):
+    """多巴胺门控 RMSNorm — 用调制信号动态缩放增益.
+
+    移植自旧世界 local_blocks.DopamineGateRMSNorm.
+    D 为组合调制信号 (0.5·D + 0.5·ACh), ∈ (0,1).
+    高 D → gain 增大 (增强该层响应), 低 D → gain 减小 (抑制).
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-5, dopamine_eta: float = 0.3):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+        self.dopamine_eta = dopamine_eta
+
+    def forward(self, x: torch.Tensor, dopamine_D: float | None = None) -> torch.Tensor:
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x_norm = x * torch.rsqrt(variance + self.eps)
+        if dopamine_D is not None:
+            gain = self.weight * (1 + self.dopamine_eta * (2 * dopamine_D - 1))
+        else:
+            gain = self.weight
+        return gain * x_norm
+
+
 class SensoryConvBlock(nn.Module):
-    """单层感官卷积 block — 仅含因果 dilated conv + salience gate + 残差。
+    """单层感官卷积 block — 因果 dilated conv + salience gate + 残差.
 
     MLP 和 post_attention_layernorm 已被移除 ——
-    SwiGLU MLP 的密集计算由 CPU NeuronPool 的稀疏连接取代。
+    SwiGLU MLP 的密集计算由 CPU NeuronPool 的稀疏连接取代.
+    使用 DopamineGateRMSNorm 替代 LayerNorm (fp16 安全).
 
     Args:
         channels: 特征通道数 (H_front, 默认 64)
@@ -35,25 +60,26 @@ class SensoryConvBlock(nn.Module):
         self.dilation = dilation
         self.block_id = block_id
 
-        # LN → causal dilated conv1d(k=3) → salience gate → residual
-        self.norm = nn.LayerNorm(channels, eps=1e-5)  # 可重参数化为 RMSNorm
+        # RMSNorm (fp16 安全) → causal dilated conv1d(k=3) → salience gate → residual
+        self.norm = DopamineGateRMSNorm(channels, eps=1e-5)
         self.conv = nn.Conv1d(
             channels, channels, kernel_size=3, bias=False, dilation=dilation, padding=0
         )
         self.gate = nn.Parameter(torch.full([channels], 5.0))  # σ(5)≈0.993 (全开)
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """前向: [1, C, S] → [1, C, S] (因果, 不改变序列长度)。
+    def forward(self, h: torch.Tensor, dopamine_D: float | None = None) -> torch.Tensor:
+        """前向: [1, C, S] → [1, C, S] (因果, 不改变序列长度).
 
         Args:
             h: [1, channels, S] 输入特征, C=H_front, S=序列位置数
+            dopamine_D: 可选的多巴胺调制值, 传入 norm 动态缩放 gain
 
         Returns:
             h_out: [1, channels, S]
         """
-        # Norm
+        # Norm (DopamineGateRMSNorm, fp16 安全)
         h_t = h.transpose(1, 2)  # [1, S, C]
-        h_norm = self.norm(h_t)  # LayerNorm on last dim
+        h_norm = self.norm(h_t, dopamine_D)  # RMSNorm on last dim
         h_norm = h_norm.transpose(1, 2)  # [1, C, S]
 
         # Causal dilated conv1d (k=3, d=dilation)
@@ -95,8 +121,10 @@ class SensoryFrontend(nn.Module):
             [SensoryConvBlock(h_front, d, bid) for bid, d in enumerate(dilations)]
         )
 
-        # 本项目只使用 fp16
-        self = self.half()
+        # 本项目只使用 fp16 — .half() 原地转换参数
+        self.byte_proj.half()
+        for block in self.blocks:
+            block.half()
 
     def forward(self, byte_seq: torch.Tensor) -> list[torch.Tensor]:
         """前向: 字节序列 → 7 个 h_conv 张量。
@@ -115,7 +143,7 @@ class SensoryFrontend(nn.Module):
 
         h_list = [h]
         for block in self.blocks:
-            h = block(h)
+            h = block(h, dopamine_D=None)  # 前端推理阶段不使用多巴胺调制
             h_list.append(h)
 
         return h_list
