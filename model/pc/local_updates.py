@@ -442,7 +442,7 @@ def compute_hebbian_conv(ε_ℓ, z_prev, conv_weight, dilation, modulation,
                 post_k = torch.bmm(
                     W_k.unsqueeze(0).expand(B, -1, -1), z_shifted
                 ).permute(0, 2, 1)
-                ps = post_k.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)
+                ps = torch.amax(post_k.abs(), dim=(0, 1), keepdim=True).clamp(min=1e-4)
                 pk_msq = ((post_k / ps) ** 2).mean(dim=(0, 1))
                 temp_pk = (oja_f * pk_msq) * ps.squeeze()
                 oja_term = temp_pk.unsqueeze(-1) * (ps.squeeze().unsqueeze(-1) * conv_weight[:, :, k])
@@ -706,7 +706,7 @@ def _hebbian_swiglu_unfused(ε_ℓ, z_conv, mlp, modulation, base_lr,
             (dW_up,   pre_up,   W_up),
             (dW_down, hidden,   W_down),
         ]:
-            act_scale = post_act.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)
+            act_scale = torch.amax(post_act.abs(), dim=(0, 1), keepdim=True).clamp(min=1e-4)
             mean_sq_scaled = ((post_act / act_scale) ** 2).mean(dim=(0, 1))
             temp = (oja_f * mean_sq_scaled) * act_scale.squeeze()
             if W_curr.shape[0] == temp.shape[0]:
@@ -862,7 +862,7 @@ def compute_hebbian_swiglu(ε_ℓ, z_conv, mlp, modulation, base_lr,
                 (dW_up,   pre_up,   W_up),
                 (dW_down, hidden,   W_down),
             ]:
-                act_scale = post_act.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)
+                act_scale = torch.amax(post_act.abs(), dim=(0, 1), keepdim=True).clamp(min=1e-4)
                 mean_sq_scaled = ((post_act / act_scale) ** 2).mean(dim=(0, 1))
                 temp = (oja_f * mean_sq_scaled) * act_scale.squeeze()
                 if W_curr.shape[0] == temp.shape[0]:
@@ -942,7 +942,7 @@ def compute_hebbian_decoder(z_L, target_byte_embed, decoder_weight,
     if oja_alpha > 0:
         oja_f = oja_eta * oja_alpha
         post = pred_softmax                         # [B, S', 256], 突触后 = decoder 输出 (softmax)
-        ps = post.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)  # [1, 1, 256]
+        ps = torch.amax(post.abs(), dim=(0, 1), keepdim=True).clamp(min=1e-4)  # [1, 1, 256]
         post_msq = ((post / ps) ** 2).mean(dim=(0, 1))                    # [256]
         temp = (oja_f * post_msq) * ps.squeeze()                          # [256]
         W_curr = decoder_weight             # [256, H]
@@ -1025,7 +1025,7 @@ def _compute_hebbian_decoder_pair(z_L, target_byte_embed,
                 p_msq = ((post / ps) ** 2).mean(dim=0)
                 temp = (oja_f * p_msq) * ps.squeeze(0)
             else:
-                ps = post.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)
+                ps = torch.amax(post.abs(), dim=(0, 1), keepdim=True).clamp(min=1e-4)
                 p_msq = ((post / ps) ** 2).mean(dim=(0, 1))
                 temp = (oja_f * p_msq) * ps.squeeze()
             dW -= temp.unsqueeze(-1) * (ps.squeeze().unsqueeze(-1) * W)
@@ -1092,7 +1092,7 @@ def compute_hebbian_byte_proj(ε_1, byte_seq, byte_proj_weight, conv1_weight,
             temp = (oja_f * z_msq) * ps.squeeze(0)
             oja_term = temp.unsqueeze(-1).unsqueeze(-1) * (ps.squeeze(0).unsqueeze(-1).unsqueeze(-1) * W_byte)
         else:
-            ps = z_0.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)  # [1, 1, H]
+            ps = torch.amax(z_0.abs(), dim=(0, 1), keepdim=True).clamp(min=1e-4)  # [1, 1, H]
             z_msq = ((z_0 / ps) ** 2).mean(dim=(0, 1))
             temp = (oja_f * z_msq) * ps.squeeze()
             oja_term = temp.unsqueeze(-1).unsqueeze(-1) * (ps.squeeze().unsqueeze(-1).unsqueeze(-1) * W_byte)
