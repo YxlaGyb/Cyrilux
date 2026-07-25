@@ -13,10 +13,10 @@
   - Level 3 → AbstractionBank.add_z_samples() 的 min_required_value
   - 自适应阈值: 每小时 (1000 步) 自动校准
 """
+
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 
 class MemoryGate:
@@ -66,15 +66,21 @@ class MemoryGate:
 
     # ── Level 2: 保留门控 ──
 
-    def compute_retention_decay(self, intrinsic_value: float, time_since_stored: int) -> float:
+    def compute_retention_decay(
+        self, intrinsic_value: float, time_since_stored: int
+    ) -> float:
         """保留衰减因子: 低价值 + 久远 = 更快遗忘。
 
         Returns:
             [0, 1] 衰减系数, 1.0 = 完全保留, 0.0 = 立即淘汰
         """
-        return math.exp(-self.decay_base * (1.0 / max(intrinsic_value, 0.01)) * time_since_stored)
+        return math.exp(
+            -self.decay_base * (1.0 / max(intrinsic_value, 0.01)) * time_since_stored
+        )
 
-    def compute_replay_priority(self, intrinsic_value: float, dopamine_score: float, age: int) -> float:
+    def compute_replay_priority(
+        self, intrinsic_value: float, dopamine_score: float, age: int
+    ) -> float:
         """综合回放优先级 = 内在价值 × 多巴胺 × 衰减。"""
         decay = self.compute_retention_decay(intrinsic_value, age)
         return decay * (intrinsic_value + 0.1) * (dopamine_score + 0.1)
@@ -116,7 +122,10 @@ class MemoryGate:
         # 调整 threshold_high 使高价值率接近 target
         if high_value_ratio > self.target_high_value_ratio * 1.5:
             self.threshold_high *= 1.1
-        elif high_value_ratio < self.target_high_value_ratio * 0.5 and self._n_high_value > 0:
+        elif (
+            high_value_ratio < self.target_high_value_ratio * 0.5
+            and self._n_high_value > 0
+        ):
             self.threshold_high *= 0.9
 
         # 重置统计
@@ -130,20 +139,22 @@ class MemoryGate:
 
     def get_stats(self) -> dict:
         return {
-            'threshold_low': self.threshold_low,
-            'threshold_high': self.threshold_high,
-            'storage_ratio': self._n_stored / max(self._n_total, 1) if self._n_total > 0 else 0.0,
-            'n_stored': self._n_stored,
-            'n_total': self._n_total,
-            'n_high_value': self._n_high_value,
+            "threshold_low": self.threshold_low,
+            "threshold_high": self.threshold_high,
+            "storage_ratio": self._n_stored / max(self._n_total, 1)
+            if self._n_total > 0
+            else 0.0,
+            "n_stored": self._n_stored,
+            "n_total": self._n_total,
+            "n_high_value": self._n_high_value,
         }
 
     def state_dict(self) -> dict:
         return {
-            'threshold_low': self.threshold_low,
-            'threshold_high': self.threshold_high,
+            "threshold_low": self.threshold_low,
+            "threshold_high": self.threshold_high,
         }
 
     def load_state_dict(self, state: dict):
-        self.threshold_low = state.get('threshold_low', self.threshold_low)
-        self.threshold_high = state.get('threshold_high', self.threshold_high)
+        self.threshold_low = state.get("threshold_low", self.threshold_low)
+        self.threshold_high = state.get("threshold_high", self.threshold_high)

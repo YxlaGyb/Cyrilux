@@ -1,4 +1,6 @@
-"""日志 Callback — tqdm 进度条、callback_dict 转发、Hebbian 诊断、100 步日志."""
+"""日志 Callback
+tqdm 进度条、callback_dict 转发、Hebbian 诊断、100 步日志.
+"""
 
 from model.core.train.callback_base import CallbackBase
 

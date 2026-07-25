@@ -1,5 +1,5 @@
 """
-virtuosov2 全局共享常量。
+Cyrilux 全局共享常量。
 
 集中管理跨模块重复出现的硬编码值:
   - DEVICE / DEVICE_STR   设备选择 (统一 cuda:0 / cpu)

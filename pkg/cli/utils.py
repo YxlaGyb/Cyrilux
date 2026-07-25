@@ -2,7 +2,13 @@
 CLI 共享工具: 路径处理 & 配置加载.
 """
 
-import os, json
+import os
+import json
+
+# 项目根目录 — 相对于 pkg/cli/utils.py 向上 3 层
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 
 
 def resolve_path(p: str) -> str:
@@ -14,15 +20,15 @@ def resolve_path(p: str) -> str:
 
 def load_config(path: str) -> dict:
     """加载 JSON 配置文件."""
-    with open(resolve_path(path), 'r', encoding='utf-8') as f:
+    with open(resolve_path(path), "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def save_config(config: dict, path: str):
     """保存 JSON 配置文件."""
     path = resolve_path(path)
-    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
     print(f"✓ 配置已保存: {path}")
 
@@ -39,6 +45,7 @@ def merge_config(config: dict, cli_overrides: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════════
 # Rich 训练进度面板
 # ═══════════════════════════════════════════════════════════════════
+
 
 class RichTrainingPanel:
     """4 区域 Rich Layout 实时训练监控面板."""
@@ -57,12 +64,8 @@ class RichTrainingPanel:
         self.layout["status"].update(
             Panel("[yellow]等待启动...[/]", title="[bold]Status")
         )
-        self.layout["progress"].update(
-            Panel("", title="[bold]Progress")
-        )
-        self.layout["log"].update(
-            Panel("", title="[bold]Log")
-        )
+        self.layout["progress"].update(Panel("", title="[bold]Progress"))
+        self.layout["log"].update(Panel("", title="[bold]Log"))
 
     def update(self, data: dict):
         """从 TrainManager 回调更新面板."""
@@ -111,9 +114,7 @@ class RichTrainingPanel:
             table.add_row("Learning Rate", f"[yellow]{lr:.2e}[/]")
 
             progress = Panel(
-                Text.from_markup(
-                    f"{bar} [bold]{pct_str}[/]\n"
-                ) + table,
+                Text.from_markup(f"{bar} [bold]{pct_str}[/]\n") + table,
                 title="[bold]Progress",
             )
 

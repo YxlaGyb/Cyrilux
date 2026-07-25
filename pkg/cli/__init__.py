@@ -1,10 +1,36 @@
-"""virtuosov2 CLI — Typer 入口, 所有逻辑委托至 model.core.*."""
+"""CLI — Typer 入口"""
 
-import pkg.cli.autonomous_cmd as autonomous_cmd
-import pkg.cli.config_cmd as config_cmd
-import pkg.cli.data_cmd as data_cmd
-import pkg.cli.eval_cmd as eval_cmd
-import pkg.cli.list_cmd as list_cmd
-import pkg.cli.prepare_cmd as prepare_cmd
-import pkg.cli.test_cmd as test_cmd
-import pkg.cli.train_cmd as train_cmd
+import typer
+
+from .commands import (
+    autonomous_cmd,
+    config_cmd,
+    data_cmd,
+    eval_cmd,
+    list_cmd,
+    prepare_cmd,
+    test_cmd,
+    train_cmd,
+)
+from .utils import PROJECT_ROOT
+
+app = typer.Typer(
+    name="cyrilux",
+    help="Cyrilux CLI — Predictive Coding 局部动态小语言模型",
+    no_args_is_help=True,
+)
+
+
+@app.callback()
+def _main(ctx: typer.Context):
+    ctx.obj = {"project_root": PROJECT_ROOT}
+
+
+app.add_typer(data_cmd.app, name="data", help="数据管理 (转换/分割/扫描)")
+app.add_typer(train_cmd.app, name="train", help="Phase 1: 模型训练")
+app.add_typer(eval_cmd.app, name="eval", help="模型评估")
+app.add_typer(test_cmd.app, name="test", help="遗忘压力测试")
+app.add_typer(prepare_cmd.app, name="prepare", help="数据准备")
+app.add_typer(config_cmd.app, name="config", help="配置文件管理")
+app.add_typer(list_cmd.app, name="list", help="信息查询")
+app.add_typer(autonomous_cmd.app, name="autonomous", help="Phase 2: 持续自主运行")

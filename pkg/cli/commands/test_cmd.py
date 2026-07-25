@@ -1,4 +1,4 @@
-"""virtuoso test — 测试子命令.
+"""test — 测试子命令.
 
 子命令:
   forgetting  多任务灾难性遗忘压力测试

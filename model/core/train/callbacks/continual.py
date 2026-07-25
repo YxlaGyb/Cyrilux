@@ -1,4 +1,7 @@
-"""持续学习 Callback — 记忆回放、遗忘嗅探、抽象漂移、任务终化、跨任务评估."""
+"""
+持续学习 Callback
+记忆回放、遗忘嗅探、抽象漂移、任务终化、跨任务评估.
+"""
 
 import json
 import math
@@ -102,9 +105,9 @@ class ContinualCallback(CallbackBase):
                 replay_byte_hc, replay_label_hc = hc_batch
                 replay_byte_hc = torch.stack(
                     [
-                        replay_byte_hc.float(),
+                        replay_byte_hc.half(),
                         torch.full_like(
-                            replay_byte_hc, 2.0, dtype=torch.float, device=loop.device
+                            replay_byte_hc, 2.0, dtype=torch.float16, device=loop.device
                         ),
                     ],
                     dim=1,

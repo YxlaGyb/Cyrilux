@@ -1,6 +1,8 @@
 """纯局部 Conv 骨干网络 — 替代旧 Transformer 骨干 (无 HuggingFace/Attention/RoPE)。
 Ponytail: Conv1D(k=3, causal) + SwiGLU MLP, 零位置编码。
 """
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -40,13 +42,15 @@ class CyreneBackbone(nn.Module):
         """接口兼容: 局部 Conv 不需要位置编码。"""
         return (None, None)
 
-    def forward_with_hidden(self, byte_seq, pos_emb=None, attention_mask=None):
+    def forward_with_hidden(self, byte_seq, pos_emb=None, attention_mask=None,
+                            dopamine_D: Optional[float] = None):
         """前向传播, 返回每子层 hidden states.
 
         Args:
             byte_seq: [bsz, seq_len] uint8
             pos_emb: 忽略 (接口兼容)
             attention_mask: 忽略 (接口兼容, 因果 conv 无 mask 需求)
+            dopamine_D: 标量 [0,1], 多巴胺信号调制 post-SwiGLU gain. None=无调制.
 
         Returns:
             logits: [bsz, seq_len, 256]
@@ -56,9 +60,9 @@ class CyreneBackbone(nn.Module):
               hidden_states[2] = MLP₁ output (pre-next-Conv)
               ...
         """
-        # 双通道: [bsz, 2, seq] → causal pad(12,0) → fp32 conv → [bsz, seq, hidden]
-        x = F.pad(byte_seq.float(), (12, 0))
-        h = F.conv1d(x, self.byte_proj.weight.float()).transpose(1, 2).half()
+        # 双通道: [bsz, 2, seq] → causal pad(12,0) → fp16 conv → [bsz, seq, hidden]
+        x = F.pad(byte_seq.half(), (12, 0))
+        h = F.conv1d(x, self.byte_proj.weight).transpose(1, 2)
         hidden_states = [h]
 
         for block in self.layers:
@@ -67,16 +71,16 @@ class CyreneBackbone(nn.Module):
             d = block.dilation
             h = F.pad(block.input_layernorm(h), (0, 0, 2 * d, 0))
             h32 = F.conv1d(
-                h.transpose(1, 2).float(),
-                block.local_conv.weight.float(),
+                h.transpose(1, 2),
+                block.local_conv.weight,
                 bias=None, stride=1, padding=0, dilation=d, groups=1,
-            ).transpose(1, 2).half()
+            ).transpose(1, 2)
             h = h32 + res
             hidden_states.append(h)
 
-            # MLP sub-layer
+            # MLP sub-layer (多巴胺门控 normalization)
             res = h
-            h = block.mlp(block.post_attention_layernorm(h))
+            h = block.mlp(block.post_attention_layernorm(h), dopamine_D=dopamine_D)
             h = h + res
             hidden_states.append(h)
 
@@ -86,9 +90,11 @@ class CyreneBackbone(nn.Module):
 
         return logits, hidden_states
 
-    def forward(self, byte_seq, labels=None, pos_emb=None, attention_mask=None):
+    def forward(self, byte_seq, labels=None, pos_emb=None, attention_mask=None,
+                dopamine_D: Optional[float] = None):
         """标准前向, 返回 (logits, loss). logits.size(-1)=256 字节级."""
-        logits, _ = self.forward_with_hidden(byte_seq, pos_emb, attention_mask)
+        logits, _ = self.forward_with_hidden(byte_seq, pos_emb, attention_mask,
+                                             dopamine_D=dopamine_D)
 
         loss = None
         if labels is not None:
@@ -118,8 +124,8 @@ class CyreneBackbone(nn.Module):
         device = byte_seq.device
         batch_size = byte_seq.shape[0]
 
-        # 单通道 [bsz, seq] uint8 → 双通道 [bsz, 2, seq] float (角色=assistant)
-        byte_float = byte_seq.float()
+        # 单通道 [bsz, seq] uint8 → 双通道 [bsz, 2, seq] float16 (角色=assistant)
+        byte_float = byte_seq.half()
         role_ch = torch.full_like(byte_float, 2.0)
         dual_input = torch.stack([byte_float, role_ch], dim=1)  # [bsz, 2, seq]
 
@@ -171,7 +177,7 @@ class CyreneBackbone(nn.Module):
                 )
 
             # 追加到双通道: byte + role(assistant)
-            new_byte = next_byte.float()
+            new_byte = next_byte.half()
             new_role = torch.full_like(new_byte, 2.0)
             new_dual = torch.stack([new_byte, new_role], dim=1)  # [bsz, 2, 1]
             dual_input = torch.cat([dual_input, new_dual], dim=-1)  # [bsz, 2, seq+1]

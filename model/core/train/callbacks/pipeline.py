@@ -1,4 +1,6 @@
-"""持续巩固管道 Callback — ConsolidationPipeline tick/force 调度."""
+"""持续巩固管道 Callback
+ConsolidationPipeline tick/force 调度.
+"""
 
 from model.core.train.callback_base import CallbackBase
 

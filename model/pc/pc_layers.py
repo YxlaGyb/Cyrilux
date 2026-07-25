@@ -10,12 +10,15 @@
 子层 ℓ 的预测: μ_ℓ = sublayer_ℓ(LN(z_{ℓ-1})) + z_{ℓ-1}
 误差: ε_ℓ = z_ℓ - μ_ℓ
 """
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from model.pc.local_blocks import LateralInhibition, SalienceGate
 from model.pc.pc_backbone_local import CyreneBackbone
+from model.model_cyrene import RMSNorm
 
 # ── 自适应精度噪声 (生物神经元膜电位噪声) ──────────────
 
@@ -55,7 +58,7 @@ class AdaptiveNeuralNoise(nn.Module):
         with torch.no_grad():
             act_mean = z.abs().mean(dim=(0, 1))  # [D], 当前批次的每维度均值
             self._running_mean.mul_(self.ema_decay).add_(act_mean * (1 - self.ema_decay))
-            noise_std = self.base_noise * alpha * (self._running_mean + 1e-8)
+            noise_std = self.base_noise * alpha * (self._running_mean + (1/256))
             noise_std = noise_std.clamp(max=0.5).to(z.dtype)
         noise = torch.randn_like(z) * noise_std.view(1, 1, self.hidden_dim)
         return z + noise
@@ -105,34 +108,33 @@ class BaseCyrenePC(nn.Module):
     # ── 批量化 temporal/topdown (Phase E) ────────────────────
 
     def _compute_batched_temporal_topdown(self, z_list, seq_len):
-        """批量化 temporal/topdown 预测 (fp32 安全). 使用缓存权重避免每步 torch.stack 分配。"""
+        """批量化 temporal/topdown 预测 (fp16). 使用缓存权重避免每步 torch.stack 分配。"""
         L = self.num_sub_layers
         if seq_len <= 1:
             return None, None
 
-        # 全部提升到 fp32 防 bmm 溢出
-        z_sub = torch.stack(z_list[1:], dim=0).float()  # [L, B, S, H]  — z 仍需 stack
+        z_sub = self.proj_input_norm(torch.stack(z_list[1:], dim=0))  # [L, B, S, H] — pre-norm
         B, H = z_sub.size(1), z_sub.size(3)
 
-        # 使用缓存的 stack 权重，避免每步 torch.stack([p.weight.float() ...])
+        # 使用缓存的 stack 权重，避免每步 torch.stack([p.weight ...])
         W_temp = getattr(self, '_cached_temporal_w', None)
         if W_temp is None:
-            W_temp = torch.stack([p.weight.float() for p in self.temporal_proj])  # [L, H, H]
+            W_temp = torch.stack([p.weight for p in self.temporal_proj])  # [L, H, H]
         z_flat = z_sub[:, :, :-1, :].reshape(L, -1, H)
-        μ_temp_flat = torch.bmm(z_flat, W_temp)  # [L, B*(S-1), H] fp32
-        μ_temp = μ_temp_flat.reshape(L, B, -1, H)  # fp32
-        pad = torch.zeros(L, B, 1, H, device=z_sub.device, dtype=torch.float32)
+        μ_temp_flat = torch.bmm(z_flat, W_temp)  # [L, B*(S-1), H] fp16
+        μ_temp = μ_temp_flat.reshape(L, B, -1, H)
+        pad = torch.zeros(L, B, 1, H, device=z_sub.device, dtype=torch.float16)
         μ_temp_all = torch.cat([pad, μ_temp], dim=2)
 
         if L > 1:
-            z_down = torch.stack(z_list[2:], dim=0).float()  # [L-1, B, S, H]
+            z_down = self.proj_input_norm(torch.stack(z_list[2:], dim=0))  # [L-1, B, S, H] — pre-norm
             W_down = getattr(self, '_cached_topdown_w', None)
             if W_down is None:
-                W_down = torch.stack([p.weight.float() for p in self.topdown_proj])
+                W_down = torch.stack([p.weight for p in self.topdown_proj])
             z_down_flat = z_down[:, :, :-1, :].reshape(L - 1, -1, H)
             μ_down_flat = torch.bmm(z_down_flat, W_down)
-            μ_down = μ_down_flat.reshape(L - 1, B, -1, H)  # fp32
-            pad_d = torch.zeros(L - 1, B, 1, H, device=z_sub.device, dtype=torch.float32)
+            μ_down = μ_down_flat.reshape(L - 1, B, -1, H)
+            pad_d = torch.zeros(L - 1, B, 1, H, device=z_sub.device, dtype=torch.float16)
             μ_down_all = torch.cat([pad_d, μ_down], dim=2)
         else:
             μ_down_all = None
@@ -187,15 +189,16 @@ class BaseCyrenePC(nn.Module):
 
         # ── Phase 1: 依赖阈值门控 ──
         # 静默通道不参与前向预测 → 自然稀疏 (替代 hardcoded top-k)
-        self._total_active_channels = 0
-        self._n_active_channels = 0
+        # 使用 local tensor 计数器 (CUDA Graph 安全: 无 .item())
+        _active_sum = torch.zeros(1, device=z_det[0].device)
+        _active_cnt = torch.zeros(1, device=z_det[0].device, dtype=torch.long)
         if hasattr(self, '_act_threshold') and self._act_threshold is not None:
             z_gated = [z_det[0]]  # z_0 (感觉输入) 无门控
             for ℓ in range(1, L + 1):
                 z_ℓ = z_det[ℓ]
-                act = z_ℓ.float().abs().mean(dim=(0, 1))  # [H] — 跨 B×S 的 per-channel 激活度
+                act = z_ℓ.abs().mean(dim=(0, 1))  # [H] — 跨 B×S 的 per-channel 激活度
                 th = self._act_threshold[ℓ - 1]
-                mask = (act > th).float().to(z_ℓ.dtype)
+                mask = (act > th).to(z_ℓ.dtype)
                 z_gated.append(z_ℓ * mask.view(1, 1, -1))
 
                 # EMA 跟踪激活分布
@@ -204,12 +207,12 @@ class BaseCyrenePC(nn.Module):
                 # 稳态可塑性: 活跃率偏离目标 → 调节阈值 (纯 tensor 操作, 无 .item())
                 active_ratio = mask.mean()
                 excess = active_ratio - self._act_target_ratio
-                factor = 1 + self._act_homeo_rate * torch.sign(excess) * (torch.abs(excess) > 0.05).float()
+                factor = 1 + self._act_homeo_rate * torch.sign(excess) * (torch.abs(excess) > 0.05)
                 th.mul_(factor.detach())
 
-                # 仅记录 scalar 用于日志 (冷路径), 不阻滞 GPU
-                self._total_active_channels += mask.sum().item()
-                self._n_active_channels += mask.numel()
+                # 纯 tensor 累积 (CUDA Graph 安全), 日志 scalars 在冷路径提取
+                _active_sum += mask.sum().detach()
+                _active_cnt += mask.numel()
         else:
             z_gated = z_det  # fallback: 无门控
 
@@ -221,16 +224,16 @@ class BaseCyrenePC(nn.Module):
             if skip_bottom_up and self._cached_mu_bu is not None:
                 # 使用 init_z 中缓存的 pre-gate 预测值, 跳过冗余 predict()
                 # 门控对 z_prev 的影响近似忽略 (T=1 时门控 ≈ 1.0)
-                μ_bu = self._cached_mu_bu[ℓ - 1].float()
+                μ_bu = self._cached_mu_bu[ℓ - 1]
             else:
-                μ_bu = self.predict(ℓ, z_prev_gated, pos_emb, fp32_out=True)
-            μ_bu_res = μ_bu + z_det[ℓ - 1].float()  # 残差用 RAW z (预测值用门控输入)
+                μ_bu = self.predict(ℓ, z_prev_gated, pos_emb)
+            μ_bu_res = μ_bu + z_det[ℓ - 1]  # 残差用 RAW z (预测值用门控输入)
 
-            μ_temp = μ_temp_all[ℓ - 1] if μ_temp_all is not None else torch.zeros_like(z_det[ℓ]).float()
-            μ_down = μ_down_all[ℓ - 1] if (μ_down_all is not None and ℓ < L) else torch.zeros_like(z_det[ℓ]).float()
+            μ_temp = μ_temp_all[ℓ - 1] if μ_temp_all is not None else torch.zeros_like(z_det[ℓ])
+            μ_down = μ_down_all[ℓ - 1] if (μ_down_all is not None and ℓ < L) else torch.zeros_like(z_det[ℓ])
 
             μ_total = μ_bu_res + μ_temp + μ_down
-            ε = z_det[ℓ].float() - μ_total
+            ε = z_det[ℓ] - μ_total
             # ── 归一化 ε: F_pred 也基于相对误差, 消除 z 绝对尺度影响 ──
             ε_abs_mean = ε.abs().mean(dim=-1, keepdim=True) + 1.0
             ε_norm = ε / ε_abs_mean
@@ -258,10 +261,10 @@ class BaseCyrenePC(nn.Module):
 
         # ── 位置级增益: 底层(ℓ=1)误差大的位置 → 放大更新 ──
         with torch.no_grad():
-            ε_bottom_det = errors_ε[0].detach().float()
+            ε_bottom_det = errors_ε[0].detach()
             per_pos_mag = ε_bottom_det.norm(dim=-1, keepdim=True)
-            per_pos_gain = 1.0 + 0.3 * per_pos_mag / (per_pos_mag.mean(dim=-1, keepdim=True) + 1e-8)
-            per_pos_gain = per_pos_gain.clamp(max=10.0)  # fp32
+            per_pos_gain = 1.0 + 0.3 * per_pos_mag / (per_pos_mag.mean(dim=-1, keepdim=True) + (1/256))
+            per_pos_gain = per_pos_gain.clamp(max=10.0)
 
         # 更新 z — 始终 detach 切断梯度流, 输出保持 fp16 (原生格式)
         new_z = [z_det[0]]
@@ -272,19 +275,17 @@ class BaseCyrenePC(nn.Module):
             ε_abs_mean = ε.abs().mean(dim=-1, keepdim=True) + 1.0
             ε_norm = ε / ε_abs_mean
             dz = gamma * ε_norm * per_pos_gain
-            # fp16 安全: 截断到 [-1e4, 1e4] 防止 .half() 溢出到 Inf
-            z_fp32 = (z_det[ℓ].float() - dz).detach()
-            z_clamped = z_fp32.clamp(-1e4, 1e4)
-            new_z.append(z_clamped.half())
-            if return_errors and not has_grad and not self._graph_capture_mode:
+            z_new = (z_det[ℓ] - dz).detach()
+            new_z.append(z_new)
+            if return_errors and not has_grad:
                 errors_info.append((
-                    (ε.detach().float() ** 2).mean(),  # e_sq tensor (Phase 7a: defer .item())
-                    ε.detach().float().norm(),          # e_norm tensor (Phase 7a: defer .item())
+                    (ε.detach() ** 2).mean(),  # e_sq tensor (Phase 7a: defer .item())
+                    ε.detach().norm(),          # e_norm tensor (Phase 7a: defer .item())
                 ))
 
         # ── Phase 3 接入: 能量代价惩罚活跃通道 ──
         if hasattr(self, '_act_threshold') and self._act_threshold is not None and self._act_energy_cost > 0:
-            active_ratio = (self._total_active_channels + 1e-8) / (self._n_active_channels + 1e-8)
+            active_ratio = (_active_sum + 1e-8) / (_active_cnt + 1e-8)
             energy_penalty = self._act_energy_cost * active_ratio
             F_val = F_val + energy_penalty
 
@@ -303,7 +304,7 @@ class BaseCyrenePC(nn.Module):
         """单步时空推理: 对所有层 ell=1..L 更新 z.
 
         推理始终在 no_grad 下运行 (手动 ∇F_z = ε).
-        F_pred 通过 compute_spatiotemporal_loss 在推理后单独计算。
+        F_pred 通过 compute_spatiotemporal_loss 在推理后单独计算.
         """
         return self._spatiotemporal_infer_step(
             z_by_layer, pos_emb, gamma, padding_mask,
@@ -314,6 +315,38 @@ class BaseCyrenePC(nn.Module):
             skip_bottom_up=skip_bottom_up,
         )
 
+    # ── T=1 融合: Hebbian 缓存接口 ──────────────────────────
+
+    def _hebbian_cache_enable(self, clear_first=True):
+        """在推理步前启用所有 MLP 的 capture_mode.
+
+        T=1 融合用: 让 predict() 内的 mlp.forward() 保存 gate/up 中间结果,
+        供计算 Hebbian 更新时跳过重建前向。
+        """
+        for block in self.model.layers:
+            mlp = block.mlp
+            if hasattr(mlp, 'capture_mode'):
+                if clear_first:
+                    mlp.clear_capture()
+                mlp.capture_mode = True
+
+    def _hebbian_cache_disable_and_collect(self):
+        """关闭 capture 并收集所有 MLP 缓存.
+
+        Returns:
+            dict: {block_idx: (captured_fused, captured_input)}
+        """
+        cache = {}
+        for block_idx, block in enumerate(self.model.layers):
+            mlp = block.mlp
+            if not getattr(mlp, 'capture_mode', False):
+                continue
+            mlp.capture_mode = False
+            if mlp.captured_fused is not None:
+                cache[block_idx] = (mlp.captured_fused, mlp.captured_input, mlp.captured_hidden)
+                mlp.clear_capture()
+        return cache
+
     def spatiotemporal_infer(self, z_by_layer, pos_emb, gamma=0.1, T=2, padding_mask=None,
                                return_errors=True, return_pred_loss=False,
                                precision_scales=None, ach_value=0.5,
@@ -321,132 +354,62 @@ class BaseCyrenePC(nn.Module):
                                adaptive_T=False, convergence_threshold=0.01,
                                patience=2, min_T=2,
                                skip_bottom_up=False):
-        """T 步时空推理循环, 返回收敛后的 z 和 F_pred.
+        """T=1 融合: 单步时空推理, 返回更新后的 z 和 F.
 
-        推理策略: 前 T-1 步纯 no_grad (快速), 最后一步启用 grad 累积 F_pred.
-        消除 compute_spatiotemporal_loss 的二次前向开销.
+        强制单步 (T 参数忽略). 使用 skip_bottom_up 从预缓存的 µ_bu 读取,
+        不调用 predict(), 避免 Conv1D 开销.
 
-        v3: 误差比率追踪 — error_ratio = F_t / F_{t-1}.
-        error_ratio > 1 (误差涨)→ γ↑ 加速更新;
-        error_ratio < 1 (误差跌)→ γ↓ 微调.
-        存储 self._last_error_ratio 供外部读取 (训练循环用).
-
-        v4 (自适应 T): 当 F_val 收敛 (|ΔF|/F < threshold 连续 patience 步)
-        且 t >= min_T 时提前终止推理循环, 减少 FP 开销。
-
-        Args:
-            ach_value: ACh 调制值 (∈ (0,1)), 影响 gamma_eff = gamma · (1 + 0.3·ACh)
-            return_ε: True 时额外返回 ε_by_layer (用于 bp_free Hebbian 更新)
-            adaptive_T: 启用自适应 T 终止
-            convergence_threshold: F_val 相对变化阈值 (默认 0.01 = 1%)
-            patience: 连续满足阈值步数 (默认 2)
-            min_T: 最小推理步数 (默认 2)
+        γ 受 ACh 调制: gamma_eff = gamma · (1 + 0.3·ACh).
+        ε 在推断步内计算并返回, 用于后续 Hebbian 更新.
 
         Returns:
-            z_by_layer: list[tensor] — 收敛后的 z (无 grad)
-            errors_hist: list of errors_info
-            F_hist: list of F_val scalars
-            F_pred: tensor or None — 有 grad_fn 的 F (仅 return_pred_loss=True)
+            z_by_layer: list[tensor] — 更新后的 z (无 grad)
+            errors_hist: list of errors_info — 单元素 list
+            F_hist: list of F_val scalars — 单元素 list
+            F_pred: tensor or None — None (仅最后一步且 return_pred_loss=True 时才有)
             如果 return_ε=True, 追加 ε_by_layer: list[tensor, L] — 各层误差
         """
         errors_hist = []
         F_hist = []
         F_pred = None
-        self._last_error_ratio = 1.0
-        _converged_count = 0
-        _T_actual = 0
 
-        # ── 预缓存 Conv1D fp32 权重，消除 predict() 中 24×/步的冗余 allocate ──
+        # ── 预缓存 Conv1D fp32 权重 (init_z 已建, 跳过) ──
         self._build_conv_fp32_cache()
-        for t in range(T):
-            _T_actual = t + 1
-            # ── 误差比率调制 γ: error_ratio>1→加速, <1→微调 ──
-            if t > 0 and len(F_hist) >= 2:
-                error_ratio = (F_hist[-1] + 1e-8) / (F_hist[-2] + 1e-8)
-                # fp16 稳定性: error_ratio 无限增长 → gamma_eff 爆炸 → z 更新 NaN
-                if getattr(self, '_graph_capture_mode', False):
-                    error_ratio = torch.clamp(error_ratio, max=10.0)
-                else:
-                    error_ratio = min(error_ratio, 10.0)
-                self._last_error_ratio = error_ratio
-                gamma_eff = gamma * (0.5 + error_ratio)
-                # gamma_eff 上限防 fp16 溢出
-                if getattr(self, '_graph_capture_mode', False):
-                    gamma_eff = torch.clamp(gamma_eff, max=10.0)
-                else:
-                    gamma_eff = min(gamma_eff, 10.0)
-            else:
-                gamma_eff = gamma
 
-            is_last = (t == T - 1)
-            # γ 受 ACh 调制: gamma_eff *= (1 + 0.3·ACh)
-            gamma_eff_ach = gamma_eff * (1.0 + 0.3 * ach_value)
+        # ── γ 调制: ACh, 无 error_ratio ──
+        gamma_eff = gamma * (1.0 + 0.3 * ach_value)
 
-            # 前 T-1 步 no_grad, 最后一步 grad (累积 F_pred)
-            # 最后一步 (或自适应 T 可能提前 break 的步骤) 才捕获 ε
-            need_ε_this_step = return_ε and (is_last or (adaptive_T and _T_actual >= min_T))
-
-            if is_last and return_pred_loss:
-                _skip = (t == 0 and skip_bottom_up)
-                step_kwargs = dict(
-                    z_by_layer=z_by_layer, pos_emb=pos_emb, gamma=gamma_eff_ach,
-                    padding_mask=padding_mask, precision_scales=precision_scales,
-                    skip_bottom_up=_skip,
+        # ── 单步 T=1: 始终 no_grad ──
+        with torch.no_grad():
+            step_kwargs = dict(
+                z_by_layer=z_by_layer, pos_emb=pos_emb, gamma=gamma_eff,
+                padding_mask=padding_mask, precision_scales=precision_scales,
+                skip_bottom_up=True,
+            )
+            if return_ε:
+                z_by_layer, errors, F_val, _, ε_list = self._spatiotemporal_infer_step(
+                    **step_kwargs, return_errors=return_errors,
+                    return_pred_loss=False, return_ε=True,
                 )
-                if need_ε_this_step:
-                    z_by_layer, errors, F_val, F_pred, ε_list = self.spatiotemporal_infer_step(
-                        **step_kwargs, return_errors=False, return_pred_loss=True, return_ε=True,
-                    )
-                else:
-                    z_by_layer, errors, F_val, F_pred = self.spatiotemporal_infer_step(
-                        **step_kwargs, return_errors=False, return_pred_loss=True,
-                    )
-                F_hist.append(F_val.item() if isinstance(F_val, torch.Tensor) else F_val)
             else:
-                with torch.no_grad():
-                    _skip = (t == 0 and skip_bottom_up)
-                    step_kwargs = dict(
-                        z_by_layer=z_by_layer, pos_emb=pos_emb, gamma=gamma_eff_ach,
-                        padding_mask=padding_mask, precision_scales=precision_scales,
-                        skip_bottom_up=_skip,
-                    )
-                    if need_ε_this_step:
-                        z_by_layer, errors, F_val, _, ε_list = self.spatiotemporal_infer_step(
-                            **step_kwargs, return_errors=return_errors, return_pred_loss=False, return_ε=True,
-                        )
-                    else:
-                        z_by_layer, errors, F_val, _ = self.spatiotemporal_infer_step(
-                            **step_kwargs, return_errors=return_errors, return_pred_loss=False,
-                        )
-                errors_hist.append([(e_sq.item(), e_norm.item()) for e_sq, e_norm in errors] if errors else [])
-                F_hist.append(F_val.item() if isinstance(F_val, torch.Tensor) else F_val)
+                z_by_layer, errors, F_val, _ = self._spatiotemporal_infer_step(
+                    **step_kwargs, return_errors=return_errors,
+                    return_pred_loss=False,
+                )
 
-            # ── 自适应 T: F 收敛时提前终止 ──
-            if adaptive_T and len(F_hist) >= 2 and _T_actual >= min_T:
-                F_prev = F_hist[-2]
-                F_curr = F_hist[-1]
-                if isinstance(F_prev, torch.Tensor):
-                    F_prev = F_prev.detach().item()
-                if isinstance(F_curr, torch.Tensor):
-                    F_curr = F_curr.detach().item()
-                rel_change = abs(F_curr - F_prev) / (abs(F_curr) + 1e-8)
-                if rel_change < convergence_threshold:
-                    _converged_count += 1
-                else:
-                    _converged_count = 0
-                if _converged_count >= patience:
-                    break  # 提前终止推理循环
+        F_val_scalar = F_val.item() if isinstance(F_val, torch.Tensor) else F_val
+        F_hist.append(F_val_scalar)
+        errors_hist.append(
+            [(e_sq.item(), e_norm.item()) for e_sq, e_norm in errors]
+            if errors else []
+        )
 
-        # ── 释放 μ_bu 缓存 (Phase 5) ──
-        if skip_bottom_up:
-            self._cached_mu_bu = None
+        # ── 清理 ──
+        self._cached_mu_bu = None
+        self._hebbian_cache = {}
 
-        # ── ε 已从最后一步推理中缓存, 直接返回 ──
+        # ── 释放 fp32 缓存 ──
         if return_ε:
-            if not locals().get('ε_list'):
-                # 安全兜底: 如果 ε 未被捕获 (极少情况), 用零误差
-                ε_list = [torch.zeros_like(z.detach()[:, :, :1]) for z in z_by_layer[1:]]
-            # ── 侧向抑制 ──
             if hasattr(self, 'lateral_inhibition'):
                 ε_list = self.lateral_inhibition(ε_list)
             self._clear_conv_fp32_cache()
@@ -489,7 +452,7 @@ class BaseCyrenePC(nn.Module):
 
             # 时序 (cat 而非 in-place)
             if seq_len > 1:
-                z_t_in = z_target[:, :-1, :]
+                z_t_in = self.proj_input_norm(z_target[:, :-1, :])
                 z_t_out = self.temporal_proj[ℓ - 1](z_t_in)
                 μ_temp = torch.cat([torch.zeros_like(z_target[:, :1, :]), z_t_out], dim=1)
             else:
@@ -497,7 +460,7 @@ class BaseCyrenePC(nn.Module):
 
             # 自上而下 (cat 而非 in-place)
             if ℓ < L and seq_len > 1:
-                z_d_in = z_det[ℓ + 1][:, :-1, :]
+                z_d_in = self.proj_input_norm(z_det[ℓ + 1][:, :-1, :])
                 z_d_out = self.topdown_proj[ℓ - 1](z_d_in)
                 μ_down = torch.cat([torch.zeros_like(z_target[:, :1, :]), z_d_out], dim=1)
             else:
@@ -508,9 +471,9 @@ class BaseCyrenePC(nn.Module):
 
             if padding_mask is not None:
                 mask = padding_mask.unsqueeze(-1).to(ε.dtype)
-                pred_loss = pred_loss + 0.5 * π * ((ε.float() * mask) ** 2).sum()
+                pred_loss = pred_loss + 0.5 * π * ((ε * mask) ** 2).sum()
             else:
-                pred_loss = pred_loss + 0.5 * π * (ε.float() ** 2).sum()
+                pred_loss = pred_loss + 0.5 * π * (ε ** 2).sum()
 
         return pred_loss
 
@@ -568,7 +531,7 @@ class BaseCyrenePC(nn.Module):
         """
         h_top = self.model.norm(z_by_layer[self.num_sub_layers])
         if hasattr(self, '_cached_lm_head_w') and self._cached_lm_head_w is not None:
-            logits = F.linear(h_top.float(), self._cached_lm_head_w)
+            logits = F.linear(h_top, self._cached_lm_head_w)
         else:
             # 模型参数为 fp16 时 (生产环境 .half()), lm_head(h_top) 天然匹配
             logits = self.model.lm_head(h_top)
@@ -577,10 +540,10 @@ class BaseCyrenePC(nn.Module):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous().long()
         return nn.functional.cross_entropy(
-            shift_logits.float().view(-1, shift_logits.size(-1)),
+            shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=-100,
-            weight=_utf8_ce_weight(shift_logits.device).to(torch.float32),
+            weight=_utf8_ce_weight(shift_logits.device).to(shift_logits.dtype),
         )
 
     # ── 生成 (统一方法, 子类通过继承共享) ──────────────────
@@ -617,10 +580,9 @@ class BaseCyrenePC(nn.Module):
 
 
 class FP32SafeLinear(nn.Linear):
-    """Linear 层包装: forward 时自动将权重提升到输入 dtype, 防 fp16 溢出."""
+    """Linear 层包装: 直接使用 fp16 权重, 无精度提升."""
     def forward(self, x):
-        w = self.weight.float()
-        return F.linear(x.to(dtype=w.dtype), w, self.bias.float() if self.bias is not None else None)
+        return F.linear(x, self.weight, self.bias)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -640,7 +602,6 @@ class CyrenePC(BaseCyrenePC):
         self.model = CyreneBackbone(config)
         self.config = config
         self.num_sub_layers = 2 * len(self.model.layers)  # 6 层 dilated conv → 12 子层
-        self._graph_capture_mode = False
         # 无 _init_rope! 无 freqs_cos/sin
 
         # ── 时序预测: z_ℓ(t-1) → z_ℓ(t) ──
@@ -679,6 +640,9 @@ class CyrenePC(BaseCyrenePC):
             num_layers=self.num_sub_layers, k=3, inhibition_strength=0.1,
         )
 
+        # ── 投影前归一化 (pre-norm), 防 fp16 溢出 ──
+        self.proj_input_norm = RMSNorm(config.hidden_size, eps=1e-5)
+
         # ── 依赖阈值发放 — Phase 1 ──
         # per-layer, per-channel 活性阈值, 模拟神经元膜电位阈值.
         # 静默通道自动不参与前向预测 → 自然产生稀疏性 (而非 top-k 后过滤).
@@ -689,13 +653,12 @@ class CyrenePC(BaseCyrenePC):
         # 能量代价 (Phase 3 接入点)
         self._act_energy_cost: float = 0.0         # β·N_active — 暂时为0, Phase 3启用
 
-        # ── fp32 权重缓存（消除前向中反复 .float() 转换）──
-        # 这些缓存会在 _refresh_all_fp32_cache 中填充，训练步前调用一次
-        self._cached_byte_proj_w = None       # fp32
-        self._cached_lm_head_w = None         # fp32
-        self._cached_local_conv_w: dict = {}  # block_idx -> fp32
-        self._cached_temporal_w = None        # [L, H, H] fp32
-        self._cached_topdown_w = None         # [L-1, H, H] fp32
+        # ── 权重缓存（消除前向中反复 attr 查找）──
+        self._cached_byte_proj_w = None
+        self._cached_lm_head_w = None
+        self._cached_local_conv_w: dict = {}
+        self._cached_temporal_w = None
+        self._cached_topdown_w = None
         self._cache_built = False
 
         # ── μ_bu 缓存 (Phase 5: 推理融合) ──
@@ -703,19 +666,19 @@ class CyrenePC(BaseCyrenePC):
         self._cached_mu_bu = None
 
     def _refresh_all_fp32_cache(self):
-        """一次性刷新所有 fp32 权重缓存。在训练步前调用，避免 .float() 重复分配。"""
+        """一次性刷新所有权重缓存。模型为 fp16, 缓存直接保持 fp16。"""
         # byte_proj
-        self._cached_byte_proj_w = self.model.byte_proj.weight.float()
+        self._cached_byte_proj_w = self.model.byte_proj.weight
         # lm_head
-        self._cached_lm_head_w = self.model.lm_head.weight.float()
+        self._cached_lm_head_w = self.model.lm_head.weight
         # local_conv (按 block_idx)
         for block_idx, block in enumerate(self.model.layers):
-            self._cached_local_conv_w[block_idx] = block.local_conv.weight.float()
+            self._cached_local_conv_w[block_idx] = block.local_conv.weight
         # temporal_proj stack
-        self._cached_temporal_w = torch.stack([p.weight.float() for p in self.temporal_proj])
+        self._cached_temporal_w = torch.stack([p.weight for p in self.temporal_proj])
         # topdown_proj stack
         if self.num_sub_layers > 1:
-            self._cached_topdown_w = torch.stack([p.weight.float() for p in self.topdown_proj])
+            self._cached_topdown_w = torch.stack([p.weight for p in self.topdown_proj])
         self._cache_built = True
 
     def _clear_all_fp32_cache(self):
@@ -731,33 +694,68 @@ class CyrenePC(BaseCyrenePC):
         """局部 Conv 不需要位置编码, 返回 None 占位."""
         return (None, None)
 
-    def init_z(self, byte_seq):
-        """前向传播初始化 z — 字节→连续波→dilated conv. 使用 fp32 缓存避免重复 .float()。"""
+    @staticmethod
+    def _safe_dilated_conv1d(h_t, weight, dilation):
+        """手动 dilated conv1d, 避开 GTX 1650 Ti 上 cuDNN fp16 dilation≥2 的 NaN bug。
+
+        融合实现: 将 3 个 kernel 位置合并为单次 kernel_size=1 conv, 
+        避免 3 次独立 conv1d 调用的 kernel launch 开销。
+
+        h_t: [B, H, T_pad] — 已经 padded 的输入 (transposed 到 CHW 格式)
+        weight: [C_out, C_in, 3] — kernel_size=3 的 conv 权重
+        dilation: int — 膨胀率
+        returns: [B, C_out, T_out]
+        """
+        C_out, C_in, K = weight.shape
+        T_out = h_t.shape[2] - 2 * dilation  # 由于 pad=2*d
+
+        # 从 3 个 kernel 位置切片并拼接为 [B, C_in*3, T_out]
+        # 切片顺序: [k=0, c_in=0..C_in-1], [k=1, c_in=0..C_in-1], [k=2, c_in=0..C_in-1]
+        x_k0 = h_t[:, :, 0 * dilation:0 * dilation + T_out]
+        x_k1 = h_t[:, :, 1 * dilation:1 * dilation + T_out]
+        x_k2 = h_t[:, :, 2 * dilation:2 * dilation + T_out]
+        x_merged = torch.cat([x_k0, x_k1, x_k2], dim=1)    # [B, C_in*3, T_out]
+
+        # 权重: [C_out, C_in, 3] → permute → [C_out, 3, C_in] → reshape → [C_out, C_in*3, 1]
+        # permute 确保通道顺序与 x_merged 一致: k=0, c_in=0..; k=1, c_in=0..; k=2, c_in=0..
+        w_merged = weight.permute(0, 2, 1).reshape(C_out, C_in * K, 1)
+
+        # 单次 kernel_size=1 conv = 大 matmul
+        return F.conv1d(x_merged, w_merged)                 # [B, C_out, T_out]
+
+    def init_z(self, byte_seq, dopamine_D: Optional[float] = None):
+        """前向传播初始化 z — 字节→连续波→dilated conv.
+
+        Args:
+            byte_seq: [B, 2, S] uint8 输入
+            dopamine_D: 标量 [0,1], 多巴胺信号调制 post-SwiGLU gain.
+                        None=无调制(仅做 RMSNorm 防溢出).
+        """
         self._refresh_all_fp32_cache()
         z = []
-        x = nn.functional.pad(byte_seq.float(), (12, 0))
-        h = F.conv1d(x, self._cached_byte_proj_w).transpose(1, 2)  # fp32
+        x = nn.functional.pad(byte_seq.half(), (12, 0))
+        h = F.conv1d(x, self._cached_byte_proj_w).transpose(1, 2)
+        h = h * (1 / 256)  # 缩放防止 fp16 LN 溢出
         z.append(h)
 
         mu_cache = []
         for block_idx, block in enumerate(self.model.layers):
-            # Conv sub-layer (dilation-aware causal pad, fp32)
             res = h
             d = block.dilation
             h = nn.functional.pad(block.input_layernorm(h), (0, 0, 2 * d, 0))
-            h32 = F.conv1d(
-                h.transpose(1, 2).float(),
+            h32 = self._safe_dilated_conv1d(
+                h.transpose(1, 2),
                 self._cached_local_conv_w[block_idx],
-                bias=None, stride=1, padding=0, dilation=d, groups=1,
+                dilation=d,
             ).transpose(1, 2)
             mu_cache.append(h32.detach())  # ← 缓存 μ_bu (conv, pre-gate)
             h = self.salience_gates[2 * block_idx](h32)  # ← Conv gate
             h = h + res
             z.append(h)
 
-            # MLP sub-layer
+            # MLP sub-layer (多巴胺门控 normalization)
             res = h
-            h = block.mlp(block.post_attention_layernorm(h))
+            h = block.mlp(block.post_attention_layernorm(h), dopamine_D=dopamine_D)
             mu_cache.append(h.detach())  # ← 缓存 μ_bu (mlp, pre-gate)
             h = self.salience_gates[2 * block_idx + 1](h)  # ← MLP gate
             h = h + res
@@ -766,31 +764,40 @@ class CyrenePC(BaseCyrenePC):
         self._cached_mu_bu = mu_cache
         return z  # len = 2L + 1 = 13
 
-    def forward_with_ce(self, byte_seq, labels, pos_emb):
-        """梯度启用的前向 (字节→连续波→dilated conv), 使用 fp32 缓存。"""
+    def forward_with_ce(self, byte_seq, labels, pos_emb,
+                        dopamine_D: Optional[float] = None):
+        """梯度启用的前向 (字节→连续波→dilated conv).
+
+        Args:
+            byte_seq: [B, 2, S] uint8 输入
+            labels: [B, S] int64 标签
+            pos_emb: 位置编码 (忽略)
+            dopamine_D: 标量 [0,1], 多巴胺信号调制 post-SwiGLU gain.
+                        None=无调制(仅做 RMSNorm 防溢出).
+        """
         self._refresh_all_fp32_cache()
         z = []
-        x = nn.functional.pad(byte_seq.float(), (12, 0))
-        h = F.conv1d(x, self._cached_byte_proj_w).transpose(1, 2)  # fp32
+        x = nn.functional.pad(byte_seq.half(), (12, 0))
+        h = F.conv1d(x, self._cached_byte_proj_w).transpose(1, 2)
+        h = h * (1 / 256)  # 缩放防止 fp16 LN 溢出
         z.append(h)
 
         for block_idx, block in enumerate(self.model.layers):
-            # Conv sub-layer (dilation-aware causal pad, fp32)
             res = h
             d = block.dilation
             h = nn.functional.pad(block.input_layernorm(h), (0, 0, 2 * d, 0))
-            h32 = F.conv1d(
-                h.transpose(1, 2).float(),
+            h32 = self._safe_dilated_conv1d(
+                h.transpose(1, 2),
                 self._cached_local_conv_w[block_idx],
-                bias=None, stride=1, padding=0, dilation=d, groups=1,
+                dilation=d,
             ).transpose(1, 2)
             h = self.salience_gates[2 * block_idx](h32)  # ← Conv gate
             h = h + res
             z.append(h)
 
-            # MLP sub-layer (FeedForward 内部 fp32)
+            # MLP sub-layer (多巴胺门控 normalization)
             res = h
-            h = block.mlp(block.post_attention_layernorm(h))
+            h = block.mlp(block.post_attention_layernorm(h), dopamine_D=dopamine_D)
             h = self.salience_gates[2 * block_idx + 1](h)  # ← MLP gate
             h = h + res
             z.append(h)
@@ -809,7 +816,7 @@ class CyrenePC(BaseCyrenePC):
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=-100,
-            weight=_utf8_ce_weight(shift_logits.device).to(torch.float32),
+            weight=_utf8_ce_weight(shift_logits.device).to(shift_logits.dtype),
         )
         return z, ce_loss
 
@@ -822,28 +829,29 @@ class CyrenePC(BaseCyrenePC):
         """清除 fp32 缓存。"""
         self._clear_all_fp32_cache()
 
-    def predict(self, layer_idx, z_prev, pos_emb, fp32_out=False):
+    def predict(self, layer_idx, z_prev, pos_emb):
         """计算 μ_bu = sublayer_ℓ(z_prev) (不含残差), Conv 版.
 
-        使用 _cached_local_conv_w 避免重复 .float() 转换。
+        使用 _safe_dilated_conv1d 避开 GTX 1650 Ti 上 cuDNN fp16 dilation≥2 的 NaN bug。
+        使用 _cached_local_conv_w 避免重复 attr 查找。
         """
         block_idx = (layer_idx - 1) // 2
         is_conv_or_attn = (layer_idx - 1) % 2 == 0
         block = self.model.layers[block_idx]
 
         if is_conv_or_attn:
-            # Conv1D (dilation-aware causal pad, fp32 安全)
+            # Conv1D (dilation-aware causal pad)
             d = block.dilation
             h = nn.functional.pad(block.input_layernorm(z_prev), (0, 0, 2 * d, 0))
             conv_w = self._cached_local_conv_w.get(block_idx)
             if conv_w is None:
-                conv_w = block.local_conv.weight.float()
-            h32 = F.conv1d(
-                h.transpose(1, 2).float(),
+                conv_w = block.local_conv.weight
+            h_out = self._safe_dilated_conv1d(
+                h.transpose(1, 2),
                 conv_w,
-                bias=None, stride=1, padding=0, dilation=d, groups=1,
+                dilation=d,
             ).transpose(1, 2)
-            return h32 if fp32_out else h32.half()
+            return h_out
         else:
             return block.mlp(block.post_attention_layernorm(z_prev))
     # generate_with_pc 继承自 BaseCyrenePC

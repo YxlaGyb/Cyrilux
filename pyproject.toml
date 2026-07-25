@@ -1,7 +1,7 @@
 [project]
-name = "virtuosov2"
+name = "Cyrilux"
 version = "0.2.0"
-description = "Predictive Coding 局部动态小语言模型 — 统一 PC + 多巴胺 + QAT + 持续学习"
+description = "From raw bytes, light emerges. 要相信浪漫一如初见，永恒属于每一刻♪"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -19,26 +19,33 @@ dependencies = [
 ]
 
 [project.scripts]
-virtuoso = "pkg.cli.app:app"
+cyrilux = "pkg.cli:app"
 
 [tool.setuptools.packages.find]
 include = [
-    "pkg", "pkg.*",
-    "model", "model.*",
-    "dataset", "dataset.*",
-    "pkg.cli", "pkg.cli.*",
-    "pkg.gui", "pkg.gui.*",
-    "model.core", "model.core.*",
-    "model.continual", "model.continual.*",
+    "pkg",
+    "pkg.*",
+    "model",
+    "model.*",
+    "dataset",
+    "dataset.*",
+    "pkg.cli",
+    "pkg.cli.*",
+    "pkg.gui",
+    "pkg.gui.*",
+    "model.core",
+    "model.core.*",
+    "model.continual",
+    "model.continual.*",
 ]
 
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchvision = [
-    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 
 
@@ -48,20 +55,25 @@ url = "https://mirrors.nju.edu.cn/pytorch/whl/cu132"
 explicit = true
 
 
+[tool.uv]
+package = true
+
 [tool.basedpyright]
 typeCheckingMode = "standard"
 reportPrivateImportUsage = "none"
 
 
 [tool.ruff]
-line-length = 88
+line-length = 100
 target-version = "py312"
 
+lint.ignore = ["E301", "E302", "E303", "E304", "E305", "E306", "E741"]
+
 lint.select = [
-    "F",   # Pyflakes — 未定义变量、未使用导入/变量等真正错误
-    "E",   # pycodestyle 错误 — 基本风格问题（缩进、空行等）
-    "I",   # isort — 导入排序
-    "D",   # pydocstyle — 文档字符串规范（配合 Google 风格）
+    "F", # Pyflakes — 未定义变量、未使用导入/变量等真正错误
+    "E", # pycodestyle 错误 — 基本风格问题（缩进、空行等）
+    # "I", # isort — 导入排序
+    # "D", # pydocstyle — 文档字符串规范（配合 Google 风格）
 ]
 
 lint.per-file-ignores = { "__init__.py" = ["F401"] }
@@ -74,4 +86,3 @@ known-first-party = ["alm", "col", "training", "scripts"]
 
 [tool.ruff.format]
 quote-style = "double"
-

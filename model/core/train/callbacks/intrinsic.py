@@ -1,4 +1,6 @@
-"""内在动机 Callback — ICM 后处理、概念 consolidation、MemoryGate 自适应."""
+"""内在动机 Callback
+ICM 后处理、概念 consolidation、MemoryGate 自适应.
+"""
 
 from model.core.train.callback_base import CallbackBase
 

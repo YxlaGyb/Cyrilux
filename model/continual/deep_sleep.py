@@ -12,11 +12,11 @@
   - 噪声 → 加宽盆地 (增强鲁棒性)
   - 平衡 → 防止一个盆地吞噬另一个
 """
+
 from __future__ import annotations
 
-import math
 import random
-from typing import List, Tuple, Optional, Dict
+from typing import List, Optional, Dict
 
 import torch
 import torch.nn.functional as F
@@ -34,16 +34,16 @@ class SleepEngine:
     def __init__(
         self,
         num_sub_layers: int = 12,
-        pattern_completion_steps: int = 20,    # Phase 1 步数
-        noise_broadening_steps: int = 20,      # Phase 2 步数
-        competitive_steps: int = 10,           # Phase 3 步数
-        noise_levels: List[float] = None,      # Phase 2 噪声级别
-        completion_mask_ratio: float = 0.5,    # Phase 1 遮掩比例
-        T_infer_sleep: int = 2,                # SLEEP 时推理步数 (减少)
-        gamma_sleep: float = 0.05,             # SLEEP 时 gamma (减弱)
-        hebbian_base_eta: float = 5e-5,        # Hebbian 学习率 (训练期 1e-5, 睡眠需略高但不过量)
-        hebbian_lambda_min: float = 0.01,      # Decoder 约束最小权重
-        dopamine_gamma: float = 0.3,           # RPE 调制系数
+        pattern_completion_steps: int = 20,  # Phase 1 步数
+        noise_broadening_steps: int = 20,  # Phase 2 步数
+        competitive_steps: int = 10,  # Phase 3 步数
+        noise_levels: List[float] = None,  # Phase 2 噪声级别
+        completion_mask_ratio: float = 0.5,  # Phase 1 遮掩比例
+        T_infer_sleep: int = 2,  # SLEEP 时推理步数 (减少)
+        gamma_sleep: float = 0.05,  # SLEEP 时 gamma (减弱)
+        hebbian_base_eta: float = 5e-5,  # Hebbian 学习率 (训练期 1e-5, 睡眠需略高但不过量)
+        hebbian_lambda_min: float = 0.01,  # Decoder 约束最小权重
+        dopamine_gamma: float = 0.3,  # RPE 调制系数
     ):
         self.num_sub_layers = num_sub_layers
         self.pattern_completion_steps = pattern_completion_steps
@@ -65,16 +65,21 @@ class SleepEngine:
 
         # 统计
         self.stats: dict = {
-            'completion_loss': [],
-            'noise_loss': [],
-            'competitive_loss': [],
+            "completion_loss": [],
+            "noise_loss": [],
+            "competitive_loss": [],
         }
 
     # ── Hebbian 更新工具 ──────────────────────────────────────────
 
     @torch.no_grad()
-    def _hebbian_step(self, model: torch.nn.Module, byte_seq: torch.Tensor,
-                      labels: torch.Tensor, device: str):
+    def _hebbian_step(
+        self,
+        model: torch.nn.Module,
+        byte_seq: torch.Tensor,
+        labels: torch.Tensor,
+        device: str,
+    ):
         """对 (byte_seq, labels) 执行一次纯 Hebbian 权重更新 (零 backward)。
 
         Args:
@@ -97,30 +102,39 @@ class SleepEngine:
 
         z_det = [z.detach() for z in z_init]
         z_conv, _, _, _, ε_list = model.spatiotemporal_infer(
-            z_det, pos_emb,
-            gamma=self.gamma_sleep, T=self.T_infer_sleep,
-            return_errors=True, return_pred_loss=False,
-            ach_value=0.5, return_ε=True,
+            z_det,
+            pos_emb,
+            gamma=self.gamma_sleep,
+            T=self.T_infer_sleep,
+            return_errors=True,
+            return_pred_loss=False,
+            ach_value=0.5,
+            return_ε=True,
         )
 
         # 固定调制基线 (睡眠阶段不需要在线多巴胺/乙酰胆碱调节)
         updates = compute_all_hebbian_updates(
-            ε_list, z_init, byte_seq, model, self,
-            D=0.5, ACh=0.5, modulation=0.5,
+            ε_list,
+            z_init,
+            byte_seq,
+            model,
+            self,
+            D=0.5,
+            ACh=0.5,
+            modulation=0.5,
             λ=self.hebbian_lambda_min,
             decoder=model.decoder,
             target_byte_embed=None,
             bcm_state=self.bcm_state,
         )
-        apply_hebbian_updates(updates, model,
-                              max_delta=0.02, weight_bound=4.0)
+        apply_hebbian_updates(updates, model, max_delta=0.02, weight_bound=4.0)
 
     def run(
         self,
         model: torch.nn.Module,
         memory_bank,
         abstraction_bank,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
         phases: Optional[List[str]] = None,
     ) -> Dict[str, float]:
         """执行完整的 SLEEP 循环 (纯 Hebbian, 零优化器/反向传播)。
@@ -132,20 +146,22 @@ class SleepEngine:
             {'completion_avg_loss': float, 'noise_avg_loss': float, 'competitive_avg_loss': float}
         """
         if phases is None:
-            phases = ['completion', 'noise', 'competitive']
+            phases = ["completion", "noise", "competitive"]
 
         results = {}
-        if 'completion' in phases and memory_bank.total > 0:
+        if "completion" in phases and memory_bank.total > 0:
             avg_loss = self._phase_pattern_completion(model, memory_bank, device)
-            results['completion_avg_loss'] = avg_loss
+            results["completion_avg_loss"] = avg_loss
 
-        if 'noise' in phases and memory_bank.total > 0:
+        if "noise" in phases and memory_bank.total > 0:
             avg_loss = self._phase_noise_broadening(model, memory_bank, device)
-            results['noise_avg_loss'] = avg_loss
+            results["noise_avg_loss"] = avg_loss
 
-        if 'competitive' in phases and memory_bank.total > 0:
-            avg_loss = self._phase_competitive_balance(model, memory_bank, abstraction_bank, device)
-            results['competitive_avg_loss'] = avg_loss
+        if "competitive" in phases and memory_bank.total > 0:
+            avg_loss = self._phase_competitive_balance(
+                model, memory_bank, abstraction_bank, device
+            )
+            results["competitive_avg_loss"] = avg_loss
 
         return results
 
@@ -173,13 +189,13 @@ class SleepEngine:
         model.train()
 
         for _ in range(self.pattern_completion_steps):
-            exemplars = memory_bank.sample(1, strategy='uniform')
+            exemplars = memory_bank.sample(1, strategy="uniform")
             if not exemplars:
                 break
 
             ex = exemplars[0]
-            full_byte = ex.byte_tensor.squeeze().unsqueeze(0).to(device)   # [1, seq]
-            full_label = ex.label_tensor.squeeze().unsqueeze(0).to(device) # [1, seq]
+            full_byte = ex.byte_tensor.squeeze().unsqueeze(0).to(device)  # [1, seq]
+            full_label = ex.label_tensor.squeeze().unsqueeze(0).to(device)  # [1, seq]
             seq_len = full_byte.size(-1)
             mask_len = max(1, int(seq_len * self.completion_mask_ratio))
 
@@ -196,9 +212,12 @@ class SleepEngine:
                 z_init, _ = model.forward_with_ce(masked_byte, full_label, pos_emb)
                 z_det = [z.detach() for z in z_init]
                 z_conv, *_ = model.spatiotemporal_infer(
-                    z_det, pos_emb,
-                    gamma=self.gamma_sleep, T=self.T_infer_sleep,
-                    return_errors=False, return_pred_loss=False,
+                    z_det,
+                    pos_emb,
+                    gamma=self.gamma_sleep,
+                    T=self.T_infer_sleep,
+                    return_errors=False,
+                    return_pred_loss=False,
                 )
                 z_full, _ = model.forward_with_ce(full_byte, full_label, pos_emb)
                 monitor_loss = 0.0
@@ -210,7 +229,7 @@ class SleepEngine:
                 losses.append(monitor_loss.item())
 
         avg_loss = sum(losses) / max(len(losses), 1) if losses else 0.0
-        self.stats['completion_loss'].append(avg_loss)
+        self.stats["completion_loss"].append(avg_loss)
         return avg_loss
 
     # ── Phase 2: 噪声加宽 ──────────────────────────────────────────
@@ -237,7 +256,7 @@ class SleepEngine:
         model.train()
 
         for _ in range(self.noise_broadening_steps):
-            exemplars = memory_bank.sample(1, strategy='uniform')
+            exemplars = memory_bank.sample(1, strategy="uniform")
             if not exemplars:
                 break
 
@@ -254,7 +273,9 @@ class SleepEngine:
             n_noise = max(1, int(seq_len * noise_scale))
             noise_pos = torch.randperm(seq_len, device=device)[:n_noise]
             noise_shape = list(noisy_byte.shape[:-1]) + [n_noise]
-            noisy_byte[..., noise_pos] = torch.randint(0, 256, noise_shape, device=device).to(noisy_byte.dtype)
+            noisy_byte[..., noise_pos] = torch.randint(
+                0, 256, noise_shape, device=device
+            ).to(noisy_byte.dtype)
 
             # Hebbian 更新: 用加噪序列驱动局部预测误差 → 自动噪声容忍学习
             self._hebbian_step(model, noisy_byte, clean_label, device)
@@ -265,9 +286,12 @@ class SleepEngine:
                 z_noisy, _ = model.forward_with_ce(noisy_byte, clean_label, pos_emb)
                 z_noisy_det = [z.detach() for z in z_noisy]
                 z_conv, *_ = model.spatiotemporal_infer(
-                    z_noisy_det, pos_emb,
-                    gamma=self.gamma_sleep, T=self.T_infer_sleep,
-                    return_errors=False, return_pred_loss=False,
+                    z_noisy_det,
+                    pos_emb,
+                    gamma=self.gamma_sleep,
+                    T=self.T_infer_sleep,
+                    return_errors=False,
+                    return_pred_loss=False,
                 )
                 z_clean, _ = model.forward_with_ce(clean_byte, clean_label, pos_emb)
                 monitor_loss = 0.0
@@ -276,7 +300,7 @@ class SleepEngine:
                 losses.append(monitor_loss.item())
 
         avg_loss = sum(losses) / max(len(losses), 1) if losses else 0.0
-        self.stats['noise_loss'].append(avg_loss)
+        self.stats["noise_loss"].append(avg_loss)
         return avg_loss
 
     # ── Phase 3: 竞争平衡 ──────────────────────────────────────────
@@ -351,18 +375,23 @@ class SleepEngine:
 
             # 记录 CE loss (仅监控)
             with torch.no_grad():
-                _, ce_loss = model.forward_with_ce(mix_byte, mix_label,
-                    model.get_position_embeddings(mix_byte.size(-1), device))
+                _, ce_loss = model.forward_with_ce(
+                    mix_byte,
+                    mix_label,
+                    model.get_position_embeddings(mix_byte.size(-1), device),
+                )
                 losses.append(ce_loss.item())
 
         avg_loss = sum(losses) / max(len(losses), 1) if losses else 0.0
-        self.stats['competitive_loss'].append(avg_loss)
+        self.stats["competitive_loss"].append(avg_loss)
         return avg_loss
 
     # ── 工具 ────────────────────────────────────────────────────────
 
     def state_dict(self) -> dict:
-        return {'stats': self.stats}
+        return {"stats": self.stats}
 
     def load_state_dict(self, state: dict):
-        self.stats = state.get('stats', {'completion_loss': [], 'noise_loss': [], 'competitive_loss': []})
+        self.stats = state.get(
+            "stats", {"completion_loss": [], "noise_loss": [], "competitive_loss": []}
+        )

@@ -18,6 +18,7 @@ MetaController:
     mind = AutonomousMind(model, lm_config)
     mind.run_forever()
 """
+
 import json
 import os
 import threading
@@ -49,41 +50,35 @@ from model.pc.pc_layers import CyrenePC
 
 DEFAULT_CFG = {
     # 阶段调度
-    'wake_steps': 20,          # 每次 WAKE 生成步数
-    'play_steps': 100,         # 每次 PLAY 训练步数
-    'sleep_interval': 500,     # 每 N 总步执行一次 SLEEP
-
+    "wake_steps": 20,  # 每次 WAKE 生成步数
+    "play_steps": 100,  # 每次 PLAY 训练步数
+    "sleep_interval": 500,  # 每 N 总步执行一次 SLEEP
     # 生成
-    'gen_max_new': 64,         # 每次生成最大新 token 数
-    'gen_temperature': 0.8,    # 生成温度
-    'gen_top_k': 40,           # Top-K 采样
-    'gen_prompt_len': 32,      # Prompt 种子长度 (从 memory 采样)
-
+    "gen_max_new": 64,  # 每次生成最大新 token 数
+    "gen_temperature": 0.8,  # 生成温度
+    "gen_top_k": 40,  # Top-K 采样
+    "gen_prompt_len": 32,  # Prompt 种子长度 (从 memory 采样)
     # 训练
-    'batch_size': 16,
-    'max_seq_len': 128,
-    'gamma': 0.05,
-    'T_infer': 1,
-
+    "batch_size": 16,
+    "max_seq_len": 128,
+    "gamma": 0.05,
+    "T_infer": 1,
     # 多巴胺
-    'dopamine_eta': 1.0,
-    'dopamine_beta': 0.3,
-    'dopamine_gamma': 0.2,
-    'dopamine_threshold': 0.05,  # D 低于此值 → 提升好奇度
-
+    "dopamine_eta": 1.0,
+    "dopamine_beta": 0.3,
+    "dopamine_gamma": 0.2,
+    "dopamine_threshold": 0.05,  # D 低于此值 → 提升好奇度
     # 记忆
-    'max_replay_buffer': 2000,
-    'replay_batch_size': 16,
-    'replay_ratio': 3,         # 每 N 步插入 1 步回放
-
+    "max_replay_buffer": 2000,
+    "replay_batch_size": 16,
+    "replay_ratio": 3,  # 每 N 步插入 1 步回放
     # 检查点
-    'save_interval': 200,
-    'out_dir': 'out_autonomous',
-    'checkpoint': None,        # 初始检查点路径
-
+    "save_interval": 200,
+    "out_dir": "out_autonomous",
+    "checkpoint": None,  # 初始检查点路径
     # 外部数据 (持续学习)
-    'data_dir': 'datasets',
-    'data_rotate_interval': 500,  # 每 N 步换一个数据集文件
+    "data_dir": "datasets",
+    "data_rotate_interval": 500,  # 每 N 步换一个数据集文件
 }
 
 
@@ -95,6 +90,7 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 好奇心采样器
 # ═══════════════════════════════════════════════════════════════════
 
+
 class CuriositySampler:
     """基于模型自身熵的好奇心驱动采样器.
 
@@ -104,13 +100,14 @@ class CuriositySampler:
       - 计算生成序列的 entropy (预测不确定性)
       - 高 entropy → 高好奇心 → 优先用于 PLAY 训练
     """
-    def __init__(self, model: 'CyrenePC', cfg: dict):
+
+    def __init__(self, model: "CyrenePC", cfg: dict):
         self.model = model
         self.cfg = cfg
         self.device = next(model.parameters()).device
-        self.temperature = cfg.get('gen_temperature', 0.8)
-        self.top_k = cfg.get('gen_top_k', 40)
-        self.max_new = cfg.get('gen_max_new', 64)
+        self.temperature = cfg.get("gen_temperature", 0.8)
+        self.top_k = cfg.get("gen_top_k", 40)
+        self.max_new = cfg.get("gen_max_new", 64)
 
     def sample(self, prompt_bytes: torch.Tensor, n_generations: int = 4) -> list:
         """从 prompt 种子生成多样化的 continuation.
@@ -144,7 +141,7 @@ class CuriositySampler:
             self.model.eval()
             seq = prompt_bytes.clone().to(device)  # [seq_len]
             max_new = self.max_new
-            max_seq_len = self.cfg.get('max_seq_len', 128)
+            max_seq_len = self.cfg.get("max_seq_len", 128)
 
             for _ in range(max_new):
                 if seq.size(0) >= max_seq_len:
@@ -159,7 +156,7 @@ class CuriositySampler:
                 if self.top_k > 0:
                     top_k_vals, _ = torch.topk(logits, self.top_k, dim=-1)
                     threshold = top_k_vals[:, -1].unsqueeze(-1)
-                    logits[logits < threshold] = -float('inf')
+                    logits[logits < threshold] = -float("inf")
 
                 probs = torch.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)  # [1, 1]
@@ -168,7 +165,7 @@ class CuriositySampler:
             self.model.train()
             return seq
         except Exception as e:
-            Logger(f'[CuriositySampler] Generation error: {e}')
+            Logger(f"[CuriositySampler] Generation error: {e}")
             self.model.train()
             return None
 
@@ -198,15 +195,17 @@ class CuriositySampler:
 # 经验回放缓冲区
 # ═══════════════════════════════════════════════════════════════════
 
+
 class ExperienceReplayBuffer:
     """FIFO 经验回放缓冲区.
 
     每条经验 = (byte_seq, byte_label, dopamine_score)
     采样策略: dopamine_weighted → 高 D 的样本更可能被回放.
     """
+
     def __init__(self, max_size: int = 2000):
         self.max_size = max_size
-        self.buffer = []       # [(bytes, labels, D)]
+        self.buffer = []  # [(bytes, labels, D)]
         self._dopamine_sum = 0.0
 
     def add(self, byte_seq: torch.Tensor, labels: torch.Tensor, D: float = 0.5):
@@ -222,13 +221,15 @@ class ExperienceReplayBuffer:
         for i in range(byte_seq.size(0)):
             self.add(byte_seq[i], labels[i], D)
 
-    def sample(self, batch_size: int, device: str = 'cpu') -> Optional[tuple]:
+    def sample(self, batch_size: int, device: str = "cpu") -> Optional[tuple]:
         """多巴胺加权采样。"""
         if len(self.buffer) < batch_size:
             return None
 
         if self._dopamine_sum > 0 and len(self.buffer) > batch_size * 2:
-            weights = torch.tensor([ex[2] + 0.01 for ex in self.buffer], dtype=torch.float)
+            weights = torch.tensor(
+                [ex[2] + 0.01 for ex in self.buffer], dtype=torch.float16
+            )
             idx = torch.multinomial(weights, batch_size, replacement=False)
         else:
             idx = torch.randperm(len(self.buffer))[:batch_size]
@@ -243,8 +244,9 @@ class ExperienceReplayBuffer:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 元控制器 — 阶段调度
+# 元控制器, 阶段调度
 # ═══════════════════════════════════════════════════════════════════
+
 
 class MetaController:
     """调度 WAKE / PLAY / SLEEP 阶段, 检测高原, 动态调整参数.
@@ -252,11 +254,12 @@ class MetaController:
     阶段状态机:
       IDLE → WAKE (生成) → PLAY (训练) → (每 sleep_interval) → SLEEP (巩固) → IDLE
     """
-    PHASES = ['IDLE', 'WAKE', 'PLAY', 'SLEEP']
+
+    PHASES = ["IDLE", "WAKE", "PLAY", "SLEEP"]
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.phase = 'IDLE'
+        self.phase = "IDLE"
         self.total_steps = 0
         self.wake_count = 0
         self.play_count = 0
@@ -268,27 +271,27 @@ class MetaController:
         self._last_plateau_step = 0
 
         # 多巴胺自适应
-        self.current_dopamine_threshold = cfg.get('dopamine_threshold', 0.05)
-        self.current_gamma = cfg.get('gamma', 0.05)
+        self.current_dopamine_threshold = cfg.get("dopamine_threshold", 0.05)
+        self.current_gamma = cfg.get("gamma", 0.05)
 
     def next_phase(self) -> str:
         """决定下一阶段。"""
         self.total_steps += 1
 
-        if self.phase in ('IDLE', 'SLEEP'):
-            self.phase = 'WAKE'
+        if self.phase in ("IDLE", "SLEEP"):
+            self.phase = "WAKE"
             self.wake_count += 1
-        elif self.phase == 'WAKE':
-            if self.wake_count >= self.cfg.get('wake_steps', 20):
-                self.phase = 'PLAY'
+        elif self.phase == "WAKE":
+            if self.wake_count >= self.cfg.get("wake_steps", 20):
+                self.phase = "PLAY"
                 self.wake_count = 0
-        elif self.phase == 'PLAY':
+        elif self.phase == "PLAY":
             self.play_count += 1
-            if self.total_steps % self.cfg.get('sleep_interval', 500) == 0:
-                self.phase = 'SLEEP'
+            if self.total_steps % self.cfg.get("sleep_interval", 500) == 0:
+                self.phase = "SLEEP"
                 self.play_count = 0
-            elif self.play_count >= self.cfg.get('play_steps', 100):
-                self.phase = 'WAKE'
+            elif self.play_count >= self.cfg.get("play_steps", 100):
+                self.phase = "WAKE"
                 self.play_count = 0
 
         return self.phase
@@ -310,7 +313,10 @@ class MetaController:
                 else:
                     self._plateau_streak = 0
 
-        if self._plateau_streak >= 3 and self.total_steps - self._last_plateau_step > 200:
+        if (
+            self._plateau_streak >= 3
+            and self.total_steps - self._last_plateau_step > 200
+        ):
             self._break_plateau()
             self._plateau_streak = 0
             self._last_plateau_step = self.total_steps
@@ -320,21 +326,25 @@ class MetaController:
         old_gamma = self.current_gamma
         old_thresh = self.current_dopamine_threshold
         self.current_gamma = min(self.current_gamma * 1.5, 0.5)
-        self.current_dopamine_threshold = max(self.current_dopamine_threshold * 0.8, 0.001)
-        Logger(f'[MetaController] ⛰ Plateau broken: '
-               f'γ {old_gamma:.3f}→{self.current_gamma:.3f}, '
-               f'D_thr {old_thresh:.3f}→{self.current_dopamine_threshold:.3f}')
+        self.current_dopamine_threshold = max(
+            self.current_dopamine_threshold * 0.8, 0.001
+        )
+        Logger(
+            f"[MetaController] ⛰ Plateau broken: "
+            f"γ {old_gamma:.3f}→{self.current_gamma:.3f}, "
+            f"D_thr {old_thresh:.3f}→{self.current_dopamine_threshold:.3f}"
+        )
 
     def to_dict(self) -> dict:
         return {
-            'phase': self.phase,
-            'total_steps': self.total_steps,
-            'wake_count': self.wake_count,
-            'play_count': self.play_count,
-            'sleep_count': self.sleep_count,
-            'plateau_streak': self._plateau_streak,
-            'dopamine_threshold': self.current_dopamine_threshold,
-            'gamma': self.current_gamma,
+            "phase": self.phase,
+            "total_steps": self.total_steps,
+            "wake_count": self.wake_count,
+            "play_count": self.play_count,
+            "sleep_count": self.sleep_count,
+            "plateau_streak": self._plateau_streak,
+            "dopamine_threshold": self.current_dopamine_threshold,
+            "gamma": self.current_gamma,
         }
 
 
@@ -342,10 +352,12 @@ class MetaController:
 # 外部数据轮换
 # ═══════════════════════════════════════════════════════════════════
 
+
 class DataRotator:
     """在 dataset/ 目录下轮换读取 jsonl 文件, 持续提供新鲜数据.
     支持格式检测 (conversations → text 自动转换).
     """
+
     def __init__(self, data_dir: str, max_seq_len: int = 128, max_samples: int = 200):
         self.data_dir = os.path.join(ROOT_DIR, data_dir)
         self.max_seq_len = max_seq_len
@@ -362,12 +374,14 @@ class DataRotator:
         if not os.path.isdir(self.data_dir):
             self.files = []
             return
-        self.files = sorted([
-            os.path.join(self.data_dir, f)
-            for f in os.listdir(self.data_dir)
-            if f.endswith('.jsonl') and not f.startswith('_')
-        ])
-        converted = [f for f in self.files if '_converted' in f]
+        self.files = sorted(
+            [
+                os.path.join(self.data_dir, f)
+                for f in os.listdir(self.data_dir)
+                if f.endswith(".jsonl") and not f.startswith("_")
+            ]
+        )
+        converted = [f for f in self.files if "_converted" in f]
         if converted:
             self.files = converted + [f for f in self.files if f not in converted]
 
@@ -383,34 +397,34 @@ class DataRotator:
 
         self._current_data = []
         try:
-            with open(fpath, 'r', encoding='utf-8') as f:
+            with open(fpath, "r", encoding="utf-8") as f:
                 for i, line in enumerate(f):
                     if i >= self.max_samples:
                         break
                     sample = json.loads(line)
 
-                    if 'text' in sample:
-                        text = sample['text']
-                    elif 'conversations' in sample:
+                    if "text" in sample:
+                        text = sample["text"]
+                    elif "conversations" in sample:
                         parts = []
-                        for turn in sample['conversations']:
-                            role = turn.get('role', 'user')
-                            content = turn.get('content', '')
-                            parts.append(f'<|{role}|>{content}')
-                        text = '\n'.join(parts) + '<|end|>'
+                        for turn in sample["conversations"]:
+                            role = turn.get("role", "user")
+                            content = turn.get("content", "")
+                            parts.append(f"<|{role}|>{content}")
+                        text = "\n".join(parts) + "<|end|>"
                     else:
                         continue
 
-                    byte_seq = text.encode('utf-8')[:self.max_seq_len]
-                    padded = byte_seq.ljust(self.max_seq_len, b'\x00')
+                    byte_seq = text.encode("utf-8")[: self.max_seq_len]
+                    padded = byte_seq.ljust(self.max_seq_len, b"\x00")
                     t = torch.frombuffer(bytearray(padded), dtype=torch.uint8).clone()
                     lbl = t.clone()
                     lbl[t == 0x00] = -100
                     self._current_data.append((t, lbl.to(torch.long)))
         except Exception as e:
-            Logger(f'[DataRotator] Load {fname} error: {e}')
+            Logger(f"[DataRotator] Load {fname} error: {e}")
 
-        Logger(f'[DataRotator] Loaded {len(self._current_data)} samples from {fname}')
+        Logger(f"[DataRotator] Loaded {len(self._current_data)} samples from {fname}")
         self._pos = 0
 
     def get_batch(self, batch_size: int) -> Optional[tuple]:
@@ -442,6 +456,7 @@ class DataRotator:
 # 自主意识核心
 # ═══════════════════════════════════════════════════════════════════
 
+
 class AutonomousMind:
     """持续自主运行核心 — 永不停止的 WAKE → PLAY → SLEEP 循环.
 
@@ -450,10 +465,11 @@ class AutonomousMind:
         mind = AutonomousMind(model, lm_config)
         mind.run_forever()   # 无限循环, 永不返回
     """
+
     def __init__(
         self,
-        model: 'CyrenePC' = None,
-        lm_config: 'CyreneConfig' = None,
+        model: "CyrenePC" = None,
+        lm_config: "CyreneConfig" = None,
         cfg: dict = None,
         log_callback: Callable = None,
     ):
@@ -464,7 +480,8 @@ class AutonomousMind:
 
         # ── 创建 / 加载模型 ──
         self.lm_config = lm_config or CyreneConfig(
-            hidden_size=256, num_hidden_layers=4,
+            hidden_size=256,
+            num_hidden_layers=4,
         )
         if model is not None:
             self.model = model.to(self.device)
@@ -476,38 +493,43 @@ class AutonomousMind:
 
         # ── 子模块 ──
         self.dopamine = DopamineSignal(
-            η=self.cfg['dopamine_eta'],
-            threshold=self.cfg['dopamine_threshold'],
+            η=self.cfg["dopamine_eta"],
+            threshold=self.cfg["dopamine_threshold"],
         )
         self.sampler = CuriositySampler(self.model, self.cfg)
-        self.replay_buffer = ExperienceReplayBuffer(self.cfg['max_replay_buffer'])
+        self.replay_buffer = ExperienceReplayBuffer(self.cfg["max_replay_buffer"])
         self.controller = MetaController(self.cfg)
         self.data_rotator = DataRotator(
-            self.cfg['data_dir'],
-            max_seq_len=self.cfg['max_seq_len'],
+            self.cfg["data_dir"],
+            max_seq_len=self.cfg["max_seq_len"],
             max_samples=200,
         )
 
         # ── 状态 ──
         self.total_steps = 0
-        self.current_phase = 'IDLE'
+        self.current_phase = "IDLE"
         self.last_save_step = 0
         self._gen_prompts_cache = []
 
-        self._log('🧠 AutonomousMind 初始化完成')
-        self._log(f'   Device: {self.device}')
-        self._log(f'   Params: {sum(p.numel() for p in self.model.parameters() if p.requires_grad) / 1e6:.2f}M')
-        self._log(f'   Config: {json.dumps(self.cfg, indent=2)}')
+        self._log("🧠 AutonomousMind 初始化完成")
+        self._log(f"   Device: {self.device}")
+        self._log(
+            f"Params: {
+                sum(p.numel() for p in self.model.parameters() if p.requires_grad) 
+                / 1e6:.2f}M"
+        )
+        self._log(f"   Config: {json.dumps(self.cfg, indent=2)}")
 
     def _log(self, msg: str):
         self.log_callback(msg)
 
     def _try_load_checkpoint(self):
         """尝试从检查点加载。自动处理 byte_proj 输入通道变化 (1→2)。"""
+
         def _fix_shapes(sd, model_sd):
             """修复 byte_proj 权重形状不匹配。"""
             for key in list(sd.keys()):
-                if key.endswith('byte_proj.weight') and key in model_sd:
+                if key.endswith("byte_proj.weight") and key in model_sd:
                     expected = model_sd[key].shape
                     actual = sd[key].shape
                     if actual != expected and actual[1] == 1 and expected[1] == 2:
@@ -521,29 +543,33 @@ class AutonomousMind:
                 return False
 
         try:
-            ckpt_path = self.cfg.get('checkpoint')
+            ckpt_path = self.cfg.get("checkpoint")
             if ckpt_path and _safe_exists(ckpt_path):
                 try:
-                    ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-                    _fix_shapes(ckpt['model_state'], self.model.state_dict())
-                    self.model.load_state_dict(ckpt['model_state'], strict=False)
-                    self._log(f'Loaded checkpoint: {ckpt_path}')
+                    ckpt = torch.load(
+                        ckpt_path, map_location=self.device, weights_only=False
+                    )
+                    _fix_shapes(ckpt["model_state"], self.model.state_dict())
+                    self.model.load_state_dict(ckpt["model_state"], strict=False)
+                    self._log(f"Loaded checkpoint: {ckpt_path}")
                     return True
                 except Exception as e:
-                    self._log(f'Checkpoint load failed: {e}')
+                    self._log(f"Checkpoint load failed: {e}")
 
-            default_path = os.path.join(ROOT_DIR, 'out_pc_unified', 'unified_final.pt')
+            default_path = os.path.join(ROOT_DIR, "out_pc_unified", "unified_final.pt")
             if _safe_exists(default_path):
                 try:
-                    ckpt = torch.load(default_path, map_location=self.device, weights_only=False)
-                    _fix_shapes(ckpt['model_state'], self.model.state_dict())
-                    self.model.load_state_dict(ckpt['model_state'], strict=False)
-                    self._log(f'Loaded default checkpoint: {default_path}')
+                    ckpt = torch.load(
+                        default_path, map_location=self.device, weights_only=False
+                    )
+                    _fix_shapes(ckpt["model_state"], self.model.state_dict())
+                    self.model.load_state_dict(ckpt["model_state"], strict=False)
+                    self._log(f"Loaded default checkpoint: {default_path}")
                     return True
                 except Exception as e:
-                    self._log(f'Default checkpoint load failed: {e}')
+                    self._log(f"Default checkpoint load failed: {e}")
         except Exception as e:
-            self._log(f'Checkpoint loading error: {type(e).__name__}: {e}')
+            self._log(f"Checkpoint loading error: {type(e).__name__}: {e}")
         return False
 
     # ══════════════════════════════════════════════════════════════
@@ -554,39 +580,39 @@ class AutonomousMind:
         """无限循环: 永不返回.
         所有异常都被捕获, 确保持续运行.
         """
-        self._log('🚀 进入持续运行模式 — 永不停止')
+        self._log("🚀 进入持续运行模式 — 永不停止")
         self._stop_flag.clear()
 
         while not self._stop_flag.is_set():
             try:
                 self._step()
             except Exception as e:
-                self._log(f'❌ 步骤异常: {e}')
+                self._log(f"❌ 步骤异常: {e}")
                 self._log(traceback.format_exc()[-500:])
                 time.sleep(1.0)
                 continue
 
-        self._log('⏹ 持续运行已停止')
+        self._log("⏹ 持续运行已停止")
 
     def stop(self):
         """设置停止标志 (线程安全)。"""
         self._stop_flag.set()
-        self._log('⏹ 正在停止...')
+        self._log("⏹ 正在停止...")
 
     def _step(self):
         """单步执行当前阶段的动作。"""
         phase = self.controller.next_phase()
         self.current_phase = phase
 
-        if phase == 'WAKE':
+        if phase == "WAKE":
             self._wake_step()
-        elif phase == 'PLAY':
+        elif phase == "PLAY":
             self._play_step()
-        elif phase == 'SLEEP':
+        elif phase == "SLEEP":
             self._sleep_step()
 
         self.total_steps = self.controller.total_steps
-        if self.total_steps - self.last_save_step >= self.cfg['save_interval']:
+        if self.total_steps - self.last_save_step >= self.cfg["save_interval"]:
             self._save_checkpoint(async_save=True)
             self.last_save_step = self.total_steps
 
@@ -617,14 +643,16 @@ class AutonomousMind:
             added += 1
 
         if added:
-            self._log(f'[WAKE] Generated {added} sequences, buffer={self.replay_buffer.size}')
+            self._log(
+                f"[WAKE] Generated {added} sequences, buffer={self.replay_buffer.size}"
+            )
 
     def _get_prompts(self, n_prompts: int = 4) -> list:
         """从 replay buffer 或外部数据获取 prompt 种子。"""
         prompts = []
-        prompt_len = self.cfg['gen_prompt_len']
+        prompt_len = self.cfg["gen_prompt_len"]
 
-        result = self.replay_buffer.sample(n_prompts, 'cpu')
+        result = self.replay_buffer.sample(n_prompts, "cpu")
         if result is not None:
             batch_bytes, _ = result
             for i in range(min(n_prompts, batch_bytes.size(0))):
@@ -651,10 +679,10 @@ class AutonomousMind:
 
     def _play_step(self):
         """一次 PLAY 训练步骤 — Hebbian。"""
-        batch = self.replay_buffer.sample(self.cfg['batch_size'], self.device)
+        batch = self.replay_buffer.sample(self.cfg["batch_size"], self.device)
 
         if batch is None:
-            batch = self.data_rotator.get_batch(self.cfg['batch_size'])
+            batch = self.data_rotator.get_batch(self.cfg["batch_size"])
             if batch is None:
                 time.sleep(0.2)
                 return
@@ -666,14 +694,15 @@ class AutonomousMind:
             pos_emb = self.model.get_position_embeddings(seq_len, self.device)
             z_init, ce_loss = self.model.forward_with_ce(byte_seq, labels, pos_emb)
         except Exception as e:
-            self._log(f'[PLAY] Forward error: {e}')
+            self._log(f"[PLAY] Forward error: {e}")
             return
 
         z_detached = [z.detach() for z in z_init]
         _, _, F_hist, F_pred, ε_list = self.model.spatiotemporal_infer(
-            z_detached, pos_emb,
+            z_detached,
+            pos_emb,
             gamma=self.controller.current_gamma,
-            T=self.cfg['T_infer'],
+            T=self.cfg["T_infer"],
             return_errors=False,
             return_pred_loss=True,
             return_ε=True,
@@ -684,37 +713,53 @@ class AutonomousMind:
 
         # ── Hebbian 更新 ──
         F_curr = F_pred.item()
-        F_prev = self._last_F if hasattr(self, '_last_F') and self._last_F is not None else F_curr
+        F_prev = (
+            self._last_F
+            if hasattr(self, "_last_F") and self._last_F is not None
+            else F_curr
+        )
         uncertainty = 1.0 - D
         _, ACh, modulation = compute_modulators(F_curr, F_prev, uncertainty, self.cfg)
         self._last_F = F_curr
 
-        base_lr = self.cfg.get('hebbian_base_eta', 1e-4)
-        gamma_rpe = self.cfg.get('dopamine_gamma', 0.3)
+        base_lr = self.cfg.get("hebbian_base_eta", 1e-4)
+        gamma_rpe = self.cfg.get("dopamine_gamma", 0.3)
 
         updates = {}
-        updates.update(compute_hebbian_temporal(ε_list, z_detached, modulation, base_lr, gamma_rpe))
-        updates.update(compute_hebbian_topdown(ε_list, z_detached, modulation, base_lr, gamma_rpe))
+        updates.update(
+            compute_hebbian_temporal(ε_list, z_detached, modulation, base_lr, gamma_rpe)
+        )
+        updates.update(
+            compute_hebbian_topdown(ε_list, z_detached, modulation, base_lr, gamma_rpe)
+        )
 
         L = len(ε_list)
         for ℓ in range(L):
             block_idx = ℓ // 2
-            is_conv = (ℓ % 2 == 0)
+            is_conv = ℓ % 2 == 0
             block = self.model.model.layers[block_idx]
             if is_conv:
                 dW_conv = compute_hebbian_conv(
-                    ε_list[ℓ], z_detached[ℓ],
-                    block.local_conv.weight, block.dilation,
-                    modulation, base_lr, gamma_rpe,
+                    ε_list[ℓ],
+                    z_detached[ℓ],
+                    block.local_conv.weight,
+                    block.dilation,
+                    modulation,
+                    base_lr,
+                    gamma_rpe,
                 )
-                updates[f'model.layers.{block_idx}.local_conv.weight'] = dW_conv
+                updates[f"model.layers.{block_idx}.local_conv.weight"] = dW_conv
             else:
                 mlp_updates = compute_hebbian_swiglu(
-                    ε_list[ℓ], z_detached[ℓ], block.mlp,
-                    modulation, base_lr, gamma_rpe,
+                    ε_list[ℓ],
+                    z_detached[ℓ],
+                    block.mlp,
+                    modulation,
+                    base_lr,
+                    gamma_rpe,
                 )
                 for k, v in mlp_updates.items():
-                    updates[f'model.layers.{block_idx}.mlp.{k}'] = v
+                    updates[f"model.layers.{block_idx}.mlp.{k}"] = v
 
         apply_hebbian_updates(updates, self.model)
 
@@ -726,9 +771,9 @@ class AutonomousMind:
 
         if self.total_steps % 10 == 0:
             self._log(
-                f'[PLAY] Step {self.total_steps} | '
-                f'CE={ce_val:.4f} F={F_val:.1f} D={D:.3f} '
-                f'mod={modulation:.3f} buf={self.replay_buffer.size}'
+                f"[PLAY] Step {self.total_steps} | "
+                f"CE={ce_val:.4f} F={F_val:.1f} D={D:.3f} "
+                f"mod={modulation:.3f} buf={self.replay_buffer.size}"
             )
 
     # ══════════════════════════════════════════════════════════════
@@ -737,13 +782,15 @@ class AutonomousMind:
 
     def _sleep_step(self):
         """SLEEP 离线巩固 — Hebbian。"""
-        self._log(f'[SLEEP] 开始离线巩固 (buffer={self.replay_buffer.size})')
+        self._log(f"[SLEEP] 开始离线巩固 (buffer={self.replay_buffer.size})")
 
         replay_steps = min(50, self.replay_buffer.size // 4)
         replay_losses = []
 
         for i in range(replay_steps):
-            batch = self.replay_buffer.sample(self.cfg['replay_batch_size'], self.device)
+            batch = self.replay_buffer.sample(
+                self.cfg["replay_batch_size"], self.device
+            )
             if batch is None:
                 break
 
@@ -756,9 +803,10 @@ class AutonomousMind:
 
                 z_detached = [z.detach() for z in z_init]
                 _, _, _, F_pred, ε_list = self.model.spatiotemporal_infer(
-                    z_detached, pos_emb,
+                    z_detached,
+                    pos_emb,
                     gamma=self.controller.current_gamma * 0.5,
-                    T=max(1, self.cfg['T_infer']),
+                    T=max(1, self.cfg["T_infer"]),
                     return_errors=False,
                     return_pred_loss=True,
                     return_ε=True,
@@ -769,54 +817,78 @@ class AutonomousMind:
 
                 # ── Hebbian 更新 ──
                 F_curr = F_pred.item()
-                F_prev = self._last_F if hasattr(self, '_last_F') and self._last_F is not None else F_curr
+                F_prev = (
+                    self._last_F
+                    if hasattr(self, "_last_F") and self._last_F is not None
+                    else F_curr
+                )
                 uncertainty = 1.0 - D
-                _, ACh, modulation = compute_modulators(F_curr, F_prev, uncertainty, self.cfg)
+                _, ACh, modulation = compute_modulators(
+                    F_curr, F_prev, uncertainty, self.cfg
+                )
                 self._last_F = F_curr
 
-                base_lr = self.cfg.get('hebbian_base_eta', 1e-4)
-                gamma_rpe = self.cfg.get('dopamine_gamma', 0.3)
+                base_lr = self.cfg.get("hebbian_base_eta", 1e-4)
+                gamma_rpe = self.cfg.get("dopamine_gamma", 0.3)
 
                 updates = {}
-                updates.update(compute_hebbian_temporal(ε_list, z_detached, modulation, base_lr, gamma_rpe))
-                updates.update(compute_hebbian_topdown(ε_list, z_detached, modulation, base_lr, gamma_rpe))
+                updates.update(
+                    compute_hebbian_temporal(
+                        ε_list, z_detached, modulation, base_lr, gamma_rpe
+                    )
+                )
+                updates.update(
+                    compute_hebbian_topdown(
+                        ε_list, z_detached, modulation, base_lr, gamma_rpe
+                    )
+                )
 
                 L = len(ε_list)
                 for ℓ in range(L):
                     block_idx = ℓ // 2
-                    is_conv = (ℓ % 2 == 0)
+                    is_conv = ℓ % 2 == 0
                     block = self.model.model.layers[block_idx]
                     if is_conv:
                         dW_conv = compute_hebbian_conv(
-                            ε_list[ℓ], z_detached[ℓ],
-                            block.local_conv.weight, block.dilation,
-                            modulation, base_lr, gamma_rpe,
+                            ε_list[ℓ],
+                            z_detached[ℓ],
+                            block.local_conv.weight,
+                            block.dilation,
+                            modulation,
+                            base_lr,
+                            gamma_rpe,
                         )
-                        updates[f'model.layers.{block_idx}.local_conv.weight'] = dW_conv
+                        updates[f"model.layers.{block_idx}.local_conv.weight"] = dW_conv
                     else:
                         mlp_updates = compute_hebbian_swiglu(
-                            ε_list[ℓ], z_detached[ℓ], block.mlp,
-                            modulation, base_lr, gamma_rpe,
+                            ε_list[ℓ],
+                            z_detached[ℓ],
+                            block.mlp,
+                            modulation,
+                            base_lr,
+                            gamma_rpe,
                         )
                         for k, v in mlp_updates.items():
-                            updates[f'model.layers.{block_idx}.mlp.{k}'] = v
+                            updates[f"model.layers.{block_idx}.mlp.{k}"] = v
 
                 apply_hebbian_updates(updates, self.model)
 
                 replay_losses.append(ce_loss.item())
 
             except Exception as e:
-                self._log(f'[SLEEP] Replay error: {e}')
+                self._log(f"[SLEEP] Replay error: {e}")
                 continue
 
         if replay_losses:
             avg_loss = sum(replay_losses) / len(replay_losses)
-            self._log(f'[SLEEP] 巩固完成: {len(replay_losses)} 步, avg_CE={avg_loss:.4f}')
+            self._log(
+                f"[SLEEP] 巩固完成: {len(replay_losses)} 步, avg_CE={avg_loss:.4f}"
+            )
 
-        self._log('[SLEEP] 轮换外部数据源')
+        self._log("[SLEEP] 轮换外部数据源")
         self.data_rotator = DataRotator(
-            self.cfg['data_dir'],
-            max_seq_len=self.cfg['max_seq_len'],
+            self.cfg["data_dir"],
+            max_seq_len=self.cfg["max_seq_len"],
             max_samples=200,
         )
 
@@ -826,24 +898,25 @@ class AutonomousMind:
 
     def _save_checkpoint(self, async_save: bool = False):
         """保存模型状态。"""
+
         def _save():
             try:
-                out_dir = os.path.join(ROOT_DIR, self.cfg['out_dir'])
+                out_dir = os.path.join(ROOT_DIR, self.cfg["out_dir"])
                 os.makedirs(out_dir, exist_ok=True)
                 ckpt = {
-                    'model_state': self.model.state_dict(),
-                    'controller_state': self.controller.to_dict(),
-                    'total_steps': self.total_steps,
-                    'lm_config': self.lm_config,
-                    'cfg': self.cfg,
+                    "model_state": self.model.state_dict(),
+                    "controller_state": self.controller.to_dict(),
+                    "total_steps": self.total_steps,
+                    "lm_config": self.lm_config,
+                    "cfg": self.cfg,
                 }
-                path = os.path.join(out_dir, f'autonomous_s{self.total_steps}.pt')
+                path = os.path.join(out_dir, f"autonomous_s{self.total_steps}.pt")
                 torch.save(ckpt, path)
-                latest = os.path.join(out_dir, 'autonomous_latest.pt')
+                latest = os.path.join(out_dir, "autonomous_latest.pt")
                 torch.save(ckpt, latest)
-                self._log(f'💾 Checkpoint saved: {path}')
+                self._log(f"💾 Checkpoint saved: {path}")
             except Exception as e:
-                self._log(f'💾 Save error: {e}')
+                self._log(f"💾 Save error: {e}")
 
         if async_save:
             t = threading.Thread(target=_save, daemon=True)
@@ -855,6 +928,7 @@ class AutonomousMind:
 # ═══════════════════════════════════════════════════════════════════
 # 内在动机元控制器
 # ═══════════════════════════════════════════════════════════════════
+
 
 class IntrinsicMetaController(MetaController):
     """支持内在动机信号 (curiosity_drive, competence_drive, boredom_signal) 的元控制器。
@@ -868,39 +942,46 @@ class IntrinsicMetaController(MetaController):
 
     def __init__(self, cfg: dict):
         super().__init__(cfg)
-        self.curiosity_drive: float = 0.5   # [0, 1]
+        self.curiosity_drive: float = 0.5  # [0, 1]
         self.competence_drive: float = 0.5  # [0, 1]
-        self.boredom_signal: float = 0.0    # [0, 1]
+        self.boredom_signal: float = 0.0  # [0, 1]
         self._icm_history: list[dict] = []
         self.concept_discovery: Optional[ConceptDiscovery] = None
 
     def update_intrinsic(self, icm_output: dict):
         """每一步接收 ICM 输出信号。"""
-        self._icm_history.append({
-            'ig': icm_output.get('information_gain', 0.0),
-            'pred_loss': icm_output.get('pred_loss', 0.0),
-            'inverse_loss': icm_output.get('inverse_loss', 0.0),
-            'uncertainty': icm_output.get('uncertainty', 0.0),
-        })
+        self._icm_history.append(
+            {
+                "ig": icm_output.get("information_gain", 0.0),
+                "pred_loss": icm_output.get("pred_loss", 0.0),
+                "inverse_loss": icm_output.get("inverse_loss", 0.0),
+                "uncertainty": icm_output.get("uncertainty", 0.0),
+            }
+        )
         if len(self._icm_history) > 100:
             self._icm_history.pop(0)
 
         # curiosity_drive: 高 information_gain → 高好奇
-        ig_ema = sum(d['ig'] for d in self._icm_history[-20:]) / max(len(self._icm_history[-20:]), 1)
+        ig_ema = sum(d["ig"] for d in self._icm_history[-20:]) / max(
+            len(self._icm_history[-20:]), 1
+        )
         self.curiosity_drive = min(1.0, ig_ema * 5.0)
 
         # competence_drive: inverse_loss 下降速度
         if len(self._icm_history) >= 20:
-            recent_inv = sum(d['inverse_loss'] for d in self._icm_history[-10:]) / 10
-            older_inv = sum(d['inverse_loss'] for d in self._icm_history[-20:-10]) / 10
+            recent_inv = sum(d["inverse_loss"] for d in self._icm_history[-10:]) / 10
+            older_inv = sum(d["inverse_loss"] for d in self._icm_history[-20:-10]) / 10
             if older_inv > 0:
                 drop = (older_inv - recent_inv) / older_inv
                 self.competence_drive = min(1.0, max(0.0, drop * 2.0))
 
         # boredom_signal: 低 IG + competence 高 → 无聊 → 切换阶段
-        self.boredom_signal = min(1.0, max(0.0,
-            (1.0 - self.curiosity_drive) * (1.0 - self.competence_drive) * 2.0
-        ))
+        self.boredom_signal = min(
+            1.0,
+            max(
+                0.0, (1.0 - self.curiosity_drive) * (1.0 - self.competence_drive) * 2.0
+            ),
+        )
 
     def next_phase(self) -> str:
         """内在动机增强的阶段决策。
@@ -912,18 +993,18 @@ class IntrinsicMetaController(MetaController):
         phase = super().next_phase()
 
         # boredom 打断
-        if phase == 'PLAY' and self.boredom_signal > 0.6:
-            self.phase = 'WAKE'
+        if phase == "PLAY" and self.boredom_signal > 0.6:
+            self.phase = "WAKE"
             self.play_count = 0
             self.wake_count = 0
-            return 'WAKE'
+            return "WAKE"
 
         # 高好奇延长 PLAY
-        if phase == 'WAKE' and self.curiosity_drive > 0.7:
-            if self.wake_count < self.cfg.get('wake_steps', 20) // 2:
-                self.phase = 'PLAY'  # 跳过剩余生成
+        if phase == "WAKE" and self.curiosity_drive > 0.7:
+            if self.wake_count < self.cfg.get("wake_steps", 20) // 2:
+                self.phase = "PLAY"  # 跳过剩余生成
                 self.wake_count = 0
-                return 'PLAY'
+                return "PLAY"
 
         return phase
 

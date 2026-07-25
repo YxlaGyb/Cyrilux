@@ -1,5 +1,5 @@
 """
-virtuoso config — 配置管理子命令.
+config — 配置管理子命令.
 """
 
 import os, json
@@ -34,7 +34,7 @@ AUTO_TEMPLATE = {
 @app.command()
 def init(
     ctx: typer.Context,
-    output: str = typer.Option("virtuoso_config.json", "--output", "-o", help="输出路径"),
+    output: str = typer.Option("cyrilux_config.json", "--output", "-o", help="输出路径"),
     template: str = typer.Option("train", "--template", "-t", help="模板类型: train|autonomous"),
 ):
     """生成默认配置文件模板."""

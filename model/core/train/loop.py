@@ -89,6 +89,8 @@ class TrainingLoop:
         # 上一步 F_total (用于多巴胺调制)
         self._last_F_bp: float = float("inf")
         self._global_F_hist: list[float] = []
+        # 上一步多巴胺 D (传递给下一轮 init_z/forward_with_ce 做门控)
+        self._last_dopamine_D: float = 0.5
 
         # 7a: WM 滚动指标
         self._wm_metrics: dict[str, list[float]] = {
@@ -195,31 +197,20 @@ class TrainingLoop:
         model._act_homeo_rate = self.cfg.act_homeo_rate
         model._act_energy_cost = self.cfg.act_energy_cost
         init_th = (
-            torch.ones(model.num_sub_layers, model.config.hidden_size)
-            * self.cfg.act_threshold_init
+            torch.ones(model.num_sub_layers, model.config.hidden_size) * self.cfg.act_threshold_init
         )
         model.register_buffer("_act_threshold", init_th)
 
-        if (
-            hasattr(torch, "compile")
-            and self.device.type == "cuda"
-            and hasattr(torch, "triton")
-        ):
+        if hasattr(torch, "compile") and self.device.type == "cuda" and hasattr(torch, "triton"):
             self._orig_forward = model.forward_with_ce
             try:
-                model.forward_with_ce = torch.compile(
-                    self._orig_forward, mode="reduce-overhead"
-                )
+                model.forward_with_ce = torch.compile(self._orig_forward, mode="reduce-overhead")
                 self._log("torch.compile 启用 (mode=reduce-overhead)")
             except Exception as e:
                 model.forward_with_ce = self._orig_forward
                 self._log(f"torch.compile 失败 (已忽略): {e}")
 
-        if (
-            hasattr(torch, "compile")
-            and self.device.type == "cuda"
-            and hasattr(torch, "triton")
-        ):
+        if hasattr(torch, "compile") and self.device.type == "cuda" and hasattr(torch, "triton"):
             try:
                 model._spatiotemporal_infer_step = torch.compile(
                     model._spatiotemporal_infer_step,
@@ -244,16 +235,12 @@ class TrainingLoop:
             )
             dummy = torch.stack(
                 [
-                    dummy_byte.float(),
-                    torch.full_like(
-                        dummy_byte, 2.0, dtype=torch.float, device=self.device
-                    ),
+                    dummy_byte.half(),
+                    torch.full_like(dummy_byte, 2.0, dtype=torch.float16, device=self.device),
                 ],
                 dim=1,
             )
-            dummy_pos = self.model.get_position_embeddings(
-                self.cfg.max_seq_len, self.device
-            )
+            dummy_pos = self.model.get_position_embeddings(self.cfg.max_seq_len, self.device)
             try:
                 _, _ = self.model.forward_with_ce(dummy, dummy_byte, dummy_pos)
             except Exception as e:
@@ -267,15 +254,13 @@ class TrainingLoop:
             if self.cfg.enable_world_model and self.world_model is not None:
                 z_init, _ = self.model.forward_with_ce(dummy, dummy_byte, dummy_pos)
                 state_tensor = (
-                    z_init[-1].detach()
-                    if isinstance(z_init, (list, tuple))
-                    else z_init.detach()
+                    z_init[-1].detach() if isinstance(z_init, (list, tuple)) else z_init.detach()
                 )
                 ctx = torch.zeros(
                     dummy.size(0),
                     self.cfg.world_model_context_dim,
                     device=self.device,
-                    dtype=torch.float32,
+                    dtype=torch.float16,
                 )
                 _, _ = self.world_model(state_tensor, ctx)
                 _ = self.world_model.loss(state_tensor, state_tensor, ctx)
@@ -297,7 +282,7 @@ class TrainingLoop:
         ctx_vals = torch.tensor(
             [step_progress, last_D, F_trend, forgetting_max, task_novelty],
             device=self.device,
-            dtype=torch.float32,
+            dtype=torch.float16,
         )
         return ctx_vals.unsqueeze(0).expand(batch_size, -1)
 
@@ -326,7 +311,7 @@ class TrainingLoop:
                 icm_uncertainty,
             ],
             device=self.device,
-            dtype=torch.float32,
+            dtype=torch.float16,
         )
         return ctx_vals.unsqueeze(0).expand(batch_size, -1)
 
@@ -352,9 +337,11 @@ class TrainingLoop:
         bsz = byte_seq.size(0)
         pos_emb = self.model.get_position_embeddings(seq_len, self.device)
 
-        # ── Phase 1: init_z (no_grad) ──
+        # ── Phase 1: init_z + 缓存 SwiGLU 前激活 ──
+        #     传递上一步多巴胺 D 给 post-SwiGLU 门控归一化层
+        self.model._hebbian_cache_enable()
         with torch.no_grad():
-            z_init = self.model.init_z(byte_seq)
+            z_init = self.model.init_z(byte_seq, dopamine_D=self._last_dopamine_D)
 
         # ── temp_loss 诊断 ──
         bp_temp_loss = 0.0
@@ -367,9 +354,7 @@ class TrainingLoop:
                 z_ℓ = z_init[layer_i + 1]
                 if z_ℓ.size(1) > 1:
                     z_proj = self.model.temporal_proj[layer_i](z_ℓ[:, :-1, :])
-                    tl = (
-                        0.5 * (z_proj - z_ℓ[:, 1:, :]).pow(2).mean()
-                    )
+                    tl = 0.5 * (z_proj - z_ℓ[:, 1:, :]).pow(2).mean()
                     tl_clamped = tl.clamp(max=100.0)
                     tl_list.append(tl_clamped)
                     tl_acc = tl_acc + tl_clamped
@@ -379,11 +364,7 @@ class TrainingLoop:
 
         # ── Phase 2: PC 推理 ──
         uncertainty = compute_uncertainty(self._global_F_hist, window=10)
-        ACh = float(
-            torch.sigmoid(
-                torch.tensor(-uncertainty + self.cfg.hebbian_ach_beta_0)
-            ).item()
-        )
+        ACh = float(torch.sigmoid(torch.tensor(-uncertainty + self.cfg.hebbian_ach_beta_0)).item())
 
         with torch.no_grad():
             z_conv, errors_hist, F_hist, _, ε_list = self.model.spatiotemporal_infer(
@@ -404,10 +385,12 @@ class TrainingLoop:
 
         F_curr = F_hist[-1] if F_hist else 0.0
 
+        # T=1 融合: 提取推理阶段缓存的 SwiGLU 预激活, 跳过 Phase 5 重建
+        hebbian_cache = self.model._hebbian_cache_disable_and_collect()
+
         # ── Phase 3: 调制信号 ──
-        D, ACh_val, modulation = compute_modulators(
-            F_curr, self._last_F_bp, uncertainty, self.cfg
-        )
+        D, ACh_val, modulation = compute_modulators(F_curr, self._last_F_bp, uncertainty, self.cfg)
+        self._last_dopamine_D = D  # 保存供下一轮 init_z 门控
         λ = compute_lambda(
             self.global_step, self.cfg.hebbian_lambda_decay, self.cfg.hebbian_lambda_min
         )
@@ -417,7 +400,7 @@ class TrainingLoop:
         if labels is not None and seq_len > 1:
             target_onehot = nn.functional.one_hot(
                 labels[:, 1:].long().clamp(0, 255), num_classes=256
-            ).float()
+            ).half()
         else:
             target_onehot = None
 
@@ -443,6 +426,7 @@ class TrainingLoop:
                 oja_alpha=oja_alpha,
                 bcm_state=self.bcm_state,
                 verbose=True,
+                hebbian_cache=hebbian_cache,
             )
             apply_hebbian_updates(
                 updates, self.model, synaptic_normalize=syn_norm, target_norm=syn_target
@@ -490,10 +474,8 @@ class TrainingLoop:
             ce_diag = self.model.compute_ce_loss(z_conv, labels).item()
             if target_onehot is not None:
                 z_L = z_conv[-1]
-                z_dec = z_L[:, :-1, :].float() if z_L.size(1) > 1 else z_L.float()
-                dec_pred = nn.functional.linear(
-                    z_dec, self.model.decoder.weight.float()
-                )
+                z_dec = z_L[:, :-1, :] if z_L.size(1) > 1 else z_L
+                dec_pred = nn.functional.linear(z_dec, self.model.decoder.weight)
                 dec_loss = nn.functional.mse_loss(dec_pred, target_onehot).item()
             else:
                 dec_loss = 0.0
@@ -536,26 +518,18 @@ class TrainingLoop:
                         action_embed = torch.cat([action_embed, pad], dim=-1)
                     icm_output = self.icm.forward(z_prev, z_curr)
                     self._icm_output = {
-                        k: (
-                            v.item()
-                            if isinstance(v, torch.Tensor) and v.numel() == 1
-                            else v
-                        )
+                        k: (v.item() if isinstance(v, torch.Tensor) and v.numel() == 1 else v)
                         for k, v in icm_output.items()
                     }
                     icm_loss_val = (
-                        self.cfg.icm_forward_weight
-                        * self._icm_output.get("pred_loss", 0.0)
-                        + self.cfg.icm_inverse_weight
-                        * self._icm_output.get("inverse_loss", 0.0)
+                        self.cfg.icm_forward_weight * self._icm_output.get("pred_loss", 0.0)
+                        + self.cfg.icm_inverse_weight * self._icm_output.get("inverse_loss", 0.0)
                         + self.cfg.icm_contrastive_weight
                         * self._icm_output.get("contrastive_loss", 0.0)
                     )
                 if self.concept_discovery is not None:
                     info_gain = self._icm_output.get("information_gain", 0.0)
-                    self.concept_discovery.observe(
-                        z_curr[0:1].detach(), intrinsic_value=info_gain
-                    )
+                    self.concept_discovery.observe(z_curr[0:1].detach(), intrinsic_value=info_gain)
             else:
                 self._icm_output = None
                 icm_loss_val = 0.0
@@ -570,10 +544,7 @@ class TrainingLoop:
             sample_label = labels[0].detach()
             sample_task = self._current_task_id
             sample_concept = ""
-            if (
-                self.concept_discovery is not None
-                and len(self.concept_discovery.concept_ids) > 0
-            ):
+            if self.concept_discovery is not None and len(self.concept_discovery.concept_ids) > 0:
                 sample_concept = self.concept_discovery.concept_ids[-1]
             self.consolidation_pipeline.observe(
                 z_states=sample_z,
@@ -643,9 +614,7 @@ class TrainingLoop:
             result["hebb_diag"] = hebb_diag
 
         # ── Phase 3c: 海马体缓冲写入 ──
-        info_gain = (
-            self._icm_output.get("information_gain", 0.0) if self._icm_output else 0.0
-        )
+        info_gain = self._icm_output.get("information_gain", 0.0) if self._icm_output else 0.0
         if info_gain > self.hippocampus.min_info_gain:
             self.hippocampus.add(
                 z_states=z_conv,
@@ -686,17 +655,15 @@ class TrainingLoop:
         pos_emb = self.model.get_position_embeddings(seq_len, self.device)
 
         if z_init is None and byte_seq is not None:
-            z_init, _ = self.model.forward_with_ce(byte_seq, labels, pos_emb)
+            z_init, _ = self.model.forward_with_ce(
+                byte_seq, labels, pos_emb, dopamine_D=self._last_dopamine_D
+            )
 
         if byte_seq is None:
             byte_seq = torch.zeros(1, 2, seq_len, device=self.device, dtype=torch.long)
 
         uncertainty = compute_uncertainty(self._global_F_hist, window=10)
-        ACh = float(
-            torch.sigmoid(
-                torch.tensor(-uncertainty + self.cfg.hebbian_ach_beta_0)
-            ).item()
-        )
+        ACh = float(torch.sigmoid(torch.tensor(-uncertainty + self.cfg.hebbian_ach_beta_0)).item())
         with torch.no_grad():
             z_conv, errors_hist, _, _, ε_list = self.model.spatiotemporal_infer(
                 z_init,
@@ -709,9 +676,9 @@ class TrainingLoop:
                 return_ε=True,
             )
         F_curr = errors_hist[-1][0][1] if errors_hist and errors_hist[-1] else 0.0
-        D, ACh_val, modulation = compute_modulators(
-            F_curr, self._last_F_bp, uncertainty, self.cfg
-        )
+        hebbian_cache = getattr(self.model, "_hebbian_cache", None)
+        D, ACh_val, modulation = compute_modulators(F_curr, self._last_F_bp, uncertainty, self.cfg)
+        self._last_dopamine_D = D
         λ = compute_lambda(
             self.global_step, self.cfg.hebbian_lambda_decay, self.cfg.hebbian_lambda_min
         )
@@ -735,6 +702,7 @@ class TrainingLoop:
                 oja_alpha=oja_alpha,
                 bcm_state=self.bcm_state,
                 verbose=False,
+                hebbian_cache=hebbian_cache,
             )
             apply_hebbian_updates(
                 updates, self.model, synaptic_normalize=syn_norm, target_norm=syn_target
@@ -746,9 +714,7 @@ class TrainingLoop:
 
     def train(
         self,
-        task_pipelines: list[
-            tuple[str, torch.utils.data.Dataset, Optional[DataLoader]]
-        ],
+        task_pipelines: list[tuple[str, torch.utils.data.Dataset, Optional[DataLoader]]],
     ):
         """主训练入口 — Callback 架构.
 
@@ -764,9 +730,7 @@ class TrainingLoop:
         self._fallback_state = {
             k: v.detach().clone().cpu() for k, v in self.model.state_dict().items()
         }
-        self._log(
-            f"NaN fallback snapshot saved ({len(self._fallback_state)} tensors on CPU)"
-        )
+        self._log(f"NaN fallback snapshot saved ({len(self._fallback_state)} tensors on CPU)")
         self._log(
             "Model: capacity budget"
             f" {budget['trainable_M']:.2f}M"
@@ -925,9 +889,7 @@ class TrainingLoop:
             # ── 8a+8b: novelty 加速 + WM reset ──
             if self.cfg.enable_world_model:
                 self._novelty_boost_steps = int(len(task_ds) * 0.05)
-                self._novelty_surprise_injected = (
-                    self.cfg.world_model_surprise_threshold * 2.0
-                )
+                self._novelty_surprise_injected = self.cfg.world_model_surprise_threshold * 2.0
                 if hasattr(self, "world_model") and self.world_model is not None:
                     self.world_model.reset_state()
                     self._log(f"[Novelty/8b] WM state reset for task {task_id}")
@@ -974,11 +936,7 @@ class TrainingLoop:
                             f"  [Hebb] oja_α={hebb['oja_alpha']:.4f} | "
                             f"mean|ΔW|={hebb['avg_growth']:.6f} | "
                             f"updates={hebb['n_params']}"
-                            + (
-                                f" | ⚠ {hebb['n_inf']} inf跳过"
-                                if hebb["n_inf"] > 0
-                                else ""
-                            )
+                            + (f" | ⚠ {hebb['n_inf']} inf跳过" if hebb["n_inf"] > 0 else "")
                         )
 
                     # 8a: novelty 注入
@@ -1016,13 +974,8 @@ class TrainingLoop:
                             self._wm_high_surprise_count += 1
                             if ce_now <= self._last_ce_for_fp:
                                 self._wm_fp_count += 1
-                        if (
-                            self.global_step % 100 == 0
-                            and self._wm_high_surprise_count > 0
-                        ):
-                            fp_rate = self._wm_fp_count / max(
-                                self._wm_high_surprise_count, 1
-                            )
+                        if self.global_step % 100 == 0 and self._wm_high_surprise_count > 0:
+                            fp_rate = self._wm_fp_count / max(self._wm_high_surprise_count, 1)
                             self._wm_metrics["fp_rate"].append(fp_rate)
                         self._last_ce_for_fp = ce_now
 
@@ -1054,9 +1007,7 @@ class TrainingLoop:
         self.model.cpu()
         fp = os.path.join(out_dir, "unified_final.pt")
         torch.save(self.model.state_dict(), fp)
-        self._log(
-            f"unified_final saved → {fp} ({os.path.getsize(fp) // 1024 // 1024}MB)"
-        )
+        self._log(f"unified_final saved → {fp} ({os.path.getsize(fp) // 1024 // 1024}MB)")
 
         self._log("Training complete.")
         if self.cfg.progress_callback:

@@ -1,5 +1,6 @@
 """
-离线生成式自巩固 — 利用 PC 模型自身预测能力做自我回放.
+离线生成式自巩固
+利用 PC 模型自身预测能力做自我回放.
 
 Phase 6 (Bonus): 在训练间隙, 让 PC 模型为 MemoryBank 中每个旧任务
 生成合成训练数据. 完全不需要原始数据源.
@@ -12,6 +13,7 @@ Phase 6 (Bonus): 在训练间隙, 让 PC 模型为 MemoryBank 中每个旧任务
 注意: 仅做生成 (inference), 不含任何 backward 训练.
 Hebbian 回放训练由 trainer._maybe_replay/_maybe_abstraction_replay 接管.
 """
+
 from __future__ import annotations
 
 import torch
@@ -48,7 +50,7 @@ class OfflineReplayer:
             return 0.5
         x = byte_t.unsqueeze(0).to(device)
         pos = self.model.get_position_embeddings(x.size(-1), device)
-        z_init, _ = self.model.forward_with_ce(x.float().unsqueeze(1), x.long(), pos)
+        z_init, _ = self.model.forward_with_ce(x.half().unsqueeze(1), x.long(), pos)
         z_top = z_init[-1].detach()
         ctx = torch.zeros(1, 5, device=device)
         _, unc = self.world_model(z_top, ctx)
@@ -82,7 +84,7 @@ class OfflineReplayer:
         temperature: float = 0.8,
         top_k: int = 20,
         prompt_len: int = 8,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
         enable_wm_filter: bool = True,
         enable_wm_temperature: bool = True,
     ) -> list:
@@ -103,7 +105,7 @@ class OfflineReplayer:
             return []
 
         samples = []
-        idx = torch.randperm(len(buf))[:min(n_samples, len(buf))].tolist()
+        idx = torch.randperm(len(buf))[: min(n_samples, len(buf))].tolist()
         for i in idx:
             ex = buf[i]
             prompt_bytes = ex.byte_tensor[:prompt_len]  # [prompt_len]
@@ -115,7 +117,8 @@ class OfflineReplayer:
                 # 对 prompt 计算世界模型 uncertainty
                 pos = self.model.get_position_embeddings(prompt.size(-1), device)
                 z_init, _ = self.model.forward_with_ce(
-                    prompt.float().unsqueeze(1), prompt.long(), pos)
+                    prompt.half().unsqueeze(1), prompt.long(), pos
+                )
                 z_top = z_init[-1].detach()
                 ctx = torch.zeros(1, 5, device=device)
                 _, unc = self.world_model(z_top, ctx)
@@ -139,7 +142,9 @@ class OfflineReplayer:
             # 截断/填充到 128
             seq_len = full_seq.size(0)
             if seq_len < 128:
-                padded = torch.cat([full_seq.cpu(), torch.zeros(128 - seq_len, dtype=torch.long)])
+                padded = torch.cat(
+                    [full_seq.cpu(), torch.zeros(128 - seq_len, dtype=torch.long)]
+                )
             else:
                 padded = full_seq[:128].cpu()
             byte_t = padded.to(torch.uint8)

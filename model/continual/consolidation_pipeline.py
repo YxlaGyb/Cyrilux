@@ -12,15 +12,14 @@
   - 薄弱吸引子周边的高信息增益样本 → 优先写入
   - 稳固吸引子周边的样本 → 跳过 (不浪费容量)
 """
+
 from __future__ import annotations
 
-import math
-from typing import List, Tuple, Optional, Dict, Callable
+from typing import List, Tuple, Optional, Dict
 
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 from model.continual.attractor_landscape import AttractorLandscape
 
@@ -28,12 +27,13 @@ from model.continual.attractor_landscape import AttractorLandscape
 @dataclass
 class ZSample:
     """单条 PC latent 表示缓存条目。"""
-    z_states: List[torch.Tensor]       # [13] × [1, seq, hidden]
-    byte_tensor: torch.Tensor          # [128] uint8
-    label_tensor: torch.Tensor         # [128] long
+
+    z_states: List[torch.Tensor]  # [13] × [1, seq, hidden]
+    byte_tensor: torch.Tensor  # [128] uint8
+    label_tensor: torch.Tensor  # [128] long
     task_id: str
     concept_id: str
-    information_gain: float            # ICM 信息增益
+    information_gain: float  # ICM 信息增益
     dopamine_score: float
     step: int
 
@@ -87,7 +87,7 @@ class ContinuousBuffer:
                 ds = 0.1
             w = max(ig, 0.01) * max(ds, 0.1)
             scores.append(max(w, 0.01))
-        weights = torch.tensor(scores, dtype=torch.float)
+        weights = torch.tensor(scores, dtype=torch.float16)
         weights = torch.nan_to_num(weights, nan=0.01)
         wsum = weights.sum().clamp_min(1e-8)
         if wsum <= 0 or not torch.isfinite(wsum):
@@ -115,12 +115,12 @@ class ConsolidationPipeline:
     def __init__(
         self,
         buffer_capacity: int = 500,
-        memory_write_interval: int = 50,        # 每 N 步写 MemoryBank
+        memory_write_interval: int = 50,  # 每 N 步写 MemoryBank
         abstraction_write_interval: int = 200,  # 每 N 步写 AbstractionBank
-        sleep_check_interval: int = 500,        # 每 N 步检查是否需要 SLEEP
-        sleep_entropy_threshold: float = 0.3,   # 归一化熵低于此值 → 需要 SLEEP
-        collapse_threshold: float = 0.2,        # 坍缩比高于此值 → 需要 SLEEP
-        memory_batch_size: int = 32,            # 每次写入的样本数
+        sleep_check_interval: int = 500,  # 每 N 步检查是否需要 SLEEP
+        sleep_entropy_threshold: float = 0.3,  # 归一化熵低于此值 → 需要 SLEEP
+        collapse_threshold: float = 0.2,  # 坍缩比高于此值 → 需要 SLEEP
+        memory_batch_size: int = 32,  # 每次写入的样本数
         abstraction_batch_size: int = 16,
         num_sub_layers: int = 12,
         min_info_gain_for_write: float = 0.05,  # 只有高于此信息增益才写入
@@ -144,10 +144,10 @@ class ConsolidationPipeline:
 
         # 统计
         self.stats: dict = {
-            'n_memory_writes': 0,
-            'n_abstraction_writes': 0,
-            'n_sleep_requests': 0,
-            'last_landscape_report': {},
+            "n_memory_writes": 0,
+            "n_abstraction_writes": 0,
+            "n_sleep_requests": 0,
+            "last_landscape_report": {},
         }
 
     # ── 核心: 每步调度 ────────────────────────────────────────────────
@@ -186,7 +186,7 @@ class ConsolidationPipeline:
         model: torch.nn.Module,
         memory_bank,
         abstraction_bank,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
         dopamine_score: Optional[float] = None,
     ) -> Dict[str, any]:
         """每步调用 — 检查是否需要触发写入或 SLEEP。
@@ -198,34 +198,34 @@ class ConsolidationPipeline:
         Returns:
             {'triggered': str | None, 'stats': dict}
         """
-        result = {'triggered': None, 'stats': {}}
+        result = {"triggered": None, "stats": {}}
 
         # ── MemoryBank 写入 ──
         if (step - self._last_memory_write) >= self.memory_write_interval:
             n_written = self._write_to_memory_bank(model, memory_bank, device)
             self._last_memory_write = step
-            self.stats['n_memory_writes'] += 1
+            self.stats["n_memory_writes"] += 1
             if n_written > 0:
-                result['triggered'] = f'memory_write:{n_written}'
+                result["triggered"] = f"memory_write:{n_written}"
 
         # ── AbstractionBank 写入 ──
         if (step - self._last_abstraction_write) >= self.abstraction_write_interval:
             n_written = self._write_to_abstraction_bank(model, abstraction_bank, device)
             self._last_abstraction_write = step
-            self.stats['n_abstraction_writes'] += 1
+            self.stats["n_abstraction_writes"] += 1
             if n_written > 0:
-                prev = result['triggered'] or ''
-                result['triggered'] = f'{prev}+abstraction_write:{n_written}'
+                prev = result["triggered"] or ""
+                result["triggered"] = f"{prev}+abstraction_write:{n_written}"
 
         # ── 睡眠检查 (误差比率驱动) ──
         if (step - self._last_sleep_check) >= self.sleep_check_interval:
             self._last_sleep_check = step
             need_sleep = self._check_sleep_needed(abstraction_bank, dopamine_score)
             if need_sleep:
-                self.stats['n_sleep_requests'] += 1
-                result['triggered'] = 'sleep_needed'
+                self.stats["n_sleep_requests"] += 1
+                result["triggered"] = "sleep_needed"
 
-        result['stats'] = dict(self.stats)
+        result["stats"] = dict(self.stats)
         return result
 
     # ── 内部: 写入逻辑 ────────────────────────────────────────────────
@@ -246,15 +246,23 @@ class ConsolidationPipeline:
             return 0
 
         # 按 task_id 分组写入
-        by_task: Dict[str, List[Tuple[torch.Tensor, torch.Tensor, float, float, float, str]]] = {}
+        by_task: Dict[
+            str, List[Tuple[torch.Tensor, torch.Tensor, float, float, float, str]]
+        ] = {}
         for s in samples:
             tid = s.task_id
             if tid not in by_task:
                 by_task[tid] = []
-            by_task[tid].append((
-                s.byte_tensor, s.label_tensor,
-                s.dopamine_score, s.information_gain, s.information_gain, s.concept_id,
-            ))
+            by_task[tid].append(
+                (
+                    s.byte_tensor,
+                    s.label_tensor,
+                    s.dopamine_score,
+                    s.information_gain,
+                    s.information_gain,
+                    s.concept_id,
+                )
+            )
 
         n_total = 0
         for tid, entries in by_task.items():
@@ -277,10 +285,13 @@ class ConsolidationPipeline:
             avg_d = sum(d_scores) / len(d_scores)
             avg_ig = sum(info_gains) / len(info_gains)
             # concept_id 取众数 (出现最多的)
-            concept_id = max(set(concept_ids), key=concept_ids.count) if concept_ids else ''
+            concept_id = (
+                max(set(concept_ids), key=concept_ids.count) if concept_ids else ""
+            )
 
             memory_bank.add_samples(
-                tid, pairs,
+                tid,
+                pairs,
                 dopamine_score=avg_d,
                 baseline_loss=0.0,  # 后续 forgot sniffer 会更新
                 transition_surprise=0.0,
@@ -318,25 +329,31 @@ class ConsolidationPipeline:
             # ── Stride 下采样 z_states ──
             if self.stride > 1:
                 for s in group:
-                    s.z_states = [z[..., ::self.stride] for z in s.z_states]
+                    s.z_states = [z[..., :: self.stride] for z in s.z_states]
 
             z_states_list = [s.z_states for s in group]
             avg_d = sum(s.dopamine_score for s in group) / len(group)
             avg_ig = sum(s.information_gain for s in group) / len(group)
             concept_ids = [s.concept_id for s in group]
-            concept_id = max(set(concept_ids), key=concept_ids.count) if concept_ids else ''
+            concept_id = (
+                max(set(concept_ids), key=concept_ids.count) if concept_ids else ""
+            )
 
             # 计算层重要性 (用第一个样本)
             if group:
                 layer_imp = compute_layer_importance(
-                    group[0].z_states, model, (None, None),
-                    dopamine_D=avg_d, eta=1.0,
+                    group[0].z_states,
+                    model,
+                    (None, None),
+                    dopamine_D=avg_d,
+                    eta=1.0,
                 )
             else:
                 layer_imp = None
 
             abstraction_bank.add_z_samples(
-                tid, z_states_list,
+                tid,
+                z_states_list,
                 layer_importance=layer_imp,
                 dopamine_score=avg_d,
                 world_model_surprise=0.0,
@@ -350,7 +367,9 @@ class ConsolidationPipeline:
 
     # ── 内部: 睡眠调度 ────────────────────────────────────────────────
 
-    def _check_sleep_needed(self, abstraction_bank, dopamine_score: Optional[float] = None) -> bool:
+    def _check_sleep_needed(
+        self, abstraction_bank, dopamine_score: Optional[float] = None
+    ) -> bool:
         """检查是否需要深度睡眠。
 
         使用多巴胺 D (RPE): D → 1 (自由能快速下降) → 稳定状态 → 适合巩固.
@@ -361,11 +380,11 @@ class ConsolidationPipeline:
 
         if dopamine_score is not None:
             # D 高 → 自由能快速下降 → 表示空间收敛 → 触发睡眠巩固
-            self.stats['last_dopamine_score'] = dopamine_score
+            self.stats["last_dopamine_score"] = dopamine_score
             need_sleep = dopamine_score > 0.70
-            self.stats['last_sleep_decision'] = {
-                'dopamine_score': dopamine_score,
-                'need_sleep': need_sleep,
+            self.stats["last_sleep_decision"] = {
+                "dopamine_score": dopamine_score,
+                "need_sleep": need_sleep,
             }
             return need_sleep
 
@@ -377,15 +396,15 @@ class ConsolidationPipeline:
         model: torch.nn.Module,
         memory_bank,
         abstraction_bank,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
     ) -> Dict[str, any]:
         """外部触发 (来自 training.py): 立即执行一次 MemoryBank + AbstractionBank 写入。
 
         用于低误差比率持续窗口时的强制巩固。
         """
-        result: Dict[str, any] = {'triggered': None}
+        result: Dict[str, any] = {"triggered": None}
         n_mem = self._write_to_memory_bank(model, memory_bank, device)
         n_abs = self._write_to_abstraction_bank(model, abstraction_bank, device)
         if n_mem > 0 or n_abs > 0:
-            result['triggered'] = f'force:mem={n_mem},abs={n_abs}'
+            result["triggered"] = f"force:mem={n_mem},abs={n_abs}"
         return result

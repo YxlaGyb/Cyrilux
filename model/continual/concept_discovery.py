@@ -16,11 +16,9 @@
   - AbstractionBank.consolidate() 可在概念级别执行
   - CuriositySampler 使用脆弱概念作为生成目标
 """
-from __future__ import annotations
 
-import math
-import uuid
-from typing import List, Tuple, Optional, Dict
+from __future__ import annotations
+from typing import Tuple, Optional
 
 import torch
 
@@ -37,10 +35,11 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 class Concept:
     """单个自动发现的概念。"""
+
     def __init__(self, concept_id: str, centroid: torch.Tensor):
         self.id = concept_id
         self.centroid = centroid.clone()  # [D]
-        self.support: int = 1             # 分配的样本数
+        self.support: int = 1  # 分配的样本数
         self.avg_intrinsic_value: float = 0.0  # 平均内在价值
         self.last_seen_step: int = 0
         self.created_step: int = 0
@@ -54,16 +53,18 @@ class Concept:
         lr = 1.0 / max(self.support, 1)
         self.centroid = self.centroid * (1 - lr) + z.squeeze() * lr
         # 指数平滑内在价值
-        self.avg_intrinsic_value = self.avg_intrinsic_value * 0.95 + intrinsic_value * 0.05
+        self.avg_intrinsic_value = (
+            self.avg_intrinsic_value * 0.95 + intrinsic_value * 0.05
+        )
 
     def to_dict(self) -> dict:
         return {
-            'id': self.id,
-            'support': self.support,
-            'avg_intrinsic_value': self.avg_intrinsic_value,
-            'last_seen_step': self.last_seen_step,
-            'created_step': self.created_step,
-            'n_merges': self.n_merges,
+            "id": self.id,
+            "support": self.support,
+            "avg_intrinsic_value": self.avg_intrinsic_value,
+            "last_seen_step": self.last_seen_step,
+            "created_step": self.created_step,
+            "n_merges": self.n_merges,
         }
 
 
@@ -89,7 +90,9 @@ class ConceptDiscovery:
         self.feature_dim = feature_dim
 
         self._concepts: dict[str, Concept] = {}
-        self._stream_buffer: list[tuple[torch.Tensor, float, int]] = []  # [(z, intrinsic_value, step)]
+        self._stream_buffer: list[
+            tuple[torch.Tensor, float, int]
+        ] = []  # [(z, intrinsic_value, step)]
         self._concept_counter: int = 0
         self._global_step: int = 0
         self._n_observations: int = 0
@@ -106,15 +109,21 @@ class ConceptDiscovery:
 
     @property
     def alive_concepts(self) -> list[tuple[str, Concept]]:
-        return [(k, v) for k, v in self._concepts.items() if v.support >= self.min_support]
+        return [
+            (k, v) for k, v in self._concepts.items() if v.support >= self.min_support
+        ]
 
     @property
     def fragile_concepts(self) -> list[tuple[str, Concept]]:
-        return [(k, v) for k, v in self._concepts.items() if v.support < self.min_support]
+        return [
+            (k, v) for k, v in self._concepts.items() if v.support < self.min_support
+        ]
 
     def get_threshold(self) -> float:
         """自适应阈值: 概念越多阈值越低。"""
-        t = self.initial_threshold - (self.n_concepts / self.max_concepts) * (self.initial_threshold - self.min_threshold)
+        t = self.initial_threshold - (self.n_concepts / self.max_concepts) * (
+            self.initial_threshold - self.min_threshold
+        )
         return max(t, self.min_threshold)
 
     # ── 核心 ──
@@ -167,12 +176,14 @@ class ConceptDiscovery:
                 best_id = cid
         return best_id, best_sim
 
-    def _create_concept(self, z_pooled: torch.Tensor, intrinsic_value: float = 0.0) -> str:
+    def _create_concept(
+        self, z_pooled: torch.Tensor, intrinsic_value: float = 0.0
+    ) -> str:
         """创建新概念。"""
         if len(self._concepts) >= self.max_concepts:
             # 淘汰最脆弱的概念
             self._evict_fragile()
-        cid = f'concept_{self._concept_counter}'
+        cid = f"concept_{self._concept_counter}"
         self._concept_counter += 1
         c = Concept(cid, z_pooled)
         c.avg_intrinsic_value = intrinsic_value
@@ -217,10 +228,14 @@ class ConceptDiscovery:
                 if sim >= self.merge_threshold:
                     # 合并 j → i
                     total = ci.support + cj.support
-                    ci.centroid = (ci.centroid * ci.support + cj.centroid * cj.support) / total
+                    ci.centroid = (
+                        ci.centroid * ci.support + cj.centroid * cj.support
+                    ) / total
                     ci.support = total
-                    ci.avg_intrinsic_value = (ci.avg_intrinsic_value * ci.support +
-                                               cj.avg_intrinsic_value * cj.support) / total
+                    ci.avg_intrinsic_value = (
+                        ci.avg_intrinsic_value * ci.support
+                        + cj.avg_intrinsic_value * cj.support
+                    ) / total
                     ci.n_merges += 1
                     merged.add(cids[j])
 
@@ -234,7 +249,10 @@ class ConceptDiscovery:
         """淘汰长期未见、支持度不足的脆弱概念。"""
         evict = []
         for cid, concept in self._concepts.items():
-            if concept.support < self.min_support and self._global_step - concept.created_step > 500:
+            if (
+                concept.support < self.min_support
+                and self._global_step - concept.created_step > 500
+            ):
                 evict.append(cid)
         for cid in evict:
             del self._concepts[cid]
@@ -250,7 +268,7 @@ class ConceptDiscovery:
     def get_all_summaries(self) -> dict[str, dict]:
         return {cid: c.to_dict() for cid, c in self._concepts.items()}
 
-    def get_centroids(self, device: str = 'cpu') -> dict[str, torch.Tensor]:
+    def get_centroids(self, device: str = "cpu") -> dict[str, torch.Tensor]:
         return {cid: c.centroid.to(device) for cid, c in self._concepts.items()}
 
     def get_most_uncertain_concept(self, n: int = 1) -> list[tuple[str, float]]:
@@ -260,7 +278,9 @@ class ConceptDiscovery:
         return scored[:n]
 
     def get_fragile_concept_ids(self) -> list[str]:
-        return [cid for cid, c in self._concepts.items() if c.support < self.min_support]
+        return [
+            cid for cid, c in self._concepts.items() if c.support < self.min_support
+        ]
 
     # ── 序列化 ──
 
@@ -271,24 +291,24 @@ class ConceptDiscovery:
             centroids[cid] = c.centroid.cpu()
             meta[cid] = c.to_dict()
         return {
-            'centroids': centroids,
-            'meta': meta,
-            'concept_counter': self._concept_counter,
-            'global_step': self._global_step,
-            'n_observations': self._n_observations,
+            "centroids": centroids,
+            "meta": meta,
+            "concept_counter": self._concept_counter,
+            "global_step": self._global_step,
+            "n_observations": self._n_observations,
         }
 
     def load_state_dict(self, state: dict):
         self._concepts = {}
-        for cid, cent in state.get('centroids', {}).items():
-            meta = state['meta'].get(cid, {})
+        for cid, cent in state.get("centroids", {}).items():
+            meta = state["meta"].get(cid, {})
             c = Concept(cid, cent)
-            c.support = meta.get('support', 1)
-            c.avg_intrinsic_value = meta.get('avg_intrinsic_value', 0.0)
-            c.last_seen_step = meta.get('last_seen_step', 0)
-            c.created_step = meta.get('created_step', 0)
-            c.n_merges = meta.get('n_merges', 0)
+            c.support = meta.get("support", 1)
+            c.avg_intrinsic_value = meta.get("avg_intrinsic_value", 0.0)
+            c.last_seen_step = meta.get("last_seen_step", 0)
+            c.created_step = meta.get("created_step", 0)
+            c.n_merges = meta.get("n_merges", 0)
             self._concepts[cid] = c
-        self._concept_counter = state.get('concept_counter', 0)
-        self._global_step = state.get('global_step', 0)
-        self._n_observations = state.get('n_observations', 0)
+        self._concept_counter = state.get("concept_counter", 0)
+        self._global_step = state.get("global_step", 0)
+        self._n_observations = state.get("n_observations", 0)

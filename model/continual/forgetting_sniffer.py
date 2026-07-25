@@ -10,6 +10,7 @@
 
 Ponytail: 嗅探器只做 T=0 纯前向 — 无 PC 推理, 开销约 = 1 步训练.
 """
+
 from __future__ import annotations
 
 from typing import List, Optional
@@ -100,8 +101,8 @@ class ForgettingSniffer:
         """
         # 使用 ICM information_gain 增强 surprise 信号
         if icm_signal is not None:
-            info_gain = icm_signal.get('information_gain', 0.0)
-            uncertainty = icm_signal.get('uncertainty', 0.0)
+            info_gain = icm_signal.get("information_gain", 0.0)
+            uncertainty = icm_signal.get("uncertainty", 0.0)
             surprise = surprise + info_gain * 0.5 + uncertainty * 0.3
 
         self._surprise_buffer.append(surprise)
@@ -109,12 +110,16 @@ class ForgettingSniffer:
             self._surprise_buffer.pop(0)
         if not self.enable_dynamic_interval or len(self._surprise_buffer) < 5:
             return
-        recent_high = sum(1 for s in self._surprise_buffer if s > self.surprise_threshold)
+        recent_high = sum(
+            1 for s in self._surprise_buffer if s > self.surprise_threshold
+        )
         ratio = recent_high / len(self._surprise_buffer)
         if ratio > 0.6:
             self._effective_interval = max(self.min_interval, self.check_interval // 2)
         elif ratio < 0.2:
-            self._effective_interval = min(self.max_interval, int(self.check_interval * 1.5))
+            self._effective_interval = min(
+                self.max_interval, int(self.check_interval * 1.5)
+            )
         else:
             self._effective_interval = self.check_interval
 
@@ -137,12 +142,14 @@ class ForgettingSniffer:
             return None
 
         results = self.memory_bank.evaluate(self.model, device, N=self.eval_n)
-        self._last_ratios = {tid: r['ratio'] for tid, r in results.items()}
+        self._last_ratios = {tid: r["ratio"] for tid, r in results.items()}
 
-        forgotten = [tid for tid, r in results.items() if r['ratio'] > self.threshold]
+        forgotten = [tid for tid, r in results.items() if r["ratio"] > self.threshold]
         return forgotten if forgotten else None
 
-    def check_concept(self, global_step: int, device: str, concept_ids: list[str]) -> list[str] | None:
+    def check_concept(
+        self, global_step: int, device: str, concept_ids: list[str]
+    ) -> list[str] | None:
         """概念级遗忘检测 — 按概念检测 CE loss 变化.
 
         Returns:
@@ -154,8 +161,10 @@ class ForgettingSniffer:
         # 按 concept_id 聚合
         concept_results: dict[str, list[float]] = {}
         for tid, r in results.items():
-            cid = tid  # 简化: task_id 即 concept_id (实际需 memory_bank 按 concept 分组)
-            concept_results.setdefault(cid, []).append(r['ratio'])
+            cid = (
+                tid  # 简化: task_id 即 concept_id (实际需 memory_bank 按 concept 分组)
+            )
+            concept_results.setdefault(cid, []).append(r["ratio"])
         ratios = {}
         for cid, ratios_list in concept_results.items():
             ratios[cid] = sum(ratios_list) / max(len(ratios_list), 1)
@@ -172,7 +181,7 @@ class ForgettingSniffer:
         self._repair_counter = 0
         repair_lr = current_lr * self.repair_lr_factor
         for pg in optimizer.param_groups:
-            pg['lr'] = repair_lr
+            pg["lr"] = repair_lr
         return repair_lr
 
     def repair_end(self, optimizer, restore_lr: float):
@@ -180,7 +189,7 @@ class ForgettingSniffer:
         self._repairing = False
         self._repair_counter = 0
         for pg in optimizer.param_groups:
-            pg['lr'] = restore_lr
+            pg["lr"] = restore_lr
 
     def repair_step(self) -> bool:
         """执行一步修复计数器. 返回 True 表示还需继续修复."""
@@ -192,7 +201,9 @@ class ForgettingSniffer:
             return False
         return True
 
-    def get_replay_batch(self, batch_size: int, device: str, strategy: str = 'dopamine'):
+    def get_replay_batch(
+        self, batch_size: int, device: str, strategy: str = "dopamine"
+    ):
         """获取用于修复回放的 batch.
 
         Args:
@@ -213,14 +224,14 @@ class ForgettingSniffer:
 
     def state_dict(self) -> dict:
         return {
-            '_repairing': self._repairing,
-            '_repair_counter': self._repair_counter,
-            '_last_ratios': dict(self._last_ratios),
-            '_last_concept_ratios': dict(self._last_concept_ratios),
+            "_repairing": self._repairing,
+            "_repair_counter": self._repair_counter,
+            "_last_ratios": dict(self._last_ratios),
+            "_last_concept_ratios": dict(self._last_concept_ratios),
         }
 
     def load_state_dict(self, state: dict):
-        self._repairing = state.get('_repairing', False)
-        self._repair_counter = state.get('_repair_counter', 0)
-        self._last_ratios = state.get('_last_ratios', {})
-        self._last_concept_ratios = state.get('_last_concept_ratios', {})
+        self._repairing = state.get("_repairing", False)
+        self._repair_counter = state.get("_repair_counter", 0)
+        self._last_ratios = state.get("_last_ratios", {})
+        self._last_concept_ratios = state.get("_last_concept_ratios", {})

@@ -31,7 +31,7 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        return (self.weight * self.norm(x.float())).type_as(x)
+        return self.weight * self.norm(x)
 
 
 class FeedForward(nn.Module):
@@ -44,11 +44,7 @@ class FeedForward(nn.Module):
         self.act_fn = _ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        """fp32 前向 (显式权重提升, 防 silu(gate)*up→down 链溢出)."""
-        w_g = self.gate_proj.weight.float()
-        w_u = self.up_proj.weight.float()
-        w_d = self.down_proj.weight.float()
-        x32 = x.float()
-        g = self.act_fn(F.linear(x32, w_g))
-        u = F.linear(x32, w_u)
-        return F.linear(g * u, w_d).to(x.dtype)
+        """fp16 前向 (直接使用 fp16 权重)."""
+        g = self.act_fn(F.linear(x, self.gate_proj.weight))
+        u = F.linear(x, self.up_proj.weight)
+        return F.linear(g * u, self.down_proj.weight)

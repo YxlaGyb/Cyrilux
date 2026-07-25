@@ -16,10 +16,10 @@
   - prediction_error → 替代旧 world_surprise (向后兼容)
   - inverse_loss → AbstractionSniffer drift 检测补充维度
 """
+
 from __future__ import annotations
 
-import math
-from typing import Tuple, Optional
+from typing import Tuple
 
 import torch
 from torch import nn
@@ -66,36 +66,50 @@ class IntrinsicCuriosityModule(nn.Module):
         )
 
         # ── 信息增益 EMA 状态 ──
-        self.register_buffer('_uncertainty_ema', torch.zeros(1))
-        self.register_buffer('_step', torch.zeros(1, dtype=torch.long))
+        self.register_buffer("_uncertainty_ema", torch.zeros(1))
+        self.register_buffer("_step", torch.zeros(1, dtype=torch.long))
 
     # ── 前向预测 (同 LatentWorldModel.forward) ──
 
     def _prepare_state(self, state: torch.Tensor, context: torch.Tensor | None):
-        state = state.float()
+        state = state.half()
         if state.dim() == 2:
             state = state.unsqueeze(1)
         if state.dim() != 3:
-            raise ValueError(f"state must have shape [B, S, D] or [B, D], got {tuple(state.shape)}")
+            raise ValueError(
+                f"state must have shape [B, S, D] or [B, D], got {tuple(state.shape)}"
+            )
 
         if context is None:
-            context = torch.zeros(state.size(0), self.context_dim, device=state.device, dtype=torch.float32)
+            context = torch.zeros(
+                state.size(0),
+                self.context_dim,
+                device=state.device,
+                dtype=torch.float16,
+            )
         else:
-            context = context.to(device=state.device, dtype=torch.float32)
+            context = context.to(device=state.device, dtype=torch.float16)
             if context.dim() == 1:
                 context = context.unsqueeze(0)
             if context.dim() != 2:
-                raise ValueError(f"context must have shape [B, C], got {tuple(context.shape)}")
+                raise ValueError(
+                    f"context must have shape [B, C], got {tuple(context.shape)}"
+                )
             if context.size(0) != state.size(0):
                 if context.size(0) == 1:
                     context = context.expand(state.size(0), -1)
                 else:
-                    raise ValueError(f"batch mismatch: state batch {state.size(0)}, context batch {context.size(0)}")
+                    raise ValueError(
+                        f"batch mismatch: state batch {
+                            state.size(0)}, context batch {context.size(0)}"
+                    )
 
         pooled = state.mean(dim=1)
         return pooled, context
 
-    def _reshape_pred(self, pred: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
+    def _reshape_pred(
+        self, pred: torch.Tensor, target_shape: torch.Size
+    ) -> torch.Tensor:
         if pred.dim() == 2 and len(target_shape) == 3:
             seq_len = target_shape[1]
             return pred.unsqueeze(1).expand(-1, seq_len, -1)
@@ -114,15 +128,17 @@ class IntrinsicCuriosityModule(nn.Module):
 
     def forward_inverse(self, state_t: torch.Tensor, state_t1: torch.Tensor):
         """反向模型: concat(z_t, z_{t+1}) → action_embed + 对比特征。"""
-        z_t = state_t.float().mean(dim=1) if state_t.dim() == 3 else state_t.float()
-        z_t1 = state_t1.float().mean(dim=1) if state_t1.dim() == 3 else state_t1.float()
+        z_t = state_t.half().mean(dim=1) if state_t.dim() == 3 else state_t.half()
+        z_t1 = state_t1.half().mean(dim=1) if state_t1.dim() == 3 else state_t1.half()
         x = torch.cat([z_t, z_t1], dim=-1)
         action_embed = self.inverse_net(x)
         contrast_feat = self.contrast_proj(action_embed)
         return action_embed, contrast_feat
 
     @torch.no_grad()
-    def _compute_inverse_labels(self, z_batch: list[torch.Tensor], seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _compute_inverse_labels(
+        self, z_batch: list[torch.Tensor], seq_len: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """构造反向模型训练对: (z_t, z_{t+1}) 和 labels (同一序列内正对, 跨序列负对)。
 
         返回:
@@ -139,11 +155,16 @@ class IntrinsicCuriosityModule(nn.Module):
                 all_pairs.append(pair)
                 all_labels.append(b)
         if not all_pairs:
-            return torch.empty(0, self.input_dim * 2, device=z_batch[0].device), \
-                   torch.empty(0, dtype=torch.long, device=z_batch[0].device)
-        return torch.stack(all_pairs), torch.tensor(all_labels, dtype=torch.long, device=z_batch[0].device)
+            return torch.empty(
+                0, self.input_dim * 2, device=z_batch[0].device
+            ), torch.empty(0, dtype=torch.long, device=z_batch[0].device)
+        return torch.stack(all_pairs), torch.tensor(
+            all_labels, dtype=torch.long, device=z_batch[0].device
+        )
 
-    def compute_inverse_contrastive_loss(self, action_embed: torch.Tensor, labels: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+    def compute_inverse_contrastive_loss(
+        self, action_embed: torch.Tensor, labels: torch.Tensor, temperature: float = 0.1
+    ) -> torch.Tensor:
         """对比损失: 同序列的转变 (z_t→z_{t+1}) 应相似, 不同序列的应不同。"""
         if action_embed.size(0) < 2:
             return torch.tensor(0.0, device=action_embed.device, requires_grad=True)
@@ -160,7 +181,7 @@ class IntrinsicCuriosityModule(nn.Module):
         # InfoNCE
         exp_sim = torch.exp(sim)
         pos_exp = (exp_sim * pos_mask).sum(dim=1)
-        neg_exp = (exp_sim * (~pos_mask).float()).sum(dim=1)
+        neg_exp = (exp_sim * (~pos_mask).half()).sum(dim=1)
         loss = -torch.log(pos_exp / (pos_exp + neg_exp + 1e-8) + 1e-8).mean()
         return loss
 
@@ -169,7 +190,9 @@ class IntrinsicCuriosityModule(nn.Module):
         old_ema = self._uncertainty_ema.clone()
         current_avg = uncertainty.detach().mean()
         # 更新 EMA
-        self._uncertainty_ema.mul_(self.info_gain_ema_decay).add_(current_avg * (1 - self.info_gain_ema_decay))
+        self._uncertainty_ema.mul_(self.info_gain_ema_decay).add_(
+            current_avg * (1 - self.info_gain_ema_decay)
+        )
         self._step.add_(1)
         # 信息增益 = 旧 EMA - 当前 uncertainty (正值 = 学会了新东西)
         ig = old_ema - current_avg
@@ -221,11 +244,12 @@ class IntrinsicCuriosityModule(nn.Module):
         # ── 逆模型对比损失 ──
         bsz, seq_len, _ = state_t.shape
         pairs, labels = self._compute_inverse_labels(
-            [state_t[i] for i in range(bsz)], seq_len)
+            [state_t[i] for i in range(bsz)], seq_len
+        )
         if pairs.size(0) > 0 and bsz > 1:
             inv_embed, _ = self.forward_inverse(
-                pairs[:, :self.input_dim].unsqueeze(1),
-                pairs[:, self.input_dim:].unsqueeze(1),
+                pairs[:, : self.input_dim].unsqueeze(1),
+                pairs[:, self.input_dim :].unsqueeze(1),
             )
             inverse_loss = self.compute_inverse_contrastive_loss(inv_embed, labels)
         else:
@@ -235,26 +259,37 @@ class IntrinsicCuriosityModule(nn.Module):
         ig = self.information_gain(uncertainty)
 
         return {
-            'pred_loss': pred_loss,
-            'inverse_loss': inverse_loss * self.inv_loss_weight,
-            'uncertainty': uncertainty.detach().mean(),
-            'information_gain': ig.detach(),
-            'prediction_error': prediction_error.detach().mean(),
-            'forward_pred': pred,
-            'action_embed': action_embed.detach(),
-            'contrast_feat': contrast_feat.detach(),
+            "pred_loss": pred_loss,
+            "inverse_loss": inverse_loss * self.inv_loss_weight,
+            "uncertainty": uncertainty.detach().mean(),
+            "information_gain": ig.detach(),
+            "prediction_error": prediction_error.detach().mean(),
+            "forward_pred": pred,
+            "action_embed": action_embed.detach(),
+            "contrast_feat": contrast_feat.detach(),
         }
 
-    def loss(self, state_t: torch.Tensor, state_t1: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+    def loss(
+        self,
+        state_t: torch.Tensor,
+        state_t1: torch.Tensor,
+        context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """联合损失 = pred_loss + inv_loss_weight * inverse_loss + confidence_penalty。"""
         out = self.forward(state_t, state_t1, context)
-        confidence_penalty = out['uncertainty'] * 0.1
-        return out['pred_loss'] + out['inverse_loss'] + confidence_penalty
+        confidence_penalty = out["uncertainty"] * 0.1
+        return out["pred_loss"] + out["inverse_loss"] + confidence_penalty
 
-    def transition_error(self, state: torch.Tensor, target: torch.Tensor, context: torch.Tensor | None = None):
+    def transition_error(
+        self,
+        state: torch.Tensor,
+        target: torch.Tensor,
+        context: torch.Tensor | None = None,
+    ):
         """兼容 LatentWorldModel.transition_error 接口。"""
-        return self.forward(state, target, context)['prediction_error'], \
-               self.forward(state, target, context)['uncertainty']
+        return self.forward(state, target, context)["prediction_error"], self.forward(
+            state, target, context
+        )["uncertainty"]
 
     def reset_state(self):
         """重置 EMA 状态 — 在概念切换时调用。"""

@@ -68,7 +68,7 @@ class DashboardPage(QWidget):
         layout.addWidget(self._ckpt_tree, 1)
 
         # ── 版本信息 ──
-        info = QLabel("virtuosov2 v0.2.0 — PC 局部动态小语言模型 + 多巴胺 + 持续学习")
+        info = QLabel("Cyrilux v0.2.0 — PC 局部动态小语言模型 + 多巴胺 + 持续学习")
         info.setObjectName("secondary")
         layout.addWidget(info)
 

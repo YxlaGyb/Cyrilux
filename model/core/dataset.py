@@ -11,9 +11,10 @@ ch1 = 角色编码: pad=0 / user=1 / assistant=2 / system=3
   4. {"chosen": [...]}                                      — RLHF chosen
   5. {"conversations": [...], "gt": [...]}                  — 含 ground truth
 """
+
 import json, re
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 
 class DualChannelDataset(Dataset):
@@ -23,24 +24,28 @@ class DualChannelDataset(Dataset):
 
     def __init__(self, data_path: str, max_length: int = 128, max_samples: int = None):
         super().__init__()
-        self.dual_tensors: list[torch.Tensor] = []   # list of [2, max_length] float32
+        self.dual_tensors: list[torch.Tensor] = []  # list of [2, max_length] float32
         self.label_tensors: list[torch.Tensor] = []  # list of [max_length] long
 
-        with open(data_path, 'r', encoding='utf-8') as f:
+        with open(data_path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f):
                 if max_samples and i >= max_samples:
                     break
                 sample = json.loads(line)
                 raw_text, roles = self._extract_with_roles(sample)
-                byte_seq = raw_text.encode('utf-8')[:max_length]
-                padded = byte_seq.ljust(max_length, b'\x00')
-                byte_t = torch.frombuffer(bytearray(padded), dtype=torch.uint8).clone().float()
+                byte_seq = raw_text.encode("utf-8")[:max_length]
+                padded = byte_seq.ljust(max_length, b"\x00")
+                byte_t = (
+                    torch.frombuffer(bytearray(padded), dtype=torch.uint8)
+                    .clone()
+                    .half()
+                )
 
                 # 角色编码: 按字节偏移映射, padding 处填 0
-                role_t = torch.zeros(max_length, dtype=torch.float)
+                role_t = torch.zeros(max_length, dtype=torch.float16)
                 for start, end, role in roles:
-                    b_start = len(raw_text[:start].encode('utf-8'))
-                    b_end = min(len(raw_text[:end].encode('utf-8')), max_length)
+                    b_start = len(raw_text[:start].encode("utf-8"))
+                    b_end = min(len(raw_text[:end].encode("utf-8")), max_length)
                     if b_start < max_length:
                         role_t[b_start:b_end] = self.ROLE_MAP.get(role, 2.0)
 
@@ -58,33 +63,33 @@ class DualChannelDataset(Dataset):
         支持 conversations 格式 (含 role 字段) 和 text 格式 (启发式拆分).
         """
         # ── 格式 1/5: conversations 格式 ──
-        if 'conversations' in sample:
-            raw = ''
+        if "conversations" in sample:
+            raw = ""
             roles = []
-            gt = sample.get('gt', None)
-            for m in sample['conversations']:
-                role = m.get('role', 'assistant')
-                content = m.get('content', m.get('value', ''))
+            gt = sample.get("gt", None)
+            for m in sample["conversations"]:
+                role = m.get("role", "assistant")
+                content = m.get("content", m.get("value", ""))
                 start = len(raw)
                 raw += content
                 end = len(raw)
                 roles.append((start, end, role))
             # ground truth 填充
             if gt and isinstance(gt, list) and any(g for g in gt if g):
-                answers = '\n'.join(str(g) for g in gt if g)
+                answers = "\n".join(str(g) for g in gt if g)
                 start = len(raw)
-                raw += '\n' + answers
+                raw += "\n" + answers
                 end = len(raw)
-                roles.append((start, end, 'assistant'))
+                roles.append((start, end, "assistant"))
             return raw, roles
 
         # ── 格式 4: chosen 格式 ──
-        if 'chosen' in sample:
-            raw = ''
+        if "chosen" in sample:
+            raw = ""
             roles = []
-            for m in sample['chosen']:
-                role = m.get('role', 'assistant')
-                content = m.get('content', m.get('value', ''))
+            for m in sample["chosen"]:
+                role = m.get("role", "assistant")
+                content = m.get("content", m.get("value", ""))
                 start = len(raw)
                 raw += content
                 end = len(raw)
@@ -92,25 +97,25 @@ class DualChannelDataset(Dataset):
             return raw, roles
 
         # ── 格式 2/3: text 格式 ──
-        if 'text' in sample:
-            raw = sample['text']
+        if "text" in sample:
+            raw = sample["text"]
         else:
             raw = str(sample)
 
         # 1) 优先解析 <|user|>/<|assistant|>/<|system|> 标记
-        marker_re = r'(<\|user\|>|<\|assistant\|>|<\|system\|>|<\|end\|>|<\|tool\|>)'
+        marker_re = r"(<\|user\|>|<\|assistant\|>|<\|system\|>|<\|end\|>|<\|tool\|>)"
         parts = re.split(marker_re, raw)
         if len(parts) >= 5:  # 至少 user + content + assistant + content + end
-            clean_raw = ''
+            clean_raw = ""
             roles = []
             i = 1  # parts[0] 是标记前的空字符串
             while i < len(parts) - 1:
                 tag = parts[i]
-                if tag == '<|end|>':
+                if tag == "<|end|>":
                     break
-                if tag in ('<|user|>', '<|assistant|>', '<|system|>', '<|tool|>'):
-                    role = tag.strip('<>|')
-                    content = parts[i + 1].strip() if i + 1 < len(parts) else ''
+                if tag in ("<|user|>", "<|assistant|>", "<|system|>", "<|tool|>"):
+                    role = tag.strip("<>|")
+                    content = parts[i + 1].strip() if i + 1 < len(parts) else ""
                     if content:
                         start = len(clean_raw)
                         clean_raw += content
@@ -123,11 +128,11 @@ class DualChannelDataset(Dataset):
                 return clean_raw, roles
 
         # 2) 回退: 启发式拆分 — 首行 \n 前 → user, 后 → assistant
-        first_nl = raw.find('\n')
+        first_nl = raw.find("\n")
         if 0 < first_nl < len(raw) * 0.6:
-            roles = [(0, first_nl, 'user'), (first_nl, len(raw), 'assistant')]
+            roles = [(0, first_nl, "user"), (first_nl, len(raw), "assistant")]
         else:
-            roles = [(0, len(raw), 'assistant')]
+            roles = [(0, len(raw), "assistant")]
         return raw, roles
 
     def __len__(self):
@@ -155,7 +160,9 @@ def load_datasets(
     """
     datasets = []
     for p in paths:
-        ds = DualChannelDataset(p, max_length=max_length, max_samples=max_samples or None)
+        ds = DualChannelDataset(
+            p, max_length=max_length, max_samples=max_samples or None
+        )
         if len(ds) > 0:
             datasets.append(ds)
     return torch.utils.data.ConcatDataset(datasets)

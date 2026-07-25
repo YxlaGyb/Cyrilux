@@ -1,4 +1,4 @@
-"""virtuoso eval — 模型评估子命令 (委托至 virtuosov2.core.evaluation).
+"""eval — 模型评估子命令 (委托至 Cyrilux.core.evaluation).
 """
 
 from typing import Optional

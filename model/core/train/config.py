@@ -1,4 +1,6 @@
-"""训练配置 — TrainingConfig + ProgressCallback."""
+"""训练配置
+TrainingConfig + ProgressCallback.
+"""
 
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -62,6 +64,9 @@ class TrainingConfig:
 
     # 误差归一化
     ε_rms_target: float = 1.0
+
+    # 位置子采样 (每步随机抽 1/6 的位置做 Hebbian 更新)
+    hebbian_subsample_ratio: float = 0.1667
 
     # 突触归一化
     synaptic_normalize: bool = False

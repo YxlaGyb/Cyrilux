@@ -206,7 +206,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("virtuosov2 — PC 局部动态小语言模型")
+        self.setWindowTitle("Cyrilux — PC 局部动态小语言模型")
         self.setMinimumSize(1200, 720)
         self.resize(1440, 900)
 

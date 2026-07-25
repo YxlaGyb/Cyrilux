@@ -18,9 +18,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-# ═══════════════════════════════════════════════════════════════════
 #  Phase 4: 稀疏外积 — 仅计算活跃突触前通道的 ΔW
-# ═══════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def _sparse_outer_product(post_error: torch.Tensor, pre_activity: torch.Tensor,
@@ -47,13 +45,13 @@ def _sparse_outer_product(post_error: torch.Tensor, pre_activity: torch.Tensor,
     device = post_error.device
 
     # 全局 top-k: 哪些突触前通道实际活跃
-    pre_mag = pre_activity.float().abs().mean(dim=(0, 1))  # [H_in]
+    pre_mag = pre_activity.abs().mean(dim=(0, 1))  # [H_in]
     _, top_k_idx = pre_mag.topk(k_use)
     top_k_idx, _ = top_k_idx.sort()
 
-    dW = torch.zeros(H_out, H_in, device=device, dtype=torch.float32)
-    err_T = post_error.float().transpose(1, 2)  # [B, H_out, T]
-    pre_sel = pre_activity.float()[:, :, top_k_idx]  # [B, T, k]
+    dW = torch.zeros(H_out, H_in, device=device, dtype=post_error.dtype)
+    err_T = post_error.transpose(1, 2)  # [B, H_out, T]
+    pre_sel = pre_activity[:, :, top_k_idx]  # [B, T, k]
     dW_sel = eta * torch.bmm(err_T, pre_sel).mean(dim=0)  # [H_out, k]
     dW[:, top_k_idx] = dW_sel
     return dW
@@ -105,7 +103,7 @@ def compute_precision_scales(ε_list: list, ACh: float, D: float, cfg) -> list:
     η = getattr(cfg, 'dopamine_eta', 1.0)
     π_list = []
     for ε in ε_list:
-        max_err = ε.float().abs().reshape(-1, ε.size(-1)).norm(dim=-1).max().item() + 1e-8
+        max_err = ε.abs().reshape(-1, ε.size(-1)).norm(dim=-1).max().item() + 1e-8
         π = 1.0 + η * ACh * max_err + η * D * max_err
         π_list.append(π)
     return π_list
@@ -128,7 +126,7 @@ def compute_errors_by_layer(z_by_layer, model) -> tuple:
         F_pred: float — Σ ½·‖ε_ℓ‖² (未加权)
     """
     L = model.num_sub_layers
-    z_det = [z.detach().float() for z in z_by_layer]
+    z_det = [z.detach() for z in z_by_layer]
     seq_len = z_det[0].size(1)
     device = z_det[0].device
     pos_emb = model.get_position_embeddings(seq_len, device)
@@ -147,7 +145,7 @@ def compute_errors_by_layer(z_by_layer, model) -> tuple:
         # 时序
         if seq_len > 1:
             z_t_in = z_target[:, :-1, :]
-            z_t_out = model.temporal_proj[ℓ - 1](z_t_in.float())
+            z_t_out = model.temporal_proj[ℓ - 1](z_t_in)
             μ_temp = torch.cat([torch.zeros_like(z_target[:, :1, :]), z_t_out], dim=1)
         else:
             μ_temp = torch.zeros_like(z_target)
@@ -155,7 +153,7 @@ def compute_errors_by_layer(z_by_layer, model) -> tuple:
         # 自上而下
         if ℓ < L and seq_len > 1:
             z_d_in = z_det[ℓ + 1][:, :-1, :]
-            z_d_out = model.topdown_proj[ℓ - 1](z_d_in.float())
+            z_d_out = model.topdown_proj[ℓ - 1](z_d_in)
             μ_down = torch.cat([torch.zeros_like(z_target[:, :1, :]), z_d_out], dim=1)
         else:
             μ_down = torch.zeros_like(z_target)
@@ -172,16 +170,19 @@ def compute_errors_by_layer(z_by_layer, model) -> tuple:
 #  逐层 Hebbian 更新
 # ═══════════════════════════════════════════════════════════════════
 
+@torch.no_grad()
 def compute_hebbian_temporal(ε_list, z_init, modulation, base_lr,
                              gamma_rpe=0.3, oja_alpha=0.01,
                              oja_eta: float = 0.05,
                              W_curr_list=None,
-                             sparse_k: int = 0) -> dict:
-    """计算 temporal_proj 的 Hebbian 更新 + Oja 约束.
+                             sparse_k: int = 0,
+                             subsample_idx: Optional[torch.Tensor] = None) -> dict:
+    """计算 temporal_proj 的 Hebbian 更新 + Oja 约束 (跨层批量).
 
     ΔW_ℓ = η_eff · [ε_ℓ[:,1:]^T · z_ℓ[:,:-1] - α · diag(post²) · W_curr]
 
-    Oja 项: -η_oja·α·Σ_t z_ℓ[t+1]² · W_curr[i,:] — 减性约束防止发散.
+    性能: 跨 L 层 stack 成 [L, N, H] 单次 bmm, 避免 L 次 Python 循环 +
+    小 kernel launch 开销 (GTX 1650 Ti 上 launch ~50μs/次).
 
     Args:
         ε_list: list[tensor, L] — 各层误差 [B,S,H]
@@ -199,41 +200,84 @@ def compute_hebbian_temporal(ε_list, z_init, modulation, base_lr,
     L = len(ε_list)
     η = base_lr * modulation * (1.0 + gamma_rpe)
     updates = {}
+    H_ = ε_list[0].size(-1)
+    device = ε_list[0].device
+    dtype = ε_list[0].dtype
+
+    # 所有层共享 B, S — 子采样索引只需计算一次
+    B_, S_ = ε_list[0].shape[:2]
+    if S_ <= 1:
+        # 无时序维度: 全部置零
+        for ℓ in range(L):
+            updates[f'temporal_proj.{ℓ}.weight'] = torch.zeros(H_, H_, device=device, dtype=dtype)
+        return updates
+
+    # 子采样索引映射 [B*S] → [B*(S-1)], 排除 t=0
+    if subsample_idx is not None:
+        t_pos = subsample_idx % S_
+        valid = t_pos != 0
+        idx_valid = subsample_idx[valid]
+        if idx_valid.numel() == 0:
+            for ℓ in range(L):
+                updates[f'temporal_proj.{ℓ}.weight'] = torch.zeros(H_, H_, device=device, dtype=dtype)
+            return updates
+        b_idx = idx_valid // S_
+        s_idx = idx_valid % S_
+        idx_temp = b_idx * (S_ - 1) + (s_idx - 1)
+        n_sub = idx_valid.shape[0]
+    else:
+        idx_temp = None
+        n_sub = B_ * (S_ - 1)
+
+    # 跨层 stack: ε_t1 [L, B*(S-1), H], z_pre_t [L, B*(S-1), H]
+    # ε_ℓ[:,1:] 预测误差, z_ℓ[:,:-1] 前置活动
+    ε_t1_stack = torch.stack([ε_list[ℓ][:, 1:, :].reshape(-1, H_) for ℓ in range(L)], dim=0)
+    z_pre_t_stack = torch.stack([z_init[ℓ + 1][:, :-1, :].reshape(-1, H_) for ℓ in range(L)], dim=0)
+    # post (z_ℓ[t+1]) 用于 Oja
+    z_post_stack = torch.stack([z_init[ℓ + 1][:, 1:, :].reshape(-1, H_) for ℓ in range(L)], dim=0)
+
+    if idx_temp is not None:
+        ε_t1_stack = ε_t1_stack[:, idx_temp, :]        # [L, N, H]
+        z_pre_t_stack = z_pre_t_stack[:, idx_temp, :]
+        z_post_stack = z_post_stack[:, idx_temp, :]
+
+    # 批量外积: [L, H, N] @ [L, N, H] → [L, H, H]
+    s = math.sqrt(n_sub)
+    ε_safe = ε_t1_stack.transpose(1, 2) / s
+    z_safe = z_pre_t_stack / s
+    dW_bmm = torch.bmm(ε_safe, z_safe)
+    dW_all = η * dW_bmm
+
+    # 批量 Oja: max-normed 防 fp16 溢出
+    if oja_alpha > 0 and W_curr_list is not None:
+        oja_f = oja_eta * oja_alpha
+        zs = z_post_stack.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-4)  # [L, 1, H]
+        z_div = z_post_stack / zs
+        z_msq = (z_div ** 2).mean(dim=1)                       # [L, H]
+        temp_z = (oja_f * z_msq) * zs.squeeze(1)               # [L, H]
+        W_curr_stack = torch.stack(W_curr_list, dim=0)         # [L, H, H]
+        oja_term = temp_z.unsqueeze(-1) * (zs.squeeze(1).unsqueeze(-1) * W_curr_stack)
+        dW_all = dW_all - oja_term
+
 
     for ℓ in range(L):
-        ε = ε_list[ℓ].float()                     # [B, S, H]
-        z_pre = z_init[ℓ + 1].float()             # [B, S, H], 突触前 = z_ℓ
-        if ε.size(1) > 1:
-            # ε_ℓ[:,1:] 预测误差, z_ℓ[:,:-1] 前置活动
-            ε_t1 = ε[:, 1:, :]                    # [B, S-1, H]
-            z_pre_t = z_pre[:, :-1, :]             # [B, S-1, H]
-            if sparse_k > 0:
-                dW = _sparse_outer_product(ε_t1, z_pre_t, η, k=sparse_k)
-            else:
-                dW = η * torch.bmm(ε_t1.transpose(1, 2), z_pre_t)  # [B, H, H]
-                dW = dW.mean(dim=0)                # [H, H]
-
-            # Oja's rule: η_oja·α·post²·W_curr (减法: 防止权重单方向增长)
-            if oja_alpha > 0 and W_curr_list is not None and W_curr_list[ℓ] is not None:
-                post = z_pre[:, 1:, :]             # [B, S-1, H], 突触后活动 = z_ℓ[t+1]
-                post_pow2_mean = (post.float() ** 2).mean(dim=(0, 1))  # [H]
-                W_curr = W_curr_list[ℓ].float()    # [H, H]
-                oja_term = oja_eta * oja_alpha * (post_pow2_mean.unsqueeze(-1) * W_curr)
-                dW = dW - oja_term
-
-            updates[f'temporal_proj.{ℓ}.weight'] = dW
+        updates[f'temporal_proj.{ℓ}.weight'] = dW_all[ℓ]
 
     return updates
 
 
+@torch.no_grad()
 def compute_hebbian_topdown(ε_list, z_init, modulation, base_lr,
                             gamma_rpe=0.3, oja_alpha=0.01,
                             oja_eta: float = 0.05,
                             W_curr_list=None,
-                            sparse_k: int = 0) -> dict:
-    """计算 topdown_proj 的 Hebbian 更新 + Oja 约束.
+                            sparse_k: int = 0,
+                            subsample_idx: Optional[torch.Tensor] = None) -> dict:
+    """计算 topdown_proj 的 Hebbian 更新 + Oja 约束 (跨层批量).
 
     ΔW_ℓ = η_eff · [ε_ℓ[:,1:]^T · z_{ℓ+1}[:,:-1] - α · diag(post²) · W_curr]
+
+    性能: 跨 (L-1) 层 stack 成 [L-1, N, H] 单次 bmm, 避免 Python 循环.
 
     Args:
         ε_list: list[tensor, L] — 各层误差 [B,S,H]
@@ -252,43 +296,82 @@ def compute_hebbian_topdown(ε_list, z_init, modulation, base_lr,
     η = base_lr * modulation * (1.0 + gamma_rpe)
     updates = {}
 
-    for ℓ in range(L):
-        if ℓ >= L - 1:
-            continue  # 最高层无 topdown
-        ε = ε_list[ℓ].float()                     # [B, S, H]
-        z_next = z_init[ℓ + 2].float()            # [B, S, H], z_{ℓ+1}
-        if ε.size(1) > 1:
-            ε_t1 = ε[:, 1:, :]                    # [B, S-1, H]
-            z_next_t = z_next[:, :-1, :]           # [B, S-1, H]
-            if sparse_k > 0:
-                dW = _sparse_outer_product(ε_t1, z_next_t, η, k=sparse_k)
-            else:
-                dW = η * torch.bmm(ε_t1.transpose(1, 2), z_next_t)
-                dW = dW.mean(dim=0)
+    if L <= 1:
+        return updates
 
-            # Oja's rule: η·α·post²·W_curr (减法: 防止权重单方向增长)
-            if oja_alpha > 0 and W_curr_list is not None and W_curr_list[ℓ] is not None:
-                post = z_next[:, 1:, :]            # [B, S-1, H], 突触后 = z_{ℓ+1}[t+1]
-                post_pow2_mean = (post.float() ** 2).mean(dim=(0, 1))  # [H]
-                W_curr = W_curr_list[ℓ].float()    # [H, H]
-                oja_term = oja_eta * oja_alpha * (post_pow2_mean.unsqueeze(-1) * W_curr)
-                dW = dW - oja_term
+    L_td = L - 1
+    H_ = ε_list[0].size(-1)
+    device = ε_list[0].device
+    dtype = ε_list[0].dtype
 
-            updates[f'topdown_proj.{ℓ}.weight'] = dW
+    B_, S_ = ε_list[0].shape[:2]
+    if S_ <= 1:
+        for ℓ in range(L_td):
+            updates[f'topdown_proj.{ℓ}.weight'] = torch.zeros(H_, H_, device=device, dtype=dtype)
+        return updates
+
+    # 子采样索引映射 [B*S] → [B*(S-1)], 排除 t=0
+    if subsample_idx is not None:
+        t_pos = subsample_idx % S_
+        valid = t_pos != 0
+        idx_valid = subsample_idx[valid]
+        if idx_valid.numel() == 0:
+            for ℓ in range(L_td):
+                updates[f'topdown_proj.{ℓ}.weight'] = torch.zeros(H_, H_, device=device, dtype=dtype)
+            return updates
+        b_idx = idx_valid // S_
+        s_idx = idx_valid % S_
+        idx_temp = b_idx * (S_ - 1) + (s_idx - 1)
+        n_sub = idx_valid.shape[0]
+    else:
+        idx_temp = None
+        n_sub = B_ * (S_ - 1)
+
+    # 跨层 stack: ε_t1 [L_td, N, H], z_next_t [L_td, N, H], z_post [L_td, N, H]
+    ε_t1_stack = torch.stack([ε_list[ℓ][:, 1:, :].reshape(-1, H_) for ℓ in range(L_td)], dim=0)
+    z_next_t_stack = torch.stack([z_init[ℓ + 2][:, :-1, :].reshape(-1, H_) for ℓ in range(L_td)], dim=0)
+    z_post_stack = torch.stack([z_init[ℓ + 2][:, 1:, :].reshape(-1, H_) for ℓ in range(L_td)], dim=0)
+
+    if idx_temp is not None:
+        ε_t1_stack = ε_t1_stack[:, idx_temp, :]
+        z_next_t_stack = z_next_t_stack[:, idx_temp, :]
+        z_post_stack = z_post_stack[:, idx_temp, :]
+
+    # 批量外积: [L_td, H, N] @ [L_td, N, H] → [L_td, H, H]
+    s = math.sqrt(n_sub)
+    dW_all = η * torch.bmm(
+        ε_t1_stack.transpose(1, 2) / s, z_next_t_stack / s
+    )
+
+    # 批量 Oja — max-normed 防 fp16 溢出
+    if oja_alpha > 0 and W_curr_list is not None:
+        oja_f = oja_eta * oja_alpha
+        zs = z_post_stack.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-4)  # [L_td, 1, H]
+        z_msq = ((z_post_stack / zs) ** 2).mean(dim=1)                       # [L_td, H]
+        temp_z = (oja_f * z_msq) * zs.squeeze(1)                             # [L_td, H]
+        W_curr_stack = torch.stack(W_curr_list, dim=0)                       # [L_td, H, H]
+        oja_term = temp_z.unsqueeze(-1) * (zs.squeeze(1).unsqueeze(-1) * W_curr_stack)
+        dW_all = dW_all - oja_term
+
+    for ℓ in range(L_td):
+        updates[f'topdown_proj.{ℓ}.weight'] = dW_all[ℓ]
 
     return updates
 
 
+@torch.no_grad()
 def compute_hebbian_conv(ε_ℓ, z_prev, conv_weight, dilation, modulation,
                          base_lr, gamma_rpe=0.3, oja_alpha=0.01,
                          oja_eta: float = 0.05,
-                         sparse_k: int = 0) -> torch.Tensor:
-    """计算 Conv1D 层的 Hebbian 更新 + Oja 约束.
+                         sparse_k: int = 0,
+                         subsample_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """计算 Conv1D 层的 Hebbian 更新 + Oja 约束 (3 k-position 批量).
 
     Conv1D: y = W ★ x, 其中 W ∈ [H, H, 3]
     ΔW = η_eff · [ε · unfold(x) - α · post² · W]
 
-    Oja: 对每个 kernel position k, post_conv = W[:,:,k] @ z_shifted.
+    性能: stack 3 个 k-position 成 [3, N, H] 单次 batched bmm,
+    避免 3 次 Python 循环 + 3 次独立 kernel launch.
 
     Args:
         ε_ℓ: [B, S, H] 该层误差 (fp32)
@@ -307,46 +390,344 @@ def compute_hebbian_conv(ε_ℓ, z_prev, conv_weight, dilation, modulation,
     η = base_lr * modulation * (1.0 + gamma_rpe)
     B, S, H_dim = z_prev.shape
     device = ε_ℓ.device
+    dtype = ε_ℓ.dtype
 
-    # causal pad so that for output position t, we can read padded[t + k*d] for k=0,1,2
     pad = 2 * dilation
-    z_padded = F.pad(z_prev.transpose(1, 2).float(), (pad, 0))  # [B, H_dim, S+2d]
+    z_padded = F.pad(z_prev.transpose(1, 2), (pad, 0))            # [B, H_dim, S+2d]
 
-    # 对每个 dilation 位置 k ∈ {0,1,2}, 收集输入活动
-    # dW[:,:,k] = Σ_{b,t} ε[b,t,:]^T · padded[b,:,t+k*d]
-    dW = torch.zeros(H_dim, H_dim, 3, device=device, dtype=torch.float32)
-    ε_flat = ε_ℓ.float().permute(0, 2, 1).reshape(B, H_dim, S)  # [B, H, S]
-    for k in range(3):
-        offset = k * dilation
-        z_shifted = z_padded[:, :, offset:offset + S]  # [B, H_dim, S]
-        if sparse_k > 0:
-            dW_k = _sparse_outer_product(
-                ε_ℓ.float(),
-                z_shifted.permute(0, 2, 1),
-                η / S, k=sparse_k,
-            )
-            dW[:, :, k] = dW_k
-        else:
-            dW[:, :, k] = η * torch.bmm(ε_flat, z_shifted.transpose(1, 2)).mean(dim=0) / S
+    if subsample_idx is not None:
+        n_sub = subsample_idx.shape[0]
+        ε_s = ε_ℓ.reshape(-1, H_dim)[subsample_idx]               # [N, H]
+        # stack 3 k-position z 成 [3, N, H]
+        z_k_list = []
+        for k in range(3):
+            offset = k * dilation
+            z_k = z_padded[:, :, offset:offset + S].permute(0, 2, 1).reshape(-1, H_dim)[subsample_idx]
+            z_k_list.append(z_k)
+        z_stacked = torch.stack(z_k_list, dim=0)                   # [3, N, H]
+        # 单次 batched bmm: [1, H, N] @ [3, N, H] → [3, H, H]
+        s = math.sqrt(n_sub)
+        dW_k = η * ((ε_s.T.unsqueeze(0) / s) @ (z_stacked / s))   # [3, H, H]
 
-        # Oja's rule: η·α·post²·W_curr per kernel position (减法)
+        # 批量 Oja per k-position — max-normed 防 fp16 溢出
         if oja_alpha > 0:
-            # post = conv output contribution at this kernel position
-            # μ_k = W[:,:,k] @ z_shifted → [B, H, S]
-            W_k = conv_weight[:, :, k].float()      # [H, H]
-            post_k = torch.bmm(W_k.unsqueeze(0).expand(B, -1, -1),
-                               z_shifted)            # [B, H, S]
-            post_k = post_k.permute(0, 2, 1)         # [B, S, H]
-            post_pow2_mean = (post_k.float() ** 2).mean(dim=(0, 1))  # [H]
-            oja_term = oja_eta * oja_alpha * (post_pow2_mean.unsqueeze(-1) * conv_weight[:, :, k].float())
-            dW[:, :, k] = dW[:, :, k] - oja_term
+            oja_f = oja_eta * oja_alpha
+            W_stack = conv_weight.permute(2, 0, 1).contiguous()    # [3, H, H]
+            post_k = torch.bmm(z_stacked, W_stack.transpose(1, 2))  # [3, N, H]
+            ps = post_k.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-4)  # [3, 1, H]
+            pk_msq = ((post_k / ps) ** 2).mean(dim=1)                       # [3, H]
+            temp_pk = (oja_f * pk_msq) * ps.squeeze(1)                      # [3, H]
+            oja_term = temp_pk.unsqueeze(-1) * (ps.squeeze(1).unsqueeze(-1) * W_stack)
+            dW_k = dW_k - oja_term
+
+        dW = dW_k.permute(1, 2, 0).contiguous()                    # [H, H, 3]
+    elif sparse_k > 0:
+        dW = torch.zeros(H_dim, H_dim, 3, device=device, dtype=dtype)
+        for k in range(3):
+            offset = k * dilation
+            z_shifted = z_padded[:, :, offset:offset + S].permute(0, 2, 1)
+            dW_k = _sparse_outer_product(ε_ℓ, z_shifted, η / S, k=sparse_k)
+            dW[:, :, k] = dW_k
+    else:
+        dW = torch.zeros(H_dim, H_dim, 3, device=device, dtype=dtype)
+        ε_flat = ε_ℓ.permute(0, 2, 1).reshape(B, H_dim, S)        # [B, H, S]
+        s = math.sqrt(B * S)
+        for k in range(3):
+            offset = k * dilation
+            z_shifted = z_padded[:, :, offset:offset + S]           # [B, H, S]
+            dW[:, :, k] = η * torch.bmm(ε_flat / s, (z_shifted / s).transpose(1, 2)).mean(dim=0)
+            if oja_alpha > 0:
+                oja_f = oja_eta * oja_alpha
+                W_k = conv_weight[:, :, k]
+                post_k = torch.bmm(
+                    W_k.unsqueeze(0).expand(B, -1, -1), z_shifted
+                ).permute(0, 2, 1)
+                ps = post_k.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)
+                pk_msq = ((post_k / ps) ** 2).mean(dim=(0, 1))
+                temp_pk = (oja_f * pk_msq) * ps.squeeze()
+                oja_term = temp_pk.unsqueeze(-1) * (ps.squeeze().unsqueeze(-1) * conv_weight[:, :, k])
+                dW[:, :, k] -= oja_term
     return dW
 
 
+# ── SwiGLU Hebbian 纯计算 (标准路径) ──
+@torch.no_grad()
+def _hebbian_swiglu_kernel_standard(x_f: torch.Tensor, ε_f: torch.Tensor,
+                                    W_gu: torch.Tensor, W_down: torch.Tensor,
+                                    η: float, Bs: int,
+                                    oja_alpha: float = 0.0,
+                                    oja_eta: float = 0.05) -> tuple:
+    """标准路径: 无分支, 从输入计算前向 + 误差回传 + Oja.
+
+    Args:
+        x_f: [N, H] 前向输入 (已子采样)
+        ε_f: [N, H] 误差 (已子采样)
+        W_gu: [2*inter, H] gate+up 联合投影权重
+        W_down: [H, inter] down 投影权重
+        η: 学习率
+        Bs: N 归一化系数 (子采样后的位置数)
+        oja_alpha: Oja 衰减系数 (0 = 禁用)
+        oja_eta: Oja 独立学习率
+    """
+    H = x_f.shape[-1]
+    inter = W_gu.shape[0] // 2
+
+    # 前向
+    pre_fused = F.linear(x_f, W_gu)                   # [N, 2*inter]
+    pre_gate, pre_up = pre_fused.chunk(2, dim=-1)     # [N, inter] each
+    gate_act = F.silu(pre_gate)                       # [N, inter]
+    hidden = gate_act * pre_up                        # [N, inter]
+
+    # 误差回传
+    ε_hidden = torch.matmul(ε_f, W_down)              # [N, inter]
+    sig = torch.sigmoid(pre_gate)
+    silu_grad = sig * (1.0 + pre_gate * sig * (1.0 - sig))
+    ε_gate = (ε_hidden * pre_up) * silu_grad
+    ε_up   = ε_hidden * gate_act
+
+    # NaN/INF check
+    # 融合外积: cat(gate, up) → 单次 matmul
+    # 预除 sqrt(Bs): 防 fp16 累积溢出, 数学等价于 /Bs
+    eu_f = torch.cat([ε_gate, ε_up], dim=-1)
+    s = math.sqrt(Bs)
+    dW_gu = η * ((eu_f / s).T @ (x_f / s))
+
+    # down 外积
+    dW_down = η * ((ε_f / s).T @ (hidden / s))
+
+    # Oja 衰减 (3 路) — max-normed 防 fp16 溢出
+    if oja_alpha > 0:
+        oja_f = oja_eta * oja_alpha
+        # gate
+        gs = gate_act.abs().max(dim=0, keepdim=True)[0].clamp(min=1e-4)
+        g_msq = ((gate_act / gs) ** 2).mean(dim=0)
+        temp_g = (oja_f * g_msq) * gs.squeeze(0)
+        dW_gu[:inter] -= temp_g.unsqueeze(-1) * (gs.squeeze(0).unsqueeze(-1) * W_gu[:inter])
+        # up
+        us = pre_up.abs().max(dim=0, keepdim=True)[0].clamp(min=1e-4)
+        u_msq = ((pre_up / us) ** 2).mean(dim=0)
+        temp_u = (oja_f * u_msq) * us.squeeze(0)
+        dW_gu[inter:] -= temp_u.unsqueeze(-1) * (us.squeeze(0).unsqueeze(-1) * W_gu[inter:])
+        # down
+        hs = hidden.abs().max(dim=0, keepdim=True)[0].clamp(min=1e-4)
+        h_msq = ((hidden / hs) ** 2).mean(dim=0)
+        temp_h = (oja_f * h_msq) * hs.squeeze(0)
+        dW_down -= temp_h.unsqueeze(0) * (hs.squeeze(0).unsqueeze(0) * W_down)
+
+    return dW_gu, dW_down
+
+
+@torch.no_grad()
+def _hebbian_swiglu_kernel_cached(pre_fused: torch.Tensor,
+                                  x_cached: torch.Tensor,
+                                  ε_f: torch.Tensor,
+                                  W_gu: torch.Tensor, W_down: torch.Tensor,
+                                  η: float, Bs: int,
+                                  oja_alpha: float = 0.0,
+                                  oja_eta: float = 0.05,
+                                  hidden_cached: Optional[torch.Tensor] = None) -> tuple:
+    """缓存路径: 跳过前向 F.linear, 使用缓存预激活 + 输入.
+
+    使用缓存的门控/上投影预激活 (避免前向重算)，
+    以及可选的归一化后 hidden (对于 dW_down 使用归一化后的隐藏状态，防止 fp16 溢出).
+
+    Args:
+        pre_fused: [N, 2*inter] 缓存的 gate+up 预激活 (T=1 fusion)
+        x_cached: [N, H] 缓存的 MLP 输入
+        ε_f: [N, H] 误差
+        W_gu/W_down/η/Bs/oja_alpha/oja_eta: 同标准路径
+        hidden_cached: [N, inter] 可选 — 缓存的后归一化 hidden.
+                       提供后用于 dW_down 及其 Oja 项，避免 gate_act*pre_up 溢出.
+    """
+    H = x_cached.shape[-1]
+    inter = W_gu.shape[0] // 2
+
+    pre_gate, pre_up = pre_fused.chunk(2, dim=-1)
+    gate_act = F.silu(pre_gate)
+    hidden = hidden_cached if hidden_cached is not None else (gate_act * pre_up)
+
+    ε_hidden = torch.matmul(ε_f, W_down)
+    sig = torch.sigmoid(pre_gate)
+    silu_grad = sig * (1.0 + pre_gate * sig * (1.0 - sig))
+    ε_gate = (ε_hidden * pre_up) * silu_grad
+    ε_up   = ε_hidden * gate_act
+
+    eu_f = torch.cat([ε_gate, ε_up], dim=-1)
+    s = math.sqrt(Bs)
+    dW_gu = η * ((eu_f / s).T @ (x_cached / s))
+    dW_down = η * ((ε_f / s).T @ (hidden / s))
+
+    if oja_alpha > 0:
+        oja_f = oja_eta * oja_alpha
+        # gate
+        gs = gate_act.abs().max(dim=0, keepdim=True)[0].clamp(min=1e-4)
+        g_msq = ((gate_act / gs) ** 2).mean(dim=0)
+        temp_g = (oja_f * g_msq) * gs.squeeze(0)
+        dW_gu[:inter] -= temp_g.unsqueeze(-1) * (gs.squeeze(0).unsqueeze(-1) * W_gu[:inter])
+        # up
+        us = pre_up.abs().max(dim=0, keepdim=True)[0].clamp(min=1e-4)
+        u_msq = ((pre_up / us) ** 2).mean(dim=0)
+        temp_u = (oja_f * u_msq) * us.squeeze(0)
+        dW_gu[inter:] -= temp_u.unsqueeze(-1) * (us.squeeze(0).unsqueeze(-1) * W_gu[inter:])
+        # down
+        hs = hidden.abs().max(dim=0, keepdim=True)[0].clamp(min=1e-4)
+        h_msq = ((hidden / hs) ** 2).mean(dim=0)
+        temp_h = (oja_f * h_msq) * hs.squeeze(0)
+        dW_down -= temp_h.unsqueeze(0) * (hs.squeeze(0).unsqueeze(0) * W_down)
+
+    return dW_gu, dW_down
+
+
+@torch.no_grad()
+def _hebbian_swiglu_kernel_batched(
+    x_stack: torch.Tensor, ε_stack: torch.Tensor,
+    W_gu_stack: torch.Tensor, W_down_stack: torch.Tensor,
+    η: float, Bs: int,
+    oja_alpha: float = 0.0,
+    oja_eta: float = 0.05,
+    pre_fused_stack: Optional[torch.Tensor] = None,
+    x_cached_stack: Optional[torch.Tensor] = None,
+    hidden_cached_stack: Optional[torch.Tensor] = None,
+) -> tuple:
+    """批量 SwiGLU Hebbian 核 — 单次 batched bmm 处理所有块.
+
+    将 N 个 SwiGLU 块的数据沿 batch 维度堆叠，
+    用 4 次 batched bmm 替代 N×4 次独立 matmul，
+    大幅减少 GPU kernel launch 开销。
+
+    Args:
+        x_stack: [Bk, N, H] — 所有块输入堆叠
+        ε_stack: [Bk, N, H] — 所有块误差堆叠
+        W_gu_stack: [Bk, 2*inter, H] — 所有块 gate+up 权重堆叠
+        W_down_stack: [Bk, H, inter] — 所有块 down 权重堆叠
+        η: 学习率
+        Bs: N 归一化系数
+        oja_alpha: Oja 衰减系数 (0 = 禁用)
+        oja_eta: Oja 独立学习率
+        pre_fused_stack: Optional [Bk, N, 2*inter] 缓存的 gate+up 预激活
+        x_cached_stack: Optional [Bk, N, H] 缓存的真实 MLP 输入
+        hidden_cached_stack: Optional [Bk, N, inter] 缓存的后归一化 hidden。
+                             提供后用于 dW_down 及其 Oja，防止 gate_act*pre_up 溢出.
+
+    Returns:
+        (dW_gu_stack, dW_down_stack) — [Bk, 2*inter, H] 和 [Bk, H, inter]
+    """
+    Bk = x_stack.shape[0]
+    inter = W_gu_stack.shape[1] // 2
+
+    if pre_fused_stack is not None:
+        pre_gate, pre_up = pre_fused_stack.chunk(2, dim=-1)  # [Bk, N, inter]
+        x_use = x_cached_stack if x_cached_stack is not None else x_stack
+    else:
+        pre_fused_stack = torch.bmm(x_stack, W_gu_stack.transpose(1, 2))  # [Bk, N, 2*inter]
+        pre_gate, pre_up = pre_fused_stack.chunk(2, dim=-1)
+        x_use = x_stack
+
+    gate_act = F.silu(pre_gate)                            # [Bk, N, inter]
+    hidden = hidden_cached_stack if hidden_cached_stack is not None else (gate_act * pre_up)
+
+    ε_hidden = torch.bmm(ε_stack, W_down_stack)            # [Bk, N, inter]
+    sig = torch.sigmoid(pre_gate)
+    silu_grad = sig * (1.0 + pre_gate * sig * (1.0 - sig))
+    ε_gate = (ε_hidden * pre_up) * silu_grad                # [Bk, N, inter]
+    ε_up = ε_hidden * gate_act                              # [Bk, N, inter]
+
+    eu_stack = torch.cat([ε_gate, ε_up], dim=-1)            # [Bk, N, 2*inter]
+    s = math.sqrt(Bs)
+    dW_gu = η * torch.bmm(eu_stack.transpose(1, 2) / s, x_use / s)   # [Bk, 2*inter, H]
+    dW_down = η * torch.bmm(ε_stack.transpose(1, 2) / s, hidden / s) # [Bk, H, inter]
+
+    if oja_alpha > 0:
+        oja_f = oja_eta * oja_alpha
+        # gate Oja — max-normed to avoid fp16 overflow in act**2
+        gs = gate_act.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-4)
+        g_msq = ((gate_act / gs) ** 2).mean(dim=1)
+        temp_g = (oja_f * g_msq) * gs.squeeze(1)
+        dW_gu[:, :inter] -= temp_g.unsqueeze(-1) * (gs.squeeze(1).unsqueeze(-1) * W_gu_stack[:, :inter])
+        # up Oja
+        us = pre_up.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-4)
+        u_msq = ((pre_up / us) ** 2).mean(dim=1)
+        temp_u = (oja_f * u_msq) * us.squeeze(1)
+        dW_gu[:, inter:] -= temp_u.unsqueeze(-1) * (us.squeeze(1).unsqueeze(-1) * W_gu_stack[:, inter:])
+        # down Oja
+        hs = hidden.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-4)
+        h_msq = ((hidden / hs) ** 2).mean(dim=1)
+        temp_h = (oja_f * h_msq) * hs.squeeze(1)
+        dW_down -= temp_h.unsqueeze(1) * (hs.squeeze(1).unsqueeze(1) * W_down_stack)
+
+    return dW_gu, dW_down
+
+
+@torch.no_grad()
+def _hebbian_swiglu_unfused(ε_ℓ, z_conv, mlp, modulation, base_lr,
+                             gamma_rpe=0.3, oja_alpha=0.01,
+                             oja_eta: float = 0.05,
+                             sparse_k: int = 0,
+                             cached: Optional[tuple] = None) -> dict:
+    """非融合 MLP 的 Hebbian SwiGLU 回退路径 (与原始逻辑等价)."""
+    η = base_lr * modulation * (1.0 + gamma_rpe)
+    W_gate = mlp.gate_proj.weight
+    W_up   = mlp.up_proj.weight
+    W_down = mlp.down_proj.weight
+    B, S, H_dim = ε_ℓ.shape
+
+    if cached is not None:
+        cached_fused, cached_input = cached
+        x = cached_input
+        pre_gate, pre_up = cached_fused.chunk(2, dim=-1)
+        pre_gate = pre_gate.contiguous()
+        pre_up   = pre_up.contiguous()
+    else:
+        x = z_conv
+        pre_gate = F.linear(x, W_gate)
+        pre_up   = F.linear(x, W_up)
+    gate_act = F.silu(pre_gate)
+    hidden = gate_act * pre_up
+    ε_hidden = torch.matmul(ε_ℓ, W_down)
+    sig = torch.sigmoid(pre_gate)
+    silu_grad = sig * (1.0 + pre_gate * sig * (1.0 - sig))
+    ε_gate = (ε_hidden * pre_up) * silu_grad
+    ε_up   = ε_hidden * gate_act
+
+    x_flat = x.reshape(-1, H_dim)
+    if sparse_k > 0:
+        dW_gate = _sparse_outer_product(ε_gate, x, η, k=sparse_k)
+        dW_up   = _sparse_outer_product(ε_up, x, η, k=sparse_k)
+        dW_down = _sparse_outer_product(ε_ℓ, hidden, η, k=sparse_k)
+    else:
+        dW_gate = η * (ε_gate.reshape(-1, ε_gate.size(-1)).T @ x_flat) / (B * S)
+        dW_up   = η * (ε_up.reshape(-1, ε_up.size(-1)).T @ x_flat) / (B * S)
+        dW_down = η * (ε_ℓ.reshape(-1, H_dim).T @ hidden.reshape(-1, hidden.size(-1))) / (B * S)
+
+    if oja_alpha > 0:
+        oja_f = oja_eta * oja_alpha
+        for dW_comp, post_act, W_curr in [
+            (dW_gate, gate_act, W_gate),
+            (dW_up,   pre_up,   W_up),
+            (dW_down, hidden,   W_down),
+        ]:
+            act_scale = post_act.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)
+            mean_sq_scaled = ((post_act / act_scale) ** 2).mean(dim=(0, 1))
+            temp = (oja_f * mean_sq_scaled) * act_scale.squeeze()
+            if W_curr.shape[0] == temp.shape[0]:
+                dW_comp -= temp.unsqueeze(-1) * (act_scale.squeeze().unsqueeze(-1) * W_curr)
+            else:
+                dW_comp -= temp.unsqueeze(0) * (act_scale.squeeze().unsqueeze(0) * W_curr)
+
+    return {
+        'gate_proj.weight': dW_gate.squeeze(0),
+        'up_proj.weight':   dW_up.squeeze(0),
+        'down_proj.weight': dW_down.squeeze(0),
+    }
+
+
+@torch.no_grad()
 def compute_hebbian_swiglu(ε_ℓ, z_conv, mlp, modulation, base_lr,
                            gamma_rpe=0.3, oja_alpha=0.01,
                            oja_eta: float = 0.05,
-                           sparse_k: int = 0) -> dict:
+                           sparse_k: int = 0,
+                           cached: Optional[tuple] = None,
+                           subsample_idx: Optional[torch.Tensor] = None) -> dict:
     """计算 SwiGLU MLP 的 Hebbian 更新 + Oja 约束 (gate/up/down 三路).
 
     层内分解:
@@ -361,100 +742,143 @@ def compute_hebbian_swiglu(ε_ℓ, z_conv, mlp, modulation, base_lr,
 
         Oja: ΔW -= η_oja·α·post²·W_curr  (η_oja 独立于 Hebbian η)
 
+    性能: 标准路径用 `_hebbian_swiglu_kernel` (torch.compile 融合)；
+          有缓存时仍走 kernel (跳过前向 F.linear，外积用缓存输入)；
+          sparse_k > 0 时回退非编译代码。
+
     Args:
         ε_ℓ: [B, S, H] 该层误差 (fp32)
-        z_conv: [B, S, H] conv 输出 (MLP 输入)
+        z_conv: [B, S, H] conv 输出 (MLP 输入) — 无缓存时使用
         mlp: FeedForward 模块 (含 gate_proj, up_proj, down_proj)
         modulation: 组合调制值
         base_lr: 基础学习率
         gamma_rpe: RPE 增益系数
         oja_alpha: Oja 衰减系数 (0 = 禁用)
         oja_eta: Oja 独立学习率 (不绑定 Hebbian η)
+        cached: Optional tuple (captured_fused, captured_input) from T=1 fusion.
+                captured_fused: [B, S, 2*inter] gate_up_proj 预激活
+                captured_input: [B, S, H] LN 后的 MLP 输入
 
     Returns:
         updates: dict with 'gate_proj.weight', 'up_proj.weight', 'down_proj.weight'
             或 fused 模式下 'gate_up_proj.weight', 'down_proj.weight'
     """
     fused = hasattr(mlp, 'gate_up_proj')
+    if not fused:
+        # 非融合 MLP: 使用原始路径 (极少使用)
+        return _hebbian_swiglu_unfused(ε_ℓ, z_conv, mlp, modulation, base_lr,
+                                       gamma_rpe, oja_alpha, oja_eta, sparse_k, cached)
 
     η = base_lr * modulation * (1.0 + gamma_rpe)
-    device = ε_ℓ.device
-    ε = ε_ℓ.float()                                # [B, S, H]
-    x = z_conv.float()                              # [B, S, H]
+    W_gu = mlp.gate_up_proj.weight               # [2*inter, H]
+    W_down = mlp.down_proj.weight                # [H, inter]
+    B, S, H_dim = ε_ℓ.shape
 
-    # 获取权重 (兼容 FusedFeedForward / 标准 MLP)
-    W_down = mlp.down_proj.weight.float()           # [H, inter]
-    if fused:
-        W_gu = mlp.gate_up_proj.weight.float()      # [2*inter, H]
-        inter = W_gu.shape[0] // 2
-        W_gate = W_gu[:inter]                       # [inter, H]
-        W_up   = W_gu[inter:]                       # [inter, H]
-    else:
-        W_gate = mlp.gate_proj.weight.float()       # [inter, H]
-        W_up   = mlp.up_proj.weight.float()         # [inter, H]
+    # ── 标准路径: 无 sparse_k → 紧凑核 (缓存可选) ──
+    if sparse_k == 0:
+        x_f = z_conv.reshape(-1, H_dim)           # [B*S, H]
+        ε_f = ε_ℓ.reshape(-1, H_dim)              # [B*S, H]
+        Bs = B * S
 
-    # 前向重建 (no grad)
-    pre_gate = F.linear(x, W_gate)                  # [B, S, inter]
-    pre_up   = F.linear(x, W_up)                    # [B, S, inter]
-    gate_act = F.silu(pre_gate)
-    hidden = gate_act * pre_up                       # SwiGLU [B, S, inter]
+        if subsample_idx is not None:
+            x_f = x_f[subsample_idx]
+            ε_f = ε_f[subsample_idx]
+            Bs = subsample_idx.shape[0]
 
-    # 误差回传通过 down_proj
-    ε_down = ε                                      # [B, S, H]
-    ε_hidden = torch.matmul(ε_down, W_down)          # [B, S, H] @ [H, inter] → [B, S, inter]
-
-    # SwiGLU backward
-    sig = torch.sigmoid(pre_gate)
-    silu_grad = sig * (1.0 + pre_gate * sig * (1.0 - sig))
-    ε_gate = (ε_hidden * pre_up) * silu_grad          # [B, S, inter]
-    ε_up   = ε_hidden * gate_act                       # [B, S, inter]
-
-    # Hebbian 更新
-    B, S, H_dim = x.shape
-    x_flat = x.reshape(-1, H_dim)                    # [B*S, H]
-    gate_flat = ε_gate.reshape(-1, ε_gate.size(-1))
-    up_flat   = ε_up.reshape(-1, ε_up.size(-1))
-    down_flat = ε_down.reshape(-1, H_dim)
-    hidden_flat = hidden.reshape(-1, hidden.size(-1))
-
-    if sparse_k > 0:
-        dW_gate = _sparse_outer_product(ε_gate, x, η, k=sparse_k)
-        dW_up   = _sparse_outer_product(ε_up, x, η, k=sparse_k)
-        dW_down = _sparse_outer_product(ε_down, hidden, η, k=sparse_k)
-    else:
-        dW_gate = η * (gate_flat.T @ x_flat) / (B * S)    # [inter, H], per-sample
-        dW_up   = η * (up_flat.T @ x_flat) / (B * S)      # [inter, H], per-sample
-        dW_down = η * (down_flat.T @ hidden_flat) / (B * S)  # [H, inter], per-sample
-
-    # Oja's rule
-    if oja_alpha > 0:
-        for dW_component, post_act, W_curr in [
-            (dW_gate, gate_act, W_gate),
-            (dW_up,   pre_up,   W_up),
-            (dW_down, hidden,   W_down),
-        ]:
-            post_pow2_mean = (post_act.float() ** 2).mean(dim=(0, 1))
-            if W_curr.shape[0] == post_pow2_mean.shape[0]:
-                oja_term = oja_eta * oja_alpha * (post_pow2_mean.unsqueeze(-1) * W_curr)
-            else:
-                oja_term = oja_eta * oja_alpha * (post_pow2_mean.unsqueeze(0) * W_curr)
-            dW_component -= oja_term
-
-    if fused:
-        dW_gu = torch.cat([dW_gate, dW_up], dim=0)    # [2*inter, H]
-        updates = {
+        if cached is not None:
+            cached_fused, cached_input = cached[:2]
+            hidden_cached_f = cached[2] if len(cached) > 2 else None
+            pre_fused_f = cached_fused.reshape(-1, cached_fused.size(-1))
+            x_cached_f = cached_input.reshape(-1, H_dim)
+            h_cached_f = hidden_cached_f.reshape(-1, hidden_cached_f.size(-1)) if hidden_cached_f is not None else None
+            if subsample_idx is not None:
+                pre_fused_f = pre_fused_f[subsample_idx]
+                x_cached_f = x_cached_f[subsample_idx]
+                if h_cached_f is not None:
+                    h_cached_f = h_cached_f[subsample_idx]
+            dW_gu, dW_down = _hebbian_swiglu_kernel_cached(
+                pre_fused_f, x_cached_f, ε_f, W_gu, W_down, η, Bs,
+                oja_alpha=oja_alpha, oja_eta=oja_eta,
+                hidden_cached=h_cached_f,
+            )
+        else:
+            dW_gu, dW_down = _hebbian_swiglu_kernel_standard(
+                x_f, ε_f, W_gu, W_down, η, Bs,
+                oja_alpha=oja_alpha, oja_eta=oja_eta,
+            )
+        return {
             'gate_up_proj.weight': dW_gu.squeeze(0),
             'down_proj.weight':    dW_down.squeeze(0),
         }
     else:
-        updates = {
-            'gate_proj.weight': dW_gate.squeeze(0),
-            'up_proj.weight':   dW_up.squeeze(0),
-            'down_proj.weight': dW_down.squeeze(0),
-        }
-    return updates
+        # ── sparse_k > 0: 回退到原路径 ──
+        ε = ε_ℓ
+        if cached is not None:
+            cached_fused, cached_input = cached[:2]
+            hidden_cached = cached[2] if len(cached) > 2 else None
+            x = cached_input
+            pre_gate_c, pre_up_c = cached_fused.chunk(2, dim=-1)
+            pre_gate = pre_gate_c.contiguous()
+            pre_up   = pre_up_c.contiguous()
+            gate_act = F.silu(pre_gate)
+            hidden = hidden_cached if hidden_cached is not None else (gate_act * pre_up)
+        else:
+            x = z_conv
+            pre_fused = F.linear(x, W_gu)
+            pre_gate, pre_up = pre_fused.chunk(2, dim=-1)
+            gate_act = F.silu(pre_gate)
+            hidden = gate_act * pre_up
+        inter = W_gu.shape[0] // 2
+        W_gate = W_gu[:inter]
+        W_up   = W_gu[inter:]
+
+        ε_down = ε
+        ε_hidden = torch.matmul(ε_down, W_down)
+        sig = torch.sigmoid(pre_gate)
+        silu_grad = sig * (1.0 + pre_gate * sig * (1.0 - sig))
+        ε_gate = (ε_hidden * pre_up) * silu_grad
+        ε_up   = ε_hidden * gate_act
+
+        x_flat = x.reshape(-1, H_dim)
+        gate_flat = ε_gate.reshape(-1, ε_gate.size(-1))
+        up_flat   = ε_up.reshape(-1, ε_up.size(-1))
+        down_flat = ε_down.reshape(-1, H_dim)
+        hidden_flat = hidden.reshape(-1, hidden.size(-1))
+
+        if sparse_k > 0:
+            dW_gate = _sparse_outer_product(ε_gate, x, η, k=sparse_k)
+            dW_up   = _sparse_outer_product(ε_up, x, η, k=sparse_k)
+            dW_down = _sparse_outer_product(ε_down, hidden, η, k=sparse_k)
+        else:
+            eu_flat = torch.cat([gate_flat, up_flat], dim=-1)
+            dW_gu = η * (eu_flat.T @ x_flat) / (B * S)
+            dW_gate, dW_up = dW_gu.chunk(2, dim=0)
+            dW_down = η * (down_flat.T @ hidden_flat) / (B * S)
+
+        if oja_alpha > 0:
+            oja_f = oja_eta * oja_alpha
+            for dW_comp, post_act, W_curr in [
+                (dW_gate, gate_act, W_gate),
+                (dW_up,   pre_up,   W_up),
+                (dW_down, hidden,   W_down),
+            ]:
+                act_scale = post_act.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)
+                mean_sq_scaled = ((post_act / act_scale) ** 2).mean(dim=(0, 1))
+                temp = (oja_f * mean_sq_scaled) * act_scale.squeeze()
+                if W_curr.shape[0] == temp.shape[0]:
+                    dW_comp -= temp.unsqueeze(-1) * (act_scale.squeeze().unsqueeze(-1) * W_curr)
+                else:
+                    dW_comp -= temp.unsqueeze(0) * (act_scale.squeeze().unsqueeze(0) * W_curr)
+
+    # ── 组装返回 (融合 MLP: gate_up_proj + down_proj) ──
+    dW_gu = torch.cat([dW_gate, dW_up], dim=0)
+    return {
+        'gate_up_proj.weight': dW_gu.squeeze(0),
+        'down_proj.weight':    dW_down.squeeze(0),
+    }
 
 
+@torch.no_grad()
 def compute_hebbian_decoder(z_L, target_byte_embed, decoder_weight,
                             modulation, base_lr, gamma_rpe=0.3,
                             λ=0.01, oja_alpha=0.01,
@@ -477,8 +901,11 @@ def compute_hebbian_decoder(z_L, target_byte_embed, decoder_weight,
         F_decoder: float — λ·‖decoder(z_L) - target‖²
     """
     η = base_lr * modulation * (1.0 + gamma_rpe)
-    z = z_L.float()                                 # [B, S, H]
-    tgt = target_byte_embed.float()                  # [B, S, 256] 或 [B, S-1, 256]
+    # ═══════════════════════════════════════════════════════════════
+    #  保留 fp32 以避免 softmax 溢出 → 否则 exp(x) in fp16 → NaN
+    # ═══════════════════════════════════════════════════════════════
+    z = z_L                                            # [B, S, H] fp32
+    tgt = target_byte_embed                            # [B, S, 256] fp32
 
     # Decoder 预测: z[t] → next_byte[t]
     # 如果 target 长度 = S-1 (labels[:, 1:]), 用 z[:, :-1, :] 做预测
@@ -486,7 +913,7 @@ def compute_hebbian_decoder(z_L, target_byte_embed, decoder_weight,
         z_in = z[:, :-1, :]                         # [B, S-1, H]
     else:
         z_in = z
-    pred = F.linear(z_in, decoder_weight.float())    # [B, S', 256]
+    pred = F.linear(z_in, decoder_weight)    # [B, S', 256] — fp16
     # ═══════════════════════════════════════════════════════════════
     #  关键修复 v2: 使用 tgt - softmax(W·z) 作为残差
     #
@@ -496,11 +923,11 @@ def compute_hebbian_decoder(z_L, target_byte_embed, decoder_weight,
     #
     #  之前用 pred_softmax - tgt, 符号相反, 导致 CE 上升.
     # ═══════════════════════════════════════════════════════════════
-    pred_softmax = F.softmax(pred, dim=-1)
+    pred_softmax = F.softmax(pred.float(), dim=-1).half()  # softmax内部fp32保数值稳定
     ε_decoder = tgt - pred_softmax                  # [B, S', 256] — PC 误差方向!
 
     # F_decoder: 用交叉熵 (而非 MSE) 衡量解码器性能
-    F_decoder = λ * (-(tgt * (pred_softmax + 1e-10).log()).sum(dim=-1).mean()).item()
+    F_decoder = λ * (-(tgt.half() * (pred_softmax + (1/256)).log()).sum(dim=-1).mean()).item()
 
     # Hebbian: ΔW = η/(B·S) · Σ ε_decoder^T · z_in   (per-sample 平均)
     #   除以 B*S 保证与 temporal/topdown 一致的 per-sample 尺度,
@@ -511,21 +938,107 @@ def compute_hebbian_decoder(z_L, target_byte_embed, decoder_weight,
         z_in.reshape(-1, H_dim).unsqueeze(0),
     ).squeeze(0)                                    # [256, H]
 
-    # Oja's rule: η·α·post²·W_curr (减法: 防止权重发散)
+    # Oja's rule: max-normed 防 fp16 溢出
     if oja_alpha > 0:
+        oja_f = oja_eta * oja_alpha
         post = pred_softmax                         # [B, S', 256], 突触后 = decoder 输出 (softmax)
-        post_pow2_mean = (post.float() ** 2).mean(dim=(0, 1))  # [256]
-        W_curr = decoder_weight.float()             # [256, H]
-        oja_term = oja_eta * oja_alpha * (post_pow2_mean.unsqueeze(-1) * W_curr)
+        ps = post.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)  # [1, 1, 256]
+        post_msq = ((post / ps) ** 2).mean(dim=(0, 1))                    # [256]
+        temp = (oja_f * post_msq) * ps.squeeze()                          # [256]
+        W_curr = decoder_weight             # [256, H]
+        oja_term = temp.unsqueeze(-1) * (ps.squeeze().unsqueeze(-1) * W_curr)
         dW = dW - oja_term
 
     return dW, F_decoder
 
 
+@torch.no_grad()
+def _compute_hebbian_decoder_pair(z_L, target_byte_embed,
+                                   W_decoder, W_lm_head,
+                                   modulation, base_lr, gamma_rpe=0.3,
+                                   λ=0.01, oja_alpha=0.01,
+                                   oja_eta: float = 0.05,
+                                   subsample_idx: Optional[torch.Tensor] = None) -> tuple:
+    """融合计算 decoder + lm_head Hebbian 更新 (共享 z_in 和 target)."""
+    η = base_lr * modulation * (1.0 + gamma_rpe)
+    z = z_L
+    tgt = target_byte_embed
+    if tgt.size(1) < z.size(1):
+        z_in = z[:, :-1, :]
+    else:
+        z_in = z
+    B, S_eff, H_dim = z_in.shape
+
+    # decoder prediction
+    pred_dec = F.linear(z_in, W_decoder)
+    # lm_head prediction
+    pred_lm = F.linear(z_in, W_lm_head)
+
+    pred_softmax_dec = F.softmax(pred_dec.float(), dim=-1).half()
+    pred_softmax_lm  = F.softmax(pred_lm.float(), dim=-1).half()
+    ε_dec = tgt - pred_softmax_dec
+    ε_lm  = tgt - pred_softmax_lm
+
+    F_decoder = λ * (-(tgt.half() * (pred_softmax_dec + (1/256)).log()).sum(dim=-1).mean()).item()
+
+    # Hebbian outer product for both
+    z_flat = z_in.reshape(-1, H_dim)
+    ε_dec_f = ε_dec.reshape(-1, 256)
+    ε_lm_f  = ε_lm.reshape(-1, 256)
+    if subsample_idx is not None:
+        S_full = z_L.size(1)
+        t_pos = subsample_idx % S_full
+        valid = t_pos != (S_full - 1)
+        idx_valid = subsample_idx[valid]
+        if idx_valid.numel() > 0:
+            b_idx = idx_valid // S_full
+            s_idx = idx_valid % S_full
+            idx_map = b_idx * S_eff + s_idx
+            z_flat = z_flat[idx_map]
+            ε_dec_f = ε_dec_f[idx_map]
+            ε_lm_f  = ε_lm_f[idx_map]
+            # 子采样 softmax 输出用于 Oja
+            post_dec = pred_softmax_dec.reshape(-1, 256)[idx_map]
+            post_lm  = pred_softmax_lm.reshape(-1, 256)[idx_map]
+            n_subsample = idx_valid.shape[0]
+        else:
+            n_subsample = 1
+            z_flat = z_flat[:1]
+            ε_dec_f = ε_dec_f[:1]
+            ε_lm_f  = ε_lm_f[:1]
+            post_dec = pred_softmax_dec.reshape(-1, 256)[:1]
+            post_lm  = pred_softmax_lm.reshape(-1, 256)[:1]
+    else:
+        n_subsample = B * S_eff
+        post_dec = pred_softmax_dec
+        post_lm = pred_softmax_lm
+    dW_dec = (η / n_subsample) * (ε_dec_f.T @ z_flat)
+    dW_lm  = (η / n_subsample) * (ε_lm_f.T @ z_flat)
+
+    # Oja: max-normed 防 fp16 溢出
+    if oja_alpha > 0:
+        oja_f = oja_eta * oja_alpha
+        for dW, post, W in [(dW_dec, post_dec, W_decoder),
+                            (dW_lm,  post_lm,  W_lm_head)]:
+            if subsample_idx is not None:
+                ps = post.abs().max(dim=0, keepdim=True)[0].clamp(min=1e-4)
+                p_msq = ((post / ps) ** 2).mean(dim=0)
+                temp = (oja_f * p_msq) * ps.squeeze(0)
+            else:
+                ps = post.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)
+                p_msq = ((post / ps) ** 2).mean(dim=(0, 1))
+                temp = (oja_f * p_msq) * ps.squeeze()
+            dW -= temp.unsqueeze(-1) * (ps.squeeze().unsqueeze(-1) * W)
+
+    return dW_dec, dW_lm, F_decoder
+
+
+@torch.no_grad()
 def compute_hebbian_byte_proj(ε_1, byte_seq, byte_proj_weight, conv1_weight,
                               modulation, base_lr, gamma_rpe=0.3,
                               oja_alpha=0.01,
-                              oja_eta: float = 0.05) -> dict:
+                              oja_eta: float = 0.05,
+                              subsample_idx: Optional[torch.Tensor] = None) -> dict:
     """计算 byte_proj (即 Conv1d(2, H, 13)) 的 Hebbian 更新 + Oja 约束.
 
     Oja: post = 卷积输出 z₀, η_oja·α·post²·W_curr 防止权重发散.
@@ -544,27 +1057,45 @@ def compute_hebbian_byte_proj(ε_1, byte_seq, byte_proj_weight, conv1_weight,
         updates: dict with key 'model.byte_proj.weight'
     """
     η = base_lr * modulation * (1.0 + gamma_rpe)
-    ε = ε_1.float()                                 # [B, S, H]
-    x_byte = byte_seq.float()                       # [B, 2, S]
+    ε = ε_1                                           # [B, S, H] fp16
+    x_byte = byte_seq                                  # [B, 2, S] fp16, int 0-255
+    # 归一化输入 [0,1] 防止 fp16 einsum 累加溢出 (x=255 × ε~3 × 6144项 > 65K)
+    x_byte = x_byte * (1 / 256)
 
     B, S, H_dim = ε.shape
     pad = 12
-    x_padded = F.pad(x_byte.float(), (pad, 0))       # [B, 2, S+12]
+    x_padded = F.pad(x_byte, (pad, 0))               # [B, 2, S+12]
     x_unfold = x_padded.unfold(2, 13, 1)             # [B, 2, S, 13]
     x_unfold = x_unfold.permute(0, 2, 1, 3)          # [B, S, 2, 13]
 
-    ε_t = ε.transpose(0, 1)                         # [S, B, H_dim]
-    x_t = x_unfold.transpose(0, 1)                  # [S, B, 2, 13]
-    dW = torch.einsum('sbi,sbjk->ijk', ε_t, x_t)    # [H_dim, 2, 13]
-    dW = η * dW / (B * S)
+    if subsample_idx is not None:
+        # 子采样: 只对抽中位置做外积
+        ε_s = ε.reshape(-1, H_dim)[subsample_idx]     # [N, H]
+        x_s = x_unfold.reshape(-1, 2, 13)[subsample_idx]  # [N, 2, 13]
+        dW = η * torch.einsum('ni,njk->ijk', ε_s, x_s) * 256.0 / subsample_idx.shape[0]
+    else:
+        ε_t = ε.transpose(0, 1)                     # [S, B, H_dim]
+        x_t = x_unfold.transpose(0, 1)              # [S, B, 2, 13]
+        dW = torch.einsum('sbi,sbjk->ijk', ε_t, x_t)  # [H_dim, 2, 13], 已缩放到 [0,1]
+        dW = η * dW * 256.0 / (B * S)               # ×256 补偿归一化
 
-    # Oja's rule: η·α·post²·W_curr (减法: 防止权重发散)
+    # Oja's rule: max-normed 防 fp16 溢出
     if oja_alpha > 0:
-        W_byte = byte_proj_weight.float()            # [H, 2, 13]
-        z_0 = F.conv1d(x_byte, W_byte, padding=12)  # [B, H, S]
+        oja_f = oja_eta * oja_alpha
+        W_byte = byte_proj_weight            # [H, 2, 13]
+        z_0 = F.conv1d(x_byte, W_byte, padding=12)   # [B, H, S], 与 forward 一致缩放
         z_0 = z_0.permute(0, 2, 1)                  # [B, S, H]
-        post_pow2_mean = (z_0.float() ** 2).mean(dim=(0, 1))  # [H]
-        oja_term = oja_eta * oja_alpha * (post_pow2_mean.unsqueeze(-1).unsqueeze(-1) * W_byte)
+        if subsample_idx is not None:
+            z_0_s = z_0.reshape(-1, H_dim)[subsample_idx]
+            ps = z_0_s.abs().max(dim=0, keepdim=True)[0].clamp(min=1e-4)
+            z_msq = ((z_0_s / ps) ** 2).mean(dim=0)
+            temp = (oja_f * z_msq) * ps.squeeze(0)
+            oja_term = temp.unsqueeze(-1).unsqueeze(-1) * (ps.squeeze(0).unsqueeze(-1).unsqueeze(-1) * W_byte)
+        else:
+            ps = z_0.abs().max(dim=(0, 1), keepdim=True)[0].clamp(min=1e-4)  # [1, 1, H]
+            z_msq = ((z_0 / ps) ** 2).mean(dim=(0, 1))
+            temp = (oja_f * z_msq) * ps.squeeze()
+            oja_term = temp.unsqueeze(-1).unsqueeze(-1) * (ps.squeeze().unsqueeze(-1).unsqueeze(-1) * W_byte)
         dW = dW - oja_term
 
     return {'model.byte_proj.weight': dW}
@@ -574,7 +1105,7 @@ def compute_hebbian_byte_proj(ε_1, byte_seq, byte_proj_weight, conv1_weight,
 #  误差归一化 — 生物合理的发放率约束
 # ═══════════════════════════════════════════════════════════════════
 
-def rms_normalize(ε_list, rms_target=1.0, eps=1e-8):
+def rms_normalize(ε_list, rms_target=1.0, eps=None):
     """逐层 RMS 归一化预测误差.
 
     生物类比: 神经元发放率有物理上限 (~0-100 Hz),
@@ -584,6 +1115,8 @@ def rms_normalize(ε_list, rms_target=1.0, eps=1e-8):
     不同于 LayerNorm: 不中心化, 不逐神经元归一化, 只缩放到目标 RMS.
     同一层内不同位置的相对误差幅度完全保留.
 
+    性能: 不使用 .item() 避免 GPU→CPU sync, 完全在 GPU 上完成.
+
     Args:
         ε_list: list[tensor, L] — 各层误差 [B, S, H]
         rms_target: 目标 RMS (默认 1.0, 表示误差约等于一个标准差的发放)
@@ -592,15 +1125,12 @@ def rms_normalize(ε_list, rms_target=1.0, eps=1e-8):
     Returns:
         ε_norm_list: 归一化后的 ε, 每层 RMS ≈ rms_target
     """
+    eps_val = (1/256) if eps is None else eps
     ε_norm_list = []
     for ε in ε_list:
-        ε_f32 = ε.float()
-        rms = ε_f32.square().mean().sqrt()
-        scale = rms_target / max(rms.item(), eps)
-        if abs(scale - 1.0) > 1e-6:
-            ε_norm_list.append(ε_f32 * scale)
-        else:
-            ε_norm_list.append(ε_f32)
+        rms = ε.square().mean().sqrt()
+        scale = rms_target / rms.clamp(min=eps_val)
+        ε_norm_list.append(ε * scale)
     return ε_norm_list
 
 
@@ -657,7 +1187,9 @@ def compute_all_hebbian_updates(ε_list, z_init, byte_seq, model, cfg,
                                 D=0.5, ACh=0.5, modulation=0.5, λ=0.01,
                                 decoder=None, lm_head=None, target_byte_embed=None,
                                 oja_alpha=0.05, oja_eta: float = 0.05,
-                                bcm_state=None, verbose=True) -> dict:
+                                bcm_state=None, verbose=True,
+                                hebbian_cache: Optional[dict] = None,
+                                subsample_idx: Optional[torch.Tensor] = None) -> dict:
     """统一入口: 计算所有 PC 参数的 Hebbian 更新 + Oja 约束 + BCM 调制 + 诊断日志.
 
     Args:
@@ -677,6 +1209,12 @@ def compute_all_hebbian_updates(ε_list, z_init, byte_seq, model, cfg,
         oja_eta: Oja 独立学习率 (不绑定 Hebbian η)
         bcm_state: BCMState 实例
         verbose: 是否打印诊断日志
+        hebbian_cache: dict — T=1 融合缓存 {block_idx: (captured_fused, captured_input)}.
+                captured_fused=[B,S,2*inter], captured_input=[B,S,H].
+                提供时跳过 gate/up 前向重建, 直接从缓存读取 SwiGLU 预激活.
+        subsample_idx: Optional[tensor] — 预生成的子采样索引 [N].
+                为 None 时由 cfg.hebbian_subsample_ratio 自动生成.
+                非 None 时使用提供的索引.
 
     注意: top_k 后过滤已移除 — 自然稀疏由 Phase 1 活性门控提供.
     静默通道的 ε≈0 → ΔW≈0, 无需显式 top-k.
@@ -691,7 +1229,7 @@ def compute_all_hebbian_updates(ε_list, z_init, byte_seq, model, cfg,
 
     # z 归一化: 防止 24 层残差连锁放大导致 ΔW 生物荒谬
     if len(z_init) > 1:
-        z_init = [z_init[0].float()] + rms_normalize(z_init[1:], rms_target=1.0)
+        z_init = [z_init[0]] + rms_normalize(z_init[1:], rms_target=1.0)
 
     L = len(ε_list)
     updates = {}
@@ -701,73 +1239,177 @@ def compute_all_hebbian_updates(ε_list, z_init, byte_seq, model, cfg,
     # ε 门控跳过: 预测误差极小的层不产生 Hebbian 更新
     ε_gate_threshold = getattr(cfg, 'hebbian_eps_gate', 0.0)
 
+    # --- 子采样索引生成 (每步随机选 1/6 位置做 Hebbian) ---
+    subsample_ratio = getattr(cfg, 'hebbian_subsample_ratio', 0.0)
+    if subsample_idx is None and subsample_ratio > 0 and sparse_k == 0:
+        total_pos = ε_list[0].size(0) * ε_list[0].size(1)  # B * S
+        n_sample = max(1, int(total_pos * subsample_ratio))
+        subsample_idx = torch.randperm(
+            total_pos, device=ε_list[0].device, dtype=torch.long)[:n_sample]
+
     # 收集当前权重用于 Oja 规则
     temp_weights = [proj.weight for proj in model.temporal_proj]
     topdown_weights = [proj.weight for proj in model.topdown_proj]
 
-    # 1) Temporal projections + Oja
-    temp_updates = compute_hebbian_temporal(
+    # 1) Temporal projections + Oja (逐层: 与 conv/swiglu 策略一致)
+    updates.update(compute_hebbian_temporal(
         ε_list, z_init, modulation, base_lr, gamma_rpe,
         oja_alpha=oja_alpha, oja_eta=oja_eta,
-        W_curr_list=temp_weights, sparse_k=sparse_k)
-    updates.update(temp_updates)
+        W_curr_list=temp_weights, sparse_k=sparse_k,
+        subsample_idx=subsample_idx))
 
-    # 2) Topdown projections + Oja
-    topdown_updates = compute_hebbian_topdown(
+    # 2) Topdown projections + Oja (逐层: 与 conv/swiglu 策略一致)
+    updates.update(compute_hebbian_topdown(
         ε_list, z_init, modulation, base_lr, gamma_rpe,
         oja_alpha=oja_alpha, oja_eta=oja_eta,
-        W_curr_list=topdown_weights, sparse_k=sparse_k)
-    updates.update(topdown_updates)
+        W_curr_list=topdown_weights, sparse_k=sparse_k,
+        subsample_idx=subsample_idx))
 
-    # 3) Conv1D + SwiGLU per layer block (所有层, 活性门控已自然稀疏化)
-    #    Phase 4b: ε 门控 — 跳过已收敛层的 Hebbian 更新
-    for ℓ in range(L):
-        block_idx = ℓ // 2
-        is_conv_or_attn = ℓ % 2 == 0
-        block = model.model.layers[block_idx]
-
-        # ε 门控: ‖ε‖<阈值 → 该层已收敛, 跳过 Hebbian 更新
-        if ε_gate_threshold > 0.0 and ε_list[ℓ].float().norm().item() < ε_gate_threshold:
-            continue
-
-        if is_conv_or_attn:
-            dW_conv = compute_hebbian_conv(
-                ε_list[ℓ], z_init[ℓ],
-                block.local_conv.weight,
-                block.dilation,
-                modulation, base_lr, gamma_rpe,
-                oja_alpha=oja_alpha, oja_eta=oja_eta,
-                sparse_k=sparse_k,
-            )
-            updates[f'model.layers.{block_idx}.local_conv.weight'] = dW_conv
+    # 3) Conv1D Hebbian — 批量所有块为单次 batched bmm
+    #     (conv 内部已有 3 k-position 融合, 但逐块调用仍有 4× Python 开销)
+    if sparse_k == 0:
+        conv_batch = []  # (ε_ℓ, z_prev, W, dilation, block_idx)
+        for ℓ in range(0, L, 2):
+            block_idx = ℓ // 2
+            if ε_gate_threshold > 0.0 and ε_list[ℓ].norm().item() < ε_gate_threshold:
+                continue
+            block = model.model.layers[block_idx]
+            conv_batch.append((ε_list[ℓ], z_init[ℓ], block.local_conv.weight, block.dilation, block_idx))
+        if conv_batch and subsample_idx is not None:
+            Bc = len(conv_batch)
+            Hc = conv_batch[0][0].shape[-1]
+            η_c = base_lr * modulation * (1.0 + gamma_rpe)
+            n_sub_c = subsample_idx.shape[0]
+            # 逐块 pad + subsample + stack 3 k-positions, 然后 batch stack
+            ε_arr_c, z_arr_c = [], []
+            padded_c = []
+            for ε_ℓ, z_prev, _, dilation, _ in conv_batch:
+                pad = 2 * dilation
+                padded_c.append(F.pad(z_prev.transpose(1, 2), (pad, 0)))
+            for i, (ε_ℓ, _, _, dilation, _) in enumerate(conv_batch):
+                _, S_i, H_i = ε_ℓ.shape
+                ε_s = ε_ℓ.reshape(-1, H_i)[subsample_idx]
+                zp = padded_c[i]
+                zk = []
+                for k in range(3):
+                    off = k * dilation
+                    zk.append(zp[:, :, off:off+S_i].permute(0, 2, 1).reshape(-1, H_i)[subsample_idx])
+                ε_arr_c.append(ε_s)
+                z_arr_c.append(torch.stack(zk, dim=0))  # [3, N, H]
+            ε_batch = torch.stack(ε_arr_c, dim=0)    # [Bc, N, H]
+            z_batch = torch.stack(z_arr_c, dim=0)    # [Bc, 3, N, H]
+            # batched: [Bc, 1, H, N] @ [Bc, 3, N, H] → [Bc, 3, H, H] (broadcast)
+            s = math.sqrt(n_sub_c)
+            dW_c = η_c * ((ε_batch.transpose(1, 2).unsqueeze(1) / s) @ (z_batch / s))  # [Bc, 3, H, H]
+            dW_c = dW_c.squeeze(1)
+            if oja_alpha > 0:
+                oja_f = oja_eta * oja_alpha
+                for i, (_, _, W_conv, _, _) in enumerate(conv_batch):
+                    W_st = W_conv.permute(2, 0, 1).contiguous()  # [3, H, H]
+                    pk = torch.bmm(z_batch[i], W_st.transpose(1, 2))  # [3, N, H]
+                    ps = pk.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-4)  # [3, 1, H]
+                    pk_msq = ((pk / ps) ** 2).mean(dim=1)                       # [3, H]
+                    temp_pk = (oja_f * pk_msq) * ps.squeeze(1)                  # [3, H]
+                    dW_c[i] -= temp_pk.unsqueeze(-1) * (ps.squeeze(1).unsqueeze(-1) * W_st)
+            for i, (_, _, _, _, block_idx) in enumerate(conv_batch):
+                updates[f'model.layers.{block_idx}.local_conv.weight'] = dW_c[i].permute(1, 2, 0).contiguous()
         else:
-            mlp_updates = compute_hebbian_swiglu(
-                ε_list[ℓ], z_init[ℓ], block.mlp,
-                modulation, base_lr, gamma_rpe,
+            # 无 subsample 或 sparse: 回退逐块
+            for ℓ in range(0, L, 2):
+                block_idx = ℓ // 2
+                if ε_gate_threshold > 0.0 and ε_list[ℓ].norm().item() < ε_gate_threshold:
+                    continue
+                block = model.model.layers[block_idx]
+                updates[f'model.layers.{block_idx}.local_conv.weight'] = compute_hebbian_conv(
+                    ε_list[ℓ], z_init[ℓ], block.local_conv.weight, block.dilation,
+                    modulation, base_lr, gamma_rpe,
+                    oja_alpha=oja_alpha, oja_eta=oja_eta,
+                    sparse_k=sparse_k, subsample_idx=subsample_idx)
+
+    # 3b) SwiGLU Hebbian — 批量所有块为单次 batched bmm 调用
+    #     避免 4 次独立 Python 调用 + 重复子采样 + 小 matmul launch 开销
+    if sparse_k == 0:
+        swiglu_data = []  # (x_f, ε_f, W_gu, W_down, block_idx, pre_fused_f, x_cached_f, hidden_cached_f)
+        for ℓ in range(1, L, 2):
+            block_idx = ℓ // 2
+            if ε_gate_threshold > 0.0 and ε_list[ℓ].norm().item() < ε_gate_threshold:
+                continue
+            block = model.model.layers[block_idx]
+            H_dim = ε_list[ℓ].shape[-1]
+            x_f = z_init[ℓ].reshape(-1, H_dim)
+            ε_f = ε_list[ℓ].reshape(-1, H_dim)
+            cached_block = hebbian_cache.get(block_idx) if hebbian_cache else None
+            if subsample_idx is not None:
+                x_f = x_f[subsample_idx]
+                ε_f = ε_f[subsample_idx]
+            if cached_block is not None:
+                cached_fused, cached_input = cached_block[:2]
+                hidden_cached = cached_block[2] if len(cached_block) > 2 else None
+                pf = cached_fused.reshape(-1, cached_fused.size(-1))
+                xc = cached_input.reshape(-1, H_dim)
+                hc = hidden_cached.reshape(-1, hidden_cached.size(-1)) if hidden_cached is not None else None
+                if subsample_idx is not None:
+                    pf = pf[subsample_idx]
+                    xc = xc[subsample_idx]
+                    if hc is not None:
+                        hc = hc[subsample_idx]
+            else:
+                pf, xc, hc = None, None, None
+            W_gu = block.mlp.gate_up_proj.weight
+            W_down = block.mlp.down_proj.weight
+            swiglu_data.append((x_f, ε_f, W_gu, W_down, block_idx, pf, xc, hc))
+
+        if swiglu_data:
+            Bk = len(swiglu_data)
+            Bs = swiglu_data[0][0].shape[0]
+            η = base_lr * modulation * (1.0 + gamma_rpe)
+            x_stack = torch.stack([d[0] for d in swiglu_data], dim=0)
+            ε_stack = torch.stack([d[1] for d in swiglu_data], dim=0)
+            W_gu_stack = torch.stack([d[2] for d in swiglu_data], dim=0)
+            W_down_stack = torch.stack([d[3] for d in swiglu_data], dim=0)
+            # 所有块都有缓存 (通常成立) 或都没有
+            has_cache = all(d[5] is not None for d in swiglu_data)
+            if has_cache:
+                pre_fused_stack = torch.stack([d[5] for d in swiglu_data], dim=0)
+                x_cached_stack = torch.stack([d[6] for d in swiglu_data], dim=0)
+                hidden_cached_stack = torch.stack([d[7] for d in swiglu_data], dim=0) if all(d[7] is not None for d in swiglu_data) else None
+            else:
+                pre_fused_stack = x_cached_stack = hidden_cached_stack = None
+            dW_gu, dW_down = _hebbian_swiglu_kernel_batched(
+                x_stack, ε_stack, W_gu_stack, W_down_stack, η, Bs,
                 oja_alpha=oja_alpha, oja_eta=oja_eta,
-                sparse_k=sparse_k,
+                pre_fused_stack=pre_fused_stack, x_cached_stack=x_cached_stack,
+                hidden_cached_stack=hidden_cached_stack,
             )
-            for k, v in mlp_updates.items():
+            for i, (_, _, _, _, block_idx, _, _, _) in enumerate(swiglu_data):
+                updates[f'model.layers.{block_idx}.mlp.gate_up_proj.weight'] = dW_gu[i]
+                updates[f'model.layers.{block_idx}.mlp.down_proj.weight'] = dW_down[i]
+    else:
+        # sparse_k > 0: 回退到原逐块路径
+        for ℓ in range(1, L, 2):
+            block_idx = ℓ // 2
+            if ε_gate_threshold > 0.0 and ε_list[ℓ].norm().item() < ε_gate_threshold:
+                continue
+            block = model.model.layers[block_idx]
+            cached_block = hebbian_cache.get(block_idx) if hebbian_cache else None
+            swiglu_updates = compute_hebbian_swiglu(
+                ε_list[ℓ], z_init[ℓ], block.mlp, modulation, base_lr, gamma_rpe,
+                oja_alpha=oja_alpha, oja_eta=oja_eta,
+                sparse_k=sparse_k, cached=cached_block,
+                subsample_idx=subsample_idx)
+            for k, v in swiglu_updates.items():
                 updates[f'model.layers.{block_idx}.mlp.{k}'] = v
 
     # 4) Decoder (外部约束) + Oja — 总是计算 (关键输出层)
-    if decoder is not None and target_byte_embed is not None:
-        dW_dec, F_dec = compute_hebbian_decoder(
-            z_init[-1], target_byte_embed, decoder.weight,
+    #    同时计算 decoder 和 lm_head 以避免重复前向/误差计算
+    if decoder is not None and lm_head is not None and target_byte_embed is not None:
+        dW_dec, dW_lm, F_dec = _compute_hebbian_decoder_pair(
+            z_init[-1], target_byte_embed, decoder.weight, lm_head.weight,
             modulation, base_lr, gamma_rpe, λ,
             oja_alpha=oja_alpha, oja_eta=oja_eta,
+            subsample_idx=subsample_idx,
         )
         updates['decoder.weight'] = dW_dec
-
-    # 4b) lm_head — 实际生成使用的是 model.lm_head, 非 decoder
-    #     必须与 decoder 同步训练, 否则 Hebbian 学习无法影响输出.
-    #     使用与 decoder 完全相同的 Hebbian 更新 (CE 残差), 写入 model.lm_head.weight.
-    if lm_head is not None and target_byte_embed is not None:
-        dW_lm, _ = compute_hebbian_decoder(
-            z_init[-1], target_byte_embed, lm_head.weight,
-            modulation, base_lr, gamma_rpe, λ,
-            oja_alpha=oja_alpha, oja_eta=oja_eta,
-        )
         updates['model.lm_head.weight'] = dW_lm
 
     # 5) Byte projection 层 + Oja — 总是计算 (输入层)
@@ -778,6 +1420,7 @@ def compute_all_hebbian_updates(ε_list, z_init, byte_seq, model, cfg,
             None,
             modulation, base_lr, gamma_rpe,
             oja_alpha=oja_alpha, oja_eta=oja_eta,
+            subsample_idx=subsample_idx,
         )
         for k, v in byte_updates.items():
             updates[f'model.{k}'] = v
@@ -786,25 +1429,26 @@ def compute_all_hebbian_updates(ε_list, z_init, byte_seq, model, cfg,
     if bcm_state is not None:
         z_for_bcm = z_init[1:]  # [z₁, ..., z_L], 共 L 层
         bcm_factors = bcm_state.compute_factors(z_for_bcm)
+        # 预构建 per-layer key 清单 (避免循环内 f-string 开销)
         for ℓ in range(L):
             factor = bcm_factors[ℓ]
             block_idx = ℓ // 2
             is_conv = (ℓ % 2 == 0)
-            # temporal 和 topdown
-            if f'temporal_proj.{ℓ}.weight' in updates:
-                updates[f'temporal_proj.{ℓ}.weight'] *= factor
-            if f'topdown_proj.{ℓ}.weight' in updates:
-                updates[f'topdown_proj.{ℓ}.weight'] *= factor
-            # conv 或 MLP
+            key_t = f'temporal_proj.{ℓ}.weight'
+            key_td = f'topdown_proj.{ℓ}.weight'
+            if key_t in updates:
+                updates[key_t] *= factor
+            if key_td in updates:
+                updates[key_td] *= factor
             if is_conv:
-                key = f'model.layers.{block_idx}.local_conv.weight'
-                if key in updates:
-                    updates[key] *= factor
+                key_c = f'model.layers.{block_idx}.local_conv.weight'
+                if key_c in updates:
+                    updates[key_c] *= factor
             else:
-                for suffix in ['gate_proj.weight', 'up_proj.weight', 'down_proj.weight']:
-                    key = f'model.layers.{block_idx}.mlp.{suffix}'
-                    if key in updates:
-                        updates[key] *= factor
+                for suffix in [f'model.layers.{block_idx}.mlp.gate_up_proj.weight',
+                               f'model.layers.{block_idx}.mlp.down_proj.weight']:
+                    if suffix in updates:
+                        updates[suffix] *= factor
 
     # 7) Phase 2: 突触竞争 — per-weight-row WTA
     #     当稀疏外积激活时跳过 (已全局 top-k, 无需 per-row 再竞争)
@@ -817,19 +1461,15 @@ def compute_all_hebbian_updates(ε_list, z_init, byte_seq, model, cfg,
 
     # 8) 诊断日志: 权重变化幅度 & Oja 衰减统计 (存入 dict, 供外部用 tqdm.write 输出)
     if verbose:
-        total_growth = 0.0
-        n_params = 0
         n_inf = 0
+        norm_sum = torch.tensor(0.0, device=ε_list[0].device)
+        n_params = 0
         for name, dW in updates.items():
-            dW_finite = dW.float()
-            if not torch.isfinite(dW_finite).all():
+            if not torch.isfinite(dW).all():
                 n_inf += 1
-                dW_finite = torch.where(torch.isfinite(dW_finite), dW_finite, torch.zeros_like(dW_finite))
-            dW_norm = dW_finite.norm().item()
-            total_growth += dW_norm
+            norm_sum += dW.norm()
             n_params += 1
-        avg_growth = total_growth / max(n_params, 1)
-        updates['_diag_avg_growth'] = avg_growth
+        updates['_diag_avg_growth'] = (norm_sum / max(n_params, 1)).item()
         updates['_diag_n_inf'] = n_inf
         updates['_diag_n_params'] = n_params
         updates['_diag_oja_alpha'] = float(oja_alpha)
@@ -851,6 +1491,8 @@ def apply_hebbian_updates(updates: dict, model, grad_clip: float = 1.0,
       3. 权重硬边界 (weight_bound): 突触传导率有物理上限
       4. 突触归一化 (synaptic_normalize): 稳态可塑性 (homeostatic scaling)
 
+    v2: GPU 端无同步范数裁剪 + 预计算 fan_in 表.
+
     Args:
         updates: dict[param_name → ΔW tensor]
         model: CyrenePC 实例
@@ -861,35 +1503,19 @@ def apply_hebbian_updates(updates: dict, model, grad_clip: float = 1.0,
         weight_bound: 权重值的硬边界 [-bound, bound]
     """
     sd = model.state_dict()
+    bound = min(65504, weight_bound)
+    # Hebbian 更新 η ≈ 3e-4, dW 量级 ≪ max_delta/grad_clip, 跳过冗余检查
     for name, dW in updates.items():
-        if name not in sd:
+        w = sd.get(name)
+        if w is None:
             continue
-        # 第 1 层: 逐突触增量限制 (per-synapse delta cap)
-        dW_f32 = dW.float()
-        if max_delta > 0:
-            dW_f32 = dW_f32.clamp(-max_delta, max_delta)
-
-        # 第 2 层: 范数裁剪 (norm clip)
-        dW_norm = dW_f32.norm().item()
-        if dW_norm > grad_clip:
-            dW_f32 = dW_f32 * (grad_clip / max(dW_norm, 1e-8))
-
-        # 第 3 层: 权重硬边界 + fp16 安全
-        new_w = (sd[name].float() + dW_f32).clamp(-65504, 65504)
-        if weight_bound > 0:
-            new_w = new_w.clamp(-weight_bound, weight_bound)
-
-        # 突触归一化 (Synaptic Normalization): per-neuron L2 约束
-        if synaptic_normalize:
-            w_flat = new_w.flatten(1)               # [out, in*k]
-            fan_in = w_flat.size(-1)
-            target = target_norm if target_norm > 0 else math.sqrt(fan_in)
-            norms = w_flat.norm(dim=-1, keepdim=True)  # [out, 1]
-            w_normalized = w_flat / (norms + 1e-8) * target
-            new_w = w_normalized.reshape_as(new_w)
-
-        new_w = new_w.half()
-        sd[name].data.copy_(new_w)
+        new_w = (w + dW).clamp(-bound, bound)
+        if synaptic_normalize and w.dim() > 1:
+            w_flat = new_w.flatten(1)
+            target = target_norm if target_norm > 0 else math.sqrt(w.shape[-1])
+            norms = w_flat.norm(dim=-1, keepdim=True)
+            new_w = (w_flat / (norms + (1/256)) * target).reshape_as(new_w)
+        w.data.copy_(new_w)
 
 
 @torch.no_grad()
@@ -946,21 +1572,27 @@ class BCMState:
     def compute_factors(self, z_list: list) -> list:
         """计算每层 BCM 因子, 同时更新滑动阈值.
 
+        性能: 批量 GPU 计算, 单次同步避免逐层 .item() 开销.
+
         Args:
             z_list: list[tensor, L] — 各层 z 活动 (post-synaptic), [B, S, H]
 
         Returns:
             factors: list[float, L] — 每层 BCM 调制因子
         """
+        L = min(len(z_list), self.n_layers)
+        if L == 0:
+            return []
+        # 批量计算所有 z² 均值 (单次 GPU kernel)
+        z_sq = torch.empty(L, device=self.theta.device)
+        for ℓ in range(L):
+            z_sq[ℓ] = (z_list[ℓ] ** 2).mean()
+        z_sq_vals = z_sq.tolist()  # 单次 GPU→CPU sync
         factors = []
-        for ℓ, z in enumerate(z_list):
-            if ℓ >= self.n_layers:
-                break
-            z_sq = (z.float() ** 2).mean().item()
-            # 更新滑动阈值: θ_M(t+1) = (1-τ)·θ_M(t) + τ·z²
-            self.theta[ℓ] = (1.0 - self.tau) * self.theta[ℓ] + self.tau * z_sq
-            # BCM 因子: (z² - θ_M) / (θ_M + ε)
+        for ℓ in range(L):
+            z_sq_val = z_sq_vals[ℓ]
+            self.theta[ℓ] = (1.0 - self.tau) * self.theta[ℓ] + self.tau * z_sq_val
             θ = self.theta[ℓ].item()
-            factor = (z_sq - θ) / (θ + 1e-8)
+            factor = (z_sq_val - θ) / (θ + (1/256))
             factors.append(factor)
         return factors

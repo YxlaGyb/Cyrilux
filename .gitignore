@@ -2,16 +2,22 @@
 out*
 /docs
 
+
 # venv
 /.venv
 /dataset
+/.ruff_cache
+/.idea
+
 *.pt
 *.jsonl
 *.egg-info
 
+
 # Python
 /__pycache__
 *.pyc
+
 
 # IDE
 /.vscode

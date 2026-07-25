@@ -1,11 +1,63 @@
 """Local Conv blocks — 纯局部 Conv1D 操作。
-Conv1D(k=3, causal) + SwiGLU MLP, 接口兼容 CyreneBackbone。
+Conv1D(k=3, causal) + SwiGLU MLP + 多巴胺门控归一化, 接口兼容 CyreneBackbone。
 """
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from model.model_cyrene import _ACT2FN, CyreneConfig, FeedForward, RMSNorm
+
+
+class DopamineGateRMSNorm(nn.Module):
+    """多巴胺门控 RMSNorm — 基准 gain 可被全局多巴胺信号 D 调制.
+
+    生物学类比:
+      前额叶皮层中, 多巴胺通过 D1 受体调节神经元的增益 (gain),
+      影响信噪比和响应选择性. 这里 D 来自自由能变化 RPE:
+        D -> 1 (奖赏/自由能下降) -> 放大 gain
+        D -> 0 (惩罚/自由能上升) -> 衰减 gain
+
+    公式:
+        gain_eff = weight * (1 + eta * (2*D - 1))
+        y = gain_eff * RMSNorm(x)
+
+    Args:
+        hidden_size: 归一化的特征维度
+        eps: RMSNorm 的小常数
+        dopamine_eta: 多巴胺调制强度 (0=无调制, 1=+/-100% gain 变化)
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-5,
+                 dopamine_eta: float = 0.3):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+        self.dopamine_eta = dopamine_eta
+
+    def forward(self, x: torch.Tensor,
+                dopamine_D: Optional[float] = None) -> torch.Tensor:
+        """前向: RMSNorm -> 多巴胺门控 gain.
+
+        Args:
+            x: [*, hidden_size] 输入张量
+            dopamine_D: 标量 [0,1], 全局多巴胺信号. None=无调制.
+
+        Returns:
+            y: [*, hidden_size] 归一化+门控后的输出
+        """
+        # RMSNorm: x -> x / RMS(x)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x_norm = x * torch.rsqrt(variance + self.eps)
+
+        # 多巴胺门控: D=0.5 中性, D->1 放大, D->0 衰减
+        if dopamine_D is not None:
+            gain = self.weight * (1 + self.dopamine_eta * (2 * dopamine_D - 1))
+        else:
+            gain = self.weight
+
+        return gain * x_norm
 
 
 class LateralInhibition(nn.Module):
@@ -58,16 +110,16 @@ class LateralInhibition(nn.Module):
         device = ε_list[0].device
 
         # 1) 计算每层误差范数 → [L]
-        norms = torch.tensor([ε.float().norm().item() for ε in ε_list], device=device)
+        # 使用 abs().mean() 而非 norm() 避免 fp16 下 ε² 溢出 (max=65504)
+        norms = torch.tensor([ε.abs().mean().item() for ε in ε_list], device=device, dtype=torch.float16)
 
         # 2) 对范数进行 softmax 归一化 → 竞争权重
-        w = F.softmax(norms / (norms.mean() + 1e-8), dim=0)
+        w = F.softmax(norms / (norms.mean() + (1/256)), dim=0)
 
         # 3) 用事先计算的核做 1D 卷积 → 邻域抑制信号
         w_pad = F.pad(w.unsqueeze(0).unsqueeze(0),  # [1, 1, L]
                       pad=(self.k, self.k), mode='replicate')
-        # 显式 float() 确保与 w_pad 类型一致 (模型 .half() 后 buffer 为 fp16)
-        kernel = self._inhibition_kernel.float().view(1, 1, -1).to(device)
+        kernel = self._inhibition_kernel.view(1, 1, -1).to(device)
         inhibition = F.conv1d(w_pad, kernel)[0, 0]  # [L]
 
         # 4) 从原始 ε 中减去抑制信号
@@ -144,7 +196,7 @@ class SalienceGate(nn.Module):
     @torch.no_grad()
     def get_active_ratio(self, threshold: float = 0.01) -> float:
         """活性通道比例 (gate > threshold)。"""
-        return (self.get_gate_values() > threshold).float().mean().item()
+        return (self.get_gate_values() > threshold).mean().item()
 
     @torch.no_grad()
     def get_sparsity_loss(self, β: float = 0.01) -> torch.Tensor:
@@ -247,12 +299,47 @@ class FusedFeedForward(nn.Module):
         self.gate_up_proj = nn.Linear(config.hidden_size, 2 * intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
         self.act_fn = _ACT2FN[config.hidden_act]
+        # ── 多巴胺门控归一化: SiLU(gate)*up 之后, down_proj 之前 ──
+        #     抑制 SwiGLU 逐元素乘法的 fp16 溢出, 同时提供 D 调制通道
+        self.post_swiglu_norm = DopamineGateRMSNorm(intermediate_size, eps=config.rms_norm_eps)
+        # ── T=1 融合缓存: 推理时保存中间结果供 Hebbian 复用 ──
+        self.capture_mode = False
+        self.captured_fused: Optional[torch.Tensor] = None  # [B, S, 2*inter] gate_up 预激活
+        self.captured_input: Optional[torch.Tensor] = None  # [B, S, H] LN 后的输入
+        self.captured_hidden: Optional[torch.Tensor] = None  # [B, S, inter] 归一化后的 SwiGLU hidden
 
-    def forward(self, x):
-        """fp32 前向 — 显式权重提升防 silu 溢出."""
-        w_gu = self.gate_up_proj.weight.float()
-        w_d = self.down_proj.weight.float()
-        x32 = x.float()
-        fused = F.linear(x32, w_gu)  # [B, S, 2*inter]
+    def forward(self, x, dopamine_D: Optional[float] = None):
+        """fp16 前向 — 直接使用 fp16 权重.
+
+        SwiGLU 结构:
+          fused = gate_up_proj(x) -> chunk -> gate, up
+          hidden = SiLU(gate) * up
+          hidden = post_swiglu_norm(hidden, dopamine_D)  # fp16 稳定 + 多巴胺门控
+          y = down_proj(hidden)
+
+        capture_mode=True 时保存 gate_up 中间结果到 self.captured_fused/input，
+        供 compute_hebbian_swiglu 跳过重建 gate/up 前向。
+
+        Args:
+            x: [B, S, H] 输入
+            dopamine_D: 标量 [0,1], 全局多巴胺信号. None=无调制.
+        """
+        fused = F.linear(x, self.gate_up_proj.weight)  # [B, S, 2*inter]
+
+        if self.capture_mode:
+            # 保存 detach 版本供 Hebbian 安全使用 (切断梯度图，不影响后续计算)
+            self.captured_fused = fused.detach()
+            self.captured_input = x.detach()
+
         gate, up = fused.chunk(2, dim=-1)
-        return F.linear(self.act_fn(gate) * up, w_d).to(x.dtype)
+        hidden = self.act_fn(gate) * up
+        hidden = self.post_swiglu_norm(hidden, dopamine_D=dopamine_D)
+        if self.capture_mode:
+            self.captured_hidden = hidden.detach()  # 缓存归一化后的 hidden 供 Hebbian dW_down 使用
+        return F.linear(hidden, self.down_proj.weight)
+
+    def clear_capture(self):
+        """清除缓存内容。"""
+        self.captured_fused = None
+        self.captured_input = None
+        self.captured_hidden = None

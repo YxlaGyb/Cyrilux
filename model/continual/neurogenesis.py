@@ -13,6 +13,7 @@
   - 分裂时复制活跃通道权重乘以 0.5 + 噪声到 dormant 通道
   - 生长间隔 > 剪枝间隔, 防止振荡
 """
+
 from typing import List, Tuple
 
 import torch
@@ -40,7 +41,8 @@ class ActivationTracker:
 
     @torch.no_grad()
     def get_dead_channels(
-        self, gates: nn.ModuleList,
+        self,
+        gates: nn.ModuleList,
         threshold_act: float = 0.001,
         threshold_gate: float = 0.05,
     ) -> List[Tuple[int, int]]:
@@ -56,8 +58,16 @@ class ActivationTracker:
         """
         dead = []
         for g_idx, gate in enumerate(gates):
-            ema = self._cached_ema[g_idx] if g_idx < len(self._cached_ema) else gate.activation_ema
-            gv = self._cached_gate_values[g_idx] if g_idx < len(self._cached_gate_values) else gate.get_gate_values()
+            ema = (
+                self._cached_ema[g_idx]
+                if g_idx < len(self._cached_ema)
+                else gate.activation_ema
+            )
+            gv = (
+                self._cached_gate_values[g_idx]
+                if g_idx < len(self._cached_gate_values)
+                else gate.get_gate_values()
+            )
             dead_mask = (ema < threshold_act) & (gv < threshold_gate)
             for c_idx in dead_mask.nonzero(as_tuple=False).squeeze(-1).tolist():
                 dead.append((g_idx, c_idx))
@@ -65,14 +75,24 @@ class ActivationTracker:
 
     @torch.no_grad()
     def get_active_channels(
-        self, gates: nn.ModuleList,
+        self,
+        gates: nn.ModuleList,
         threshold_gate: float = 0.5,
     ) -> List[Tuple[int, int, float]]:
-        """返回 (gate_idx, channel_idx, activation_ema) 列表, 按 activation_ema 降序。"""
+        """返回 (gate_idx, channel_idx, activation_ema) 列表, 按 activation_ema 降序。
+        """
         active = []
         for g_idx, gate in enumerate(gates):
-            gv = self._cached_gate_values[g_idx] if g_idx < len(self._cached_gate_values) else gate.get_gate_values()
-            ema = self._cached_ema[g_idx] if g_idx < len(self._cached_ema) else gate.activation_ema
+            gv = (
+                self._cached_gate_values[g_idx]
+                if g_idx < len(self._cached_gate_values)
+                else gate.get_gate_values()
+            )
+            ema = (
+                self._cached_ema[g_idx]
+                if g_idx < len(self._cached_ema)
+                else gate.activation_ema
+            )
             active_mask = gv > threshold_gate
             for c_idx in active_mask.nonzero(as_tuple=False).squeeze(-1).tolist():
                 active.append((g_idx, c_idx, ema[c_idx].item()))
@@ -81,13 +101,18 @@ class ActivationTracker:
 
     @torch.no_grad()
     def get_dormant_channels(
-        self, gates: nn.ModuleList,
+        self,
+        gates: nn.ModuleList,
         threshold_gate: float = 0.05,
     ) -> List[Tuple[int, int]]:
         """返回 (gate_idx, channel_idx) 对, gate 已关闭的通道。"""
         dormant = []
         for g_idx, gate in enumerate(gates):
-            gv = self._cached_gate_values[g_idx] if g_idx < len(self._cached_gate_values) else gate.get_gate_values()
+            gv = (
+                self._cached_gate_values[g_idx]
+                if g_idx < len(self._cached_gate_values)
+                else gate.get_gate_values()
+            )
             dormant_mask = gv < threshold_gate
             for c_idx in dormant_mask.nonzero(as_tuple=False).squeeze(-1).tolist():
                 dormant.append((g_idx, c_idx))
@@ -161,13 +186,12 @@ class ChannelGrowth:
         L = len(ε_list)
         layer_errors = []
         for ℓ in range(L):
-            err = ε_list[ℓ].float().abs().mean().item()
+            err = ε_list[ℓ].abs().mean().item()
             layer_errors.append(err)
 
         # 找出误差最高的层
         high_error_layers = [
-            ℓ for ℓ, err in enumerate(layer_errors)
-            if err > self.error_threshold_high
+            ℓ for ℓ, err in enumerate(layer_errors) if err > self.error_threshold_high
         ]
 
         for ℓ in high_error_layers:
@@ -175,8 +199,8 @@ class ChannelGrowth:
                 break
 
             # 该层对应的两个 gate 索引
-            g_conv = 2 * ℓ       # conv gate
-            g_mlp = 2 * ℓ + 1   # MLP gate
+            g_conv = 2 * ℓ  # conv gate
+            g_mlp = 2 * ℓ + 1  # MLP gate
 
             # 尝试从两个 gate 中找 dormant 通道
             for g_idx in [g_conv, g_mlp]:
@@ -195,7 +219,9 @@ class ChannelGrowth:
                 else:
                     # 无 dormant → 分裂: 复制最活跃通道到最不活跃
                     active = tracker.get_active_channels(gates)
-                    active_here = [(gi, ci, ema) for gi, ci, ema in active if gi == g_idx]
+                    active_here = [
+                        (gi, ci, ema) for gi, ci, ema in active if gi == g_idx
+                    ]
                     if len(active_here) >= 2:
                         # 找 gate 最低的通道 (可能只是略高于阈值)
                         all_gv = gates[g_idx].get_gate_values()
@@ -209,13 +235,16 @@ class ChannelGrowth:
 
     @torch.no_grad()
     def _resurrect_channel(
-        self, model: nn.Module, gates: nn.ModuleList,
-        g_idx: int, c_idx: int,
+        self,
+        model: nn.Module,
+        gates: nn.ModuleList,
+        g_idx: int,
+        c_idx: int,
     ):
         """复活指定通道: 随机化其权重 + 打开 gate。"""
         H = gates[g_idx].logits.size(0)
         block_idx = g_idx // 2
-        is_conv = (g_idx % 2 == 0)
+        is_conv = g_idx % 2 == 0
 
         # 随机化权重
         if is_conv and block_idx < len(model.model.layers):
@@ -238,13 +267,17 @@ class ChannelGrowth:
 
     @torch.no_grad()
     def _split_channel(
-        self, model: nn.Module, gates: nn.ModuleList,
-        g_idx: int, src_c: int, dst_c: int,
+        self,
+        model: nn.Module,
+        gates: nn.ModuleList,
+        g_idx: int,
+        src_c: int,
+        dst_c: int,
     ):
         """分裂: 复制源通道权重 * 0.5 + noise 到目标通道。"""
         H = gates[g_idx].logits.size(0)
         block_idx = g_idx // 2
-        is_conv = (g_idx % 2 == 0)
+        is_conv = g_idx % 2 == 0
 
         if is_conv and block_idx < len(model.model.layers):
             conv_w = model.model.layers[block_idx].local_conv.weight
@@ -304,9 +337,14 @@ class NeurogenesisController:
         Returns:
             dict: {n_pruned, n_resurrected, n_split, active_ratio}
         """
-        gates = getattr(model, 'salience_gates', None)
+        gates = getattr(model, "salience_gates", None)
         if gates is None or len(gates) == 0:
-            return {'n_pruned': 0, 'n_resurrected': 0, 'n_split': 0, 'active_ratio': 1.0}
+            return {
+                "n_pruned": 0,
+                "n_resurrected": 0,
+                "n_split": 0,
+                "active_ratio": 1.0,
+            }
 
         # 更新追踪器
         self.tracker.update(gates)
@@ -322,7 +360,10 @@ class NeurogenesisController:
         # 生长 (每 grow_interval 步)
         if global_step % self.grow_interval == 0 and global_step > 0 and ε_list:
             n_resurrected, n_split = self.grower.grow(
-                model, gates, self.tracker, ε_list,
+                model,
+                gates,
+                self.tracker,
+                ε_list,
                 max_grow=self.max_grow_per_step,
             )
 
@@ -331,8 +372,8 @@ class NeurogenesisController:
         mean_active = sum(active_ratios) / len(active_ratios) if active_ratios else 1.0
 
         return {
-            'n_pruned': n_pruned,
-            'n_resurrected': n_resurrected,
-            'n_split': n_split,
-            'active_ratio': mean_active,
+            "n_pruned": n_pruned,
+            "n_resurrected": n_resurrected,
+            "n_split": n_split,
+            "active_ratio": mean_active,
         }

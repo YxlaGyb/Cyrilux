@@ -1,4 +1,5 @@
-"""抽象记忆银行 — PC 表示空间中的原型压缩 + 表示级回放 + 吸引子检测.
+"""抽象记忆银行
+PC 表示空间中的原型压缩 + 表示级回放 + 吸引子检测.
 
 核心转变:
   MemoryBank 存"模型见过什么"(原始字节),
@@ -10,6 +11,7 @@
   VariationalReplayer — 结构变体生成 + 吸引子强度测试
   AbstractionSniffer  — 抽象级遗忘检测 (余弦距离到原型)
 """
+
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
@@ -19,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # 工具: 层重要性计算
+
 
 @torch.no_grad()
 def compute_layer_importance(
@@ -69,9 +72,9 @@ def compute_layer_importance(
 
         μ_total = μ_bu_res + μ_temp + μ_down
         ε = z_conv[ℓ] - μ_total
-        ε_sq.append((ε ** 2).mean().item())
+        ε_sq.append((ε**2).mean().item())
 
-    π = torch.tensor(ε_sq, dtype=torch.float)
+    π = torch.tensor(ε_sq, dtype=torch.float16)
     # 归一化到 [0, 1] 区间, 保留相对比例
     π_min, π_max = π.min(), π.max()
     if π_max > π_min:
@@ -84,6 +87,7 @@ def compute_layer_importance(
 
 
 # AbstractionEntry — 单条抽象记忆
+
 
 @torch.no_grad()
 def _kmeans_cosine(
@@ -150,6 +154,7 @@ def _kmeans_cosine(
 
 
 # AbstractionBank — 抽象记忆银行
+
 
 class AbstractionBank:
     """表示级抽象记忆银行.
@@ -221,7 +226,7 @@ class AbstractionBank:
         dopamine_score: float = 0.0,
         world_model_surprise: float = 0.0,
         # 内在动机扩展
-        concept_id: str = '',
+        concept_id: str = "",
         information_gain: float = 0.0,
         group_by_concept: bool = False,
     ):
@@ -233,38 +238,50 @@ class AbstractionBank:
             information_gain: ICM 信息增益 (用于加权)
             group_by_concept: True → 按 concept_id 分组存储 (而非 task_id)
         """
-        group_key = concept_id if (self.enable_concept_grouping and group_by_concept and concept_id) else task_id
-        store = self._store_by_concept if (self.enable_concept_grouping and group_by_concept and concept_id) else self._store
+        group_key = (
+            concept_id
+            if (self.enable_concept_grouping and group_by_concept and concept_id)
+            else task_id
+        )
+        store = (
+            self._store_by_concept
+            if (self.enable_concept_grouping and group_by_concept and concept_id)
+            else self._store
+        )
 
         if group_key not in store:
             store[group_key] = []
             self._consolidation_counter[group_key] = 0
-            self._meta[group_key] = {'n_entries': 0, 'n_consolidations': 0}
+            self._meta[group_key] = {"n_entries": 0, "n_consolidations": 0}
 
         buf = store[group_key]
         for z_states in z_states_list:
             if layer_importance is None:
-                π = torch.ones(12, dtype=torch.float)
+                π = torch.ones(12, dtype=torch.float16)
             else:
                 π = layer_importance.clone().cpu()
 
-            buf.append({
-                'z_states': [z.clone().cpu() for z in z_states],
-                'layer_importance': π,
-                'dopamine_score': dopamine_score,
-                'world_model_surprise': float(world_model_surprise),
-                'information_gain': float(information_gain),
-                'retention_weight': 1.0 + max(float(world_model_surprise), 0.0) + float(information_gain),
-                'seq_len': z_states[0].size(1),
-                'task_id': task_id,
-                'concept_id': concept_id,
-            })
+            buf.append(
+                {
+                    "z_states": [z.clone().cpu() for z in z_states],
+                    "layer_importance": π,
+                    "dopamine_score": dopamine_score,
+                    "world_model_surprise": float(world_model_surprise),
+                    "information_gain": float(information_gain),
+                    "retention_weight": 1.0
+                    + max(float(world_model_surprise), 0.0)
+                    + float(information_gain),
+                    "seq_len": z_states[0].size(1),
+                    "task_id": task_id,
+                    "concept_id": concept_id,
+                }
+            )
 
         # FIFO 淘汰
         while len(buf) > self.max_entries_per_task:
             buf.pop(0)
 
-        self._meta[group_key]['n_entries'] = len(buf)
+        self._meta[group_key]["n_entries"] = len(buf)
 
         # 自动触发异步 consolidate
         self._consolidation_counter[group_key] += 1
@@ -281,7 +298,10 @@ class AbstractionBank:
         """
         n_proto = n_prototypes or self.n_prototypes
         # 同时检查 _store 和 _store_by_concept
-        all_stores = {'_store': self._store, '_store_by_concept': self._store_by_concept}
+        all_stores = {
+            "_store": self._store,
+            "_store_by_concept": self._store_by_concept,
+        }
 
         if group_key:
             # 找到 group_key 所属的 store
@@ -308,13 +328,15 @@ class AbstractionBank:
         retention_weights = []
         info_gains = []
         for e in entries:
-            z_top = e['z_states'][-1]
+            z_top = e["z_states"][-1]
             z_tops.append(z_top.squeeze(0))
-            importances.append(e['layer_importance'])
-            rw = e.get('retention_weight', 1.0 + max(e.get('world_model_surprise', 0.0), 0.0)
-                        + e.get('information_gain', 0.0))
+            importances.append(e["layer_importance"])
+            rw = e.get(
+                "retention_weight",
+                1.0 + max(e.get("world_model_surprise", 0.0), 0.0) + e.get("information_gain", 0.0),
+            )
             retention_weights.append(rw)
-            info_gains.append(e.get('information_gain', 0.0))
+            info_gains.append(e.get("information_gain", 0.0))
 
         all_z = torch.cat(z_tops, dim=0)
         hidden = all_z.size(-1)
@@ -326,14 +348,14 @@ class AbstractionBank:
 
         # information_gain 加权评分
         n_total = all_z.size(0)
-        seq_len = max(entries[0]['z_states'][-1].size(1), 1)
+        seq_len = max(entries[0]["z_states"][-1].size(1), 1)
         point_entry_idx = torch.arange(n_total, device=assignments.device) // seq_len
         imp_stack = torch.stack(importances)
-        retention_stack = torch.tensor(retention_weights, dtype=torch.float)
-        info_gain_stack = torch.tensor(info_gains, dtype=torch.float)
-        proto_importances = torch.zeros(k, 12, dtype=torch.float)
-        proto_scores = torch.zeros(k, dtype=torch.float)
-        proto_info_gains = torch.zeros(k, dtype=torch.float)
+        retention_stack = torch.tensor(retention_weights, dtype=torch.float16)
+        info_gain_stack = torch.tensor(info_gains, dtype=torch.float16)
+        proto_importances = torch.zeros(k, 12, dtype=torch.float16)
+        proto_scores = torch.zeros(k, dtype=torch.float16)
+        proto_info_gains = torch.zeros(k, dtype=torch.float16)
         for i in range(k):
             mask = assignments == i
             if mask.any():
@@ -342,7 +364,9 @@ class AbstractionBank:
                 entry_weights = retention_stack[entry_indices.clamp(0, len(retention_weights) - 1)]
                 proto_importances[i] = (matched * entry_weights.unsqueeze(1)).mean(dim=0)
                 proto_scores[i] = entry_weights.mean()
-                proto_info_gains[i] = info_gain_stack[entry_indices.clamp(0, len(info_gains) - 1)].mean()
+                proto_info_gains[i] = info_gain_stack[
+                    entry_indices.clamp(0, len(info_gains) - 1)
+                ].mean()
             else:
                 proto_scores[i] = 1.0
 
@@ -358,17 +382,17 @@ class AbstractionBank:
             self._prototypes[group_key] = centroids[keep_mask]
             self._prototype_importances[group_key] = proto_importances[keep_mask]
             self._prototype_scores[group_key] = proto_scores[keep_mask]
-            self._meta[group_key]['n_pruned'] = self._meta[group_key].get('n_pruned', 0) + n_pruned
+            self._meta[group_key]["n_pruned"] = self._meta[group_key].get("n_pruned", 0) + n_pruned
         elif not keep_mask.any():
             best_idx = effective_scores.argmax()
-            self._prototypes[group_key] = centroids[best_idx:best_idx+1]
-            self._prototype_importances[group_key] = proto_importances[best_idx:best_idx+1]
-            self._prototype_scores[group_key] = proto_scores[best_idx:best_idx+1]
-            self._meta[group_key]['n_pruned'] = self._meta[group_key].get('n_pruned', 0) + (k - 1)
+            self._prototypes[group_key] = centroids[best_idx : best_idx + 1]
+            self._prototype_importances[group_key] = proto_importances[best_idx : best_idx + 1]
+            self._prototype_scores[group_key] = proto_scores[best_idx : best_idx + 1]
+            self._meta[group_key]["n_pruned"] = self._meta[group_key].get("n_pruned", 0) + (k - 1)
 
-        self._meta[group_key]['n_consolidations'] += 1
-        self._meta[group_key]['compression_ratio'] = (
-            len(entries) * entries[0]['seq_len'] / max(k, 1)
+        self._meta[group_key]["n_consolidations"] += 1
+        self._meta[group_key]["compression_ratio"] = (
+            len(entries) * entries[0]["seq_len"] / max(k, 1)
         )
         self._consolidation_counter[group_key] = 0
 
@@ -377,7 +401,7 @@ class AbstractionBank:
     def sample_prototypes(
         self,
         batch_size: int = 16,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
     ) -> List[Tuple[str, torch.Tensor, torch.Tensor]]:
         """从所有任务的原型中采样一批.
 
@@ -390,16 +414,16 @@ class AbstractionBank:
         # 收集所有 (task_id, prototype_vector, importance, weight)
         all_protos: List[Tuple[str, torch.Tensor, torch.Tensor, float]] = []
         for tid, protos in self._prototypes.items():
-            imp = self._prototype_importances.get(tid, torch.ones(12, dtype=torch.float))
-            score = self._prototype_scores.get(tid, torch.ones(protos.size(0), dtype=torch.float))
+            imp = self._prototype_importances.get(tid, torch.ones(12, dtype=torch.float16))
+            score = self._prototype_scores.get(tid, torch.ones(protos.size(0), dtype=torch.float16))
             for i in range(protos.size(0)):
                 weight = max(float(score[i]) if i < score.size(0) else 1.0, 0.1)
-                all_protos.append((tid, protos[i: i + 1], imp[i], weight))
+                all_protos.append((tid, protos[i : i + 1], imp[i], weight))
 
         if not all_protos:
             return []
 
-        weights = torch.tensor([item[3] for item in all_protos], dtype=torch.float32)
+        weights = torch.tensor([item[3] for item in all_protos], dtype=torch.float16)
         weights = weights / weights.sum().clamp_min(1e-8)
         n = min(batch_size, len(all_protos))
         idx = torch.multinomial(weights, n, replacement=False).tolist()
@@ -415,7 +439,7 @@ class AbstractionBank:
         self,
         model: nn.Module,
         batch_size: int = 16,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
         pos_emb: Tuple = (None, None),
     ) -> Optional[torch.Tensor]:
         """表示级回放 loss.
@@ -458,7 +482,7 @@ class AbstractionBank:
                 π_ℓ = max(0.1, min(3.0, π_ℓ))
 
                 ε = z_proto - μ_total  # [1, 1, hidden]
-                ℓ_loss += 0.5 * π_ℓ * (ε ** 2).sum()
+                ℓ_loss += 0.5 * π_ℓ * (ε**2).sum()
 
                 # 更新 z_prev = 当前层的原型 (用于下一层的 bottom-up)
                 # 下一层预测 z_{ℓ+1} 需要 z_ℓ 作为输入
@@ -476,7 +500,7 @@ class AbstractionBank:
         model: nn.Module,
         batch_size: int = 4,
         seq_len: int = 8,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
         pos_emb: Tuple = (None, None),
     ) -> Optional[torch.Tensor]:
         """序列级表示回放 — 用多个原型拼接成伪序列.
@@ -503,11 +527,11 @@ class AbstractionBank:
 
         for seq_idx in range(n_seq):
             start = seq_idx * seq_len
-            seq_protos = proto_batch[start: start + seq_len]
+            seq_protos = proto_batch[start : start + seq_len]
 
             # 构建伪序列张量: [1, seq_len, hidden]
             pseudo_seq = torch.cat([p[1] for p in seq_protos], dim=1)  # [1, seq_len, hidden]
-            seq_imp = torch.stack([p[2] for p in seq_protos], dim=0)   # [seq_len, 12]
+            seq_imp = torch.stack([p[2] for p in seq_protos], dim=0)  # [seq_len, 12]
 
             # 逐层计算预测误差
             ℓ_loss = 0.0
@@ -601,7 +625,7 @@ class AbstractionBank:
             π_ℓ = max(0.1, min(3.0, π_ℓ))
 
             ε = z_ℓ - μ_total
-            total_loss += 0.5 * π_ℓ * (ε ** 2).sum()
+            total_loss += 0.5 * π_ℓ * (ε**2).sum()
 
         return total_loss
 
@@ -614,31 +638,33 @@ class AbstractionBank:
         proto_score_cpu = {tid: score.cpu() for tid, score in self._prototype_scores.items()}
 
         return {
-            'prototypes': proto_cpu,
-            'prototype_importances': imp_cpu,
-            'prototype_scores': proto_score_cpu,
-            'meta': self._meta,
-            'config': {
-                'max_entries_per_task': self.max_entries_per_task,
-                'n_prototypes': self.n_prototypes,
-                'enable_concept_grouping': self.enable_concept_grouping,
+            "prototypes": proto_cpu,
+            "prototype_importances": imp_cpu,
+            "prototype_scores": proto_score_cpu,
+            "meta": self._meta,
+            "config": {
+                "max_entries_per_task": self.max_entries_per_task,
+                "n_prototypes": self.n_prototypes,
+                "enable_concept_grouping": self.enable_concept_grouping,
             },
         }
 
     def load_state_dict(self, state: dict):
         """从状态字典恢复."""
-        self._prototypes = {tid: p.clone() for tid, p in state.get('prototypes', {}).items()}
+        self._prototypes = {tid: p.clone() for tid, p in state.get("prototypes", {}).items()}
         self._prototype_importances = {
-            tid: imp.clone() for tid, imp in state.get('prototype_importances', {}).items()
+            tid: imp.clone() for tid, imp in state.get("prototype_importances", {}).items()
         }
         self._prototype_scores = {
-            tid: score.clone() for tid, score in state.get('prototype_scores', {}).items()
+            tid: score.clone() for tid, score in state.get("prototype_scores", {}).items()
         }
-        self._meta = state.get('meta', {})
-        cfg = state.get('config', {})
-        self.max_entries_per_task = cfg.get('max_entries_per_task', self.max_entries_per_task)
-        self.n_prototypes = cfg.get('n_prototypes', self.n_prototypes)
-        self.enable_concept_grouping = cfg.get('enable_concept_grouping', self.enable_concept_grouping)
+        self._meta = state.get("meta", {})
+        cfg = state.get("config", {})
+        self.max_entries_per_task = cfg.get("max_entries_per_task", self.max_entries_per_task)
+        self.n_prototypes = cfg.get("n_prototypes", self.n_prototypes)
+        self.enable_concept_grouping = cfg.get(
+            "enable_concept_grouping", self.enable_concept_grouping
+        )
 
         self._store.clear()
         self._store_by_concept.clear()
@@ -646,7 +672,7 @@ class AbstractionBank:
     def sample_replay_batch(
         self,
         batch_size: int = 16,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
     ):
         """从原始存储(非原型)采样一批 z_states, 用于 Hebbian 回放.
 
@@ -668,14 +694,14 @@ class AbstractionBank:
         chosen = [all_entries[i] for i in idx]
 
         # 取第一项的 seq_len (假设 batch 内一致)
-        seq_len = chosen[0]['seq_len']
+        seq_len = chosen[0]["seq_len"]
 
         # stack z_states: 每个 entry 有 13 个 [1, S, H] 层
         z_stack = []
         for layer_idx in range(13):
             layer_tensors = []
             for entry in chosen:
-                z = entry['z_states'][layer_idx].to(device)  # [1, S, H]
+                z = entry["z_states"][layer_idx].to(device)  # [1, S, H]
                 layer_tensors.append(z)
             z_stack.append(torch.cat(layer_tensors, dim=0))  # [B, S, H]
 
@@ -685,14 +711,14 @@ class AbstractionBank:
         return self.total_prototypes
 
     def __repr__(self):
-        tasks_str = ', '.join(
-            f'{tid}: {self.get_num_prototypes(tid)} proto'
-            for tid in self._prototypes
+        tasks_str = ", ".join(
+            f"{tid}: {self.get_num_prototypes(tid)} proto" for tid in self._prototypes
         )
-        return f'AbstractionBank({tasks_str})'
+        return f"AbstractionBank({tasks_str})"
 
 
 # VariationalReplayer — 结构变体生成 + 吸引子测试
+
 
 class VariationalReplayer:
     """结构变体生成器.
@@ -711,7 +737,7 @@ class VariationalReplayer:
     @torch.no_grad()
     def generate_variants(
         self,
-        prototype_z: torch.Tensor,        # [1, hidden]
+        prototype_z: torch.Tensor,  # [1, hidden]
         n_variants: int = 5,
         noise_scale: float = 0.1,
         T_infer: int = 4,
@@ -749,20 +775,26 @@ class VariationalReplayer:
 
             # 从扰动后的 z 做 PC 推理
             z_reconverged, errors_hist, F_hist, _ = self.model.spatiotemporal_infer(
-                z_noised, pos_emb, gamma=gamma, T=T_infer,
-                return_errors=False, return_pred_loss=False,
+                z_noised,
+                pos_emb,
+                gamma=gamma,
+                T=T_infer,
+                return_errors=False,
+                return_pred_loss=False,
             )
 
             convergence_dist = (z_reconverged[-1] - prototype_z.unsqueeze(0)).norm().item()
             F_drop = F_hist[0] - F_hist[-1] if len(F_hist) > 1 else 0.0
             converged = convergence_dist < 0.5  # 启发式阈值
 
-            results.append({
-                'z_reconverged': z_reconverged,
-                'convergence_dist': convergence_dist,
-                'F_drop': F_drop,
-                'converged': converged,
-            })
+            results.append(
+                {
+                    "z_reconverged": z_reconverged,
+                    "convergence_dist": convergence_dist,
+                    "F_drop": F_drop,
+                    "converged": converged,
+                }
+            )
 
         return results
 
@@ -774,7 +806,7 @@ class VariationalReplayer:
         noise_scales: List[float] = [0.05, 0.1, 0.2, 0.5],
         T_infer: int = 4,
         gamma: float = 0.1,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
         pos_emb: Tuple = (None, None),
     ) -> dict:
         """评估指定任务的吸引子强度.
@@ -788,7 +820,11 @@ class VariationalReplayer:
         """
         prototypes = self.bank.get_prototypes(task_id)
         if prototypes is None or prototypes.size(0) == 0:
-            return {'basin_attraction': {}, 'avg_convergence_dist': {}, 'avg_F_drop': {}}
+            return {
+                "basin_attraction": {},
+                "avg_convergence_dist": {},
+                "avg_F_drop": {},
+            }
 
         results = {}
         for noise in noise_scales:
@@ -798,28 +834,33 @@ class VariationalReplayer:
             n_total = 0
 
             for proto_idx in range(prototypes.size(0)):
-                proto_z = prototypes[proto_idx: proto_idx + 1].to(device)  # [1, hidden]
+                proto_z = prototypes[proto_idx : proto_idx + 1].to(device)  # [1, hidden]
                 variants = self.generate_variants(
-                    proto_z, n_variants=n_variants,
-                    noise_scale=noise, T_infer=T_infer, gamma=gamma, pos_emb=pos_emb,
+                    proto_z,
+                    n_variants=n_variants,
+                    noise_scale=noise,
+                    T_infer=T_infer,
+                    gamma=gamma,
+                    pos_emb=pos_emb,
                 )
                 for v in variants:
                     n_total += 1
-                    if v['converged']:
+                    if v["converged"]:
                         n_converged += 1
-                    total_dist += v['convergence_dist']
-                    total_F_drop += v['F_drop']
+                    total_dist += v["convergence_dist"]
+                    total_F_drop += v["F_drop"]
 
             results[noise] = {
-                'basin_attraction': n_converged / max(n_total, 1),
-                'avg_convergence_dist': total_dist / max(n_total, 1),
-                'avg_F_drop': total_F_drop / max(n_total, 1),
+                "basin_attraction": n_converged / max(n_total, 1),
+                "avg_convergence_dist": total_dist / max(n_total, 1),
+                "avg_F_drop": total_F_drop / max(n_total, 1),
             }
 
         return results
 
 
 # AbstractionSniffer — 抽象级遗忘检测
+
 
 class AbstractionSniffer:
     """抽象级遗忘检测.
@@ -911,13 +952,17 @@ class AbstractionSniffer:
         wm_surprises = []
         for i in idx:
             entry = entries[i]
-            z_top_stored = entry['z_states'][-1]  # [1, seq, hidden]
+            z_top_stored = entry["z_states"][-1]  # [1, seq, hidden]
 
             # 当前模型对同一样本重新 infer
-            z_init = [z.clone().to(device) for z in entry['z_states']]
+            z_init = [z.clone().to(device) for z in entry["z_states"]]
             z_reconv, _, _, _ = self.model.spatiotemporal_infer(
-                z_init, pos_emb, gamma=0.1, T=4,
-                return_errors=False, return_pred_loss=False,
+                z_init,
+                pos_emb,
+                gamma=0.1,
+                T=4,
+                return_errors=False,
+                return_pred_loss=False,
             )
 
             # 取顶层平均池化
@@ -925,7 +970,7 @@ class AbstractionSniffer:
             z_current_norm = F.normalize(z_current, dim=-1)
 
             # 与所有原型的余弦相似度
-            cos_sim = (z_current_norm @ prototypes_norm.T)  # [1, k]
+            cos_sim = z_current_norm @ prototypes_norm.T  # [1, k]
             max_sim = cos_sim.max().item()
             similarities.append(max_sim)
 
@@ -983,7 +1028,7 @@ class AbstractionSniffer:
         self._repair_counter = 0
         repair_lr = current_lr * self.repair_lr_factor
         for pg in optimizer.param_groups:
-            pg['lr'] = repair_lr
+            pg["lr"] = repair_lr
         return repair_lr
 
     def repair_end(self, optimizer, restore_lr: float):
@@ -991,7 +1036,7 @@ class AbstractionSniffer:
         self._repairing = False
         self._repair_counter = 0
         for pg in optimizer.param_groups:
-            pg['lr'] = restore_lr
+            pg["lr"] = restore_lr
 
     def get_replay_batch(
         self,
@@ -1009,8 +1054,8 @@ class AbstractionSniffer:
 
     def get_drift_report(self) -> str:
         """生成漂移检测文本报告."""
-        lines = ['[AbstractionSniffer] Drift Report:']
+        lines = ["[AbstractionSniffer] Drift Report:"]
         for tid, sim in sorted(self._last_similarities.items()):
-            status = '✓' if sim >= self.drift_threshold else '✗ DRIFT'
-            lines.append(f'  {tid}: cosine={sim:.4f} {status}')
-        return '\n'.join(lines)
+            status = "✓" if sim >= self.drift_threshold else "✗ DRIFT"
+            lines.append(f"  {tid}: cosine={sim:.4f} {status}")
+        return "\n".join(lines)

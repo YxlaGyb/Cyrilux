@@ -22,17 +22,18 @@
       batch = hippocampus.sample_for_replay(batch_size)
       # → 对 batch 执行一次 Hebbian update
 """
+
 from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 
 class HippocampusEntry:
     """单条海马体条目。"""
-    __slots__ = ('z_states', 'byte_tensor', 'label_tensor', 'info_gain', 'step')
+
+    __slots__ = ("z_states", "byte_tensor", "label_tensor", "info_gain", "step")
 
     def __init__(
         self,
@@ -111,8 +112,9 @@ class HippocampusBuffer:
             if info_gain > min_ig:
                 self._buffer[min_idx] = entry
 
-    def sample_for_replay(self, n: int, device: str = 'cuda:0') -> Optional[
-            Tuple[torch.Tensor, torch.Tensor]]:
+    def sample_for_replay(
+        self, n: int, device: str = "cuda:0"
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """按信息增益加权采样 N 条条目, 返回 (byte_tensor, label_tensor) batch。
 
         Returns:
@@ -124,8 +126,10 @@ class HippocampusBuffer:
         n = min(n, len(self._buffer))
 
         # 信息增益加权采样
-        gains = torch.tensor([max(e.info_gain, self.min_info_gain)
-                              for e in self._buffer], dtype=torch.float)
+        gains = torch.tensor(
+            [max(e.info_gain, self.min_info_gain) for e in self._buffer],
+            dtype=torch.float16,
+        )
         weights = gains / (gains.sum() + 1e-8)
 
         if len(self._buffer) <= n:
@@ -140,8 +144,7 @@ class HippocampusBuffer:
             batch_bytes.append(e.byte_tensor.unsqueeze(0).to(device))
             batch_labels.append(e.label_tensor.unsqueeze(0).to(device))
 
-        return (torch.cat(batch_bytes, dim=0),
-                torch.cat(batch_labels, dim=0))
+        return (torch.cat(batch_bytes, dim=0), torch.cat(batch_labels, dim=0))
 
     def clear(self):
         """清空缓冲。"""
@@ -151,15 +154,15 @@ class HippocampusBuffer:
     def state_dict(self) -> dict:
         """序列化 (不保存 z_states, 仅保存统计)。"""
         return {
-            'capacity': self.capacity,
-            'min_info_gain': self.min_info_gain,
-            'n_entries': len(self._buffer),
-            'step_counter': self._step_counter,
+            "capacity": self.capacity,
+            "min_info_gain": self.min_info_gain,
+            "n_entries": len(self._buffer),
+            "step_counter": self._step_counter,
         }
 
     def load_state_dict(self, state: dict):
         """恢复统计状态 (缓冲内容重置)。"""
-        self.capacity = state.get('capacity', self.capacity)
-        self.min_info_gain = state.get('min_info_gain', self.min_info_gain)
-        self._step_counter = state.get('step_counter', 0)
+        self.capacity = state.get("capacity", self.capacity)
+        self.min_info_gain = state.get("min_info_gain", self.min_info_gain)
+        self._step_counter = state.get("step_counter", 0)
         # 不恢复具体条目 (冷启动)

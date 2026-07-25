@@ -1,7 +1,7 @@
 """多任务灾难性遗忘压力测试 — 无回放 vs MemoryBank+Sniffer 4×4 CE 矩阵.
 
 用法:
-  virtuoso test forgetting ...
+  test forgetting ...
 
 Phase 1: 无回放 (A→B→C→D 灾难性遗忘基线)
 Phase 2: MemoryBank + Sniffer 保护 (A→B→C→D 持续学习)

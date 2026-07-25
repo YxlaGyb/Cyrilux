@@ -11,6 +11,7 @@
   记忆 = 吸引子盆地。强度 = basin 的深度 × 宽度。
   不查表，用 PC inference 重构。
 """
+
 from __future__ import annotations
 
 import math
@@ -37,7 +38,7 @@ class AttractorLandscape:
         self.n_variants_per_proto = n_variants_per_proto
         self.T_infer = T_infer
 
-    # ── 核心测量 ──────────────────────────────────────────────────────
+    # 核心测量
 
     @torch.no_grad()
     def estimate_basin_depth(
@@ -47,7 +48,7 @@ class AttractorLandscape:
         noise_levels: Optional[List[float]] = None,
         pos_emb: Tuple = (None, None),
         gamma: float = 0.1,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
         similarity_threshold: float = 0.85,
     ) -> Dict[str, float]:
         """测量吸引子深度: 加噪声后 PC infer 收敛回原点的成功率。
@@ -66,7 +67,10 @@ class AttractorLandscape:
         hidden = proto.size(-1)
 
         # 将 [1, hidden] 扩展为 [1, 1, hidden] 用于 PC inference
-        z_proto = [torch.zeros(1, 1, hidden, device=device, dtype=torch.float16) for _ in range(self.num_sub_layers + 1)]
+        z_proto = [
+            torch.zeros(1, 1, hidden, device=device, dtype=torch.float16)
+            for _ in range(self.num_sub_layers + 1)
+        ]
         z_proto[-1] = proto.unsqueeze(1)  # [1, 1, hidden]
 
         results = {}
@@ -81,9 +85,12 @@ class AttractorLandscape:
 
                 # PC inference: 看噪声状态能否收敛回原型
                 z_conv, *_ = model.spatiotemporal_infer(
-                    z_noisy, pos_emb,
-                    gamma=gamma, T=self.T_infer,
-                    return_errors=False, return_pred_loss=False,
+                    z_noisy,
+                    pos_emb,
+                    gamma=gamma,
+                    T=self.T_infer,
+                    return_errors=False,
+                    return_pred_loss=False,
                 )
                 z_final = z_conv[-1]  # [1, 1, hidden]
 
@@ -93,7 +100,7 @@ class AttractorLandscape:
                     n_converged += 1
                 n_total += 1
 
-            results[f'{noise:.2f}'] = n_converged / max(n_total, 1)
+            results[f"{noise:.2f}"] = n_converged / max(n_total, 1)
 
         return results
 
@@ -104,7 +111,7 @@ class AttractorLandscape:
         prototype: torch.Tensor,
         pos_emb: Tuple = (None, None),
         gamma: float = 0.1,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
         similarity_threshold: float = 0.85,
     ) -> float:
         """估计吸引子宽度: 二分搜索找到最大噪声容忍度。
@@ -117,11 +124,15 @@ class AttractorLandscape:
         for _ in range(8):  # 二分 8 轮
             mid = (lo + hi) / 2.0
             depth = self.estimate_basin_depth(
-                model, prototype, noise_levels=[mid],
-                pos_emb=pos_emb, gamma=gamma, device=device,
+                model,
+                prototype,
+                noise_levels=[mid],
+                pos_emb=pos_emb,
+                gamma=gamma,
+                device=device,
                 similarity_threshold=similarity_threshold,
             )
-            rate = depth.get(f'{mid:.2f}', 0.0)
+            rate = depth.get(f"{mid:.2f}", 0.0)
             if rate >= 0.5:
                 best = mid
                 lo = mid
@@ -137,7 +148,7 @@ class AttractorLandscape:
         group_key: str,
         pos_emb: Tuple = (None, None),
         gamma: float = 0.1,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
     ) -> Dict[str, float]:
         """检测某组原型的吸引子是否坍缩。
 
@@ -150,33 +161,37 @@ class AttractorLandscape:
         """
         prototypes = abstraction_bank.get_prototypes(group_key)
         if prototypes is None or prototypes.size(0) == 0:
-            return {'collapse_level': 1.0, 'n_prototypes_collapsed': 0, 'details': {}}
+            return {"collapse_level": 1.0, "n_prototypes_collapsed": 0, "details": {}}
 
         collapsed = 0
         details = {}
         for i in range(prototypes.size(0)):
-            proto = prototypes[i:i+1, :]  # [1, hidden]
+            proto = prototypes[i : i + 1, :]  # [1, hidden]
             depth_low = self.estimate_basin_depth(
-                model, proto, noise_levels=[0.05, 0.2],
-                pos_emb=pos_emb, gamma=gamma, device=device,
+                model,
+                proto,
+                noise_levels=[0.05, 0.2],
+                pos_emb=pos_emb,
+                gamma=gamma,
+                device=device,
             )
-            low_rate = depth_low.get('0.05', 0.0)
-            mid_rate = depth_low.get('0.20', 0.0)
+            low_rate = depth_low.get("0.05", 0.0)
+            mid_rate = depth_low.get("0.20", 0.0)
             is_collapsed = low_rate < 0.5 or mid_rate < 0.3
             if is_collapsed:
                 collapsed += 1
-            details[f'proto_{i}'] = {
-                'low_noise_rate': low_rate,
-                'mid_noise_rate': mid_rate,
-                'collapsed': is_collapsed,
+            details[f"proto_{i}"] = {
+                "low_noise_rate": low_rate,
+                "mid_noise_rate": mid_rate,
+                "collapsed": is_collapsed,
             }
 
         collapse_level = collapsed / max(prototypes.size(0), 1)
         return {
-            'collapse_level': collapse_level,
-            'n_prototypes_collapsed': collapsed,
-            'total_prototypes': prototypes.size(0),
-            'details': details,
+            "collapse_level": collapse_level,
+            "n_prototypes_collapsed": collapsed,
+            "total_prototypes": prototypes.size(0),
+            "details": details,
         }
 
     @torch.no_grad()
@@ -198,10 +213,15 @@ class AttractorLandscape:
         all_centroids = []
         for tid, protos in abstraction_bank._prototypes.items():
             for i in range(protos.size(0)):
-                all_centroids.append(protos[i:i+1, :])
+                all_centroids.append(protos[i : i + 1, :])
 
         if len(all_centroids) < 2:
-            return {'entropy': 0.0, 'max_entropy': 0.0, 'normalized_entropy': 0.0, 'n_groups': len(all_centroids)}
+            return {
+                "entropy": 0.0,
+                "max_entropy": 0.0,
+                "normalized_entropy": 0.0,
+                "n_groups": len(all_centroids),
+            }
 
         all_z = torch.cat(all_centroids, dim=0)  # [N, hidden]
         all_z = F.normalize(all_z, dim=-1)
@@ -220,10 +240,10 @@ class AttractorLandscape:
         normalized = entropy / max_entropy if max_entropy > 0 else 0.0
 
         return {
-            'entropy': entropy,
-            'max_entropy': max_entropy,
-            'normalized_entropy': normalized,
-            'n_groups': len(all_centroids),
+            "entropy": entropy,
+            "max_entropy": max_entropy,
+            "normalized_entropy": normalized,
+            "n_groups": len(all_centroids),
         }
 
     @torch.no_grad()
@@ -233,7 +253,7 @@ class AttractorLandscape:
         abstraction_bank: AbstractionBank,
         pos_emb: Tuple = (None, None),
         gamma: float = 0.1,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
         top_k: int = 3,
     ) -> List[Tuple[str, int, float]]:
         """找出最脆弱的 top-k 吸引子 (宽度最小)。
@@ -245,9 +265,13 @@ class AttractorLandscape:
         for gk in abstraction_bank._prototypes:
             protos = abstraction_bank._prototypes[gk]
             for i in range(protos.size(0)):
-                proto = protos[i:i+1, :]
+                proto = protos[i : i + 1, :]
                 width = self.estimate_basin_width(
-                    model, proto, pos_emb=pos_emb, gamma=gamma, device=device,
+                    model,
+                    proto,
+                    pos_emb=pos_emb,
+                    gamma=gamma,
+                    device=device,
                 )
                 candidates.append((gk, i, width))
 
@@ -261,7 +285,7 @@ class AttractorLandscape:
         abstraction_bank: AbstractionBank,
         pos_emb: Tuple = (None, None),
         gamma: float = 0.1,
-        device: str = 'cuda:0',
+        device: str = "cuda:0",
     ) -> dict:
         """生成完整的景观报告 — 用于 GUI 展示和调度决策。
 
@@ -275,11 +299,11 @@ class AttractorLandscape:
               - group_reports: {group_key: {...}}
         """
         report = {
-            'n_prototypes_total': abstraction_bank.total_prototypes,
-            'n_groups': len(abstraction_bank._prototypes),
-            'collapse_ratio': 0.0,
-            'entropy_metrics': self.compute_landscape_entropy(abstraction_bank),
-            'group_reports': {},
+            "n_prototypes_total": abstraction_bank.total_prototypes,
+            "n_groups": len(abstraction_bank._prototypes),
+            "collapse_ratio": 0.0,
+            "entropy_metrics": self.compute_landscape_entropy(abstraction_bank),
+            "group_reports": {},
         }
 
         if abstraction_bank.total_prototypes == 0:
@@ -294,11 +318,15 @@ class AttractorLandscape:
             if protos.size(0) == 0:
                 continue
 
-            grp_report = {'n_prototypes': protos.size(0), 'basin_depths': {}}
+            grp_report = {"n_prototypes": protos.size(0), "basin_depths": {}}
             for i in range(protos.size(0)):
-                proto = protos[i:i+1, :]
+                proto = protos[i : i + 1, :]
                 depths = self.estimate_basin_depth(
-                    model, proto, pos_emb=pos_emb, gamma=gamma, device=device,
+                    model,
+                    proto,
+                    pos_emb=pos_emb,
+                    gamma=gamma,
+                    device=device,
                 )
                 for noise_str, rate in depths.items():
                     if noise_str not in depth_accum:
@@ -306,15 +334,13 @@ class AttractorLandscape:
                     depth_accum[noise_str].append(rate)
 
                 # 坍缩检查
-                low_rate = depths.get('0.05', 0.0)
+                low_rate = depths.get("0.05", 0.0)
                 if low_rate < 0.5:
                     collapsed_total += 1
                 proto_total += 1
 
-            report['group_reports'][gk] = grp_report
+            report["group_reports"][gk] = grp_report
 
-        report['collapse_ratio'] = collapsed_total / max(proto_total, 1)
-        report['avg_basin_depths'] = {
-            k: sum(v) / len(v) for k, v in depth_accum.items()
-        }
+        report["collapse_ratio"] = collapsed_total / max(proto_total, 1)
+        report["avg_basin_depths"] = {k: sum(v) / len(v) for k, v in depth_accum.items()}
         return report

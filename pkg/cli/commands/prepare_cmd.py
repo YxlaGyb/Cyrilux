@@ -1,8 +1,7 @@
 """
-virtuoso prepare — 数据准备子命令 (委托至 virtuosov2.core.prepare_tasks).
+prepare — 数据准备子命令 (委托至 Cyrilux.core.prepare_tasks).
 """
 
-import os
 from typing import Optional
 
 import typer
@@ -13,7 +12,9 @@ app = typer.Typer(name="prepare", help="数据准备命令", no_args_is_help=Tru
 @app.command()
 def four_task(
     ctx: typer.Context,
-    subset: Optional[int] = typer.Option(None, "--subset", "-n", help="每任务采样数 (默认 20000)"),
+    subset: Optional[int] = typer.Option(
+        None, "--subset", "-n", help="每任务采样数 (默认 20000)"
+    ),
     seed: int = typer.Option(42, "--seed", "-s", help="随机种子"),
 ):
     """按领域切分 4 个任务数据集 (A/B/C/D)."""

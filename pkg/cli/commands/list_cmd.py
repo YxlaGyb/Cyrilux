@@ -1,5 +1,5 @@
 """
-virtuoso list — 信息查询子命令.
+list — 信息查询子命令.
 """
 
 import os

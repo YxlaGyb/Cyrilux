@@ -1,4 +1,7 @@
-"""睡眠 Consolidation Callback — 6a WM 驱动合并 + 6b 深度睡眠."""
+"""
+睡眠 Consolidation Callback
+6a WM 驱动合并 + 6b 深度睡眠.
+"""
 
 import math
 
