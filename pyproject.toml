@@ -25,6 +25,8 @@ cyrilux = "pkg.cli:app"
 include = [
     "pkg",
     "pkg.*",
+    "pkg.device",
+    "pkg.device.*",
     "model",
     "model.*",
     "dataset",

@@ -8,6 +8,7 @@ out*
 /dataset
 /.ruff_cache
 /.idea
+/build
 
 *.pt
 *.jsonl
