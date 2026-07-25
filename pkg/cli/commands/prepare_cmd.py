@@ -21,7 +21,7 @@ def four_task(
     from pkg.utils.prepare_tasks import prepare_4tasks
 
     print("准备 4 任务数据")
-    prepare_4tasks(subset=subset, seed=seed)
+    prepare_4tasks(subset=subset, seed=seed)  # type: ignore[call-arg]
     print("✓ 4 任务数据准备完成")
 
 

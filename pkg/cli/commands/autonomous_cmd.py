@@ -63,5 +63,5 @@ def autonomous(
     print(f"  训练: batch={batch_size}  seq_len={max_seq_len}")
     print(f"  设备: {device}")
 
-    mind.run()
+    mind.run()  # type: ignore[attr-defined]
     print("✓ 自主运行结束")

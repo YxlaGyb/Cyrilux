@@ -1,6 +1,7 @@
 """Local Conv blocks — 纯局部 Conv1D 操作。
 Conv1D(k=3, causal) + SwiGLU MLP + 多巴胺门控归一化, 接口兼容 CyreneBackbone。
 """
+
 from typing import Optional
 
 import torch
@@ -29,15 +30,13 @@ class DopamineGateRMSNorm(nn.Module):
         dopamine_eta: 多巴胺调制强度 (0=无调制, 1=+/-100% gain 变化)
     """
 
-    def __init__(self, hidden_size: int, eps: float = 1e-5,
-                 dopamine_eta: float = 0.3):
+    def __init__(self, hidden_size: int, eps: float = 1e-5, dopamine_eta: float = 0.3):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
         self.dopamine_eta = dopamine_eta
 
-    def forward(self, x: torch.Tensor,
-                dopamine_D: Optional[float] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, dopamine_D: Optional[float] = None) -> torch.Tensor:
         """前向: RMSNorm -> 多巴胺门控 gain.
 
         Args:
@@ -75,8 +74,7 @@ class LateralInhibition(nn.Module):
         inhibition_strength: 抑制强度 (0=无抑制, 1=完全抑制)
     """
 
-    def __init__(self, num_layers: int = 12, k: int = 3,
-                 inhibition_strength: float = 0.1):
+    def __init__(self, num_layers: int = 12, k: int = 3, inhibition_strength: float = 0.1):
         super().__init__()
         self.num_layers = num_layers
         self.k = min(k, num_layers // 2)  # 对称半径
@@ -89,10 +87,10 @@ class LateralInhibition(nn.Module):
             if dist == 0:
                 kernel[i] = 0.0  # 不自抑制
             else:
-                kernel[i] = torch.exp(torch.tensor(-dist ** 2 / (2 * (self.k / 2) ** 2)))
+                kernel[i] = torch.exp(torch.tensor(-(dist**2) / (2 * (self.k / 2) ** 2)))
         # 归一化使抑制总和 = 1
         kernel = kernel / (kernel.sum() + 1e-8)
-        self.register_buffer('_inhibition_kernel', kernel)
+        self.register_buffer("_inhibition_kernel", kernel)
 
     def forward(self, ε_list):
         """应用侧向抑制到误差列表。
@@ -106,21 +104,25 @@ class LateralInhibition(nn.Module):
         if self.inhibition_strength <= 0 or self.num_layers <= 2:
             return ε_list
 
-        L = len(ε_list)
         device = ε_list[0].device
 
         # 1) 计算每层误差范数 → [L]
         # 使用 abs().mean() 而非 norm() 避免 fp16 下 ε² 溢出 (max=65504)
-        norms = torch.tensor([ε.abs().mean().item() for ε in ε_list], device=device, dtype=torch.float16)
+        norms = torch.tensor(
+            [ε.abs().mean().item() for ε in ε_list], device=device, dtype=torch.float16
+        )
 
         # 2) 对范数进行 softmax 归一化 → 竞争权重
-        w = F.softmax(norms / (norms.mean() + (1/256)), dim=0)
+        w = F.softmax(norms / (norms.mean() + (1 / 256)), dim=0)
 
         # 3) 用事先计算的核做 1D 卷积 → 邻域抑制信号
-        w_pad = F.pad(w.unsqueeze(0).unsqueeze(0),  # [1, 1, L]
-                      pad=(self.k, self.k), mode='replicate')
-        kernel = self._inhibition_kernel.view(1, 1, -1).to(device)
-        inhibition = F.conv1d(w_pad, kernel)[0, 0]  # [L]
+        w_pad = F.pad(
+            w.unsqueeze(0).unsqueeze(0),  # [1, 1, L]
+            pad=(self.k, self.k),
+            mode="replicate",
+        )
+        kernel = self._inhibition_kernel.view(1, 1, -1).to(device)  # type: ignore[operator]
+        inhibition = F.conv1d(w_pad, kernel)[0, 0]  # type: ignore[arg-type]  # [L]
 
         # 4) 从原始 ε 中减去抑制信号
         ε_inhibited = []
@@ -132,8 +134,7 @@ class LateralInhibition(nn.Module):
         return ε_inhibited
 
     def extra_repr(self):
-        return (f'L={self.num_layers}, k={self.k}, '
-                f'inhibition={self.inhibition_strength:.2f}')
+        return f"L={self.num_layers}, k={self.k}, inhibition={self.inhibition_strength:.2f}"
 
 
 class SalienceGate(nn.Module):
@@ -158,8 +159,8 @@ class SalienceGate(nn.Module):
         self.temperature = temperature
 
         # EMA 追踪 (供 Phase C 神经发生控制器使用)
-        self.register_buffer('activation_ema', torch.zeros(hidden_size))
-        self.register_buffer('_step', torch.tensor(0, dtype=torch.long))
+        self.register_buffer("activation_ema", torch.zeros(hidden_size))
+        self.register_buffer("_step", torch.tensor(0, dtype=torch.long))
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """应用门控。训练时软门控 (可微), 推理时硬门控 (阈值 0.5)。
@@ -183,7 +184,9 @@ class SalienceGate(nn.Module):
                 # 对除最后一维外的所有维度求平均 → 每通道均值
                 act = z.abs().mean(dim=tuple(range(z.ndim - 1)))  # [hidden_size]
                 decay = 0.99
-                self.activation_ema.mul_(decay).add_(act * (1 - decay))
+                self.activation_ema.mul_(  # type: ignore[operator]
+                    torch.tensor(decay, device=self.activation_ema.device)  # type: ignore[arg-type]
+                ).add_(act * (1 - decay))
                 self._step += 1
 
         return z * gate.view(1, 1, -1)
@@ -209,7 +212,7 @@ class SalienceGate(nn.Module):
 
     def extra_repr(self):
         active = self.get_active_ratio()
-        return f'H={self.logits.size(0)}, τ={self.temperature}, active={active:.2%}'
+        return f"H={self.logits.size(0)}, τ={self.temperature}, active={active:.2%}"
 
 
 class LocalConvBlock(nn.Module):
@@ -234,13 +237,17 @@ class LocalConvBlock(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # kernel_size=3, bias=False, padding=0 → 手动 causal pad
         self.local_conv = nn.Conv1d(
-            config.hidden_size, config.hidden_size,
-            kernel_size=3, padding=0, dilation=dilation, bias=False,
+            config.hidden_size,
+            config.hidden_size,
+            kernel_size=3,
+            padding=0,
+            dilation=dilation,
+            bias=False,
         )
 
         # ── MLP 子层 (SwiGLU) ──
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        use_fused = getattr(config, 'use_fused_mlp', True)
+        use_fused = getattr(config, "use_fused_mlp", True)
         self.mlp = FusedFeedForward(config) if use_fused else FeedForward(config)
 
     def forward(self, hidden_states, position_embeddings=None, **kwargs):
@@ -272,7 +279,8 @@ class LocalConvBlock(nn.Module):
         return hidden_states, None
 
     def extra_repr(self):
-        return f'layer_id={self.layer_id}, conv={self.local_conv}'
+        return f"layer_id={self.layer_id}, conv={self.local_conv}"
+
 
 class FusedFeedForward(nn.Module):
     """Fused SwiGLU MLP — 将 gate_proj + up_proj 合并为单次 matmul.
@@ -292,7 +300,7 @@ class FusedFeedForward(nn.Module):
     减少 1 次 matmul / 前向, 33% MLP 计算量减少。
     """
 
-    def __init__(self, config: CyreneConfig, intermediate_size: int = None):
+    def __init__(self, config: CyreneConfig, intermediate_size: Optional[int] = None):
         super().__init__()
         intermediate_size = intermediate_size or config.intermediate_size
         # 融合 gate + up 为一个更大的权重矩阵
@@ -306,7 +314,9 @@ class FusedFeedForward(nn.Module):
         self.capture_mode = False
         self.captured_fused: Optional[torch.Tensor] = None  # [B, S, 2*inter] gate_up 预激活
         self.captured_input: Optional[torch.Tensor] = None  # [B, S, H] LN 后的输入
-        self.captured_hidden: Optional[torch.Tensor] = None  # [B, S, inter] 归一化后的 SwiGLU hidden
+        self.captured_hidden: Optional[torch.Tensor] = (
+            None  # [B, S, inter] 归一化后的 SwiGLU hidden
+        )
 
     def forward(self, x, dopamine_D: Optional[float] = None):
         """fp16 前向 — 直接使用 fp16 权重.

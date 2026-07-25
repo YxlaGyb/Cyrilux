@@ -15,13 +15,14 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple, Optional, Dict
+from typing import Any, List, Tuple, Optional, Dict
 
 from dataclasses import dataclass
 
 import torch
 
 from model.continual.attractor_landscape import AttractorLandscape
+from model.continual.abstraction_bank import compute_layer_importance
 
 
 @dataclass
@@ -188,7 +189,7 @@ class ConsolidationPipeline:
         abstraction_bank,
         device: str = "cuda:0",
         dopamine_score: Optional[float] = None,
-    ) -> Dict[str, any]:
+    ) -> dict[str, Any]:
         """每步调用 — 检查是否需要触发写入或 SLEEP。
 
         多巴胺 D (RPE) 来自 PC 推理循环的自组织信号:
@@ -397,12 +398,12 @@ class ConsolidationPipeline:
         memory_bank,
         abstraction_bank,
         device: str = "cuda:0",
-    ) -> Dict[str, any]:
+    ) -> dict[str, Any]:
         """外部触发 (来自 training.py): 立即执行一次 MemoryBank + AbstractionBank 写入。
 
         用于低误差比率持续窗口时的强制巩固。
         """
-        result: Dict[str, any] = {"triggered": None}
+        result: dict[str, Any] = {"triggered": None}
         n_mem = self._write_to_memory_bank(model, memory_bank, device)
         n_abs = self._write_to_abstraction_bank(model, abstraction_bank, device)
         if n_mem > 0 or n_abs > 0:

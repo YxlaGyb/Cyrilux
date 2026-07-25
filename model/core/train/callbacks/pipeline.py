@@ -47,6 +47,7 @@ class PipelineCallback(CallbackBase):
         mean_D = sum(self._dopamine_window) / max(len(self._dopamine_window), 1)
         mean_D_trigger = 0.70
         if mean_D > mean_D_trigger and len(self._dopamine_window) >= 20:
+            force_result = {}
             try:
                 force_result = loop.consolidation_pipeline.force_consolidate(
                     loop.global_step,

@@ -335,7 +335,7 @@ class MainWindow(QMainWindow):
         # 通知各页面
         for page in self._pages.values():
             if hasattr(page, "on_theme_changed"):
-                page.on_theme_changed(self._theme)
+                page.on_theme_changed(self._theme)  # type: ignore[attr-defined]
 
     def _apply_theme(self) -> None:
         qss = self._theme.qss()
@@ -354,7 +354,7 @@ class MainWindow(QMainWindow):
             if "dashboard" in self._pages:
                 page = self._pages["dashboard"]
                 if hasattr(page, "refresh"):
-                    page.refresh()
+                    page.refresh()  # type: ignore[attr-defined]
         except Exception as exc:
             import traceback
             traceback.print_exc()

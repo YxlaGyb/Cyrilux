@@ -5,10 +5,13 @@ CLI 共享工具: 路径处理 & 配置加载.
 import os
 import json
 
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.text import Text
+from rich.table import Table
+
 # 项目根目录 — 相对于 pkg/cli/utils.py 向上 3 层
-PROJECT_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def resolve_path(p: str) -> str:
@@ -61,9 +64,7 @@ class RichTrainingPanel:
         self._init_panels(device)
 
     def _init_panels(self, device: str):
-        self.layout["status"].update(
-            Panel("[yellow]等待启动...[/]", title="[bold]Status")
-        )
+        self.layout["status"].update(Panel("[yellow]等待启动...[/]", title="[bold]Status"))
         self.layout["progress"].update(Panel("", title="[bold]Progress"))
         self.layout["log"].update(Panel("", title="[bold]Log"))
 
@@ -76,9 +77,7 @@ class RichTrainingPanel:
             self.log_lines.append(f"[dim]{msg}[/]")
             if len(self.log_lines) > 200:
                 self.log_lines = self.log_lines[-100:]
-            self.layout["log"].update(
-                Panel("\n".join(self.log_lines[-25:]), title="[bold]Log")
-            )
+            self.layout["log"].update(Panel("\n".join(self.log_lines[-25:]), title="[bold]Log"))
 
         elif t == "progress":
             step = data.get("step", 0)
@@ -124,29 +123,21 @@ class RichTrainingPanel:
         elif t == "checkpoint":
             ckpt = data.get("checkpoint_path", "")
             self.log_lines.append(f"[green]✓[/] 检查点: {ckpt}")
-            self.layout["log"].update(
-                Panel("\n".join(self.log_lines[-25:]), title="[bold]Log")
-            )
+            self.layout["log"].update(Panel("\n".join(self.log_lines[-25:]), title="[bold]Log"))
 
         elif t == "phase":
             msg = data.get("message", "")
             self.log_lines.append(f"[blue]◆[/] {msg}")
-            self.layout["log"].update(
-                Panel("\n".join(self.log_lines[-25:]), title="[bold]Log")
-            )
+            self.layout["log"].update(Panel("\n".join(self.log_lines[-25:]), title="[bold]Log"))
 
         elif t == "done":
             self.log_lines.append("[bold green]══════════════════════════════[/]")
             self.log_lines.append("[bold green]✓ 训练完成![/]")
-            self.layout["log"].update(
-                Panel("\n".join(self.log_lines[-25:]), title="[bold]Log")
-            )
+            self.layout["log"].update(Panel("\n".join(self.log_lines[-25:]), title="[bold]Log"))
 
         elif t == "error":
             self.log_lines.append(f"[bold red]✗ 错误: {data.get('message', '')}[/]")
-            self.layout["log"].update(
-                Panel("\n".join(self.log_lines[-25:]), title="[bold]Log")
-            )
+            self.layout["log"].update(Panel("\n".join(self.log_lines[-25:]), title="[bold]Log"))
 
 
 # ═══════════════════════════════════════════════════════════════════

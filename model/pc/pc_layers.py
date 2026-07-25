@@ -10,7 +10,7 @@
 子层 ℓ 的预测: μ_ℓ = sublayer_ℓ(LN(z_{ℓ-1})) + z_{ℓ-1}
 误差: ε_ℓ = z_ℓ - μ_ℓ
 """
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +23,9 @@ from model.model_cyrene import RMSNorm
 # ── 自适应精度噪声 (生物神经元膜电位噪声) ──────────────
 
 class AdaptiveNeuralNoise(nn.Module):
+    _running_mean: torch.Tensor
+    _running_std: torch.Tensor
+
     """每神经元自适应噪声注入 — 生物膜电位噪声的 ML 模拟。
 
     生物灵感：神经元的膜电位天然存在 channel noise / synaptic noise，
@@ -79,6 +82,30 @@ def _utf8_ce_weight(device='cpu'):
 # F = Σ ½·‖ε_ℓ(t)‖²  (纯预测误差, 无 CE, 无 token loss)
 
 class BaseCyrenePC(nn.Module):
+    # 子类设置的属性 — 类级标注让 pyright 能正确推断类型
+    num_sub_layers: int
+    temporal_proj: nn.ModuleList
+    topdown_proj: nn.ModuleList
+    proj_input_norm: nn.Module
+    model: CyreneBackbone
+    predict: Callable
+    init_z: Callable
+    get_position_embeddings: Callable
+    _build_conv_fp32_cache: Callable
+    _clear_conv_fp32_cache: Callable
+    lateral_inhibition: Callable
+    _act_threshold: torch.Tensor
+    _act_ema_decay: float
+    _act_target_ratio: float
+    _act_homeo_rate: float
+    _act_energy_cost: float
+    _cached_lm_head_w: torch.Tensor | None
+    _cached_mu_bu: list | None
+    _cached_temporal_w: torch.Tensor | None
+    _cached_topdown_w: torch.Tensor | None
+    _cached_local_conv_w: list | None
+    _cached_byte_proj_w: torch.Tensor | None
+
     """时空预测编码基类。
 
     核心转变: "预测下一个 token" → "预测下一个神经状态"
@@ -119,7 +146,7 @@ class BaseCyrenePC(nn.Module):
         # 使用缓存的 stack 权重，避免每步 torch.stack([p.weight ...])
         W_temp = getattr(self, '_cached_temporal_w', None)
         if W_temp is None:
-            W_temp = torch.stack([p.weight for p in self.temporal_proj])  # [L, H, H]
+            W_temp = torch.stack([p.weight for p in self.temporal_proj])  # type: ignore[arg-type]  # [L, H, H]
         z_flat = z_sub[:, :, :-1, :].reshape(L, -1, H)
         μ_temp_flat = torch.bmm(z_flat, W_temp)  # [L, B*(S-1), H] fp16
         μ_temp = μ_temp_flat.reshape(L, B, -1, H)
@@ -130,7 +157,7 @@ class BaseCyrenePC(nn.Module):
             z_down = self.proj_input_norm(torch.stack(z_list[2:], dim=0))  # [L-1, B, S, H] — pre-norm
             W_down = getattr(self, '_cached_topdown_w', None)
             if W_down is None:
-                W_down = torch.stack([p.weight for p in self.topdown_proj])
+                W_down = torch.stack([p.weight for p in self.topdown_proj])  # type: ignore[arg-type]
             z_down_flat = z_down[:, :, :-1, :].reshape(L - 1, -1, H)
             μ_down_flat = torch.bmm(z_down_flat, W_down)
             μ_down = μ_down_flat.reshape(L - 1, B, -1, H)
@@ -140,23 +167,6 @@ class BaseCyrenePC(nn.Module):
             μ_down_all = None
 
         return μ_temp_all, μ_down_all
-
-    # ── 时空推理单步 ──────────────────────────────────────────
-
-    def spatiotemporal_infer_step(self, z_by_layer, pos_emb, gamma, padding_mask=None,
-                                    return_errors=True, return_pred_loss=False,
-                                    precision_scales=None):
-        """单步时空推理: 对所有层 ell=1..L 更新 z.
-
-        推理始终在 no_grad 下运行 (手动 ∇F_z = ε).
-        F_pred 通过 compute_spatiotemporal_loss 在推理后单独计算。
-        """
-        return self._spatiotemporal_infer_step(
-            z_by_layer, pos_emb, gamma, padding_mask,
-            return_errors=return_errors,
-            return_pred_loss=return_pred_loss,
-            precision_scales=precision_scales,
-        )
 
     def _spatiotemporal_infer_step(self, z_by_layer, pos_emb, gamma, padding_mask,
                                      return_errors=True, return_pred_loss=False,
@@ -184,7 +194,7 @@ class BaseCyrenePC(nn.Module):
         has_grad = torch.is_grad_enabled()
 
         errors_ε = []
-        F_val = 0.0  # scalar, for logging
+        F_val = torch.tensor(0.0, device=z_det[0].device)  # scalar, for logging
         F_pred = None
 
         # ── Phase 1: 依赖阈值门控 ──
@@ -327,8 +337,8 @@ class BaseCyrenePC(nn.Module):
             mlp = block.mlp
             if hasattr(mlp, 'capture_mode'):
                 if clear_first:
-                    mlp.clear_capture()
-                mlp.capture_mode = True
+                    mlp.clear_capture()  # type: ignore[attr-defined]
+                mlp.capture_mode = True  # type: ignore[attr-defined]
 
     def _hebbian_cache_disable_and_collect(self):
         """关闭 capture 并收集所有 MLP 缓存.
@@ -341,10 +351,10 @@ class BaseCyrenePC(nn.Module):
             mlp = block.mlp
             if not getattr(mlp, 'capture_mode', False):
                 continue
-            mlp.capture_mode = False
-            if mlp.captured_fused is not None:
-                cache[block_idx] = (mlp.captured_fused, mlp.captured_input, mlp.captured_hidden)
-                mlp.clear_capture()
+            mlp.capture_mode = False  # type: ignore[attr-defined]
+            if mlp.captured_fused is not None:  # type: ignore[attr-defined]
+                cache[block_idx] = (mlp.captured_fused, mlp.captured_input, mlp.captured_hidden)  # type: ignore[attr-defined]
+                mlp.clear_capture()  # type: ignore[attr-defined]
         return cache
 
     def spatiotemporal_infer(self, z_by_layer, pos_emb, gamma=0.1, T=2, padding_mask=None,
@@ -381,19 +391,20 @@ class BaseCyrenePC(nn.Module):
 
         # ── 单步 T=1: 始终 no_grad ──
         with torch.no_grad():
-            step_kwargs = dict(
-                z_by_layer=z_by_layer, pos_emb=pos_emb, gamma=gamma_eff,
-                padding_mask=padding_mask, precision_scales=precision_scales,
-                skip_bottom_up=True,
-            )
             if return_ε:
-                z_by_layer, errors, F_val, _, ε_list = self._spatiotemporal_infer_step(
-                    **step_kwargs, return_errors=return_errors,
+                z_by_layer, errors, F_val, _, ε_list = self._spatiotemporal_infer_step(  # type: ignore[assignment, arg-type]
+                    z_by_layer=z_by_layer, pos_emb=pos_emb, gamma=gamma_eff,
+                    padding_mask=padding_mask, precision_scales=precision_scales,
+                    skip_bottom_up=True,
+                    return_errors=return_errors,
                     return_pred_loss=False, return_ε=True,
                 )
             else:
-                z_by_layer, errors, F_val, _ = self._spatiotemporal_infer_step(
-                    **step_kwargs, return_errors=return_errors,
+                z_by_layer, errors, F_val, _ = self._spatiotemporal_infer_step(  # type: ignore[assignment, arg-type]
+                    z_by_layer=z_by_layer, pos_emb=pos_emb, gamma=gamma_eff,
+                    padding_mask=padding_mask, precision_scales=precision_scales,
+                    skip_bottom_up=True,
+                    return_errors=return_errors,
                     return_pred_loss=False,
                 )
 
@@ -411,9 +422,9 @@ class BaseCyrenePC(nn.Module):
         # ── 释放 fp32 缓存 ──
         if return_ε:
             if hasattr(self, 'lateral_inhibition'):
-                ε_list = self.lateral_inhibition(ε_list)
+                ε_list = self.lateral_inhibition(ε_list)  # type: ignore[possibly-unbound]
             self._clear_conv_fp32_cache()
-            return z_by_layer, errors_hist, F_hist, F_pred, ε_list
+            return z_by_layer, errors_hist, F_hist, F_pred, ε_list  # type: ignore[possibly-unbound]
 
         self._clear_conv_fp32_cache()
         return z_by_layer, errors_hist, F_hist, F_pred
@@ -531,7 +542,7 @@ class BaseCyrenePC(nn.Module):
         """
         h_top = self.model.norm(z_by_layer[self.num_sub_layers])
         if hasattr(self, '_cached_lm_head_w') and self._cached_lm_head_w is not None:
-            logits = F.linear(h_top, self._cached_lm_head_w)
+            logits = F.linear(h_top, self._cached_lm_head_w)  # type: ignore[arg-type]
         else:
             # 模型参数为 fp16 时 (生产环境 .half()), lm_head(h_top) 天然匹配
             logits = self.model.lm_head(h_top)
@@ -543,7 +554,7 @@ class BaseCyrenePC(nn.Module):
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=-100,
-            weight=_utf8_ce_weight(shift_logits.device).to(shift_logits.dtype),
+            weight=_utf8_ce_weight(str(shift_logits.device)).to(shift_logits.dtype),
         )
 
     # ── 生成 (统一方法, 子类通过继承共享) ──────────────────
@@ -560,7 +571,7 @@ class BaseCyrenePC(nn.Module):
             seq_len = input_ids.size(1)
             pos_emb = self.get_position_embeddings(seq_len, device)
             z_init = self.init_z(input_ids)
-            z_conv, _, _, _ = self.spatiotemporal_infer(
+            z_conv, _, _, _ = self.spatiotemporal_infer(  # type: ignore[assignment]
                 z_init, pos_emb, gamma=gamma, T=T_infer)
             logits = self.compute_ce_loss(z_conv, None)  # -> [bsz, seq, vocab]
             next_logits = logits[0, -1, :] / temperature
@@ -581,8 +592,8 @@ class BaseCyrenePC(nn.Module):
 
 class FP32SafeLinear(nn.Linear):
     """Linear 层包装: 直接使用 fp16 权重, 无精度提升."""
-    def forward(self, x):
-        return F.linear(x, self.weight, self.bias)
+    def forward(self, input):
+        return F.linear(input, self.weight, self.bias)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -656,7 +667,7 @@ class CyrenePC(BaseCyrenePC):
         # ── 权重缓存（消除前向中反复 attr 查找）──
         self._cached_byte_proj_w = None
         self._cached_lm_head_w = None
-        self._cached_local_conv_w: dict = {}
+        self._cached_local_conv_w: dict = {}  # type: ignore[annotation-unchecked]
         self._cached_temporal_w = None
         self._cached_topdown_w = None
         self._cache_built = False
@@ -673,12 +684,12 @@ class CyrenePC(BaseCyrenePC):
         self._cached_lm_head_w = self.model.lm_head.weight
         # local_conv (按 block_idx)
         for block_idx, block in enumerate(self.model.layers):
-            self._cached_local_conv_w[block_idx] = block.local_conv.weight
+            self._cached_local_conv_w[block_idx] = block.local_conv.weight  # type: ignore[arg-type, operator]
         # temporal_proj stack
-        self._cached_temporal_w = torch.stack([p.weight for p in self.temporal_proj])
+        self._cached_temporal_w = torch.stack([p.weight for p in self.temporal_proj])  # type: ignore[arg-type]
         # topdown_proj stack
         if self.num_sub_layers > 1:
-            self._cached_topdown_w = torch.stack([p.weight for p in self.topdown_proj])
+            self._cached_topdown_w = torch.stack([p.weight for p in self.topdown_proj])  # type: ignore[arg-type]
         self._cache_built = True
 
     def _clear_all_fp32_cache(self):
@@ -734,15 +745,15 @@ class CyrenePC(BaseCyrenePC):
         self._refresh_all_fp32_cache()
         z = []
         x = nn.functional.pad(byte_seq.half(), (12, 0))
-        h = F.conv1d(x, self._cached_byte_proj_w).transpose(1, 2)
+        h = F.conv1d(x, self._cached_byte_proj_w).transpose(1, 2)  # type: ignore[arg-type, operator]
         h = h * (1 / 256)  # 缩放防止 fp16 LN 溢出
         z.append(h)
 
         mu_cache = []
         for block_idx, block in enumerate(self.model.layers):
             res = h
-            d = block.dilation
-            h = nn.functional.pad(block.input_layernorm(h), (0, 0, 2 * d, 0))
+            d = block.dilation  # type: ignore[operator, misc]
+            h = nn.functional.pad(block.input_layernorm(h), (0, 0, 2 * d, 0))  # type: ignore[operator, misc]
             h32 = self._safe_dilated_conv1d(
                 h.transpose(1, 2),
                 self._cached_local_conv_w[block_idx],
@@ -755,7 +766,7 @@ class CyrenePC(BaseCyrenePC):
 
             # MLP sub-layer (多巴胺门控 normalization)
             res = h
-            h = block.mlp(block.post_attention_layernorm(h), dopamine_D=dopamine_D)
+            h = block.mlp(block.post_attention_layernorm(h), dopamine_D=dopamine_D)  # type: ignore[attr-defined,misc]
             mu_cache.append(h.detach())  # ← 缓存 μ_bu (mlp, pre-gate)
             h = self.salience_gates[2 * block_idx + 1](h)  # ← MLP gate
             h = h + res
@@ -778,14 +789,14 @@ class CyrenePC(BaseCyrenePC):
         self._refresh_all_fp32_cache()
         z = []
         x = nn.functional.pad(byte_seq.half(), (12, 0))
-        h = F.conv1d(x, self._cached_byte_proj_w).transpose(1, 2)
+        h = F.conv1d(x, self._cached_byte_proj_w).transpose(1, 2)  # type: ignore[arg-type, operator]
         h = h * (1 / 256)  # 缩放防止 fp16 LN 溢出
         z.append(h)
 
         for block_idx, block in enumerate(self.model.layers):
             res = h
-            d = block.dilation
-            h = nn.functional.pad(block.input_layernorm(h), (0, 0, 2 * d, 0))
+            d = block.dilation  # type: ignore[operator, misc]
+            h = nn.functional.pad(block.input_layernorm(h), (0, 0, 2 * d, 0))  # type: ignore[operator, misc]
             h32 = self._safe_dilated_conv1d(
                 h.transpose(1, 2),
                 self._cached_local_conv_w[block_idx],
@@ -797,7 +808,7 @@ class CyrenePC(BaseCyrenePC):
 
             # MLP sub-layer (多巴胺门控 normalization)
             res = h
-            h = block.mlp(block.post_attention_layernorm(h), dopamine_D=dopamine_D)
+            h = block.mlp(block.post_attention_layernorm(h), dopamine_D=dopamine_D)  # type: ignore[attr-defined,misc]
             h = self.salience_gates[2 * block_idx + 1](h)  # ← MLP gate
             h = h + res
             z.append(h)
@@ -809,14 +820,14 @@ class CyrenePC(BaseCyrenePC):
 
         # CE from top layer (使用缓存的 lm_head fp32)
         h_top = self.model.norm(z[-1])
-        logits = F.linear(h_top, self._cached_lm_head_w)
+        logits = F.linear(h_top, self._cached_lm_head_w)  # type: ignore[arg-type]
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous().long()
         ce_loss = nn.functional.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=-100,
-            weight=_utf8_ce_weight(shift_logits.device).to(shift_logits.dtype),
+            weight=_utf8_ce_weight(str(shift_logits.device)).to(shift_logits.dtype),
         )
         return z, ce_loss
 
@@ -841,11 +852,11 @@ class CyrenePC(BaseCyrenePC):
 
         if is_conv_or_attn:
             # Conv1D (dilation-aware causal pad)
-            d = block.dilation
-            h = nn.functional.pad(block.input_layernorm(z_prev), (0, 0, 2 * d, 0))
+            d = block.dilation  # type: ignore[operator, misc]
+            h = nn.functional.pad(block.input_layernorm(z_prev), (0, 0, 2 * d, 0))  # type: ignore[operator, misc]
             conv_w = self._cached_local_conv_w.get(block_idx)
             if conv_w is None:
-                conv_w = block.local_conv.weight
+                conv_w = block.local_conv.weight  # type: ignore[arg-type, operator]
             h_out = self._safe_dilated_conv1d(
                 h.transpose(1, 2),
                 conv_w,
@@ -853,7 +864,7 @@ class CyrenePC(BaseCyrenePC):
             ).transpose(1, 2)
             return h_out
         else:
-            return block.mlp(block.post_attention_layernorm(z_prev))
+            return block.mlp(block.post_attention_layernorm(z_prev))  # type: ignore[attr-defined,misc]
     # generate_with_pc 继承自 BaseCyrenePC
 
     # ── Salience Gate 工具 ──────────────────────────────────────
@@ -869,7 +880,7 @@ class CyrenePC(BaseCyrenePC):
             return torch.tensor(0.0, device=device)
         total = torch.tensor(0.0, device=device)
         for gate in self.salience_gates:
-            total = total + gate.get_sparsity_loss(β=β)
+            total = total + gate.get_sparsity_loss(β=β)  # type: ignore[attr-defined]
         return total
 
     @torch.no_grad()
@@ -877,10 +888,10 @@ class CyrenePC(BaseCyrenePC):
         """返回所有 gate 的活性统计。"""
         if not hasattr(self, 'salience_gates') or not self.salience_gates:
             return {'active_ratio': 1.0, 'n_active': 0, 'n_total': 0}
-        active_list = [g.get_active_ratio() for g in self.salience_gates]
+        active_list = [g.get_active_ratio() for g in self.salience_gates]  # type: ignore[attr-defined]
         total = len(self.salience_gates) * self.config.hidden_size
         n_active = sum(self.config.hidden_size for g in self.salience_gates
-                       if g.get_active_ratio() > 0.5)
+                       if g.get_active_ratio() > 0.5)  # type: ignore[attr-defined]
         return {
             'active_ratio': sum(active_list) / len(active_list),
             'n_active': n_active,

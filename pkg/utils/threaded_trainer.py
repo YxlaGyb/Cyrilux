@@ -13,8 +13,8 @@
     # 训练完成后获取模型做 Phase 2
     model = trainer.get_model()
 """
-import os, json, math, threading, traceback
-from dataclasses import dataclass, field
+
+import os, threading, traceback
 from typing import Optional
 
 import torch
@@ -22,10 +22,10 @@ from torch.utils.data import DataLoader
 
 from model.core.train import TrainingLoop, TrainingConfig
 from model.core.dataset import DualChannelDataset, load_datasets
-from pkg.utils.trainer_utils import Logger
 
 
 # ─── Tkinter 进度回调 ──────────────────────────────────────────
+
 
 class TkProgressCallback:
     """将训练进度推送到 Tkinter Text 组件。"""
@@ -40,8 +40,8 @@ class TkProgressCallback:
         self.root = root
 
     def __call__(self, data: dict):
-        msg_type = data.get('type', 'log')
-        message = data.get('message', '')
+        msg_type = data.get("type", "log")
+        message = data.get("message", "")
 
         if self.root:
             self.root.after(0, self._do_update, data)
@@ -49,39 +49,38 @@ class TkProgressCallback:
             self._do_update(data)
 
     def _do_update(self, data: dict):
-        msg_type = data.get('type', 'log')
-        message = data.get('message', '')
+        msg_type = data.get("type", "log")
+        message = data.get("message", "")
 
-        if msg_type == 'log':
-            self._insert(f'[INFO] {message}\n')
-        elif msg_type == 'progress':
-            step = data.get('step', 0)
-            total = data.get('total_steps', 0)
-            ce = data.get('ce_loss', 0)
-            F = data.get('F', 0)
-            D = data.get('D', 0)
-            lr = data.get('lr', 0)
-            self._insert(
-                f'[Step {step}/{total}] CE={ce:.4f} F={F:.1f} D={D:.3f} lr={lr:.2e}\n'
-            )
-        elif msg_type == 'phase':
-            pname = data.get('phase_name', '')
-            self._insert(f'\n── [{pname}] {message} ──\n')
-        elif msg_type == 'checkpoint':
-            ckpt_path = data.get('checkpoint_path', '')
-            self._insert(f'[CHECKPOINT] {ckpt_path}\n')
-        elif msg_type == 'done':
-            self._insert(f'\n✅ {message}\n')
-        elif msg_type == 'error':
-            self._insert(f'\n❌ {message}\n')
+        if msg_type == "log":
+            self._insert(f"[INFO] {message}\n")
+        elif msg_type == "progress":
+            step = data.get("step", 0)
+            total = data.get("total_steps", 0)
+            ce = data.get("ce_loss", 0)
+            F = data.get("F", 0)
+            D = data.get("D", 0)
+            lr = data.get("lr", 0)
+            self._insert(f"[Step {step}/{total}] CE={ce:.4f} F={F:.1f} D={D:.3f} lr={lr:.2e}\n")
+        elif msg_type == "phase":
+            pname = data.get("phase_name", "")
+            self._insert(f"\n── [{pname}] {message} ──\n")
+        elif msg_type == "checkpoint":
+            ckpt_path = data.get("checkpoint_path", "")
+            self._insert(f"[CHECKPOINT] {ckpt_path}\n")
+        elif msg_type == "done":
+            self._insert(f"\n✅ {message}\n")
+        elif msg_type == "error":
+            self._insert(f"\n❌ {message}\n")
 
     def _insert(self, text: str):
-        self.text.insert('end', text)
-        self.text.see('end')
+        self.text.insert("end", text)
+        self.text.see("end")
         self.text.update_idletasks()
 
 
 # ─── 线程安全训练管理器 ────────────────────────────────────────
+
 
 class ThreadedTrainer:
     """
@@ -111,28 +110,28 @@ class ThreadedTrainer:
     def start(self):
         """启动后台训练 (非阻塞)。"""
         if self._thread and self._thread.is_alive():
-            self._log('训练已在运行中')
+            self._log("训练已在运行中")
             return
         self._stop_flag.clear()
         self._thread = threading.Thread(target=self._run_training, daemon=True)
         self._thread.start()
-        self._log('训练线程已启动')
+        self._log("训练线程已启动")
 
     def stop(self):
         """请求停止训练。"""
         self._stop_flag.set()
         self._pause_flag.set()  # 解除暂停阻塞, 让线程快速退出
-        self._log('正在停止训练...')
+        self._log("正在停止训练...")
 
     def pause(self):
         """暂停训练。"""
         self._pause_flag.clear()
-        self._log('⏸ 训练已暂停')
+        self._log("⏸ 训练已暂停")
 
     def resume(self):
         """恢复训练。"""
         self._pause_flag.set()
-        self._log('▶ 训练已恢复')
+        self._log("▶ 训练已恢复")
 
     def is_paused(self) -> bool:
         return not self._pause_flag.is_set()
@@ -161,10 +160,10 @@ class ThreadedTrainer:
     # ── 内部 ──
 
     def _log(self, msg: str):
-        self.callback({'type': 'log', 'message': msg})
+        self.callback({"type": "log", "message": msg})
 
     def _progress(self, **kwargs):
-        kwargs['type'] = 'progress'
+        kwargs["type"] = "progress"
         self.callback(kwargs)
 
     def _emit(self, **kwargs):
@@ -180,7 +179,6 @@ class ThreadedTrainer:
 
         task_specs: [(task_id, data_path_or_ds, max_samples?), ...]
         """
-        import json
         pipelines = []
         for spec in task_specs:
             task_id = spec[0]
@@ -221,8 +219,8 @@ class ThreadedTrainer:
             orig_cb = real_cb
 
             def progress_wrapper(data: dict):
-                data_type = data.get('type', '')
-                if data_type == 'progress':
+                data_type = data.get("type", "")
+                if data_type == "progress":
                     # 暂停阻塞: 等待 pause_flag 被 set (仅当 paused 时阻塞)
                     self._pause_flag.wait()
                     # 停止检查
@@ -235,21 +233,28 @@ class ThreadedTrainer:
 
             # ── 构建任务流水线 ──
             # 优先使用 GUI 传入的 _custom_pipelines (选中文件)
-            if hasattr(self, '_custom_pipelines') and self._custom_pipelines:
+            if hasattr(self, "_custom_pipelines") and self._custom_pipelines:
                 task_pipelines = self._build_task_pipelines(self._custom_pipelines)
             else:
                 # 回退: 从 datasets/ 目录自动发现
                 from pathlib import Path
-                data_dir = Path(os.getcwd()) / 'datasets'
+
+                data_dir = Path(os.getcwd()) / "datasets"
                 if data_dir.exists():
-                    jsonl_files = sorted(data_dir.glob('*.jsonl'))
+                    jsonl_files = sorted(data_dir.glob("*.jsonl"))
                 else:
                     jsonl_files = []
                 if jsonl_files:
-                    pipelines = [('default', str(jsonl_files[0]), self.config.subset if self.config.subset > 0 else 0)]
+                    pipelines = [
+                        (
+                            "default",
+                            str(jsonl_files[0]),
+                            self.config.subset if self.config.subset > 0 else 0,
+                        )
+                    ]
                     task_pipelines = self._build_task_pipelines(pipelines)
                 else:
-                    self._emit(type='error', message='未找到数据文件 (请先在 GUI 中选择数据集文件)')
+                    self._emit(type="error", message="未找到数据文件 (请先在 GUI 中选择数据集文件)")
                     return
 
             # ── 训练 ──
@@ -257,17 +262,17 @@ class ThreadedTrainer:
 
             self._trained_loop = loop
             self._final_state = {
-                'model': loop.model,
-                'config': self.config.to_dict(),
-                'steps': loop.global_step,
+                "model": loop.model,
+                "config": self.config.to_dict(),
+                "steps": loop.global_step,
             }
 
-            self._emit(type='done', message='训练完成！')
+            self._emit(type="done", message="训练完成！")
 
         except Exception as e:
             tb = traceback.format_exc()
-            self._emit(type='error', message=f'训练出错: {str(e)}\n{tb}')
-            self._log(f'错误: {str(e)}')
+            self._emit(type="error", message=f"训练出错: {str(e)}\n{tb}")
+            self._log(f"错误: {str(e)}")
 
     def set_task_pipelines(self, pipelines: list):
         """设置自定义任务流水线。"""
@@ -275,6 +280,7 @@ class ThreadedTrainer:
 
 
 # ─── 独立运行入口 ──────────────────────────────────────────────
+
 
 def run_training_standalone(config: TrainingConfig, task_specs: list = None):
     """
@@ -284,12 +290,14 @@ def run_training_standalone(config: TrainingConfig, task_specs: list = None):
         config: TrainingConfig 配置
         task_specs: [(task_id, data_path_or_ds, max_samples?), ...]
     """
-    import sys
-    mgr = ThreadedTrainer(config, progress_callback=lambda x: (
-        print(f'[{x.get("type","?")}] {x.get("message","")}')
-        if x.get('type') in ('log', 'phase', 'checkpoint', 'done', 'error')
-        else None  # progress 类型由 tqdm 承担, 不 print
-    ))
+    mgr = ThreadedTrainer(
+        config,
+        progress_callback=lambda x: (
+            print(f"[{x.get('type', '?')}] {x.get('message', '')}")
+            if x.get("type") in ("log", "phase", "checkpoint", "done", "error")
+            else None  # progress 类型由 tqdm 承担, 不 print
+        ),
+    )
 
     if task_specs:
         mgr.set_task_pipelines(mgr._build_task_pipelines(task_specs))

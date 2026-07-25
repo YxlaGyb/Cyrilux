@@ -45,19 +45,19 @@ def compute_layer_importance(
     Returns:
         layer_importance: [num_sub_layers=12] float tensor
     """
-    L = model.num_sub_layers  # = 12
+    L = model.num_sub_layers  # type: ignore[attr-defined, operator]  # = 12
     ε_sq = []
 
     for ℓ in range(1, L + 1):
         # 自下而上预测
-        μ_bu = model.predict(ℓ, z_conv[ℓ - 1], pos_emb)
+        μ_bu = model.predict(ℓ, z_conv[ℓ - 1], pos_emb)  # type: ignore[attr-defined]
         μ_bu_res = μ_bu + z_conv[ℓ - 1]
 
         # 时序预测
         seq_len = z_conv[ℓ].size(1)
         if seq_len > 1:
             z_prev_t = z_conv[ℓ][:, :-1, :]
-            z_temp = model.temporal_proj[ℓ - 1](z_prev_t)
+            z_temp = model.temporal_proj[ℓ - 1](z_prev_t)  # type: ignore[attr-defined]
             μ_temp = torch.cat([torch.zeros_like(z_conv[ℓ][:, :1, :]), z_temp], dim=1)
         else:
             μ_temp = torch.zeros_like(z_conv[ℓ])
@@ -65,7 +65,7 @@ def compute_layer_importance(
         # 自上而下预测
         if ℓ < L and seq_len > 1:
             z_down_prev = z_conv[ℓ + 1][:, :-1, :]
-            z_down = model.topdown_proj[ℓ - 1](z_down_prev)
+            z_down = model.topdown_proj[ℓ - 1](z_down_prev)  # type: ignore[attr-defined]
             μ_down = torch.cat([torch.zeros_like(z_conv[ℓ][:, :1, :]), z_down], dim=1)
         else:
             μ_down = torch.zeros_like(z_conv[ℓ])
@@ -128,6 +128,7 @@ def _kmeans_cosine(
         prob = torch.nan_to_num(prob, nan=1.0 / dists.size(0))
         centroids.append(points[torch.multinomial(prob, 1)].squeeze(0))  # [d]
     centroids = torch.stack(centroids)  # [k, d]
+    assignments = torch.zeros(points.size(0), dtype=torch.long, device=points.device)  # type: ignore[arg-type]
 
     for it in range(max_iter):
         # 余弦距离 = 1 - cosine_similarity
@@ -339,7 +340,6 @@ class AbstractionBank:
             info_gains.append(e.get("information_gain", 0.0))
 
         all_z = torch.cat(z_tops, dim=0)
-        hidden = all_z.size(-1)
         k = min(n_proto, all_z.size(0))
         if k < 1:
             return
@@ -461,7 +461,7 @@ class AbstractionBank:
             return None
 
         total_loss = 0.0
-        L = model.num_sub_layers
+        L = model.num_sub_layers  # type: ignore[attr-defined, operator]
 
         for _task_id, z_proto, proto_imp in proto_batch:
             # z_proto: [1, hidden] — 单个原型向量
@@ -470,7 +470,7 @@ class AbstractionBank:
 
             ℓ_loss = 0.0
             for ℓ in range(1, L + 1):
-                μ_bu = model.predict(ℓ, z_prev, pos_emb)  # [1, 1, hidden]
+                μ_bu = model.predict(ℓ, z_prev, pos_emb)  # type: ignore[attr-defined]  # [1, 1, hidden]
                 μ_bu_res = μ_bu + z_prev
 
                 # 单步时序 (t=1, 无 t-1, 所以 μ_temp = 0)
@@ -491,7 +491,7 @@ class AbstractionBank:
 
             total_loss += ℓ_loss
 
-        return total_loss / max(len(proto_batch), 1)
+        return total_loss / max(len(proto_batch), 1)  # type: ignore[return-type]
 
     # ── 序列级回放 (替代方案: 用原型重建伪序列) ─────────────────────
 
@@ -523,7 +523,7 @@ class AbstractionBank:
             return None
 
         total_loss = 0.0
-        L = model.num_sub_layers
+        L = model.num_sub_layers  # type: ignore[attr-defined, operator]
 
         for seq_idx in range(n_seq):
             start = seq_idx * seq_len
@@ -539,13 +539,13 @@ class AbstractionBank:
 
             for ℓ in range(1, L + 1):
                 # 自下而上: sublayer(z_{ℓ-1}) + residual
-                μ_bu = model.predict(ℓ, z_prev, pos_emb)
+                μ_bu = model.predict(ℓ, z_prev, pos_emb)  # type: ignore[attr-defined]
                 μ_bu_res = μ_bu + z_prev
 
                 # 时序: z_ℓ(t-1) → z_ℓ(t)
                 if seq_len > 1:
                     z_prev_t = pseudo_seq[:, :-1, :]
-                    z_temp = model.temporal_proj[ℓ - 1](z_prev_t)
+                    z_temp = model.temporal_proj[ℓ - 1](z_prev_t)  # type: ignore[attr-defined]
                     μ_temp = torch.cat([torch.zeros_like(pseudo_seq[:, :1, :]), z_temp], dim=1)
                 else:
                     μ_temp = torch.zeros_like(pseudo_seq)
@@ -553,7 +553,7 @@ class AbstractionBank:
                 # 自上而下: z_{ℓ+1}(t-1) → z_ℓ(t)
                 if ℓ < L and seq_len > 1:
                     z_down_prev = pseudo_seq[:, :-1, :]
-                    z_down = model.topdown_proj[ℓ - 1](z_down_prev)
+                    z_down = model.topdown_proj[ℓ - 1](z_down_prev)  # type: ignore[attr-defined]
                     μ_down = torch.cat([torch.zeros_like(pseudo_seq[:, :1, :]), z_down], dim=1)
                 else:
                     μ_down = torch.zeros_like(pseudo_seq)
@@ -572,7 +572,7 @@ class AbstractionBank:
 
             total_loss += ℓ_loss
 
-        return total_loss / max(n_seq, 1)
+        return total_loss / max(n_seq, 1)  # type: ignore[return-type]
 
     # ── 序列级回放（完整多层版本）─────────────────────────────────
 
@@ -588,7 +588,7 @@ class AbstractionBank:
         z_conv_exemplar: [13] × [1, seq, hidden] — 从 AbstractionBank 取出的一条 z 记录
         layer_importance: [12] — 每层精度
         """
-        L = model.num_sub_layers
+        L = model.num_sub_layers  # type: ignore[attr-defined, operator]
         total_loss = 0.0
 
         # 使用存储的 z_states 作为目标
@@ -600,13 +600,13 @@ class AbstractionBank:
             z_ℓ_minus_1 = z_targets[ℓ - 1]
 
             # 自下而上
-            μ_bu = model.predict(ℓ, z_ℓ_minus_1, pos_emb)
+            μ_bu = model.predict(ℓ, z_ℓ_minus_1, pos_emb)  # type: ignore[attr-defined]
             μ_bu_res = μ_bu + z_ℓ_minus_1
 
             # 时序
             if seq_len > 1:
                 z_prev_t = z_ℓ[:, :-1, :]
-                z_temp = model.temporal_proj[ℓ - 1](z_prev_t)
+                z_temp = model.temporal_proj[ℓ - 1](z_prev_t)  # type: ignore[attr-defined]
                 μ_temp = torch.cat([torch.zeros_like(z_ℓ[:, :1, :]), z_temp], dim=1)
             else:
                 μ_temp = torch.zeros_like(z_ℓ)
@@ -614,7 +614,7 @@ class AbstractionBank:
             # 自上而下
             if ℓ < L and seq_len > 1:
                 z_down_prev = z_targets[ℓ + 1][:, :-1, :]
-                z_down = model.topdown_proj[ℓ - 1](z_down_prev)
+                z_down = model.topdown_proj[ℓ - 1](z_down_prev)  # type: ignore[attr-defined]
                 μ_down = torch.cat([torch.zeros_like(z_ℓ[:, :1, :]), z_down], dim=1)
             else:
                 μ_down = torch.zeros_like(z_ℓ)
@@ -763,7 +763,6 @@ class VariationalReplayer:
         """
         # 用原型构建全 13 层表示: z_0..z_12
         # 对于局部 Conv 模型, 各层表示维度相同 = [1, 1, hidden]
-        hidden = prototype_z.size(-1)
         results = []
 
         for _ in range(n_variants):
@@ -774,7 +773,7 @@ class VariationalReplayer:
                 z_noised.append((prototype_z + noise).unsqueeze(0))
 
             # 从扰动后的 z 做 PC 推理
-            z_reconverged, errors_hist, F_hist, _ = self.model.spatiotemporal_infer(
+            z_reconverged, errors_hist, F_hist, _ = self.model.spatiotemporal_infer(  # type: ignore[attr-defined]
                 z_noised,
                 pos_emb,
                 gamma=gamma,
@@ -945,18 +944,16 @@ class AbstractionSniffer:
         n = min(n_samples, len(entries))
         idx = torch.randperm(len(entries))[:n].tolist()
 
-        proto_device = prototypes.device
         prototypes_norm = F.normalize(prototypes, dim=-1)  # [k, hidden]
 
         similarities = []
         wm_surprises = []
         for i in idx:
             entry = entries[i]
-            z_top_stored = entry["z_states"][-1]  # [1, seq, hidden]
 
             # 当前模型对同一样本重新 infer
             z_init = [z.clone().to(device) for z in entry["z_states"]]
-            z_reconv, _, _, _ = self.model.spatiotemporal_infer(
+            z_reconv, _, _, _ = self.model.spatiotemporal_infer(  # type: ignore[attr-defined]
                 z_init,
                 pos_emb,
                 gamma=0.1,
@@ -977,7 +974,7 @@ class AbstractionSniffer:
             # 世界模型 transition surprise
             if self.world_model is not None:
                 ctx = torch.zeros(1, self.world_model_context_dim, device=device)
-                _, uncertainty = self.world_model(z_current, ctx)
+                _, uncertainty = self.world_model(z_current, ctx)  # type: ignore[misc]
                 wm_surprises.append(uncertainty.mean().item())
 
         avg_sim = sum(similarities) / max(len(similarities), 1)
@@ -1050,7 +1047,7 @@ class AbstractionSniffer:
         # 返回原型 z 和重要性 (用于 replay_loss)
         # 注意: 这不是 byte 级回放, 而是表示级回放
         # 调用方应使用 bank.replay_loss() 而非 CE loss
-        return proto_batch
+        return proto_batch  # type: ignore[return-type]
 
     def get_drift_report(self) -> str:
         """生成漂移检测文本报告."""

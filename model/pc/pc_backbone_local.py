@@ -62,7 +62,7 @@ class CyreneBackbone(nn.Module):
         """
         # 双通道: [bsz, 2, seq] → causal pad(12,0) → fp16 conv → [bsz, seq, hidden]
         x = F.pad(byte_seq.half(), (12, 0))
-        h = F.conv1d(x, self.byte_proj.weight).transpose(1, 2)
+        h = F.conv1d(x, self.byte_proj.weight).transpose(1, 2)  # type: ignore[arg-type]
         hidden_states = [h]
 
         for block in self.layers:
@@ -71,7 +71,7 @@ class CyreneBackbone(nn.Module):
             d = block.dilation
             h = F.pad(block.input_layernorm(h), (0, 0, 2 * d, 0))
             h32 = F.conv1d(
-                h.transpose(1, 2),
+                h.transpose(1, 2),  # type: ignore[arg-type]
                 block.local_conv.weight,
                 bias=None, stride=1, padding=0, dilation=d, groups=1,
             ).transpose(1, 2)

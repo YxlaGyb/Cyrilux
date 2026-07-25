@@ -132,7 +132,7 @@ def run_phase1(model, task_paths, epochs, max_seq_len, batch_size,
     gamma_rpe = cfg.get('dopamine_gamma', 0.3)
 
     for i, path in enumerate(task_paths):
-        ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
+        ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)  # type: ignore[arg-type]
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
         total_steps = len(loader) * epochs
         gs = 0
@@ -223,7 +223,7 @@ def run_phase2(model, task_paths, epochs, max_seq_len, batch_size, max_samples, 
         if i == 0:
             # 第一个任务: 纯 Hebbian 训练 (无保护)
             print(f'\n--- [P2-{name}] {os.path.basename(path)} (首次, 无保护) ---')
-            ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
+            ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)  # type: ignore[arg-type]
             loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
             total_steps = len(loader) * epochs
             gs = 0
@@ -240,7 +240,7 @@ def run_phase2(model, task_paths, epochs, max_seq_len, batch_size, max_samples, 
         else:
             # 后续任务: 带 MemoryBank 回放 + Sniffer 保护
             print(f'\n--- [P2-{name}] {os.path.basename(path)} [回放保护中] ---')
-            ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
+            ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)  # type: ignore[arg-type]
             loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
             total_steps = len(loader) * epochs
             gs = 0
@@ -283,7 +283,7 @@ def run_phase2(model, task_paths, epochs, max_seq_len, batch_size, max_samples, 
 
         # 收集 exemplars → MemoryBank (每任务都做, 即使第一个任务)
         print(f'  [P2-{name}] 收集 exemplars → MemoryBank...')
-        ds_eval = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
+        ds_eval = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)  # type: ignore[arg-type]
         n_ex = min(n_exemplars, len(ds_eval))
         idx = torch.randperm(len(ds_eval))[:n_ex].tolist()
         samples_list, total_bl = [], 0.0

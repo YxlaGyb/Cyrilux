@@ -150,7 +150,7 @@ class CuriositySampler:
                 pos = self.model.get_position_embeddings(ctx.size(1), device)
 
                 logits, _ = self.model.forward_with_ce(ctx, None, pos)
-                logits = logits[:, -1, :]  # [1, vocab]
+                logits = logits[:, -1, :]  # type: ignore[index]  # [1, vocab]
                 logits = logits / self.temperature
 
                 if self.top_k > 0:
@@ -468,8 +468,8 @@ class AutonomousMind:
 
     def __init__(
         self,
-        model: "CyrenePC" = None,
-        lm_config: "CyreneConfig" = None,
+        model: Optional["CyrenePC"] = None,
+        lm_config: Optional["CyreneConfig"] = None,
         cfg: dict = None,
         log_callback: Callable = None,
     ):
@@ -698,7 +698,7 @@ class AutonomousMind:
             return
 
         z_detached = [z.detach() for z in z_init]
-        _, _, F_hist, F_pred, ε_list = self.model.spatiotemporal_infer(
+        _, _, F_hist, F_pred, ε_list = self.model.spatiotemporal_infer(  # type: ignore[assignment]
             z_detached,
             pos_emb,
             gamma=self.controller.current_gamma,
@@ -708,11 +708,11 @@ class AutonomousMind:
             return_ε=True,
         )
 
-        D = self.dopamine.update(F_pred.item())
+        D = self.dopamine.update(F_pred.item())  # type: ignore[union-attr]
         D = max(D, 0.01)
 
         # ── Hebbian 更新 ──
-        F_curr = F_pred.item()
+        F_curr = F_pred.item()  # type: ignore[union-attr]
         F_prev = (
             self._last_F
             if hasattr(self, "_last_F") and self._last_F is not None
@@ -766,7 +766,7 @@ class AutonomousMind:
         self.replay_buffer.add_batch(byte_seq.detach(), labels.detach(), D=D)
 
         ce_val = ce_loss.item()
-        F_val = F_pred.item()
+        F_val = F_pred.item()  # type: ignore[union-attr]
         self.controller.report_loss(ce_val)
 
         if self.total_steps % 10 == 0:
@@ -802,7 +802,7 @@ class AutonomousMind:
                 z_init, ce_loss = self.model.forward_with_ce(byte_seq, labels, pos_emb)
 
                 z_detached = [z.detach() for z in z_init]
-                _, _, _, F_pred, ε_list = self.model.spatiotemporal_infer(
+                _, _, _, F_pred, ε_list = self.model.spatiotemporal_infer(  # type: ignore[assignment]
                     z_detached,
                     pos_emb,
                     gamma=self.controller.current_gamma * 0.5,
@@ -812,11 +812,11 @@ class AutonomousMind:
                     return_ε=True,
                 )
 
-                D = self.dopamine.update(F_pred.item())
+                D = self.dopamine.update(F_pred.item())  # type: ignore[union-attr]
                 D = max(D, 0.01)
 
                 # ── Hebbian 更新 ──
-                F_curr = F_pred.item()
+                F_curr = F_pred.item()  # type: ignore[union-attr]
                 F_prev = (
                     self._last_F
                     if hasattr(self, "_last_F") and self._last_F is not None
@@ -852,7 +852,7 @@ class AutonomousMind:
                         dW_conv = compute_hebbian_conv(
                             ε_list[ℓ],
                             z_detached[ℓ],
-                            block.local_conv.weight,
+                            block.local_conv.weight,  # type: ignore[attr-defined]  # type: ignore[attr-defined]
                             block.dilation,
                             modulation,
                             base_lr,

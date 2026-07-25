@@ -61,7 +61,7 @@ class CheckpointCallback(CallbackBase):
 
     # ── 内部 ────────────────────────────────────────────────
 
-    def save_checkpoint(self, loop, path: str, epoch: int = 0, task_id: str = None):
+    def save_checkpoint(self, loop, path: str, epoch: int = 0, task_id: str | None = None):
         """保存检查点到磁盘."""
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         torch.save(self._build_ckpt(loop, epoch, task_id), path)

@@ -6,6 +6,8 @@ train
 import os
 from typing import Optional, List
 
+import torch
+
 import typer
 from pkg.cli.utils import resolve_path, load_config
 from model.core.globals import DEVICE_STR
@@ -122,7 +124,7 @@ def train_main(
         resolve_path(f.strip()) for f in data_files.split(",") if f.strip()
     ]
 
-    config = TrainingConfig(
+    config = TrainingConfig(  # type: ignore[call-arg]
         model_type=model_type,
         checkpoint_path=resolve_path(checkpoint) if checkpoint else None,
         hidden_size=hidden_size,
@@ -155,7 +157,7 @@ def train_main(
     for i, fp in enumerate(data_file_list):
         tid = f"task_{i}"
         ds = DualChannelDataset(
-            fp, max_length=max_seq_len, max_samples=subset if subset else None
+            fp, max_length=max_seq_len, max_samples=subset if subset else None  # type: ignore[arg-type]
         )
         task_pipelines.append((tid, ds))
 
@@ -180,7 +182,6 @@ def from_config(
     from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
 
-    device = ctx.obj.get("device", DEVICE_STR)
     cfg = load_config(config)
 
     model_cfg = cfg.get("model", {})
@@ -192,7 +193,7 @@ def from_config(
 
     data_file_list = [resolve_path(f) for f in data_cfg.get("data_files", [])]
 
-    config_obj = TrainingConfig(
+    config_obj = TrainingConfig(  # type: ignore[call-arg]
         model_type=model_cfg.get("model_type", "pc_unified"),
         checkpoint_path=model_cfg.get("checkpoint_path"),
         hidden_size=model_cfg.get("hidden_size", 256),
@@ -224,7 +225,7 @@ def from_config(
         ds = DualChannelDataset(
             fp,
             max_length=config_obj.max_seq_len,
-            max_samples=config_obj.subset if config_obj.subset else None,
+            max_samples=config_obj.subset if config_obj.subset else None,  # type: ignore[arg-type]
         )
         task_pipelines.append((tid, ds))
 
@@ -244,7 +245,6 @@ def resume(
     from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
 
-    device = ctx.obj.get("device", DEVICE_STR)
     ckpt_path = resolve_path(checkpoint)
 
     if not os.path.exists(ckpt_path):
@@ -255,7 +255,7 @@ def resume(
     out_dir = os.path.dirname(ckpt_path)
     out_name = os.path.basename(out_dir)
 
-    config = TrainingConfig(
+    config = TrainingConfig(  # type: ignore[call-arg]
         checkpoint_path=ckpt_path,
         out_dir=out_name,
         model_type="pc_unified",

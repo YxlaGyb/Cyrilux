@@ -147,6 +147,7 @@ class CudaTimer:
             bar = "█" * int(pct / 2) + "░" * (50 - int(pct / 2))
             parts.append((ms, pct, name, bar))
         parts.sort(key=lambda x: -x[0])
+        bar = ""
         print(f"\n{'=' * 70}")
         print(f"  GPU Timing Breakdown (avg over {PROFILE_STEPS} steps)")
         print(f"{'=' * 70}")
@@ -182,7 +183,7 @@ for _ in range(WARMUP_STEPS):
     # Phase 2: 推理 (T步)
     pos_emb = model.get_position_embeddings(SEQ_LEN, device)
     with torch.no_grad():
-        z_conv, errors_hist, F_hist, _, ε_list = model.spatiotemporal_infer(
+        z_conv, errors_hist, F_hist, _, ε_list = model.spatiotemporal_infer(  # type: ignore[assignment]
             z_init,
             pos_emb,
             gamma=cfg.gamma,
@@ -273,7 +274,7 @@ for step in range(PROFILE_STEPS):
         torch.sigmoid(torch.tensor(-uncertainty + cfg.hebbian_ach_beta_0)).item()
     )
     with torch.no_grad():
-        z_conv, errors_hist, F_hist, _, ε_list = model.spatiotemporal_infer(
+        z_conv, errors_hist, F_hist, _, ε_list = model.spatiotemporal_infer(  # type: ignore[assignment]
             z_init,
             pos_emb,
             gamma=cfg.gamma,
@@ -367,7 +368,7 @@ with torch.no_grad():
     z_init2 = model.init_z(byte_seq)
 pos_emb2 = model.get_position_embeddings(SEQ_LEN, device)
 with torch.no_grad():
-    z_conv2, _, F_hist2, _, ε_list2 = model.spatiotemporal_infer(
+    z_conv2, _, F_hist2, _, ε_list2 = model.spatiotemporal_infer(  # type: ignore[assignment]
         z_init2,
         pos_emb2,
         gamma=cfg.gamma,
@@ -433,7 +434,7 @@ for block_idx in range(6):
     compute_hebbian_conv(
         ε_list2[ℓ],
         z_init2[ℓ],
-        model.model.layers[block_idx].local_conv.weight,
+        model.model.layers[block_idx].local_conv.weight,  # type: ignore[attr-defined]
         model.model.layers[block_idx].dilation,
         mod2,
         cfg.hebbian_base_eta,
@@ -443,6 +444,9 @@ for block_idx in range(6):
     )
     timer2.end_last(label)
 
+target_onehot = F.one_hot(
+    labels[:, 1:].long().clamp(0, 255), num_classes=256
+).half()
 # swiglu — 逐层测
 for block_idx in range(6):
     label = f"swiglu (block {block_idx})"

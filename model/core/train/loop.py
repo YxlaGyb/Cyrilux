@@ -228,6 +228,7 @@ class TrainingLoop:
 
     def warmup(self):
         """预热: 用 dummy 数据跑一次前向."""
+        assert self.model is not None
         self.model.train()
         with torch.no_grad():
             dummy_byte = torch.randint(
@@ -332,6 +333,7 @@ class TrainingLoop:
 
         Returns: dict 同 train_step 格式
         """
+        assert self.model is not None
         # ── Phase 0: 数据准备 ──
         seq_len = byte_seq.size(-1)
         bsz = byte_seq.size(0)
@@ -367,7 +369,7 @@ class TrainingLoop:
         ACh = float(torch.sigmoid(torch.tensor(-uncertainty + self.cfg.hebbian_ach_beta_0)).item())
 
         with torch.no_grad():
-            z_conv, errors_hist, F_hist, _, ε_list = self.model.spatiotemporal_infer(
+            z_conv, errors_hist, F_hist, _, ε_list = self.model.spatiotemporal_infer(  # type: ignore[assignment]
                 z_init,
                 pos_emb,
                 gamma=self.cfg.gamma,
@@ -462,9 +464,9 @@ class TrainingLoop:
                 β = self.cfg.salience_reg_weight
                 η_gate = self.cfg.salience_gate_lr
                 for gate in self.model.salience_gates:
-                    gate_sig = torch.sigmoid(gate.logits)
+                    gate_sig = torch.sigmoid(gate.logits)  # type: ignore[attr-defined]
                     grad = -2.0 * β * (1.0 - gate_sig) * gate_sig * (1.0 - gate_sig)
-                    gate.logits -= η_gate * grad
+                    gate.logits -= η_gate * grad  # type: ignore[attr-defined]
 
         # ── Phase 6: 日志 + 诊断 ──
         self._last_F_bp = F_curr
@@ -638,6 +640,7 @@ class TrainingLoop:
         stride: int = 1,
     ):
         """对 (byte_seq, labels) 或预计算 z_init 执行纯 Hebbian 权重更新."""
+        assert self.model is not None
         if z_init is not None:
             seq_len = z_init[0].size(1)
         elif byte_seq is not None:
@@ -665,7 +668,7 @@ class TrainingLoop:
         uncertainty = compute_uncertainty(self._global_F_hist, window=10)
         ACh = float(torch.sigmoid(torch.tensor(-uncertainty + self.cfg.hebbian_ach_beta_0)).item())
         with torch.no_grad():
-            z_conv, errors_hist, _, _, ε_list = self.model.spatiotemporal_infer(
+            z_conv, errors_hist, _, _, ε_list = self.model.spatiotemporal_infer(  # type: ignore[assignment]
                 z_init,
                 pos_emb,
                 gamma=self.cfg.gamma,
@@ -870,7 +873,7 @@ class TrainingLoop:
 
         self._emit("on_fit_start")
 
-        for task_id, task_ds in task_pipelines:
+        for task_id, task_ds, _ in task_pipelines:
             self._current_task_id = task_id
 
             if isinstance(task_ds, DataLoader):
@@ -888,7 +891,7 @@ class TrainingLoop:
 
             # ── 8a+8b: novelty 加速 + WM reset ──
             if self.cfg.enable_world_model:
-                self._novelty_boost_steps = int(len(task_ds) * 0.05)
+                self._novelty_boost_steps = int(len(task_ds) * 0.05)  # type: ignore[arg-type]
                 self._novelty_surprise_injected = self.cfg.world_model_surprise_threshold * 2.0
                 if hasattr(self, "world_model") and self.world_model is not None:
                     self.world_model.reset_state()
@@ -902,7 +905,7 @@ class TrainingLoop:
 
             self._log(
                 "\n" + "=" * 60 + f"\nStarting Task {task_id}:"
-                f" {len(loader.dataset)} samples\n" + "=" * 60
+                f" {len(loader.dataset)} samples\n" + "=" * 60  # type: ignore[arg-type]
             )
             self._emit("on_task_start", task_id=task_id, task_dataset=task_ds)
 

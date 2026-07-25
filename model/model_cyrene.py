@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -35,7 +36,7 @@ class RMSNorm(torch.nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, config: CyreneConfig, intermediate_size: int = None):
+    def __init__(self, config: CyreneConfig, intermediate_size: Optional[int] = None):
         super().__init__()
         intermediate_size = intermediate_size or config.intermediate_size
         self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
