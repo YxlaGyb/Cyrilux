@@ -21,6 +21,11 @@ from .homeostasis import (
     grow_network,
     homeostasis_step,
 )
+from .sparse_projections import (
+    SparseTemporalSelf,
+    SparseTopdown,
+    SparseLMHead,
+)
 
 __all__ = [
     # neuron_pool
@@ -47,4 +52,8 @@ __all__ = [
     "should_grow",
     "grow_network",
     "homeostasis_step",
+    # sparse_projections
+    "SparseTemporalSelf",
+    "SparseTopdown",
+    "SparseLMHead",
 ]

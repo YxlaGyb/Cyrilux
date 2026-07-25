@@ -64,6 +64,7 @@ class Neuron:
     last_active: int = 0          # 最后一次发放的步数
     position: int = -1            # 对于 sensory neurons: 序列位置
     channel: int = -1             # 对于 sensory neurons: 特征通道
+    _z_prev: float = 0.0          # 上一步的 z (用于 temporal 预测)
 
 
 # ── 事件 ──────────────────────────────────────────────────────────

@@ -37,10 +37,13 @@ class SensoryEventQueue:
         self.max_size = max_size
         self._dropped: int = 0
 
-    def push_from_hlist(self, h_list: list[torch.Tensor],
-                        block_id_offset: int = 0,
-                        threshold: float = 0.0,
-                        top_k: int = 0) -> int:
+    def push_from_hlist(
+        self,
+        h_list: list[torch.Tensor],
+        block_id_offset: int = 0,
+        threshold: float = 0.0,
+        top_k: int = 0,
+    ) -> int:
         """将 SensoryFrontend 的 7 个 h_conv 张量展平为 SensoryEvent。
 
         Args:
@@ -196,9 +199,7 @@ class EventBridge:
     串联成一个完整流程。
     """
 
-    def __init__(self, pool: NeuronPool,
-                 sensory_threshold: float = 0.05,
-                 h_front: int = 64):
+    def __init__(self, pool: NeuronPool, sensory_threshold: float = 0.05, h_front: int = 64):
         self.pool = pool
         self.sensory_queue = SensoryEventQueue()
         self.network_queue = NetworkEventQueue()
@@ -215,8 +216,7 @@ class EventBridge:
         """设置 warmup 步数。warmup 期间所有事件都发送。"""
         self._warmup_remaining = warmup_steps
 
-    def ingest_hlist(self, h_list: list[torch.Tensor],
-                     top_k: int = 0) -> int:
+    def ingest_hlist(self, h_list: list[torch.Tensor], top_k: int = 0) -> int:
         """从 SensoryFrontend 输出推入感官事件。
 
         Args:
@@ -231,7 +231,9 @@ class EventBridge:
         t_k = 0 if is_warmup else top_k
 
         n = self.sensory_queue.push_from_hlist(
-            h_list, threshold=threshold, top_k=t_k,
+            h_list,
+            threshold=threshold,
+            top_k=t_k,
         )
         self._total_sensory_events += n
 
@@ -287,7 +289,10 @@ class EventBridge:
             处理的事件数。
         """
         from model.pc.sparse_forward import (
-            predict_neuron, update_neuron, hebbian_step, emit_if_active,
+            predict_neuron,
+            update_neuron,
+            hebbian_step,
+            emit_if_active,
         )
 
         events = self.network_queue.pop(max_events)
@@ -304,7 +309,8 @@ class EventBridge:
 
             # 如果该神经元也发放, 继续传播
             child_event = emit_if_active(
-                self.pool, ev.neuron_id,
+                self.pool,
+                ev.neuron_id,
                 current_time=self._step,
             )
             if child_event is not None:
@@ -315,9 +321,12 @@ class EventBridge:
 
         return n_processed
 
-    def step(self, h_list: Optional[list[torch.Tensor]] = None,
-             max_sensory_events: int = -1,
-             max_network_events: int = 5) -> dict:
+    def step(
+        self,
+        h_list: Optional[list[torch.Tensor]] = None,
+        max_sensory_events: int = -1,
+        max_network_events: int = 5,
+    ) -> dict:
         """执行一个完整的事件桥接步。
 
         Args:

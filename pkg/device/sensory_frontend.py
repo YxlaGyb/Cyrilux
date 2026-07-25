@@ -37,8 +37,9 @@ class SensoryConvBlock(nn.Module):
 
         # LN → causal dilated conv1d(k=3) → salience gate → residual
         self.norm = nn.LayerNorm(channels, eps=1e-5)  # 可重参数化为 RMSNorm
-        self.conv = nn.Conv1d(channels, channels, kernel_size=3,
-                              bias=False, dilation=dilation, padding=0)
+        self.conv = nn.Conv1d(
+            channels, channels, kernel_size=3, bias=False, dilation=dilation, padding=0
+        )
         self.gate = nn.Parameter(torch.full([channels], 5.0))  # σ(5)≈0.993 (全开)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
@@ -51,18 +52,18 @@ class SensoryConvBlock(nn.Module):
             h_out: [1, channels, S]
         """
         # Norm
-        h_t = h.transpose(1, 2)   # [1, S, C]
-        h_norm = self.norm(h_t)   # LayerNorm on last dim
+        h_t = h.transpose(1, 2)  # [1, S, C]
+        h_norm = self.norm(h_t)  # LayerNorm on last dim
         h_norm = h_norm.transpose(1, 2)  # [1, C, S]
 
         # Causal dilated conv1d (k=3, d=dilation)
         pad = 2 * self.dilation
-        h_pad = F.pad(h_norm, (pad, 0))   # pad left only (causal)
+        h_pad = F.pad(h_norm, (pad, 0))  # pad left only (causal)
 
         h_conv = self.conv(h_pad)
 
         # Salience gate: h * sigmoid(gate)
-        gate = torch.sigmoid(self.gate)    # [C]
+        gate = torch.sigmoid(self.gate)  # [C]
         h_gated = h_conv * gate.view(1, -1, 1)
 
         # Residual
@@ -82,20 +83,17 @@ class SensoryFrontend(nn.Module):
         dilations: 扩张率序列, 默认 (1, 2, 4, 8, 16, 32)
     """
 
-    def __init__(self, h_front: int = 64,
-                 dilations: Sequence[int] = (1, 2, 4, 8, 16, 32)):
+    def __init__(self, h_front: int = 64, dilations: Sequence[int] = (1, 2, 4, 8, 16, 32)):
         super().__init__()
         self.h_front = h_front
 
         # 字节投影: Conv1d(2 → H_front, k=13, causal, no bias)
-        self.byte_proj = nn.Conv1d(2, h_front, kernel_size=13,
-                                   padding=0, bias=False)
+        self.byte_proj = nn.Conv1d(2, h_front, kernel_size=13, padding=0, bias=False)
 
         # 6 层感官卷积 (无 MLP)
-        self.blocks = nn.ModuleList([
-            SensoryConvBlock(h_front, d, bid)
-            for bid, d in enumerate(dilations)
-        ])
+        self.blocks = nn.ModuleList(
+            [SensoryConvBlock(h_front, d, bid) for bid, d in enumerate(dilations)]
+        )
 
         # 本项目只使用 fp16
         self = self.half()
@@ -113,7 +111,7 @@ class SensoryFrontend(nn.Module):
         """
         # causal pad (12,0) for k=13
         x = F.pad(byte_seq, (12, 0))
-        h = self.byte_proj(x)   # [1, H_front, S]
+        h = self.byte_proj(x)  # [1, H_front, S]
 
         h_list = [h]
         for block in self.blocks:
@@ -134,9 +132,7 @@ class SensoryFrontend(nn.Module):
         """
         return self.forward(byte_seq)
 
-    def load_pretrained_conv_weights(self, state_dict: dict,
-                                     h_front: int,
-                                     old_h: int = 256):
+    def load_pretrained_conv_weights(self, state_dict: dict, h_front: int, old_h: int = 256):
         """从旧 CyreneBackbone checkpoint 加载 conv 权重。
 
         Args:
