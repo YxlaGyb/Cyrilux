@@ -123,13 +123,10 @@ def train_main(
         resolve_path(f.strip()) for f in data_files.split(",") if f.strip()
     ]
 
-    config = TrainingConfig(  # type: ignore[call-arg]
-        model_type=model_type,
+    config = TrainingConfig(
         checkpoint_path=resolve_path(checkpoint) if checkpoint else None,
         hidden_size=hidden_size,
         num_hidden_layers=num_hidden_layers,
-        data_files=data_file_list,
-        combined_training=combined_training,
         batch_size=batch_size,
         max_seq_len=max_seq_len,
         lr=lr,
@@ -137,18 +134,16 @@ def train_main(
         subset=subset,
         T_infer=T_infer,
         gamma=gamma,
-        enable_dopamine=enable_dopamine,
         dopamine_eta=dopamine_eta,
         dopamine_beta=dopamine_beta,
         dopamine_gamma=dopamine_gamma,
         out_dir=out_dir,
         save_interval=save_interval,
-        use_abstraction_bank=use_abstraction_bank,
     )
 
     print(
-        f"Phase 1 训练 — {config.model_type}  hidden={config.hidden_size}  "
-        f"layers={config.num_hidden_layers}  device={device}"
+        f"Phase 1 Training  hidden={config.hidden_size}  "
+        f"device={device}"
     )
 
     # 构建任务管道
@@ -192,13 +187,10 @@ def from_config(
 
     data_file_list = [resolve_path(f) for f in data_cfg.get("data_files", [])]
 
-    config_obj = TrainingConfig(  # type: ignore[call-arg]
-        model_type=model_cfg.get("model_type", "pc_unified"),
+    config_obj = TrainingConfig(
         checkpoint_path=model_cfg.get("checkpoint_path"),
         hidden_size=model_cfg.get("hidden_size", 256),
         num_hidden_layers=model_cfg.get("num_hidden_layers", 4),
-        data_files=data_file_list,
-        combined_training=data_cfg.get("combined_training", True),
         batch_size=batch_size or train_cfg.get("batch_size", 48),
         max_seq_len=train_cfg.get("max_seq_len", 128),
         lr=lr or train_cfg.get("lr", 3e-4),
@@ -206,13 +198,11 @@ def from_config(
         subset=train_cfg.get("subset", 0),
         T_infer=pc_cfg.get("T_infer", 1),
         gamma=pc_cfg.get("gamma", 0.1),
-        enable_dopamine=dop_cfg.get("enabled", True),
         dopamine_eta=dop_cfg.get("eta", 1.0),
         dopamine_beta=dop_cfg.get("beta", 0.5),
         dopamine_gamma=dop_cfg.get("gamma", 0.3),
         out_dir=out_cfg.get("out_dir", "out_pc_unified"),
         save_interval=out_cfg.get("save_interval", 500),
-        use_abstraction_bank=model_cfg.get("use_abstraction_bank", False),
     )
 
     print(f"从配置启动训练: {config}")
@@ -254,10 +244,9 @@ def resume(
     out_dir = os.path.dirname(ckpt_path)
     out_name = os.path.basename(out_dir)
 
-    config = TrainingConfig(  # type: ignore[call-arg]
+    config = TrainingConfig(
         checkpoint_path=ckpt_path,
         out_dir=out_name,
-        model_type="pc_unified",
         batch_size=batch_size,
         max_seq_len=max_seq_len,
     )

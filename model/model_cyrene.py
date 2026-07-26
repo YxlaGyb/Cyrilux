@@ -131,7 +131,6 @@ class CyreneModel:
 
         # lm_head 状态
         self._last_logits: list[float] | None = None
-        self._last_lm_loss: float = 0.0
         self._last_pred_byte: int = -1
 
         # warmup
@@ -427,13 +426,14 @@ class CyreneModel:
         return sum(n.ε**2 for n in self.pool.neurons.values())
 
     def _compute_lm(self) -> tuple[float, int]:
+        """计算 LM head 预测, 返回 (0.0, pred_byte). CE loss 由 evaluation 模块独立计算."""
+        last_pred = -1
         if self._top_layer > 0 and self.pool.layer_groups.get(self._top_layer):
             logits = self.lm_head.predict_logits(self.pool, self._top_layer)
             self._last_logits = logits
-            pred = max(range(256), key=lambda i: logits[i])
-            self._last_pred_byte = pred
-            self._last_lm_loss = 0.0
-        return self._last_lm_loss, self._last_pred_byte
+            last_pred = max(range(256), key=lambda i: logits[i])
+            self._last_pred_byte = last_pred
+        return 0.0, last_pred
 
     def _store_prev_z(self):
         for neuron in self.pool.neurons.values():
@@ -490,7 +490,6 @@ class CyreneModel:
             "modulation": self._last_modulation,
             "lm_head_stats": self.lm_head.get_stats() if self._top_layer > 0 else {},
             "last_pred_byte": self._last_pred_byte,
-            "last_lm_loss": self._last_lm_loss,
             "temporal_stats": self.temporal.get_stats() if self._top_layer > 0 else {},
             "topdown_connections": len(self.topdown),
         }

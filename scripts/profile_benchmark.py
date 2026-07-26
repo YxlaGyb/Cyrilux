@@ -1,10 +1,8 @@
 """CyreneModel 性能基准测试 — 字节级指标。
 
-指标是字节级, No token:
+指标:
   - steps/s  (step 吞吐)
   - bytes/s  (字节吞吐 = steps/s * seq_len)
-  - BPB      (bits-per-byte = CE_loss / ln(2))
-  - free_energy 收敛曲线
   - 延迟分布 (ms/step)
   - 不同神经元规模下的显存/内存占用
 
@@ -15,7 +13,6 @@
 
 from __future__ import annotations
 
-import math
 import time
 import tracemalloc
 from argparse import ArgumentParser
@@ -121,7 +118,7 @@ def main():
 
     if torch.cuda.is_available():
         print(f"Device: {torch.cuda.get_device_name()}  "
-              f"Mem: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f}GB")
+              f"Mem: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
 
     seq = _make_seq(args.seq_len)
     n_steps = args.steps
@@ -134,31 +131,14 @@ def main():
     print(f"               {tput['bytes_s']:.0f} bytes/s")
     print(f"               {tput['bytes_s'] * 8:.0f} bits/s")
 
-    # 2. BPB (用随机序列测 CE loss)
-    print("\n--- 2. bits-per-byte (随机序列) ---")
-    total_ce = 0.0
-    n_pos = 0
-    for pos in range(1, args.seq_len):
-        ctx = seq[:, :, :pos].contiguous()
-        if ctx.shape[-1] < 13:
-            continue
-        stats = model.step(ctx)
-        if not stats.get("warmup", True):
-            total_ce += stats.get("lm_loss", 0.0)
-            n_pos += 1
-    avg_ce = total_ce / max(n_pos, 1)
-    bpb = avg_ce / math.log(2)
-    print(f"  Mean CE:  {avg_ce:.4f}")
-    print(f"  BPB:      {bpb:.4f}")
-
-    # 3. 延迟分布
+    # 2. 延迟分布
     print("\n--- 3. 延迟分布 ---")
     lat = benchmark_latency(model, seq, 100)
     print(f"  mean={lat['mean_ms']:.3f}ms  median={lat['median_ms']:.3f}ms")
     print(f"  p90={lat['p90_ms']:.3f}ms  p99={lat['p99_ms']:.3f}ms")
     print(f"  min={lat['min_ms']:.3f}ms  max={lat['max_ms']:.3f}ms")
 
-    # 4. 内存 (仅 --all)
+    # 3. 内存 (仅 --all)
     if args.all:
         print("\n--- 4. 内存占用 (不同规模) ---")
         for m in benchmark_memory([64, 128, 256]):

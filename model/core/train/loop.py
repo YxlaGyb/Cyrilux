@@ -1,4 +1,5 @@
-"""TrainingLoop — 事件驱动, 纯局部 Hebbian, 零 autograd.
+"""TrainingLoop
+事件驱动, 纯局部 Hebbian, 零 autograd.
 
 CyreneModel.step() 内部已包含: 感官前端 -> 事件驱动传播 -> 自由能 ->
 D/ACh/pi 调制 -> Hebbian 更新. 训练循环仅负责数据注入 + 监控.
@@ -6,20 +7,16 @@ D/ACh/pi 调制 -> Hebbian 更新. 训练循环仅负责数据注入 + 监控.
 
 from __future__ import annotations
 
-import math
 import os
 from typing import Optional
 
 import torch
 from tqdm import tqdm
 
-from model.continual.hippocampus_buffer import HippocampusBuffer
 from pkg.utils.trainer_utils import setup_seed
 from model.model_cyrene import CyreneConfig, CyreneModel
 
 from .config import TrainingConfig
-
-_LOG2 = math.log(2)
 
 
 class TrainingLoop:
@@ -32,8 +29,6 @@ class TrainingLoop:
         self._last_stats: dict = {}
         self._last_F: float = float("inf")
         self._last_D: float = 0.5
-        self.hippocampus = HippocampusBuffer(capacity=200, min_info_gain=0.03)
-        self._icm_output: Optional[dict] = None
 
     def _setup_environment(self):
         setup_seed(self.cfg.seed)
@@ -55,6 +50,7 @@ class TrainingLoop:
             ach_beta_0=self.cfg.hebbian_ach_beta_0,
         )
         runner = CyreneModel(cfg)
+        runner.frontend = runner.frontend.to(self.device)
         runner.add_hidden_layer(
             n_neurons=min(self.cfg.hidden_size * 4, 512),
             from_layer=0,
@@ -122,9 +118,7 @@ class TrainingLoop:
 
     def train(
         self,
-        task_pipelines: list[
-            tuple[str, torch.utils.data.Dataset, Optional[torch.utils.data.DataLoader]]
-        ],
+        task_pipelines: list[tuple[str, torch.utils.data.Dataset]],
     ):
         out_dir = os.path.join(os.getcwd(), self.cfg.out_dir)
         os.makedirs(out_dir, exist_ok=True)
@@ -133,22 +127,21 @@ class TrainingLoop:
         self._log("CyreneModel training initialized")
         self.global_step = 0
 
-        for task_id, dataset, _loader_override in task_pipelines:
-            loader = (
-                _loader_override
-                if _loader_override is not None
-                else torch.utils.data.DataLoader(
-                    dataset,
-                    batch_size=self.cfg.batch_size,
-                    shuffle=True,
-                    num_workers=0,
-                )
+        max_steps = getattr(self.cfg, "max_steps", 0)
+        log_interval = getattr(self.cfg, "log_interval", 50)
+
+        for task_id, dataset in task_pipelines:
+            loader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=1,
+                shuffle=True,
+                num_workers=0,
             )
 
             for batch_idx, (byte_seq, labels) in enumerate(
                 tqdm(loader, desc=f"Task {task_id}")
             ):
-                if self.cfg.max_steps > 0 and batch_idx >= self.cfg.max_steps:
+                if max_steps > 0 and batch_idx >= max_steps:
                     break
                 self.global_step += 1
 
@@ -156,7 +149,7 @@ class TrainingLoop:
                 labels = labels.to(self.device)
                 self.train_step(byte_seq, labels)
 
-                if self.global_step % self.cfg.log_interval == 0:
+                if self.global_step % log_interval == 0:
                     self._log(f"[{self.global_step}] F={self._last_F:.1f}")
 
                 if self.global_step % self.cfg.save_interval == 0:

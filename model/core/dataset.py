@@ -36,11 +36,18 @@ class DualChannelDataset(Dataset):
                 raw_text, roles = self._extract_with_roles(sample)
                 byte_seq = raw_text.encode("utf-8")[:max_length]
                 padded = byte_seq.ljust(max_length, b"\x00")
-                byte_t = (
+                byte_raw = (
                     torch.frombuffer(bytearray(padded), dtype=torch.uint8)
                     .clone()
-                    .half()
                 )
+
+                # 标签先从原始字节提取 [0,255], padding 位置设为 -100
+                lbl = byte_raw.clone().long()
+                lbl[byte_raw == 0x00] = -100
+                self.label_tensors.append(lbl)
+
+                # 归一化: [0, 255] → [-1, 1] (与 ingest_stream/generate_text 一致)
+                byte_t = byte_raw.half().div_(128.0).sub_(1.0)
 
                 # 角色编码: 按字节偏移映射, padding 处填 0
                 role_t = torch.zeros(max_length, dtype=torch.float16)
@@ -52,10 +59,6 @@ class DualChannelDataset(Dataset):
 
                 dual_t = torch.stack([byte_t, role_t], dim=0)  # [2, max_length]
                 self.dual_tensors.append(dual_t)
-
-                lbl = byte_t.clone().long()
-                lbl[byte_t == 0x00] = -100
-                self.label_tensors.append(lbl)
 
     @staticmethod
     def _extract_with_roles(sample: dict) -> tuple[str, list]:

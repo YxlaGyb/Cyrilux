@@ -142,7 +142,7 @@ class ThreadedTrainer:
     def get_model(self):
         """获取训练后的模型 (供 Phase 2 使用)。"""
         if self._trained_loop:
-            return self._trained_loop.model
+            return self._trained_loop.runner
         return None
 
     def get_loop(self):
@@ -262,7 +262,7 @@ class ThreadedTrainer:
 
             self._trained_loop = loop
             self._final_state = {
-                "model": loop.model,
+                "model": loop.runner,
                 "config": self.config.to_dict(),
                 "steps": loop.global_step,
             }

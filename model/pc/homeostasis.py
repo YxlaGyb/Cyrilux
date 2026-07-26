@@ -18,9 +18,11 @@ from .neuron_pool import NeuronPool
 
 # ── 阈值调节 ──────────────────────────────────────────────────────
 
-def adjust_threshold(pool: NeuronPool, neuron_id: int,
-                     target_rate: float = 0.01,
-                     rate_eta: float = 0.001) -> float:
+def adjust_threshold(
+        pool: NeuronPool, neuron_id: int,
+        target_rate: float = 0.01,
+        rate_eta: float = 0.001
+    ) -> float:
     """调节单个神经元的发放阈值以实现目标活跃率。
 
     规则:

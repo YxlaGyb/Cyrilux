@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import heapq
 from collections import deque
-from typing import Optional
 
 import torch
 
