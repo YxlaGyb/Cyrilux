@@ -14,6 +14,7 @@ import torch
 from tqdm import tqdm
 
 from pkg.utils.trainer_utils import setup_seed
+from pkg.device.cuda import setup_cuda_device
 from model.model_cyrene import CyreneConfig, CyreneModel
 
 from .config import TrainingConfig
@@ -22,7 +23,7 @@ from .config import TrainingConfig
 class TrainingLoop:
     def __init__(self, config: TrainingConfig):
         self.cfg = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = setup_cuda_device()
         self._setup_environment()
         self.runner: Optional[CyreneModel] = None
         self.global_step = 0
@@ -32,10 +33,6 @@ class TrainingLoop:
 
     def _setup_environment(self):
         setup_seed(self.cfg.seed)
-        if self.device.type == "cuda":
-            torch.set_float32_matmul_precision("medium")
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.allow_tf32 = True
 
     def _log(self, message: str):
         if self.cfg.progress_callback:
@@ -111,9 +108,12 @@ class TrainingLoop:
             "n_synapses": (
                 self.runner.pool.get_total_synapses() if self.runner else 0
             ),
-            "temporal_connections": len(self.runner.temporal) if self.runner else 0,
-            "topdown_connections": len(self.runner.topdown) if self.runner else 0,
-            "lm_head_connections": len(self.runner.lm_head) if self.runner else 0,
+            "temporal_connections": (
+                int(self.runner.pool.t_connected.sum().item()) if self.runner else 0
+            ),
+            "topdown_connections": (
+                int(self.runner.pool.td_alive.sum().item()) if self.runner else 0
+            ),
         }
 
     def train(

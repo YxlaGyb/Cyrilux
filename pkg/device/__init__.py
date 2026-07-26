@@ -9,12 +9,11 @@ CPU 和 GPU 的所有设备代码集中于此。
 """
 
 from .sensory_frontend import SensoryConvBlock, SensoryFrontend
-from .event_bridge import EventBridge, SensoryEventQueue, NetworkEventQueue
+from .event_bridge import EventBridge, SensoryEventBatch
 
 __all__ = [
     "SensoryConvBlock",
     "SensoryFrontend",
     "EventBridge",
-    "SensoryEventQueue",
-    "NetworkEventQueue",
+    "SensoryEventBatch",
 ]
