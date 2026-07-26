@@ -47,11 +47,3 @@ byte_proj(Conv1D 2→H, k=13, causal) → 6× LocalConvBlock (dilation 1→32, R
 ## 硬规则
 
 CLAUDE.md
-
----
-
-## 参考指令文件
-
-- `CLAUDE.md` — 主代理指令 (fp16 规则、架构守则、沟通偏好)
-- `.github/instructions/专业术语.instructions.md` — 领域术语规范
-- `.github/instructions/工具.instructions.md` — 工具链规范 (uv/ruff/git)

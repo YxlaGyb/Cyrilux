@@ -67,7 +67,9 @@ class TrainingLoop:
 
     def train_step(self, byte_seq: torch.Tensor, labels: torch.Tensor) -> dict:
         assert self.runner is not None
-        stats = self.runner.step(byte_seq)
+        # labels 是 [1, S] tensor, 取首个非 padding 字节作为 target
+        target = int(labels[0, 0].item()) if labels.numel() > 0 else -1
+        stats = self.runner.step(byte_seq, target_byte=target)
         F_curr = stats.get("free_energy", 0.0)
         D = stats.get("D", 0.5)
         modulation = stats.get("modulation", 0.5)

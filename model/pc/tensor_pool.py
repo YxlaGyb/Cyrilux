@@ -92,8 +92,8 @@ class TensorNeuronPool:
         self.in_ptrs = torch.full((max_neurons, K), -1, dtype=torch.int32, device=self.device)
         self.out_ptrs = torch.full((max_neurons, K), -1, dtype=torch.int32, device=self.device)
         # 每神经元当前连接数 (CPU 侧辅助, 用于快速找到空槽)
-        self._in_counts = torch.zeros(max_neurons, dtype=torch.int32)
-        self._out_counts = torch.zeros(max_neurons, dtype=torch.int32)
+        self._in_counts = torch.zeros(max_neurons, dtype=torch.int32, device=self.device)
+        self._out_counts = torch.zeros(max_neurons, dtype=torch.int32, device=self.device)
 
         # ── 时序投影 ──
         self.t_weight = torch.zeros(max_neurons, dtype=torch.float16, device=self.device)
@@ -195,7 +195,9 @@ class TensorNeuronPool:
         # 确保有空槽
         while len(self._free_neurons) < n_create:
             if not self._force_recycle():
-                raise RuntimeError(f"TensorNeuronPool 空间不足: 需要 {n_create}, 仅 {len(self._free_neurons)} 空槽")
+                raise RuntimeError(
+                    f"TensorNeuronPool 空间不足: 需要 {n_create}, 仅 {len(self._free_neurons)} 空槽"
+                )
 
         nids = [self._free_neurons.pop() for _ in range(n_create)]
         nids_t = torch.tensor(nids, dtype=torch.int32, device=self.device)
@@ -532,9 +534,10 @@ class TensorNeuronPool:
     # ═══════════════════════════════════════════════════════════════
 
     def predict_all(self) -> None:
-        """全网 scatter-add 预测: mu = scatter_add(weight * z[pre], post).
+        """全网 scatter-add 预测: mu = 1/sqrt(K) * scatter_add(weight * z_pre, post).
 
-        结果写入 state[:, F_MU] 和 state[:, F_EPS].
+        1/sqrt(K) 缩放防止 fp16 溢出 (K = 入连接数).
+        写入 state[:, F_MU] 和 state[:, F_EPS].
         """
         alive_syn = self.syn_alive
         if not alive_syn.any():
@@ -546,13 +549,27 @@ class TensorNeuronPool:
         w = self.weight[syn_mask]
         z_pre = self.state[pre.long(), F_Z]
 
+        # z_pre RMSNorm (投影前归一化, 防止上游激活值爆炸)
+        rms = (z_pre * z_pre).mean().sqrt()
+        rms = rms + 1e-6
+        z_pre = z_pre / rms
+
         contrib = w * z_pre
         mu = torch.zeros(self.N, dtype=torch.float16, device=self.device)
         mu.scatter_add_(0, post.long(), contrib)
 
+        # 1/sqrt(K) 缩放 (K = 每神经元入连接数)
         alive = self.alive
-        self.state[alive, F_MU] = mu[alive]
+        fan_in = (self.in_ptrs[alive] >= 0).sum(dim=-1, keepdim=True).to(torch.float16)
+        scale = torch.rsqrt(fan_in + 1e-6)
+        self.state[alive, F_MU] = mu[alive] * scale.squeeze(-1)
         self.state[alive, F_EPS] = self.state[alive, F_Z] - self.state[alive, F_MU]
+
+        # 非感官层神经元: z 跟踪 mu (无直接感官输入, z_min = mu)
+        non_sensory = alive & (self.layer > 0)
+        if non_sensory.any():
+            self.state[non_sensory, F_Z] = self.state[non_sensory, F_MU]
+            self.state[non_sensory, F_EPS] = 0.0
 
     def predict_neurons(self, nids: torch.Tensor) -> torch.Tensor:
         """批量预测指定神经元的 mu.
@@ -827,6 +844,15 @@ class TensorNeuronPool:
 
         return float(dw.abs().sum().item())
 
+    def adjust_thresholds(self, target_rate: float = 0.01, rate_eta: float = 0.01):
+        """每步阈值调节 (稳态 homeostatic plasticity)."""
+        alive = self.alive
+        if alive.any():
+            delta = rate_eta * (self.state[alive, F_FIRING_RATE] - target_rate)
+            self.state[alive, F_THRESHOLD] = torch.clamp(
+                self.state[alive, F_THRESHOLD] + delta, min=1e-4
+            )
+
     def homeostasis_step(
         self,
         current_step: int,
@@ -838,33 +864,33 @@ class TensorNeuronPool:
         max_grow: int = 2,
         max_inactive: int = 1000,
     ) -> dict:
-        """完整稳态维护步.
+        """周期性维护: 修剪 + 生长 (阈值调节已移至每步 adjust_thresholds).
 
         Returns:
             {action: count} 统计字典.
         """
-        stats: dict = {}
+        stats: dict = {"threshold_adjusted": 0}
 
-        # 1. 阈值调节 (全部存活神经元)
         alive = self.alive
-        if alive.any():
-            delta = rate_eta * (self.state[alive, F_FIRING_RATE] - target_rate)
-            self.state[alive, F_THRESHOLD] = torch.clamp(
-                self.state[alive, F_THRESHOLD] + delta, min=1e-4
-            )
-        stats["threshold_adjusted"] = int(alive.sum().item())
 
-        # 2. 修剪
+        # 1. 修剪 (包含孤儿检查 + 不活跃检查)
         if current_step % prune_interval == 0:
             alive_ids = torch.where(alive)[0]
             age = current_step - self.created_at[alive_ids]
             inactive_for = current_step - self.last_active[alive_ids]
+            in_counts = self._in_counts[alive_ids]
 
-            prune_mask = (
+            # 隐藏层神经元需要更长 min_age
+            layer_of_alive = self.layer[alive_ids]
+            min_age = torch.where(layer_of_alive > 0, 500, 100)
+
+            orphan_mask = (in_counts == 0) & (age > 500)  # 孤儿: 无入连接且活了很久
+            inactive_mask = (
                 (inactive_for > max_inactive)
                 & (self.state[alive_ids, F_FIRING_RATE] < 0.001)
-                & (age > 100)
+                & (age > min_age)
             )
+            prune_mask = (orphan_mask | inactive_mask)
             candidates = alive_ids[prune_mask][:max_prune]
             for nid in candidates.tolist():
                 self.prune_neuron(int(nid))
@@ -872,7 +898,7 @@ class TensorNeuronPool:
         else:
             stats["pruned"] = 0
 
-        # 3. 生长 (分裂高误差神经元)
+        # 2. 生长 (分裂高误差神经元)
         if current_step % grow_interval == 0:
             alive_ids = torch.where(alive)[0]
             high_err = self.state[alive_ids, F_EPS].abs() > self.state[alive_ids, F_THRESHOLD] * 3.0
@@ -1125,7 +1151,9 @@ class TensorNeuronPool:
         self._sensory_index.clear()
         for nid in torch.where(self.alive & (self.position >= 0))[0].tolist():
             self._sensory_index[
-                    (int(self.layer[nid].item()), 
-                    int(self.position[nid].item()), 
-                    int(self.channel[nid].item()))
-                ] = nid
+                (
+                    int(self.layer[nid].item()),
+                    int(self.position[nid].item()),
+                    int(self.channel[nid].item()),
+                )
+            ] = nid

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass, fields
 from typing import Callable
 
@@ -99,6 +100,7 @@ class CyreneModel:
         self._step: int = 0
         self._top_layer: int = 0
         self._hidden_layer_created: bool = False
+        self._pending_connect: tuple | None = None
         self._free_energy_history: list[float] = []
 
         # 神经调制状态
@@ -145,12 +147,16 @@ class CyreneModel:
         to_layer: int = 7,
         connection_density: float = 0.2,
     ):
-        """添加隐藏层: 创建神经元, 建立感官→隐藏连接, 分配时序投影."""
+        """添加隐藏层: 创建神经元, 分配时序投影.
+
+        连接延迟到 warmup 后 (感官神经元届时已存在).
+        """
         nids = [self.pool.create_neuron(layer=to_layer) for _ in range(n_neurons)]
-        self.pool.connect_layer(from_layer, to_layer, connection_density)
         self.pool.temporal_connect(nids)
         self._top_layer = max(self._top_layer, to_layer)
         self._hidden_layer_created = True
+        # 延迟连接: warmup 结束后触发
+        self._pending_connect = (from_layer, to_layer, connection_density)
 
     # ═══════════════════════════════════════════════════════════════
     # 显式阶段方法
@@ -178,7 +184,8 @@ class CyreneModel:
             return 0
 
         E = len(events)
-        max_ev = 500
+        is_warmup_now = self._step <= self.config.warmup_steps
+        max_ev = 2000 if is_warmup_now else 500
         if E > max_ev:
             events = SensoryEventBatch(
                 pos=events.pos[:max_ev],
@@ -218,6 +225,16 @@ class CyreneModel:
                 channels=new_channels,
                 thresholds=[0.05] * n_unmatched,
             )
+            # 动态连接新感官神经元到隐藏层
+            if self._top_layer > 0 and not self._pending_connect:
+                hidden_nids = self.pool.get_neurons_by_layer(self._top_layer)
+                if len(hidden_nids) > 0:
+                    h_list = hidden_nids.tolist()
+                    for snid in new_nids:
+                        k = max(1, int(len(h_list) * 0.2))
+                        sampled = random.sample(h_list, min(k, len(h_list)))
+                        for hnid in sampled:
+                            self.pool.create_synapse(snid, hnid)
         else:
             new_nids = []
 
@@ -245,8 +262,9 @@ class CyreneModel:
 
     @torch.inference_mode()
     def predict_pass(self):
-        """Stage 5: 时序 + 自上而下预测."""
+        """Stage 5: 前馈预测 + 时序 + 自上而下预测."""
         self._fire("before_predict")
+        self.pool.predict_all()  # 前馈: sensory → hidden
         self.pool.temporal_topdown_pass(self._top_layer)
         self._fire("after_predict")
 
@@ -319,17 +337,27 @@ class CyreneModel:
     # ═══════════════════════════════════════════════════════════════
 
     @torch.inference_mode()
-    def step(self, byte_seq: torch.Tensor) -> dict:
+    def step(self, byte_seq: torch.Tensor, target_byte: int = -1) -> dict:
         """执行一个完整步.
 
         Args:
             byte_seq: [1, 2, S] fp16 双通道字节编码
+            target_byte: 目标字节 (0..255), -1 = 无监督信号
 
         Returns:
             统计字典.
         """
         self._step += 1
         is_warmup = self._step <= self.config.warmup_steps
+
+        # warmup 结束后触发延迟连接
+        if not is_warmup and self._pending_connect is not None:
+            from_l, to_l, density = self._pending_connect
+            n_conn = self.pool.connect_layer(from_l, to_l, density)
+            self._pending_connect = None
+            # 确保 LM head 连接
+            if self._top_layer > 0:
+                self.pool.lm_ensure_top_connected(self._top_layer)
 
         self._fire("before_step", byte_seq=byte_seq)
 
@@ -345,6 +373,9 @@ class CyreneModel:
         if active.shape[0] > 0:
             self.bridge.push_network_events(active, self.pool.state[active.long(), 2])
 
+        # 每步阈值调节 (不管 homeostasis 间隔, 强反馈压制过度发放)
+        self.pool.adjust_thresholds(target_rate=0.01, rate_eta=0.05)
+
         hs_stats: dict = {}
         if self._step % self.config.homeostasis_interval == 0:
             hs_stats = self.homeostasis_pass()
@@ -352,6 +383,13 @@ class CyreneModel:
         if not is_warmup and free_energy > 1e-8:
             self.modulate(free_energy)
             self.hebbian_pass(self._last_modulation)
+            # LM head Hebbian (仅当有监督信号时)
+            if target_byte >= 0 and self._top_layer > 0:
+                self.pool.hebbian_lm_head(
+                    self._top_layer, target_byte,
+                    eta=self.config.hebbian_base_eta * 0.3,
+                    dopamine=self._last_modulation,
+                )
 
         uncertainty = (
             0.5
