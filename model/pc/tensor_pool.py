@@ -32,6 +32,8 @@ import random
 
 import torch
 
+from .page_storage import PAGE_NEURONS, PAGE_SYNAPSES, MemoryBudgetError, PageStorage
+
 
 # ── 神经元状态列索引 ─────────────────────────────────────────────────
 F_Z = 0
@@ -57,64 +59,58 @@ class TensorNeuronPool:
 
     def __init__(
         self,
-        max_neurons: int = 65536,
-        max_synapses: int = 8_000_000,
         K: int = 128,
-        S_td: int = 5_000_000,
         device: torch.device | str = "cpu",
+        max_memory_bytes: int = 2_147_483_648,
+        initial_neurons: int = PAGE_NEURONS,
+        initial_synapses: int = PAGE_SYNAPSES,
     ):
-        self.N = max_neurons
-        self.S = max_synapses
         self.K = K
-        self.S_td = S_td
         self.device = torch.device(device) if isinstance(device, str) else device
+        self._max_memory_bytes = max_memory_bytes
 
-        # ── 神经元张量 ──
-        self.state = torch.zeros(
-            max_neurons, N_STATE_FIELDS, dtype=torch.float16, device=self.device
+        # ── 页式存储 (对外暴露所有张量属性) ──
+        self._storage = PageStorage(
+            device=self.device,
+            max_memory_bytes=max_memory_bytes,
+            initial_neurons=initial_neurons,
+            initial_synapses=initial_synapses,
         )
-        self.layer = torch.full((max_neurons,), -1, dtype=torch.int16, device=self.device)
-        self.position = torch.full((max_neurons,), -1, dtype=torch.int16, device=self.device)
-        self.channel = torch.full((max_neurons,), -1, dtype=torch.int16, device=self.device)
-        self.created_at = torch.zeros(max_neurons, dtype=torch.int32, device=self.device)
-        self.last_active = torch.zeros(max_neurons, dtype=torch.int32, device=self.device)
-        self.alive = torch.zeros(max_neurons, dtype=torch.bool, device=self.device)
 
-        # ── 突触张量 ──
-        self.pre_id = torch.zeros(max_synapses, dtype=torch.int32, device=self.device)
-        self.post_id = torch.zeros(max_synapses, dtype=torch.int32, device=self.device)
-        self.weight = torch.zeros(max_synapses, dtype=torch.float16, device=self.device)
-        self.trace = torch.zeros(max_synapses, dtype=torch.float16, device=self.device)
-        self.syn_age = torch.zeros(max_synapses, dtype=torch.int32, device=self.device)
-        self.syn_alive = torch.zeros(max_synapses, dtype=torch.bool, device=self.device)
+        # ── 张量属性 (从 _storage 直接引用, 扩容时 _storage 会更新引用) ──
+        self.state = self._storage.state
+        self.layer = self._storage.layer
+        self.position = self._storage.position
+        self.channel = self._storage.channel
+        self.created_at = self._storage.created_at
+        self.last_active = self._storage.last_active
+        self.alive = self._storage.alive
+        self.pre_id = self._storage.pre_id
+        self.post_id = self._storage.post_id
+        self.weight = self._storage.weight
+        self.trace = self._storage.trace
+        self.syn_age = self._storage.syn_age
+        self.syn_alive = self._storage.syn_alive
+        self.in_ptrs = self._storage.in_ptrs
+        self.out_ptrs = self._storage.out_ptrs
+        self._in_counts = self._storage._in_counts
+        self._out_counts = self._storage._out_counts
+        self.t_weight = self._storage.t_weight
+        self.t_connected = self._storage.t_connected
+        self.td_pre = self._storage.td_pre
+        self.td_post = self._storage.td_post
+        self.td_weight = self._storage.td_weight
+        self.td_alive = self._storage.td_alive
+        self.lm_weight = self._storage.lm_weight
 
-        # ── 邻接表 (pad -1 表示空槽) ──
-        self.in_ptrs = torch.full((max_neurons, K), -1, dtype=torch.int32, device=self.device)
-        self.out_ptrs = torch.full((max_neurons, K), -1, dtype=torch.int32, device=self.device)
-        # 每神经元当前连接数 (CPU 侧辅助, 用于快速找到空槽)
-        self._in_counts = torch.zeros(max_neurons, dtype=torch.int32)
-        self._out_counts = torch.zeros(max_neurons, dtype=torch.int32)
+        # ── 容量属性 (代理到 _storage) ──
+        self._free_neurons: list[int] = self._storage._free_neurons
+        self._free_synapses: list[int] = self._storage._free_synapses
 
-        # ── 时序投影 ──
-        self.t_weight = torch.zeros(max_neurons, dtype=torch.float16, device=self.device)
-        self.t_connected = torch.zeros(max_neurons, dtype=torch.bool, device=self.device)
-
-        # ── 自上而下投影 (COO) ──
-        self.td_pre = torch.zeros(S_td, dtype=torch.int32, device=self.device)
-        self.td_post = torch.zeros(S_td, dtype=torch.int32, device=self.device)
-        self.td_weight = torch.zeros(S_td, dtype=torch.float16, device=self.device)
-        self.td_alive = torch.zeros(S_td, dtype=torch.bool, device=self.device)
+        # ── 状态 ──
         self._td_count: int = 0
-
-        # ── LM Head (稠密 [256, N], 32MB) ──
-        self.lm_weight = torch.zeros(256, max_neurons, dtype=torch.float16, device=self.device)
-
-        # ── CPU 侧辅助 ──
-        self._free_neurons: list[int] = list(range(max_neurons))
-        self._free_synapses: list[int] = list(range(max_synapses))
         self._occupied_neurons: int = 0
         self._occupied_synapses: int = 0
-        # 感官神经元 hash 索引: (layer, position, channel) → nid
         self._sensory_index: dict[tuple[int, int, int], int] = {}
 
         # 统计
@@ -122,6 +118,51 @@ class TensorNeuronPool:
         self._total_pruned: int = 0
         self._total_syn_created: int = 0
         self._total_syn_pruned: int = 0
+
+    # ═══════════════════════════════════════════════════════════════
+    # 容量属性 (代理到 PageStorage)
+    # ═══════════════════════════════════════════════════════════════
+
+    @property
+    def N(self) -> int:
+        return self._storage.N
+
+    @property
+    def S(self) -> int:
+        return self._storage.S
+
+    @property
+    def S_td(self) -> int:
+        return self._storage.S_td
+
+    def _sync_storage_refs(self):
+        """扩容后刷新张量引用 (_storage 可能已分配新 tensor)."""
+        self.state = self._storage.state
+        self.layer = self._storage.layer
+        self.position = self._storage.position
+        self.channel = self._storage.channel
+        self.created_at = self._storage.created_at
+        self.last_active = self._storage.last_active
+        self.alive = self._storage.alive
+        self.pre_id = self._storage.pre_id
+        self.post_id = self._storage.post_id
+        self.weight = self._storage.weight
+        self.trace = self._storage.trace
+        self.syn_age = self._storage.syn_age
+        self.syn_alive = self._storage.syn_alive
+        self.in_ptrs = self._storage.in_ptrs
+        self.out_ptrs = self._storage.out_ptrs
+        self._in_counts = self._storage._in_counts
+        self._out_counts = self._storage._out_counts
+        self.t_weight = self._storage.t_weight
+        self.t_connected = self._storage.t_connected
+        self.td_pre = self._storage.td_pre
+        self.td_post = self._storage.td_post
+        self.td_weight = self._storage.td_weight
+        self.td_alive = self._storage.td_alive
+        self.lm_weight = self._storage.lm_weight
+        self._free_neurons = self._storage._free_neurons
+        self._free_synapses = self._storage._free_synapses
 
     # ═══════════════════════════════════════════════════════════════
     # 结构操作 (CPU 侧)
@@ -137,11 +178,8 @@ class TensorNeuronPool:
         Returns:
             神经元索引 (0..N-1).
         """
-        if not self._free_neurons:
-            if not self._force_recycle():
-                raise RuntimeError(f"TensorNeuronPool 已达上限 {self.N}, 无法回收")
-
-        nid = self._free_neurons.pop()
+        nid = self._storage.alloc_neuron_slot()
+        self._sync_storage_refs()
         self.alive[nid] = True
         self.layer[nid] = layer
         self._occupied_neurons += 1
@@ -192,27 +230,28 @@ class TensorNeuronPool:
         if n_create == 0:
             return []
 
-        # 确保有空槽 (批量回收最久未活跃神经元, 避免逐元素 GPU sync)
-        while len(self._free_neurons) < n_create:
-            alive_ids = torch.where(self.alive)[0]
-            if len(alive_ids) == 0:
-                raise RuntimeError(
-                    f"TensorNeuronPool 空间不足: 需要 {n_create}, 无存活神经元可回收"
-                )
-            need = n_create - len(self._free_neurons)
-            """
-            一次 topk 找到最旧的 N 个神经元
-            逐个 prune (prune 本身有 .item() 但远少于 2000 次全扫描)
-            """
-            k = min(need, len(alive_ids))
-            _, oldest_rel = torch.topk(self.last_active[alive_ids], k, largest=False)
-            oldest_nids = alive_ids[oldest_rel]
-            for nid_val in oldest_nids.tolist():
-                self.prune_neuron(int(nid_val))
-                if len(self._free_neurons) >= n_create:
-                    break
-
-        nids = [self._free_neurons.pop() for _ in range(n_create)]
+        # 确保有空槽: 逐个分配 (PageStorage 内部处理扩容)
+        nids = []
+        while len(nids) < n_create:
+            try:
+                nids.append(self._storage.alloc_neuron_slot())
+            except MemoryBudgetError:
+                # 预算耗尽: 回收最旧神经元腾空间
+                alive_ids = torch.where(self.alive)[0]
+                if len(alive_ids) == 0:
+                    raise RuntimeError(f"TensorNeuronPool 内存预算耗尽, 且无存活神经元可回收")
+                need = n_create - len(nids)
+                k = min(need, len(alive_ids))
+                _, oldest_rel = torch.topk(self.last_active[alive_ids], k, largest=False)
+                for nid_val in alive_ids[oldest_rel].tolist():
+                    self.prune_neuron(int(nid_val))
+                    try:
+                        nids.append(self._storage.alloc_neuron_slot())
+                    except MemoryBudgetError:
+                        continue
+                    if len(nids) >= n_create:
+                        break
+        self._sync_storage_refs()
         nids_t = torch.tensor(nids, dtype=torch.int32, device=self.device)
 
         # 批量写入 alive 和 layer
@@ -261,14 +300,15 @@ class TensorNeuronPool:
         Returns:
             突触索引 (0..S-1).
         """
-        if not self._free_synapses:
-            # 扩展: 在可用槽位中找未使用的位置
+        try:
+            sid = self._storage.alloc_synapse_slot()
+        except MemoryBudgetError:
+            # 预算耗尽: 搜索死槽位
             dead = torch.where(~self.syn_alive)[0]
             if len(dead) == 0:
-                raise RuntimeError(f"TensorNeuronPool 突触已达上限 {self.S}")
+                raise RuntimeError(f"TensorNeuronPool 突触内存预算耗尽, 无死槽位可回收")
             sid = int(dead[0].item())
-        else:
-            sid = self._free_synapses.pop()
+        self._sync_storage_refs()
 
         if weight is None:
             fan_in = max(1, int(self._in_counts[pre].item()) + 1)
@@ -318,14 +358,18 @@ class TensorNeuronPool:
         if n == 0:
             return 0
 
-        # 分配槽位
-        while len(self._free_synapses) < n:
-            dead = torch.where(~self.syn_alive)[0]
-            if len(dead) == 0:
-                raise RuntimeError(f"突触槽位不足: 需要 {n}")
-            self._free_synapses.extend(dead[: n - len(self._free_synapses)].tolist())
-
-        sids = [self._free_synapses.pop() for _ in range(n)]
+        # 分配槽位 (PageStorage 内部处理扩容)
+        sids = []
+        while len(sids) < n:
+            try:
+                sids.append(self._storage.alloc_synapse_slot())
+            except MemoryBudgetError:
+                dead = torch.where(~self.syn_alive)[0]
+                if len(dead) == 0:
+                    raise RuntimeError(f"突触内存预算耗尽: 需要 {n}")
+                for d in dead[: n - len(sids)].tolist():
+                    sids.append(int(d))
+        self._sync_storage_refs()
         sids_t = torch.tensor(sids, dtype=torch.int32, device=self.device)
 
         # 批量写入突触数据
@@ -406,22 +450,22 @@ class TensorNeuronPool:
         self.alive[nid] = False
         self.layer[nid] = -1
         self._occupied_neurons -= 1
-        self._free_neurons.append(nid)
+        self._storage.free_neuron_slot(nid)
 
-        # 惰性删除关联突触 (回收槽位到 _free_synapses)
+        # 惰性删除关联突触
         in_c = int(self._in_counts[nid].item())
         for i in range(min(in_c, self.K)):
             sid = int(self.in_ptrs[nid, i].item())
             if sid >= 0:
                 self.syn_alive[sid] = False
-                self._free_synapses.append(sid)
+                self._storage.free_synapse_slot(sid)
                 self._occupied_synapses -= 1
         out_c = int(self._out_counts[nid].item())
         for i in range(min(out_c, self.K)):
             sid = int(self.out_ptrs[nid, i].item())
             if sid >= 0:
                 self.syn_alive[sid] = False
-                self._free_synapses.append(sid)
+                self._storage.free_synapse_slot(sid)
                 self._occupied_synapses -= 1
 
         # 重置邻接计数
@@ -693,7 +737,7 @@ class TensorNeuronPool:
         if non_sensory.any():
             z_old = self.state[non_sensory, F_Z]
             mu_ns = self.state[non_sensory, F_MU]
-            z_new = 0.5 * z_old + 0.5 * mu_ns  # 50%历史 + 50%当前输入 → 可区分不同输入
+            z_new = 0.3 * z_old + 0.7 * mu_ns  # 30%历史 + 70%当前输入 → z 紧跟 mu 变化
 
             # 微小噪声打破对称性: 模拟生物神经元的内在异质性
             # 不同神经元有细微差异 → k-WTA 对不同输入选出不同赢家 → Hebbian 固化
@@ -711,7 +755,6 @@ class TensorNeuronPool:
                 if n_L <= 4:
                     continue
                 z_L = z_new[in_layer]
-                z_L = z_L - z_L.mean()  # 中心化: 去除公共分量
                 k = max(4, n_L // 10)
                 _, top_idx = torch.topk(z_L.abs(), k)
                 winners = torch.zeros(n_L, dtype=torch.bool, device=self.device)
@@ -803,13 +846,14 @@ class TensorNeuronPool:
         """F = sum(epsilon^2) over alive neurons."""
         return (self.state[self.alive, F_EPS] ** 2).sum()
 
-    def compute_lm_logits(self, top_layer: int) -> torch.Tensor:
+    def compute_lm_logits(self, top_layer: int, use_mu: bool = False) -> torch.Tensor:
         """计算 256 个字节 logits.
 
         logits = lm_weight @ z[top_layer_mask]  (选择顶层活跃神经元)
 
         Args:
             top_layer: 顶层索引
+            use_mu: True=用 MU(有选择性), False=用 Z(默认)
 
         Returns:
             logits: [256] fp16
@@ -819,7 +863,8 @@ class TensorNeuronPool:
         if n_top == 0:
             return torch.zeros(256, dtype=torch.float16, device=self.device)
 
-        z_top = self.state[top_mask, F_Z]  # [n_top]
+        state_col = F_MU if use_mu else F_Z
+        z_top = self.state[top_mask, state_col]  # [n_top]
         w_sub = self.lm_weight[:, top_mask]  # [256, n_top]
         logits = w_sub @ z_top  # [256]
         return logits
@@ -961,6 +1006,7 @@ class TensorNeuronPool:
         eta: float,
         dopamine: float,
         pred_byte: int = -1,
+        use_mu: bool = False,
     ) -> float:
         """LM head 权重的生物启发更新 — 误差门控 + 异突触竞争.
 
@@ -975,6 +1021,7 @@ class TensorNeuronPool:
             eta: 学习率
             dopamine: 多巴胺调制
             pred_byte: 当前模型预测 (argmax logits), -1 = 未计算
+            use_mu: True=用 MU (有选择性), False=用 Z (默认)
 
         Returns:
             总绝对权重变化量.
@@ -984,7 +1031,8 @@ class TensorNeuronPool:
         if n_top == 0:
             return 0.0
 
-        z_top = self.state[top_mask, F_Z]  # [n_top]
+        state_col = F_MU if use_mu else F_Z
+        z_top = self.state[top_mask, state_col]  # [n_top]
         eta_eff = eta * dopamine
 
         # 计算预测 (若调用方未传入)
@@ -1039,8 +1087,23 @@ class TensorNeuronPool:
 
         alive = self.alive
 
+        # ── 内存预算压力调节 ──
+        usage = self._storage.usage_ratio()
+        _prune_interval = prune_interval
+        _max_prune = max_prune
+        _grow_interval = grow_interval
+        _max_grow = max_grow
+
+        if usage > 0.7:
+            _prune_interval = max(10, prune_interval // 2)
+            _max_prune = max_prune * 2
+            _grow_interval = grow_interval * 2
+            _max_grow = max(0, max_grow - 1)
+        if usage > 0.9:
+            _max_grow = 0  # 暂停生长
+
         # 1. 修剪 (包含孤儿检查 + 不活跃检查)
-        if current_step % prune_interval == 0:
+        if current_step % _prune_interval == 0:
             alive_ids = torch.where(alive)[0]
             age = current_step - self.created_at[alive_ids]
             inactive_for = current_step - self.last_active[alive_ids]
@@ -1057,7 +1120,7 @@ class TensorNeuronPool:
                 & (age > min_age)
             )
             prune_mask = orphan_mask | inactive_mask
-            candidates = alive_ids[prune_mask][:max_prune]
+            candidates = alive_ids[prune_mask][:_max_prune]
             for nid in candidates.tolist():
                 self.prune_neuron(int(nid))
             stats["pruned"] = len(candidates)
@@ -1065,10 +1128,10 @@ class TensorNeuronPool:
             stats["pruned"] = 0
 
         # 2. 生长 (分裂高误差神经元)
-        if current_step % grow_interval == 0:
+        if _max_grow > 0 and current_step % _grow_interval == 0:
             alive_ids = torch.where(alive)[0]
             high_err = self.state[alive_ids, F_EPS].abs() > self.state[alive_ids, F_THRESHOLD] * 3.0
-            candidates = alive_ids[high_err][:max_grow]
+            candidates = alive_ids[high_err][:_max_grow]
             grown = 0
             for nid in candidates.tolist():
                 if self.split_neuron(int(nid)) is not None:
@@ -1247,31 +1310,47 @@ class TensorNeuronPool:
     # ═══════════════════════════════════════════════════════════════
 
     def state_dict(self) -> dict:
-        """返回可序列化的状态字典 (CPU tensors)."""
+        """稀疏序列化: 仅保存 alive 神经元/突触/topdown, 含原始槽位索引.
+
+        _format=2: 稀疏格式, 兼容旧 _format=1 (或无 _format) 的全量格式.
+        """
+        alive_idx = torch.where(self.alive)[0]
+        syn_idx = torch.where(self.syn_alive)[0]
+        td_idx = torch.where(self.td_alive)[0]
+
         return {
-            "state": self.state.cpu().clone(),
-            "layer": self.layer.cpu().clone(),
-            "position": self.position.cpu().clone(),
-            "channel": self.channel.cpu().clone(),
-            "created_at": self.created_at.cpu().clone(),
-            "last_active": self.last_active.cpu().clone(),
-            "alive": self.alive.cpu().clone(),
-            "pre_id": self.pre_id.cpu().clone(),
-            "post_id": self.post_id.cpu().clone(),
-            "weight": self.weight.cpu().clone(),
-            "trace": self.trace.cpu().clone(),
-            "syn_age": self.syn_age.cpu().clone(),
-            "syn_alive": self.syn_alive.cpu().clone(),
-            "in_ptrs": self.in_ptrs.cpu().clone(),
-            "out_ptrs": self.out_ptrs.cpu().clone(),
-            "t_weight": self.t_weight.cpu().clone(),
-            "t_connected": self.t_connected.cpu().clone(),
-            "td_pre": self.td_pre.cpu().clone(),
-            "td_post": self.td_post.cpu().clone(),
-            "td_weight": self.td_weight.cpu().clone(),
-            "td_alive": self.td_alive.cpu().clone(),
-            "td_count": self._td_count,
-            "lm_weight": self.lm_weight.cpu().clone(),
+            "_format": 2,
+            "N": self.N,
+            "S": self.S,
+            "S_td": self.S_td,
+            "K": self.K,
+            # ── 神经元 (只存 alive 行 + 原始索引) ──
+            "state": self.state[alive_idx].cpu().clone(),
+            "alive_idx": alive_idx.cpu().clone(),
+            "layer": self.layer[alive_idx].cpu().clone(),
+            "position": self.position[alive_idx].cpu().clone(),
+            "channel": self.channel[alive_idx].cpu().clone(),
+            "created_at": self.created_at[alive_idx].cpu().clone(),
+            "last_active": self.last_active[alive_idx].cpu().clone(),
+            "t_weight": self.t_weight[alive_idx].cpu().clone(),
+            "t_connected": self.t_connected[alive_idx].cpu().clone(),
+            "in_ptrs": self.in_ptrs[alive_idx].cpu().clone(),
+            "out_ptrs": self.out_ptrs[alive_idx].cpu().clone(),
+            # ── 突触 (只存 alive 行 + 原始索引) ──
+            "pre_id": self.pre_id[syn_idx].cpu().clone(),
+            "post_id": self.post_id[syn_idx].cpu().clone(),
+            "weight": self.weight[syn_idx].cpu().clone(),
+            "trace": self.trace[syn_idx].cpu().clone(),
+            "syn_age": self.syn_age[syn_idx].cpu().clone(),
+            "syn_idx": syn_idx.cpu().clone(),
+            # ── Topdown (只存 alive 行 + 原始索引) ──
+            "td_pre": self.td_pre[td_idx].cpu().clone(),
+            "td_post": self.td_post[td_idx].cpu().clone(),
+            "td_weight": self.td_weight[td_idx].cpu().clone(),
+            "td_idx": td_idx.cpu().clone(),
+            # ── LM Head (只存 alive 列) ──
+            "lm_weight": self.lm_weight[:, alive_idx].cpu().clone(),
+            # ── 统计 ──
             "occupied_neurons": self._occupied_neurons,
             "occupied_synapses": self._occupied_synapses,
             "total_created": self._total_created,
@@ -1281,36 +1360,52 @@ class TensorNeuronPool:
         }
 
     def load_state_dict(self, sd: dict):
-        """从状态字典恢复."""
-        for key in [
-            "state",
-            "layer",
-            "position",
-            "channel",
-            "created_at",
-            "last_active",
-            "alive",
-            "pre_id",
-            "post_id",
-            "weight",
-            "trace",
-            "syn_age",
-            "syn_alive",
-            "in_ptrs",
-            "out_ptrs",
-            "t_weight",
-            "t_connected",
-            "td_pre",
-            "td_post",
-            "td_weight",
-            "td_alive",
-            "lm_weight",
-        ]:
-            if key in sd:
-                t = sd[key].to(self.device)
-                setattr(self, key, t)
+        """从稀疏格式恢复 (_format=2).  旧格式由迁移脚本处理."""
+        alive_idx = sd["alive_idx"].to(self.device)
+        syn_idx = sd["syn_idx"].to(self.device)
+        td_idx = sd.get("td_idx", torch.zeros(0, dtype=torch.int32)).to(self.device)
 
-        self._td_count = sd.get("td_count", 0)
+        # 确保容量足够
+        if len(alive_idx) > 0:
+            self._storage.ensure_neuron_capacity(int(alive_idx.max().item()) + 1)
+            self._sync_storage_refs()
+        if len(syn_idx) > 0:
+            self._storage.ensure_synapse_capacity(int(syn_idx.max().item()) + 1)
+            self._sync_storage_refs()
+
+        # Scatter 神经元数据
+        self.state[alive_idx] = sd["state"].to(self.device)
+        self.layer[alive_idx] = sd["layer"].to(self.device)
+        self.position[alive_idx] = sd["position"].to(self.device)
+        self.channel[alive_idx] = sd["channel"].to(self.device)
+        self.created_at[alive_idx] = sd["created_at"].to(self.device)
+        self.last_active[alive_idx] = sd["last_active"].to(self.device)
+        self.alive[alive_idx] = True
+        self.t_weight[alive_idx] = sd["t_weight"].to(self.device)
+        self.t_connected[alive_idx] = sd["t_connected"].to(self.device)
+        self.in_ptrs[alive_idx] = sd["in_ptrs"].to(self.device)
+        self.out_ptrs[alive_idx] = sd["out_ptrs"].to(self.device)
+
+        # Scatter 突触数据
+        self.pre_id[syn_idx] = sd["pre_id"].to(self.device)
+        self.post_id[syn_idx] = sd["post_id"].to(self.device)
+        self.weight[syn_idx] = sd["weight"].to(self.device)
+        self.trace[syn_idx] = sd["trace"].to(self.device)
+        self.syn_age[syn_idx] = sd["syn_age"].to(self.device)
+        self.syn_alive[syn_idx] = True
+
+        # Topdown
+        if len(td_idx) > 0:
+            self.td_pre[td_idx] = sd["td_pre"].to(self.device)
+            self.td_post[td_idx] = sd["td_post"].to(self.device)
+            self.td_weight[td_idx] = sd["td_weight"].to(self.device)
+            self.td_alive[td_idx] = True
+        self._td_count = len(td_idx)
+
+        # LM Head
+        self.lm_weight[:, alive_idx] = sd["lm_weight"].to(self.device)
+
+        # 统计
         self._occupied_neurons = sd.get("occupied_neurons", int(self.alive.sum().item()))
         self._occupied_synapses = sd.get("occupied_synapses", int(self.syn_alive.sum().item()))
         self._total_created = sd.get("total_created", self._occupied_neurons)
@@ -1318,16 +1413,23 @@ class TensorNeuronPool:
         self._total_syn_created = sd.get("total_syn_created", self._occupied_synapses)
         self._total_syn_pruned = sd.get("total_syn_pruned", 0)
 
-        # 重建 CPU 辅助 (用 tensor 操作, 避免逐元素 .item())
+        # 重建 freelists: 取 alive_mask 反向填充
         dead = torch.where(~self.alive)[0].tolist()
-        self._free_neurons = dead if dead else list(range(self.N))
+        self._storage._free_neurons.clear()
+        self._storage._free_neurons.extend(dead if dead else list(range(self.N)))
+        self._free_neurons = self._storage._free_neurons
+
         dead_syn = torch.where(~self.syn_alive)[0].tolist()
-        self._free_synapses = dead_syn if dead_syn else list(range(self.S))
-        # 批量计算邻接计数 (CPU 侧)
+        self._storage._free_synapses.clear()
+        self._storage._free_synapses.extend(dead_syn if dead_syn else list(range(self.S)))
+        self._free_synapses = self._storage._free_synapses
+
+        # 批量计算邻接计数
         valid_in = self.in_ptrs >= 0
         valid_out = self.out_ptrs >= 0
         self._in_counts = valid_in.sum(dim=-1).cpu().to(torch.int32)
         self._out_counts = valid_out.sum(dim=-1).cpu().to(torch.int32)
+
         # 维护感官索引
         self._sensory_index.clear()
         for nid in torch.where(self.alive & (self.position >= 0))[0].tolist():

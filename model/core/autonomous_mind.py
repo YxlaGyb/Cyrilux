@@ -52,7 +52,7 @@ DEFAULT_CFG = {
     "max_replay_buffer": 2000,
     "replay_batch_size": 16,
     "replay_ratio": 3,
-    "save_interval": 200,
+    "save_interval": 10000,
     "out_dir": "out_autonomous",
     "checkpoint": None,
     "data_dir": "datasets",
@@ -99,7 +99,7 @@ class CuriositySampler:
         return results
 
     def _generate(self, prompt_bytes: torch.Tensor) -> Optional[torch.Tensor]:
-        """自回归生成, 使用 runner.step() + lm_head. """
+        """自回归生成, 使用 runner.step() + lm_head."""
         try:
             seq = prompt_bytes.clone().to(self.device)
             byte_list = seq.tolist()
@@ -110,8 +110,7 @@ class CuriositySampler:
                     break
                 # 编码为 [1, 2, S] fp16
                 byte_vals = torch.tensor(
-                    [[b / 128.0 - 1.0 for b in byte_list]],
-                    dtype=torch.half, device=self.device
+                    [[b / 128.0 - 1.0 for b in byte_list]], dtype=torch.half, device=self.device
                 ).unsqueeze(0)
                 mask = torch.ones_like(byte_vals)
                 inp = torch.cat([byte_vals, mask], dim=1)
@@ -166,7 +165,8 @@ class CuriositySampler:
 
 
 class ExperienceReplayBuffer:
-    """FIFO 经验回放缓冲区. """
+    """FIFO 经验回放缓冲区."""
+
     def __init__(self, max_size: int = 2000):
         self.max_size = max_size
         self.buffer = []
@@ -187,9 +187,7 @@ class ExperienceReplayBuffer:
         if len(self.buffer) < batch_size:
             return None
         if self._dopamine_sum > 0 and len(self.buffer) > batch_size * 2:
-            weights = torch.tensor(
-                [ex[2] + 0.01 for ex in self.buffer], dtype=torch.float16
-            )
+            weights = torch.tensor([ex[2] + 0.01 for ex in self.buffer], dtype=torch.float16)
             idx = torch.multinomial(weights, batch_size, replacement=False)
         else:
             idx = torch.randperm(len(self.buffer))[:batch_size]
@@ -209,6 +207,7 @@ class ExperienceReplayBuffer:
 
 class MetaController:
     """调度 WAKE / PLAY / SLEEP 阶段, 检测高原."""
+
     PHASES = ["IDLE", "WAKE", "PLAY", "SLEEP"]
 
     def __init__(self, cfg: dict):
@@ -264,14 +263,22 @@ class MetaController:
         old_d = self.current_dopamine_threshold
         self.current_gamma = min(self.current_gamma * 1.5, 0.5)
         self.current_dopamine_threshold = max(self.current_dopamine_threshold * 0.8, 0.001)
-        Logger(f"[MetaController] Plateau: gamma {old_g:.3f}->{self.current_gamma:.3f}, "
-               f"D_thr {old_d:.3f}->{self.current_dopamine_threshold:.3f}")
+        Logger(
+            f"[MetaController] Plateau: gamma {old_g:.3f}->{self.current_gamma:.3f}, "
+            f"D_thr {old_d:.3f}->{self.current_dopamine_threshold:.3f}"
+        )
 
     def to_dict(self) -> dict:
-        return {"phase": self.phase, "total_steps": self.total_steps,
-                "wake_count": self.wake_count, "play_count": self.play_count,
-                "sleep_count": self.sleep_count, "plateau_streak": self._plateau_streak,
-                "dopamine_threshold": self.current_dopamine_threshold, "gamma": self.current_gamma}
+        return {
+            "phase": self.phase,
+            "total_steps": self.total_steps,
+            "wake_count": self.wake_count,
+            "play_count": self.play_count,
+            "sleep_count": self.sleep_count,
+            "plateau_streak": self._plateau_streak,
+            "dopamine_threshold": self.current_dopamine_threshold,
+            "gamma": self.current_gamma,
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -281,6 +288,7 @@ class MetaController:
 
 class DataRotator:
     """在 dataset/ 目录下轮换读取 jsonl 文件."""
+
     def __init__(self, data_dir: str, max_seq_len: int = 128, max_samples: int = 200):
         self.data_dir = os.path.join(ROOT_DIR, data_dir)
         self.max_seq_len = max_seq_len
@@ -296,8 +304,9 @@ class DataRotator:
         if not os.path.isdir(self.data_dir):
             self.files = []
             return
-        self.files = sorted(f for f in os.listdir(self.data_dir)
-                            if f.endswith(".jsonl") and not f.startswith("_"))
+        self.files = sorted(
+            f for f in os.listdir(self.data_dir) if f.endswith(".jsonl") and not f.startswith("_")
+        )
         conv = [f for f in self.files if "_converted" in f]
         if conv:
             self.files = conv + [f for f in self.files if f not in conv]
@@ -317,12 +326,14 @@ class DataRotator:
                     sample = json.loads(line)
                     text = sample.get("text", "")
                     if not text and "conversations" in sample:
-                        parts = [f"<|{t.get('role','user')}|>{t.get('content','')}"
-                                 for t in sample["conversations"]]
+                        parts = [
+                            f"<|{t.get('role', 'user')}|>{t.get('content', '')}"
+                            for t in sample["conversations"]
+                        ]
                         text = "\n".join(parts) + "<|end|>"
                     if not text:
                         continue
-                    byte_seq = text.encode("utf-8")[:self.max_seq_len]
+                    byte_seq = text.encode("utf-8")[: self.max_seq_len]
                     padded = byte_seq.ljust(self.max_seq_len, b"\x00")
                     t = torch.frombuffer(bytearray(padded), dtype=torch.uint8).clone()
                     lbl = t.clone()
@@ -330,8 +341,10 @@ class DataRotator:
                     self._current_data.append((t, lbl.to(torch.long)))
         except Exception as e:
             Logger(f"[DataRotator] Load error: {e}")
-        Logger(f"[DataRotator] Loaded {len(self._current_data)} "
-                f"from {self.files[self._current_file_idx]}")
+        Logger(
+            f"[DataRotator] Loaded {len(self._current_data)} "
+            f"from {self.files[self._current_file_idx]}"
+        )
         self._pos = 0
 
     def get_batch(self, batch_size: int) -> Optional[tuple]:
@@ -359,6 +372,7 @@ class DataRotator:
 
 class AutonomousMind:
     """持续自主运行 — WAKE → PLAY → SLEEP 循环 (StreamRunner)."""
+
     def __init__(
         self,
         runner: CyreneModel,
@@ -374,13 +388,17 @@ class AutonomousMind:
         self.replay_buffer = ExperienceReplayBuffer(self.cfg["max_replay_buffer"])
         self.controller = MetaController(self.cfg)
         self.data_rotator = DataRotator(
-            self.cfg["data_dir"], max_seq_len=self.cfg["max_seq_len"], max_samples=200,
+            self.cfg["data_dir"],
+            max_seq_len=self.cfg["max_seq_len"],
+            max_samples=200,
         )
         self.total_steps = 0
         self.current_phase = "IDLE"
         self.last_save_step = 0
-        self._log(f"AutonomousMind init, device={self.device}, "
-                  f"neurons={self.runner.pool.get_total_neurons()}")
+        self._log(
+            f"AutonomousMind init, device={self.device}, "
+            f"neurons={self.runner.pool.get_total_neurons()}"
+        )
 
     def _log(self, msg: str):
         self.log_callback(msg)
@@ -465,12 +483,14 @@ class AutonomousMind:
         mask = torch.ones_like(byte_vals)
         inp = torch.cat([byte_vals, mask], dim=1)
         for i in range(byte_seq.size(0)):
-            self.runner.step(inp[i:i+1])
+            self.runner.step(inp[i : i + 1])
         if self.total_steps % 10 == 0:
             s = self.runner.get_state()
-            self._log(f"[PLAY] Step {self.total_steps} | F={s['free_energy']:.1f} "
-                      f"D={s['D']:.3f} n={self.runner.pool.get_total_neurons()} "
-                      f"buf={self.replay_buffer.size}")
+            self._log(
+                f"[PLAY] Step {self.total_steps} | F={s['free_energy']:.1f} "
+                f"D={s['D']:.3f} n={self.runner.pool.get_total_neurons()} "
+                f"buf={self.replay_buffer.size}"
+            )
 
     def _sleep_step(self):
         """SLEEP: replay buffer consolidation via StreamRunner."""
@@ -484,10 +504,11 @@ class AutonomousMind:
             mask = torch.ones_like(byte_vals)
             inp = torch.cat([byte_vals, mask], dim=1)
             for i in range(byte_seq.size(0)):
-                self.runner.step(inp[i:i+1])
+                self.runner.step(inp[i : i + 1])
         self._log("[SLEEP] done, rotating data")
-        self.data_rotator = DataRotator(self.cfg["data_dir"],
-                                        max_seq_len=self.cfg["max_seq_len"], max_samples=200)
+        self.data_rotator = DataRotator(
+            self.cfg["data_dir"], max_seq_len=self.cfg["max_seq_len"], max_samples=200
+        )
 
     def _save_checkpoint(self, async_save: bool = False):
         def _save():
@@ -506,6 +527,7 @@ class AutonomousMind:
                 self._log(f"Saved: {path}")
             except Exception as e:
                 self._log(f"Save error: {e}")
+
         if async_save:
             threading.Thread(target=_save, daemon=True).start()
         else:
@@ -519,6 +541,7 @@ class AutonomousMind:
 
 class IntrinsicMetaController(MetaController):
     """支持内在动机信号的元控制器."""
+
     def __init__(self, cfg: dict):
         super().__init__(cfg)
         self.curiosity_drive: float = 0.5
@@ -531,8 +554,7 @@ class IntrinsicMetaController(MetaController):
         self._icm_history.append(icm_output)
         if len(self._icm_history) > 100:
             self._icm_history.pop(0)
-        ig_ema = sum(d.get("information_gain", 0)
-                    for d in self._icm_history[-20:])
+        ig_ema = sum(d.get("information_gain", 0) for d in self._icm_history[-20:])
         ig_ema /= max(len(self._icm_history[-20:]), 1)
         self.curiosity_drive = min(1.0, ig_ema * 5.0)
         if len(self._icm_history) >= 20:
@@ -540,8 +562,9 @@ class IntrinsicMetaController(MetaController):
             older = sum(d.get("inverse_loss", 0) for d in self._icm_history[-20:-10]) / 10
             if older > 0:
                 self.competence_drive = min(1.0, max(0.0, (older - recent) / older * 2))
-        self.boredom_signal = min(1.0, max(0.0,
-            (1 - self.curiosity_drive) * (1 - self.competence_drive) * 2))
+        self.boredom_signal = min(
+            1.0, max(0.0, (1 - self.curiosity_drive) * (1 - self.competence_drive) * 2)
+        )
 
     def next_phase(self) -> str:
         phase = super().next_phase()
@@ -550,8 +573,11 @@ class IntrinsicMetaController(MetaController):
             self.play_count = 0
             self.wake_count = 0
             return "WAKE"
-        if (phase == "WAKE" and self.curiosity_drive > 0.7
-                and self.wake_count < self.cfg.get("wake_steps", 20) // 2):
+        if (
+            phase == "WAKE"
+            and self.curiosity_drive > 0.7
+            and self.wake_count < self.cfg.get("wake_steps", 20) // 2
+        ):
             self.phase = "PLAY"
             self.wake_count = 0
             return "PLAY"

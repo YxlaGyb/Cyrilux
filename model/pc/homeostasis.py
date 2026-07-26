@@ -26,24 +26,5 @@ def homeostasis_step(
     )
 
 
-def compute_prune_mask(
-    pool: TensorNeuronPool,
-    current_step: int,
-    max_inactive: int = 1000,
-    min_age: int = 100,
-) -> torch.Tensor:
-    """计算应修剪的神经元掩码 (惰性删除决策).
-
-    Returns:
-        [N] bool mask.
-    """
-    alive = pool.alive
-    age = current_step - pool.created_at
-    inactive_for = current_step - pool.last_active
-
-    orphan = torch.zeros(pool.N, dtype=torch.bool, device=pool.device)
-    negligible = (pool.state[:, 2].abs() < 1e-6) & (age > 100) & alive
-    inactive = (inactive_for > max_inactive) & (pool.state[:, 4] < 0.001) & alive
-    too_young = age < min_age
-
-    return (orphan | negligible | inactive) & ~too_young & alive
+# compute_prune_mask 已删除 — 死代码，从未被调用。
+# 剪枝逻辑在 TensorNeuronPool.homeostasis_step() 内部。

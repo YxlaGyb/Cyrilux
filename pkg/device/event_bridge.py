@@ -166,11 +166,11 @@ class EventBridge:
         if len(batch) > self._max_sensory:
             self._sensory_dropped += len(batch) - self._max_sensory
             batch = SensoryEventBatch(
-                pos=batch.pos[:self._max_sensory],
-                ch=batch.ch[:self._max_sensory],
-                val=batch.val[:self._max_sensory],
-                layer=batch.layer[:self._max_sensory],
-                block_id=batch.block_id[:self._max_sensory],
+                pos=batch.pos[: self._max_sensory],
+                ch=batch.ch[: self._max_sensory],
+                val=batch.val[: self._max_sensory],
+                layer=batch.layer[: self._max_sensory],
+                block_id=batch.block_id[: self._max_sensory],
             )
 
         self._total_sensory += len(batch)
@@ -197,8 +197,8 @@ class EventBridge:
 
         end = min(self._net_write + n, self._max_network)
         space = end - self._net_write
-        self._net_nid[self._net_write:end] = nids[:space].to(torch.int32)
-        self._net_eps[self._net_write:end] = eps[:space].to(torch.float16)
+        self._net_nid[self._net_write : end] = nids[:space].to(torch.int32)
+        self._net_eps[self._net_write : end] = eps[:space].to(torch.float16)
         self._net_count = min(self._net_count + space, self._max_network)
         self._net_write = end % self._max_network
         self._total_network += space
@@ -226,14 +226,18 @@ class EventBridge:
             # 环形回绕
             first = self._max_network - read_start
             second = available - first
-            nids = torch.cat([
-                self._net_nid[read_start:],
-                self._net_nid[:second],
-            ])
-            eps = torch.cat([
-                self._net_eps[read_start:],
-                self._net_eps[:second],
-            ])
+            nids = torch.cat(
+                [
+                    self._net_nid[read_start:],
+                    self._net_nid[:second],
+                ]
+            )
+            eps = torch.cat(
+                [
+                    self._net_eps[read_start:],
+                    self._net_eps[:second],
+                ]
+            )
 
         self._net_count -= available
         return nids, eps

@@ -65,27 +65,8 @@ def setup_seed(seed: int = 42):
 
 
 # ── 参数统计 ──
-
-def count_parameters(model: torch.nn.Module, trainable_only: bool = True) -> dict:
-    """
-    旧名称, 保留向后兼容。
-    语义已改为 count_budget — 预算上限, 不代表模型当前有效容量。
-    """
-    return count_budget(model, trainable_only)
-
-
-def count_budget(model: torch.nn.Module, trainable_only: bool = True) -> dict:
-    """统计模型预算上限 (固定参数总数, 不代表有效容量)。"""
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    non_trainable = total - trainable
-    return {
-        'total': total,
-        'total_M': total / 1e6,
-        'trainable': trainable,
-        'trainable_M': trainable / 1e6,
-        'non_trainable': non_trainable,
-    }
+# count_parameters / count_budget 已删除 — 页面化池不使用 nn.Module.parameters().
+# effective_params / effective_capacity 保留, 用于分析池内权重稀疏度.
 
 
 def effective_params(tensor: torch.Tensor, eps: float = 1e-4) -> int:

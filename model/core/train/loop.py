@@ -45,6 +45,11 @@ class TrainingLoop:
             hebbian_base_eta=self.cfg.hebbian_base_eta,
             oja_alpha=getattr(self.cfg, "oja_alpha", 0.05),
             ach_beta_0=self.cfg.hebbian_ach_beta_0,
+            prune_interval=self.cfg.prune_interval,
+            grow_interval=self.cfg.grow_interval,
+            homeostasis_interval=self.cfg.homeostasis_interval,
+            connection_density=self.cfg.connection_density,
+            bias_strength=self.cfg.bias_strength,
         )
         runner = CyreneModel(cfg)
         runner.frontend = runner.frontend.to(self.device)
@@ -52,16 +57,20 @@ class TrainingLoop:
             n_neurons=min(self.cfg.hidden_size * 4, 512),
             from_layer=0,
             to_layer=7,
-            connection_density=0.2,
+            connection_density=self.cfg.connection_density,
         )
-        self._log(f"CyreneModel built: h_front={self.cfg.hidden_size}")
+        self._log(
+            f"CyreneModel built: h_front={self.cfg.hidden_size}, "
+            f"budget={runner.pool._storage.total_allocated_bytes() / 1e6:.0f}MB / "
+            f"{runner.pool._storage.max_memory_bytes / 1e9:.1f}GB"
+        )
         return runner
 
     def warmup(self):
         assert self.runner is not None
         with torch.no_grad():
             dummy = torch.zeros(1, 2, 64, dtype=torch.half, device=self.device)
-            for _ in range(getattr(self.cfg, 'warmup_steps', 20)):
+            for _ in range(getattr(self.cfg, "warmup_steps", 20)):
                 self.runner.step(dummy)
         self._log("Warmup done")
 
@@ -104,12 +113,8 @@ class TrainingLoop:
             "global_step": self.global_step,
             "last_F": self._last_F,
             "last_D": self._last_D,
-            "n_neurons": (
-                self.runner.pool.get_total_neurons() if self.runner else 0
-            ),
-            "n_synapses": (
-                self.runner.pool.get_total_synapses() if self.runner else 0
-            ),
+            "n_neurons": (self.runner.pool.get_total_neurons() if self.runner else 0),
+            "n_synapses": (self.runner.pool.get_total_synapses() if self.runner else 0),
             "temporal_connections": (
                 int(self.runner.pool.t_connected.sum().item()) if self.runner else 0
             ),
@@ -140,9 +145,7 @@ class TrainingLoop:
                 num_workers=0,
             )
 
-            for batch_idx, (byte_seq, labels) in enumerate(
-                tqdm(loader, desc=f"Task {task_id}")
-            ):
+            for batch_idx, (byte_seq, labels) in enumerate(tqdm(loader, desc=f"Task {task_id}")):
                 if max_steps > 0 and batch_idx >= max_steps:
                     break
                 self.global_step += 1

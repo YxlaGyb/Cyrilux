@@ -1,7 +1,7 @@
 # model.pc — Predictive Coding 核心模块 (全张量化)
 
 from .tensor_pool import TensorNeuronPool
-from .homeostasis import homeostasis_step, compute_prune_mask
+from .homeostasis import homeostasis_step
 from .neuromodulation import (
     compute_uncertainty,
     compute_dopamine,
@@ -13,7 +13,6 @@ from .neuromodulation import (
 __all__ = [
     "TensorNeuronPool",
     "homeostasis_step",
-    "compute_prune_mask",
     "compute_uncertainty",
     "compute_dopamine",
     "compute_ach",

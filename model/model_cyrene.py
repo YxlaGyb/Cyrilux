@@ -26,7 +26,7 @@ from model.pc.neuromodulation import (
     compute_precision_scales,
     compute_uncertainty,
 )
-from model.pc.tensor_pool import TensorNeuronPool
+from model.pc.tensor_pool import F_EPS, F_Z, TensorNeuronPool
 from pkg.device.cuda import setup_cuda_device
 from pkg.device.event_bridge import EventBridge, SensoryEventBatch
 from pkg.device.sensory_frontend import SensoryFrontend
@@ -38,8 +38,7 @@ class CyreneConfig:
 
     hidden_size: int = 64
     num_hidden_layers: int = 1
-    max_neurons: int = 65536
-    max_synapses: int = 8_000_000
+    max_memory_bytes: int = 2_147_483_648  # 内存预算上限 (2GB)
     K_fan: int = 128
     warmup_steps: int = 50
     hebbian_base_eta: float = 3e-4
@@ -48,6 +47,7 @@ class CyreneConfig:
     hidden_neurons: int = 256
     connection_density: float = 0.2
     bias_strength: float = 0.7  # connect_layer 偏好池权重 (0=随机, 1=纯本地)
+    use_mu_lm: bool = False  # True=LM head 用 MU (有选择性), False=用 Z
     prune_interval: int = 100
     grow_interval: int = 200
     homeostasis_interval: int = 50
@@ -59,14 +59,15 @@ class LMHead:
     def __init__(self, pool):
         self._pool = pool
 
-    def predict_logits(self, pool, top_layer: int) -> list[float]:
+    def predict_logits(self, pool, top_layer: int, use_mu: bool = False) -> list[float]:
         """返回 256 个字节的 logits (list[float], CPU)."""
-        logits = pool.compute_lm_logits(top_layer)
+        logits = pool.compute_lm_logits(top_layer, use_mu=use_mu)
         return logits.cpu().tolist()
 
     def cross_entropy_loss(self, logits: list[float], target: int) -> float:
         """计算 CE loss."""
         import torch
+
         t = torch.tensor(logits, dtype=torch.float32).unsqueeze(0)
         target_t = torch.tensor([target])
         return float(torch.nn.functional.cross_entropy(t, target_t).item())
@@ -83,13 +84,20 @@ class CyreneModel:
     """
 
     _EVENTS = [
-        "before_step", "after_step",
-        "before_encode", "after_encode",
-        "before_sensory", "after_sensory",
-        "before_predict", "after_predict",
-        "before_modulate", "after_modulate",
-        "before_hebbian", "after_hebbian",
-        "before_homeostasis", "after_homeostasis",
+        "before_step",
+        "after_step",
+        "before_encode",
+        "after_encode",
+        "before_sensory",
+        "after_sensory",
+        "before_predict",
+        "after_predict",
+        "before_modulate",
+        "after_modulate",
+        "before_hebbian",
+        "after_hebbian",
+        "before_homeostasis",
+        "after_homeostasis",
     ]
 
     def __init__(self, config: CyreneConfig):
@@ -101,12 +109,11 @@ class CyreneModel:
         self.frontend.eval()
         self.frontend = self.frontend.to(self.device)
 
-        # 全张量化神经元池
+        # 页式动态神经元池 (自组织, 2GB 约束内生长/修剪)
         self.pool = TensorNeuronPool(
-            max_neurons=config.max_neurons,
-            max_synapses=config.max_synapses,
             K=config.K_fan,
             device=self.device,
+            max_memory_bytes=config.max_memory_bytes,
         )
 
         # LM Head (委托到 pool)
@@ -285,7 +292,7 @@ class CyreneModel:
             return 0
 
         # 更新 (使用当前 z, 重算预测)
-        self.pool.update_batch(nids, self.pool.state[nids.long(), 0])
+        self.pool.update_batch(nids, self.pool.state[nids.long(), F_Z])
         return nids.shape[0]
 
     @torch.inference_mode()
@@ -314,9 +321,7 @@ class CyreneModel:
         self._fire("before_modulate", free_energy=free_energy)
         uncertainty = compute_uncertainty(self._free_energy_history)
         F_prev = (
-            self._free_energy_history[-2]
-            if len(self._free_energy_history) >= 2
-            else free_energy
+            self._free_energy_history[-2] if len(self._free_energy_history) >= 2 else free_energy
         )
         D = compute_dopamine(free_energy, F_prev)
         ACh = compute_ach(uncertainty, self.config.ach_beta_0)
@@ -401,7 +406,7 @@ class CyreneModel:
         # 发射活跃神经元作为网络事件 (传给下一步)
         active = self.pool.emit_active(self._step)
         if active.shape[0] > 0:
-            self.bridge.push_network_events(active, self.pool.state[active.long(), 2])
+            self.bridge.push_network_events(active, self.pool.state[active.long(), F_EPS])
 
         # 每步阈值调节 (不管 homeostasis 间隔, 强反馈压制过度发放)
         self.pool.adjust_thresholds(target_rate=0.01, rate_eta=0.05)
@@ -419,10 +424,12 @@ class CyreneModel:
             # LM head Hebbian (仅当有监督信号时)
             if target_byte >= 0 and self._top_layer > 0:
                 self.pool.hebbian_lm_head(
-                    self._top_layer, target_byte,
+                    self._top_layer,
+                    target_byte,
                     eta=self.config.hebbian_base_eta * 0.3,
                     dopamine=self._last_modulation,
                     pred_byte=pred_byte,
+                    use_mu=self.config.use_mu_lm,
                 )
 
         uncertainty = (

@@ -178,7 +178,7 @@ TRAIN_CONFIG_TEMPLATE = {
     },
     "output": {
         "out_dir": "out_pc_unified",
-        "save_interval": 500,
+        "save_interval": 10000,
     },
 }
 
@@ -203,7 +203,7 @@ AUTONOMOUS_CONFIG_TEMPLATE = {
     "max_replay_buffer": 2000,
     "replay_batch_size": 16,
     "replay_ratio": 3,
-    "save_interval": 200,
+    "save_interval": 10000,
     "out_dir": "out_autonomous",
     "data_dir": "dataset",
     "data_rotate_interval": 500,

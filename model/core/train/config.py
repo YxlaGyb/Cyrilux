@@ -78,14 +78,12 @@ class TrainingConfig:
     salience_reg_weight: float = 0.001
     salience_gate_lr: float = 1e-3
 
-    # 神经发生
-    enable_neurogenesis: bool = True
-    neurogenesis_prune_interval: int = 100
-    neurogenesis_grow_interval: int = 300
-    neurogenesis_prune_threshold_act: float = 0.001
-    neurogenesis_prune_threshold_gate: float = 0.05
-    neurogenesis_grow_error_threshold: float = 2.0
-    neurogenesis_max_grow_per_step: int = 8
+    # 稳态 (生长/修剪)
+    prune_interval: int = 100
+    grow_interval: int = 200
+    homeostasis_interval: int = 50
+    connection_density: float = 0.2
+    bias_strength: float = 0.7
 
     # Phase 7b: 降频
     consolidation_pipeline_interval: int = 5
@@ -125,7 +123,7 @@ class TrainingConfig:
 
     # I/O
     out_dir: str = "out_pc_unified"
-    save_interval: int = 1000
+    save_interval: int = 10000
 
     # 回调
     progress_callback: Optional[ProgressCallback] = None
