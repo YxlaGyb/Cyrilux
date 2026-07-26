@@ -41,16 +41,6 @@ def _make_eval_runner(h_front: int = 64) -> CyreneModel:
     return runner
 
 
-def load_with_remap(model, ckpt_path, device="cpu"):
-    """加载检查点 (StreamRunner 暂不支持完整恢复)."""
-    import os
-    if not os.path.exists(ckpt_path):
-        print(f"Checkpoint not found: {ckpt_path}")
-        return model
-    print(f"StreamRunner checkpoint loading not yet implemented: {ckpt_path}")
-    return model
-
-
 # ═══════════════════════════════════════════════════════════════
 # 1. Perplexity
 # ═══════════════════════════════════════════════════════════════
@@ -169,8 +159,6 @@ def run_full_evaluation(
             generations.append({"prompt": p, "generated": gen})
             print(f"  Prompt: {p}")
             print(f"  Generated: {gen[:100]}...")
-
-            runner = _make_eval_runner(h_front=runner.h_front)
 
     result["generations"] = generations
     return result

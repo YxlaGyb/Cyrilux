@@ -10,7 +10,6 @@ import torch
 
 import typer
 from pkg.cli.utils import resolve_path, load_config
-from model.core.globals import DEVICE_STR
 
 app = typer.Typer(name="train", help="Phase 1: 模型训练", no_args_is_help=True)
 
@@ -119,7 +118,7 @@ def train_main(
     from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
 
-    device = ctx.obj.get("device", DEVICE_STR)
+    device = ctx.obj.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     data_file_list = [
         resolve_path(f.strip()) for f in data_files.split(",") if f.strip()
     ]

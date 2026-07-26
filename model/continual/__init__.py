@@ -1,5 +1,5 @@
 """持续学习:
-多巴胺门控记忆回放 + 遗忘嗅探 + 生成式自巩固 + 抽象记忆银行 + 世界模型.
+记忆回放 + 遗忘嗅探 + 抽象记忆银行.
 """
 
 from .memory_bank import MemoryBank, Exemplar
@@ -9,11 +9,4 @@ from .abstraction_bank import (
     AbstractionSniffer,
     VariationalReplayer,
     compute_layer_importance,
-)
-from .world_model import LatentWorldModel
-from .neurogenesis import (
-    NeurogenesisController,
-    ActivationTracker,
-    ChannelPruner,
-    ChannelGrowth,
 )

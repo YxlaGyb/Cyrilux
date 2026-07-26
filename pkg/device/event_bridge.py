@@ -191,12 +191,12 @@ class NetworkEventQueue:
 
 
 class EventBridge:
-    """事件桥接 — 统一 GPU ↔ CPU 事件流。
+    """事件桥接 — GPU ↔ CPU 事件队列管理。
 
-    将 SensoryFrontend → SensoryEventQueue → NeuronPool
-    以及 NeuronPool → NetworkEventQueue → NeuronPool (内部传播)
-
-    串联成一个完整流程。
+    职责:
+      - SensoryFrontend → SensoryEventQueue (GPU → CPU)
+      - NetworkEventQueue 管理 (CPU 内部)
+    模型逻辑 (neurons predict/update/hebbian) 已移至 CyreneModel.
     """
 
     def __init__(self, pool: NeuronPool, sensory_threshold: float = 0.05, h_front: int = 64):
@@ -205,7 +205,6 @@ class EventBridge:
         self.network_queue = NetworkEventQueue()
         self.sensory_threshold = sensory_threshold
         self.h_front = h_front
-        self._step: int = 0
         self._warmup_remaining: int = 0  # 0 = 稳态模式
 
         # 统计
@@ -241,119 +240,6 @@ class EventBridge:
             self._warmup_remaining -= 1
         return n
 
-    def process_sensory_events(self, max_events: int = -1) -> int:
-        """消费感官事件并更新 NeuronPool。
-
-        Args:
-            max_events: 最多处理的事件数。-1 = 全部。
-
-        Returns:
-            处理的事件数。
-        """
-        from model.pc.sparse_forward import update_neuron, predict_neuron, hebbian_step
-
-        events = self.sensory_queue.pop(max_events)
-        n_processed = 0
-        for ev in events:
-            # 找或创建感觉神经元
-            target_id = None
-            for n in self.pool.get_neurons_by_layer(ev.layer):
-                if n.position == ev.pos and n.channel == ev.channel:
-                    target_id = n.id
-                    break
-
-            if target_id is None:
-                n = self.pool.create_neuron(
-                    layer=ev.layer,
-                    position=ev.pos,
-                    channel=ev.channel,
-                    threshold=0.05,
-                )
-                target_id = n.id
-
-            # 预测 → 更新 → Hebbian
-            predict_neuron(self.pool, target_id)
-            update_neuron(self.pool, target_id, z_new=ev.value)
-            hebbian_step(self.pool, target_id, eta=3e-4)
-            n_processed += 1
-
-        return n_processed
-
-    def process_network_events(self, max_events: int = 5) -> int:
-        """消费 CPU 内部网络事件并传播。
-
-        Args:
-            max_events: 每步最多处理的事件数。
-
-        Returns:
-            处理的事件数。
-        """
-        from model.pc.sparse_forward import (
-            predict_neuron,
-            update_neuron,
-            hebbian_step,
-            emit_if_active,
-        )
-
-        events = self.network_queue.pop(max_events)
-        n_processed = 0
-        for ev in events:
-            target = self.pool.neurons.get(ev.neuron_id)
-            if target is None:
-                continue
-
-            # 后神经元预测 → 更新 → Hebbian
-            predict_neuron(self.pool, ev.neuron_id)
-            update_neuron(self.pool, ev.neuron_id)
-            hebbian_step(self.pool, ev.neuron_id, eta=3e-4)
-
-            # 如果该神经元也发放, 继续传播
-            child_event = emit_if_active(
-                self.pool,
-                ev.neuron_id,
-                current_time=self._step,
-            )
-            if child_event is not None:
-                self.network_queue.push(child_event)
-                self._total_network_events += 1
-
-            n_processed += 1
-
-        return n_processed
-
-    def step(
-        self,
-        h_list: Optional[list[torch.Tensor]] = None,
-        max_sensory_events: int = -1,
-        max_network_events: int = 5,
-    ) -> dict:
-        """执行一个完整的事件桥接步。
-
-        Args:
-            h_list: 来自 SensoryFrontend 的 h_conv 张量列表 (可为 None)
-            max_sensory_events: 最多处理的感官事件数
-            max_network_events: 最多处理的网络事件数
-
-        Returns:
-            {n_sensory, n_network, queue_depth} 统计。
-        """
-        self._step += 1
-
-        if h_list is not None:
-            self.ingest_hlist(h_list)
-
-        n_sensory = self.process_sensory_events(max_sensory_events)
-        n_network = self.process_network_events(max_network_events)
-
-        return {
-            "step": self._step,
-            "n_sensory": n_sensory,
-            "n_network": n_network,
-            "sensory_queue": len(self.sensory_queue),
-            "network_queue": len(self.network_queue),
-            "warmup_remaining": self._warmup_remaining,
-        }
-
     def get_stats(self) -> dict:
         """返回桥接统计。"""
         return {
@@ -364,5 +250,4 @@ class EventBridge:
             "sensory_queue_depth": len(self.sensory_queue),
             "network_queue_depth": len(self.network_queue),
             "warmup_remaining": self._warmup_remaining,
-            "step": self._step,
         }

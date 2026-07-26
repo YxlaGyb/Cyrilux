@@ -1,4 +1,4 @@
-"""eval — 模型评估子命令 (委托至 Cyrilux.core.evaluation).
+"""eval — 模型评估子命令 (委托至 model.core.evaluation).
 """
 
 from typing import Optional
@@ -13,26 +13,23 @@ app = typer.Typer(name="eval", help="模型评估命令", no_args_is_help=True)
 @app.command()
 def all(
     ctx: typer.Context,
-    checkpoint: Optional[str] = typer.Option(None, "--checkpoint", "-c", help="Unified 检查点路径"),
+    checkpoint: Optional[str] = typer.Option(None, "--checkpoint", "-c", help="检查点路径"),
     device: str = typer.Option("cuda:0", "--device", "-d", help="计算设备"),
 ):
-    """全面评估: 自监督指标 + Perplexity + 文本生成."""
+    """全面评估: Perplexity + 文本生成."""
 
-    from model.core.evaluation import run_full_evaluation
-    from pkg.utils.trainer_utils import setup_seed
+    from model.core.evaluation import create_eval_runner_loader, run_full_evaluation
     from model.model_cyrene import CyreneConfig, CyreneModel
 
-    setup_seed(42)
     print(f"全面评估 — 检查点: {checkpoint or '默认'}  设备: {device}")
 
-    runner = CyreneModel(CyreneConfig(hidden_size=64, warmup_steps=50))
-
-    # 如果指定了检查点, 尝试加载 (TODO: checkpoint save/load for sparse)
     if checkpoint:
-        ckpt_path = resolve_path(checkpoint)
-        print(f"检查点加载未实现 (稀疏结构): {ckpt_path}")
+        runner = CyreneModel.load(resolve_path(checkpoint))
+    else:
+        runner = CyreneModel(CyreneConfig(hidden_size=64, warmup_steps=50))
+        runner.add_hidden_layer(n_neurons=256, from_layer=0, to_layer=7, connection_density=0.2)
+        runner.warmup(20)
 
-    from model.core.evaluation import create_eval_runner_loader
     loader = create_eval_runner_loader("dataset/sft_t2t.jsonl", max_length=128, max_samples=200)
     run_full_evaluation(
         runner, loader,
@@ -51,14 +48,12 @@ def language(
     """语言能力评估: Perplexity + 文本生成."""
 
     from model.core.evaluation import create_eval_runner_loader, run_full_evaluation
-    from pkg.utils.trainer_utils import setup_seed
-    from model.model_cyrene import CyreneConfig, CyreneModel
+    from model.model_cyrene import CyreneModel
 
-    setup_seed(42)
     ckpt_path = resolve_path(checkpoint)
     print(f"语言评估 — 检查点: {ckpt_path}  设备: {device}")
 
-    runner = CyreneModel(CyreneConfig(hidden_size=64, warmup_steps=50))
+    runner = CyreneModel.load(ckpt_path)
 
     loader = create_eval_runner_loader("dataset/sft_t2t.jsonl", max_length=128, max_samples=500)
     run_full_evaluation(

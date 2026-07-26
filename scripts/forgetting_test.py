@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from model.continual.forgetting_sniffer import ForgettingSniffer
 from model.continual.memory_bank import MemoryBank
 from model.core.dataset import DualChannelDataset
-from model.core.globals import DEVICE_STR
+import torch
 from model.model_cyrene import CyreneConfig, CyreneModel
 from pkg.utils.trainer_utils import setup_seed
 
@@ -350,7 +350,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    device = DEVICE_STR
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     n_tasks = len(args.tasks)
     if n_tasks < 2:

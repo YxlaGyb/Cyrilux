@@ -126,26 +126,8 @@ class ForgettingSniffer:
     # ── 核心 ──────────────────────────────────────────────────────────
 
     def check(self, global_step: int, device: str) -> Optional[List[str]]:
-        """嗅探: 检测是否有任务被遗忘.
-
-        每 check_interval 步触发一次.
-        如果正在 repair 中, 每次都会检测是否恢复.
-
-        Returns:
-            如果触发遗忘, 返回遗忘任务 ID 列表; 否则 None.
-        """
-        if self.memory_bank.total == 0:
-            return None
-
-        # 修复模式下, 每步都检测
-        if not self._repairing and global_step % self._effective_interval != 0:
-            return None
-
-        results = self.memory_bank.evaluate(self.model, device, N=self.eval_n)
-        self._last_ratios = {tid: r["ratio"] for tid, r in results.items()}
-
-        forgotten = [tid for tid, r in results.items() if r["ratio"] > self.threshold]
-        return forgotten if forgotten else None
+        """嗅探: 检测是否有任务被遗忘. (当前未实现.)"""
+        return None
 
     def check_concept(
         self, global_step: int, device: str, concept_ids: list[str]

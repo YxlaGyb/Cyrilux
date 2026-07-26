@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, fields
+from typing import Callable
 
 import torch
 
@@ -21,7 +22,14 @@ from model.pc.neuromodulation import (
     compute_precision_scales,
     compute_uncertainty,
 )
-from model.pc.sparse_forward import _to_fp16, batch_hebbian
+from model.pc.sparse_forward import (
+    _to_fp16,
+    batch_hebbian,
+    emit_if_active,
+    hebbian_step,
+    predict_neuron,
+    update_neuron,
+)
 from model.pc.sparse_projections import (
     SparseLMHead,
     SparseTemporalSelf,
@@ -49,6 +57,10 @@ class CyreneConfig:
     homeostasis_interval: int = 50
 
 
+def _default_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 class CyreneModel:
     """Cyrene 模型 — 字节级 PC 持续学习模型。
 
@@ -59,13 +71,30 @@ class CyreneModel:
         └─ lm_head 字节预测 (SparseLMHead)
     可塑性: Hebbian + Oja, 多巴胺/乙酰胆碱调制
     无 train/eval 模式: 启动即持续运行.
+    提供 stage 方法将 step 拆分为可独立调用的阶段, 以及 hook 扩展点.
 
     Usage:
         config = CyreneConfig(hidden_size=64)
         model = CyreneModel(config)
         model.add_hidden_layer(256)
+        model.hook('after_step', my_logger)
         stats = model.step(byte_seq)
+        # 或显式分阶段:
+        h = model.encode(byte_seq)
+        model.ingest(h)
+        model.process_sensory_events()
+        ...
     """
+
+    _EVENTS = [
+        "before_step", "after_step",
+        "before_encode", "after_encode",
+        "before_sensory", "after_sensory",
+        "before_predict", "after_predict",
+        "before_modulate", "after_modulate",
+        "before_hebbian", "after_hebbian",
+        "before_homeostasis", "after_homeostasis",
+    ]
 
     def __init__(self, config: CyreneConfig):
         self.config = config
@@ -108,6 +137,32 @@ class CyreneModel:
         # warmup
         self.bridge.set_warmup(config.warmup_steps)
 
+        # hook 系统
+        self._hooks: dict[str, list[Callable]] = {e: [] for e in self._EVENTS}
+
+    # ═══════════════════════════════════════════════════════════════
+    # Hook 系统
+    # ═══════════════════════════════════════════════════════════════
+
+    def hook(self, event: str, fn: Callable):
+        """注册 hook fn(model, **ctx) 到 event."""
+        if event not in self._EVENTS:
+            raise ValueError(f"Unknown hook event: {event}")
+        self._hooks.setdefault(event, []).append(fn)
+
+    def unhook(self, event: str, fn: Callable | None = None):
+        """移除 hook. fn=None 清空该事件全部 hook."""
+        if event not in self._EVENTS:
+            raise ValueError(f"Unknown hook event: {event}")
+        if fn is None:
+            self._hooks[event].clear()
+        else:
+            self._hooks[event] = [h for h in self._hooks[event] if h is not fn]
+
+    def _fire(self, event: str, **ctx):
+        for fn in self._hooks.get(event, ()):
+            fn(self, **ctx)
+
     # ═══════════════════════════════════════════════════════════════
     # 架构构建
     # ═══════════════════════════════════════════════════════════════
@@ -130,7 +185,161 @@ class CyreneModel:
         self._hidden_layer_created = True
 
     # ═══════════════════════════════════════════════════════════════
-    # 核心运行逻辑
+    # 显式阶段方法, 每一步可独立调用
+    # ═══════════════════════════════════════════════════════════════
+
+    @torch.inference_mode()
+    def encode(self, byte_seq: torch.Tensor) -> list[torch.Tensor]:
+        """Stage 1: GPU 感官编码."""
+        self._fire("before_encode", byte_seq=byte_seq)
+        h_list = self.frontend(byte_seq)
+        self._fire("after_encode", h_list=h_list)
+        return h_list
+
+    def ingest(self, h_list: list[torch.Tensor], top_k: int = 0):
+        """Stage 2: 特征 → 事件队列."""
+        self.bridge.ingest_hlist(h_list, top_k=top_k)
+
+    def process_sensory_events(self, max_events: int = 500) -> int:
+        """Stage 3: 消费感官事件并更新神经元."""
+        self._fire("before_sensory")
+        events = self.bridge.sensory_queue.pop(max_events)
+        n_processed = 0
+        for ev in events:
+            self._process_sensory_event(ev)
+            n_processed += 1
+        self._n_sensory_events += n_processed
+        self._fire("after_sensory", n_processed=n_processed)
+        return n_processed
+
+    def process_network_events(self, max_events: int = 10) -> int:
+        """Stage 4: 消费网络事件并传播."""
+        events = self.bridge.network_queue.pop(max_events)
+        n_processed = 0
+        for ev in events:
+            self._process_network_event(ev)
+            n_processed += 1
+        self._n_network_events += n_processed
+        return n_processed
+
+    @torch.inference_mode()
+    def predict_pass(self):
+        """Stage 5: 时序 + 自上而下预测."""
+        self._fire("before_predict")
+        self._temporal_topdown_pass()
+        self._fire("after_predict")
+
+    @torch.inference_mode()
+    def compute_stats(self) -> tuple[float, float, int]:
+        """Stage 6: 自由能 + LM loss."""
+        free_energy = self._compute_free_energy()
+        lm_loss, pred_byte = self._compute_lm()
+        self._free_energy_history.append(free_energy)
+        return free_energy, lm_loss, pred_byte
+
+    @torch.inference_mode()
+    def modulate(self, free_energy: float):
+        """Stage 7: 神经调质 D/ACh 计算 (每步调用)."""
+        self._fire("before_modulate", free_energy=free_energy)
+        uncertainty = compute_uncertainty(self._free_energy_history)
+        F_prev = (
+            self._free_energy_history[-2]
+            if len(self._free_energy_history) >= 2
+            else free_energy
+        )
+        D = compute_dopamine(free_energy, F_prev)
+        ACh = compute_ach(uncertainty, self.config.ach_beta_0)
+        modulation = combine_modulation(D, ACh)
+        self._last_D = D
+        self._last_ACh = ACh
+        self._last_modulation = modulation
+        compute_precision_scales(self.pool, D, ACh)
+        self._fire("after_modulate", D=D, ACh=ACh, modulation=modulation, uncertainty=uncertainty)
+
+    @torch.inference_mode()
+    def hebbian_pass(self, modulation: float):
+        """Stage 8: Hebbian + Oja 更新 (非 warmup 时调用)."""
+        self._fire("before_hebbian", modulation=modulation)
+        active = [n.id for n in self.pool.neurons.values() if abs(n.ε) > n.threshold]
+        if active:
+            batch_hebbian(
+                self.pool,
+                active,
+                eta=self.config.hebbian_base_eta,
+                oja_alpha=self.config.oja_alpha,
+                dopamine=modulation,
+            )
+            for nid in active:
+                n = self.pool.neurons[nid]
+                eta_ = self.config.hebbian_base_eta * 0.3
+                self.temporal.hebbian_step(nid, n._z_prev, n.ε, eta=eta_, dopamine=modulation)
+                self.topdown.hebbian_step(self.pool, nid, n.ε, eta=eta_, dopamine=modulation)
+        self._fire("after_hebbian", n_active=len(active))
+
+    @torch.inference_mode()
+    def homeostasis_pass(self) -> dict:
+        """Stage 8b: 稳态可塑性 (阈值/修剪/生长)."""
+        self._fire("before_homeostasis")
+        hs = homeostasis_step(
+            self.pool,
+            self._step,
+            target_rate=0.01,
+            prune_interval=self.config.prune_interval,
+            grow_interval=self.config.grow_interval,
+        )
+        self._fire("after_homeostasis", hs_stats=hs)
+        return hs
+
+    @torch.inference_mode()
+    def finalize_step(self):
+        """Stage 9: 保存 z(t) 供下一轮使用."""
+        self._store_prev_z()
+
+    # ═══════════════════════════════════════════════════════════════
+    # 事件处理 (私有 — 从 EventBridge 移入)
+    # ═══════════════════════════════════════════════════════════════
+
+    def _process_sensory_event(self, ev):
+        """处理单条感官事件: 找/创建神经元 → 预测 → 更新 → Hebbian."""
+        target_id = None
+        for n in self.pool.get_neurons_by_layer(ev.layer):
+            if n.position == ev.pos and n.channel == ev.channel:
+                target_id = n.id
+                break
+
+        if target_id is None:
+            n = self.pool.create_neuron(
+                layer=ev.layer,
+                position=ev.pos,
+                channel=ev.channel,
+                threshold=0.05,
+            )
+            target_id = n.id
+
+        predict_neuron(self.pool, target_id)
+        update_neuron(self.pool, target_id, z_new=ev.value)
+        hebbian_step(self.pool, target_id, eta=3e-4)
+
+    def _process_network_event(self, ev):
+        """处理单条网络事件: 预测 → 更新 → Hebbian → 可选传播."""
+        target = self.pool.neurons.get(ev.neuron_id)
+        if target is None:
+            return
+
+        predict_neuron(self.pool, ev.neuron_id)
+        update_neuron(self.pool, ev.neuron_id)
+        hebbian_step(self.pool, ev.neuron_id, eta=3e-4)
+
+        child_event = emit_if_active(
+            self.pool,
+            ev.neuron_id,
+            current_time=self._step,
+        )
+        if child_event is not None:
+            self.bridge.network_queue.push(child_event)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 核心运行逻辑, 向后兼容的完整 step
     # ═══════════════════════════════════════════════════════════════
 
     @torch.inference_mode()
@@ -146,82 +355,34 @@ class CyreneModel:
         self._step += 1
         is_warmup = self._step <= self.config.warmup_steps
 
-        # 1. GPU: 感官编码
-        h_list = self.frontend(byte_seq)
+        self._fire("before_step", byte_seq=byte_seq)
 
-        # 2. Bridge: 特征 → 事件队列
-        self.bridge.ingest_hlist(h_list, top_k=(0 if is_warmup else 4))
+        h_list = self.encode(byte_seq)
+        self.ingest(h_list, top_k=(0 if is_warmup else 4))
+        self.process_sensory_events(max_events=500)
+        self.process_network_events(max_events=10)
+        self.predict_pass()
+        free_energy, lm_loss, pred_byte = self.compute_stats()
 
-        # 3. CPU: 消费感官事件
-        n_sensory = self.bridge.process_sensory_events(max_events=500)
-        self._n_sensory_events += n_sensory
-
-        # 4. CPU: 稀疏传播
-        n_network = self.bridge.process_network_events(max_events=10)
-        self._n_network_events += n_network
-
-        # 5. 时序 + 自上而下预测
-        self._temporal_topdown_pass()
-
-        # 6. 自由能 + 字节预测
-        free_energy = self._compute_free_energy()
-        lm_loss, pred_byte = self._compute_lm()
-        self._free_energy_history.append(free_energy)
-
-        # 7. 稳态可塑性
-        hs_stats = {}
+        hs_stats: dict = {}
         if self._step % self.config.homeostasis_interval == 0:
-            hs_stats = homeostasis_step(
-                self.pool,
-                self._step,
-                target_rate=0.01,
-                prune_interval=self.config.prune_interval,
-                grow_interval=self.config.grow_interval,
-            )
-
-        # 8. 神经调制 + Hebbian 更新
-        D = self._last_D if hasattr(self, "_last_D") else 0.5
-        ACh = self._last_ACh if hasattr(self, "_last_ACh") else 0.5
-        modulation = self._last_modulation if hasattr(self, "_last_modulation") else 1.0
-        uncertainty = 0.5
+            hs_stats = self.homeostasis_pass()
 
         if not is_warmup and free_energy > 1e-8:
-            uncertainty = compute_uncertainty(self._free_energy_history)
-            F_prev = (
-                self._free_energy_history[-2]
-                if len(self._free_energy_history) >= 2
-                else free_energy
-            )
-            D = compute_dopamine(free_energy, F_prev)
-            ACh = compute_ach(uncertainty, self.config.ach_beta_0)
-            modulation = combine_modulation(D, ACh)
-            self._last_D = D
-            self._last_ACh = ACh
-            self._last_modulation = modulation
-            compute_precision_scales(self.pool, D, ACh)
+            self.modulate(free_energy)
+            self.hebbian_pass(self._last_modulation)
 
-            active = [n.id for n in self.pool.neurons.values() if abs(n.ε) > n.threshold]
-            if active:
-                batch_hebbian(
-                    self.pool,
-                    active,
-                    eta=self.config.hebbian_base_eta,
-                    oja_alpha=self.config.oja_alpha,
-                    dopamine=modulation,
-                )
-                for nid in active:
-                    n = self.pool.neurons[nid]
-                    eta_ = self.config.hebbian_base_eta * 0.3
-                    self.temporal.hebbian_step(nid, n._z_prev, n.ε, eta=eta_, dopamine=modulation)
-                    self.topdown.hebbian_step(self.pool, nid, n.ε, eta=eta_, dopamine=modulation)
+        uncertainty = (
+            0.5
+            if is_warmup or len(self._free_energy_history) < 3
+            else compute_uncertainty(self._free_energy_history[-20:])
+        )
+        self.finalize_step()
 
-        # 9. 保存 z(t) 供下一轮使用
-        self._store_prev_z()
-
-        return {
+        stats = {
             "step": self._step,
-            "n_sensory_events": n_sensory,
-            "n_network_events": n_network,
+            "n_sensory_events": self._n_sensory_events,
+            "n_network_events": self._n_network_events,
             "free_energy": free_energy,
             "lm_loss": lm_loss,
             "pred_byte": pred_byte,
@@ -230,12 +391,15 @@ class CyreneModel:
             "firing_rate": self.pool.get_activity_stats()["avg_firing_rate"],
             "threshold": self.pool.get_activity_stats()["avg_threshold"],
             "warmup": is_warmup,
-            "D": D,
-            "ACh": ACh,
-            "modulation": modulation,
+            "D": self._last_D,
+            "ACh": self._last_ACh,
+            "modulation": self._last_modulation,
             "uncertainty": uncertainty,
             **hs_stats,
         }
+
+        self._fire("after_step", stats=stats)
+        return stats
 
     # ── 内部辅助 ──────────────────────────────────────────────────
 

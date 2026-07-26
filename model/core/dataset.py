@@ -12,7 +12,8 @@ ch1 = 角色编码: pad=0 / user=1 / assistant=2 / system=3
   5. {"conversations": [...], "gt": [...]}                  — 含 ground truth
 """
 
-import json, re
+import json
+import re
 import torch
 from torch.utils.data import Dataset
 

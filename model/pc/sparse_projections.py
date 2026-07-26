@@ -16,6 +16,7 @@ import random
 from typing import Optional
 
 from .neuron_pool import NeuronPool
+from .sparse_forward import _to_fp16
 
 
 # ── 时序自连接 ───────────────────────────────────────────────────
@@ -488,13 +489,4 @@ class SparseLMHead:
         }
 
 
-# ── 工具 ──────────────────────────────────────────────────────────
-
-
-def _to_fp16(v: float) -> float:
-    """模拟 fp16 精度截断。"""
-    if v == 0.0 or not math.isfinite(v):
-        return 0.0
-    v = max(-65504.0, min(65504.0, v))
-    digits = -int(math.floor(math.log10(abs(v)))) + 3
-    return round(v, max(0, digits))
+# (工具函数 _to_fp16 定义在 sparse_forward.py 中, 从此模块导入)

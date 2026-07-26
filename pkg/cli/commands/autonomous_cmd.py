@@ -7,9 +7,9 @@ autonomous
 
 from typing import Optional
 
+import torch
 import typer
 from pkg.cli.utils import resolve_path
-from model.core.globals import DEVICE_STR
 
 app = typer.Typer(name="autonomous", help="Phase 2: 持续自主运行", no_args_is_help=True)
 
@@ -34,7 +34,7 @@ def autonomous(
     """Phase 2: 持续自主运行 (WAKE→PLAY→SLEEP 循环)."""
     from model.core.autonomous_mind import AutonomousMind
 
-    device = ctx.obj.get("device", DEVICE_STR)
+    device = ctx.obj.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     resolved_checkpoint = resolve_path(checkpoint) if checkpoint else None
     resolved_data_dir = resolve_path(data_dir)
 

@@ -52,7 +52,7 @@ def compute_layer_importance(
             importance.append(0.0)
             continue
         eps_vals = [
-            abs(runner.pool.neurons[nid].epsilon)
+            abs(runner.pool.neurons[nid].ε)
             for nid in nids
             if nid in runner.pool.neurons
         ]

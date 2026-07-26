@@ -180,55 +180,6 @@ class MemoryBank:
         idx = torch.multinomial(w, min(batch_size, len(all_ex)), replacement=False)
         return [all_ex[i] for i in idx.tolist()]
 
-    # ── 评估 ──────────────────────────────────────────────────────────
-
-    @torch.no_grad()
-    def evaluate(self, model, device: str, N: int = 32) -> dict:
-        """纯前向评估 bank 中各任务的 CE loss (无梯度, T=0).
-
-        Returns:
-            {task_id: {'avg_ce': float, 'baseline_ce': float, 'ratio': float}}
-        """
-        if self.total == 0:
-            return {}
-        model.eval()
-        results = {}
-        for task_id, buf in self._store.items():
-            if not buf:
-                continue
-            idx = torch.randperm(len(buf))[: min(N, len(buf))].tolist()
-            losses = []
-            for i in idx:
-                ex = buf[i]
-                x = ex.byte_tensor.unsqueeze(0).to(device)
-                y = ex.label_tensor.unsqueeze(0).to(device)
-                z = model.init_z(x)
-                h = model.model.norm(z[model.num_sub_layers])
-                logits = model.model.lm_head(
-                    h.to(dtype=model.model.lm_head.weight.dtype)
-                )
-                s_logits = logits[..., :-1, :].contiguous()
-                s_labels = y[..., 1:].contiguous()
-                loss = torch.nn.functional.cross_entropy(
-                    s_logits.view(-1, s_logits.size(-1)),
-                    s_labels.view(-1),
-                    ignore_index=-100,
-                    reduction="sum",
-                )
-                n_tokens = (s_labels != -100).sum().item()
-                losses.append(loss.item() / max(n_tokens, 1))
-            avg_ce = sum(losses) / len(losses)
-            # baseline_loss 平均值 (只统计 >0 的有效值)
-            baselines = [ex.baseline_loss for ex in buf if ex.baseline_loss > 0]
-            baseline_ce = sum(baselines) / max(len(baselines), 1)
-            ratio = avg_ce / max(baseline_ce, 1e-8)
-            results[task_id] = {
-                "avg_ce": avg_ce,
-                "baseline_ce": baseline_ce,
-                "ratio": ratio,
-            }
-        return results
-
     # ── 序列化 ────────────────────────────────────────────────────────
 
     def state_dict(self) -> dict:
