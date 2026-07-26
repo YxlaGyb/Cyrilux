@@ -192,12 +192,24 @@ class TensorNeuronPool:
         if n_create == 0:
             return []
 
-        # 确保有空槽
+        # 确保有空槽 (批量回收最久未活跃神经元, 避免逐元素 GPU sync)
         while len(self._free_neurons) < n_create:
-            if not self._force_recycle():
+            alive_ids = torch.where(self.alive)[0]
+            if len(alive_ids) == 0:
                 raise RuntimeError(
-                    f"TensorNeuronPool 空间不足: 需要 {n_create}, 仅 {len(self._free_neurons)} 空槽"
+                    f"TensorNeuronPool 空间不足: 需要 {n_create}, 无存活神经元可回收"
                 )
+            need = n_create - len(self._free_neurons)
+            # 一次 topk 找到最旧的 N 个神经元, 逐个 prune (prune 本身有 .item() 但远少于 2000 次全扫描)
+            k = min(need, len(alive_ids))
+            _, oldest_rel = torch.topk(
+                self.last_active[alive_ids], k, largest=False
+            )
+            oldest_nids = alive_ids[oldest_rel]
+            for nid_val in oldest_nids.tolist():
+                self.prune_neuron(int(nid_val))
+                if len(self._free_neurons) >= n_create:
+                    break
 
         nids = [self._free_neurons.pop() for _ in range(n_create)]
         nids_t = torch.tensor(nids, dtype=torch.int32, device=self.device)
@@ -320,9 +332,14 @@ class TensorNeuronPool:
         post_t = torch.tensor(post_ids, dtype=torch.int32, device=self.device)
 
         if weights is None:
+            # 按 post 分组预读 fan_in, 减少 .item() 同步
+            fan_in_cache: dict[int, int] = {}
             w_list = []
+            for post_i in post_ids:
+                if post_i not in fan_in_cache:
+                    fan_in_cache[post_i] = max(1, int(self._in_counts[post_i].item()) + 1)
             for pre_i, post_i in zip(pre_ids, post_ids):
-                fan_in = max(1, int(self._in_counts[post_i].item()) + 1)
+                fan_in = fan_in_cache[post_i]
                 w = random.gauss(0, 1.0 / math.sqrt(fan_in))
                 w = max(-1.0, min(1.0, w))
                 w_list.append(w)
@@ -338,16 +355,30 @@ class TensorNeuronPool:
         self.syn_age[sids_t] = 0
         self._occupied_synapses += n
 
-        # 批量更新邻接表 (CPU 侧, 每个神经元独立)
-        for i, (pre_i, post_i, sid) in enumerate(zip(pre_ids, post_ids, sids)):
+        # 批量更新邻接表 — 按神经元分组, 每神经元仅一次 .item()
+        _post_to_sids: dict[int, list[int]] = {}
+        for sid, post_i in zip(sids, post_ids):
+            _post_to_sids.setdefault(post_i, []).append(sid)
+        for post_i, syn_list in _post_to_sids.items():
             in_c = int(self._in_counts[post_i].item())
+            avail = min(len(syn_list), self.K - in_c)
+            if avail > 0:
+                self.in_ptrs[post_i, in_c:in_c + avail] = torch.tensor(
+                    syn_list[:avail], dtype=torch.int32, device=self.device
+                )
+                self._in_counts[post_i] = in_c + avail
+
+        _pre_to_sids: dict[int, list[int]] = {}
+        for sid, pre_i in zip(sids, pre_ids):
+            _pre_to_sids.setdefault(pre_i, []).append(sid)
+        for pre_i, syn_list in _pre_to_sids.items():
             out_c = int(self._out_counts[pre_i].item())
-            if in_c < self.K:
-                self.in_ptrs[post_i, in_c] = sid
-                self._in_counts[post_i] = in_c + 1
-            if out_c < self.K:
-                self.out_ptrs[pre_i, out_c] = sid
-                self._out_counts[pre_i] = out_c + 1
+            avail = min(len(syn_list), self.K - out_c)
+            if avail > 0:
+                self.out_ptrs[pre_i, out_c:out_c + avail] = torch.tensor(
+                    syn_list[:avail], dtype=torch.int32, device=self.device
+                )
+                self._out_counts[pre_i] = out_c + avail
 
         self._total_syn_created += n
         return n
@@ -376,17 +407,21 @@ class TensorNeuronPool:
         self._occupied_neurons -= 1
         self._free_neurons.append(nid)
 
-        # 惰性删除关联突触
+        # 惰性删除关联突触 (回收槽位到 _free_synapses)
         in_c = int(self._in_counts[nid].item())
         for i in range(min(in_c, self.K)):
             sid = int(self.in_ptrs[nid, i].item())
             if sid >= 0:
                 self.syn_alive[sid] = False
+                self._free_synapses.append(sid)
+                self._occupied_synapses -= 1
         out_c = int(self._out_counts[nid].item())
         for i in range(min(out_c, self.K)):
             sid = int(self.out_ptrs[nid, i].item())
             if sid >= 0:
                 self.syn_alive[sid] = False
+                self._free_synapses.append(sid)
+                self._occupied_synapses -= 1
 
         # 重置邻接计数
         self._in_counts[nid] = 0
@@ -523,12 +558,11 @@ class TensorNeuronPool:
                 break
 
     def _remove_td_for_neuron(self, nid: int):
-        """移除神经元的所有 topdown 连接 (惰性)."""
-        for i in range(self._td_count):
-            if self.td_alive[i] and (
-                int(self.td_pre[i].item()) == nid or int(self.td_post[i].item()) == nid
-            ):
-                self.td_alive[i] = False
+        """移除神经元的所有 topdown 连接 (向量化布尔索引)."""
+        td_pre_slice = self.td_pre[:self._td_count]
+        td_post_slice = self.td_post[:self._td_count]
+        mask = (td_pre_slice == nid) | (td_post_slice == nid)
+        self.td_alive[:self._td_count][mask] = False
 
     # ═══════════════════════════════════════════════════════════════
     # 查询 (tensor 原生)
@@ -845,7 +879,10 @@ class TensorNeuronPool:
         eta: float,
         dopamine: float,
     ) -> float:
-        """Topdown 权重的 Hebbian 更新 (仅更新连接到活跃神经元的 topdown 权重)."""
+        """Topdown 权重的 Hebbian 更新 (向量化, 零逐元素 .item()).
+
+        仅更新连接到活跃神经元的 topdown 权重: dw = eta * dopamine * eps * z_pre.
+        """
         if active_nids.shape[0] == 0:
             return 0.0
 
@@ -853,27 +890,22 @@ class TensorNeuronPool:
         if not td_alive.any():
             return 0.0
 
-        # 找到 post 在 active_nids 中的 topdown 连接
-        active_set = set(active_nids.tolist())
-
-        # 逐连接更新 (topdown 连接数相对少)
-        total_delta = 0.0
         td_indices = torch.where(td_alive)[0]
-        for i in td_indices.tolist():
-            post = int(self.td_post[i].item())
-            if post not in active_set:
-                continue
-            pre = int(self.td_pre[i].item())
-            if not self.alive[pre]:
-                continue
-            eps = float(self.state[post, F_EPS].item())
-            z_pre_val = float(self.state[pre, F_Z].item())
-            w = float(self.td_weight[i].item())
-            dw = eta * dopamine * eps * z_pre_val
-            self.td_weight[i] = w + dw
-            total_delta += abs(dw)
+        post = self.td_post[td_indices].long()
+        pre = self.td_pre[td_indices].long()
 
-        return total_delta
+        # GPU 侧布尔掩码: post 在 active_nids 中 且 pre 存活
+        active_mask = torch.isin(post, active_nids) & self.alive[pre]
+        if not active_mask.any():
+            return 0.0
+
+        idx = td_indices[active_mask]
+        eps = self.state[post[active_mask], F_EPS]
+        z_pre_val = self.state[pre[active_mask], F_Z]
+        w = self.td_weight[idx]
+        dw = eta * dopamine * eps * z_pre_val
+        self.td_weight[idx] = w + dw
+        return float(dw.abs().sum().item())
 
     def hebbian_lm_head(
         self,
@@ -903,14 +935,11 @@ class TensorNeuronPool:
         z_top = self.state[top_mask, F_Z]  # [n_top]
         eta_eff = eta * dopamine
 
-        # 目标字节: dw = eta_eff * z; 非目标: dw = -eta_eff * 0.01 * w
-        for logit_idx in range(256):
-            w_slice = self.lm_weight[logit_idx, top_mask]  # [n_top]
-            if logit_idx == target_byte:
-                dw = eta_eff * z_top
-            else:
-                dw = -eta_eff * 0.01 * w_slice
-            self.lm_weight[logit_idx, top_mask] += dw
+        # 向量化: 全部 256 logit 同时更新 (替代逐 logit Python 循环)
+        # 全部 logit 默认衰减, 目标 logit 增强
+        dw = -eta_eff * 0.01 * self.lm_weight[:, top_mask]  # [256, n_top]
+        dw[target_byte] = eta_eff * z_top
+        self.lm_weight[:, top_mask] += dw
 
         return float(dw.abs().sum().item())
 

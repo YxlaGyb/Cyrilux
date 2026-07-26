@@ -225,16 +225,21 @@ class CyreneModel:
                 channels=new_channels,
                 thresholds=[0.05] * n_unmatched,
             )
-            # 动态连接新感官神经元到隐藏层
+            # 动态连接新感官神经元到隐藏层 (批量创建, 一次 GPU 写入)
             if self._top_layer > 0 and not self._pending_connect:
                 hidden_nids = self.pool.get_neurons_by_layer(self._top_layer)
                 if len(hidden_nids) > 0:
                     h_list = hidden_nids.tolist()
+                    pre_list: list[int] = []
+                    post_list: list[int] = []
                     for snid in new_nids:
                         k = max(1, int(len(h_list) * 0.2))
                         sampled = random.sample(h_list, min(k, len(h_list)))
                         for hnid in sampled:
-                            self.pool.create_synapse(snid, hnid)
+                            pre_list.append(snid)
+                            post_list.append(hnid)
+                    if pre_list:
+                        self.pool.create_synapses_batch(pre_list, post_list)
         else:
             new_nids = []
 
