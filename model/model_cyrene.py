@@ -409,7 +409,7 @@ class CyreneModel:
             self.bridge.push_network_events(active, self.pool.state[active.long(), F_EPS])
 
         # 每步阈值调节 (不管 homeostasis 间隔, 强反馈压制过度发放)
-        self.pool.adjust_thresholds(target_rate=0.01, rate_eta=0.05)
+        self.pool.adjust_thresholds(target_rate=0.15, rate_eta=0.05)
 
         hs_stats: dict = {}
         if self._step % self.config.homeostasis_interval == 0:

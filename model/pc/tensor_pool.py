@@ -764,6 +764,12 @@ class TensorNeuronPool:
             self.state[non_sensory, F_Z] = z_new
             self.state[non_sensory, F_EPS] = z_new - mu_ns
 
+        # BCM 滑动阈值: 每个神经元追踪自己的近期平均活动量 (|z|)
+        # EMA decay=0.995 → 时间常数 ~200 步, 不受瞬态波动干扰
+        self.state[:, F_FIRING_RATE] = (
+            0.995 * self.state[:, F_FIRING_RATE] + 0.005 * self.state[:, F_Z].abs()
+        )
+
     def predict_neurons(self, nids: torch.Tensor) -> torch.Tensor:
         """批量预测指定神经元的 mu.
 
@@ -920,6 +926,12 @@ class TensorNeuronPool:
 
         # Hebb: eta * eps * z_pre
         hebb = eta_eff * eps_post * z_pre
+        # BCM 滑动阈值: 每个神经元根据近期平均活动量调节学习率
+        # 活跃过多 → 学习率下降/LTD, 活跃过少 → 学习率升高
+        bcm_avg = self.state[active_nids.long(), F_FIRING_RATE].unsqueeze(-1)  # [A, 1]
+        bcm_gain = 1.0 - 4.0 * bcm_avg
+        bcm_gain = torch.clamp(bcm_gain, -1.0, 1.0)
+        hebb = hebb * bcm_gain
         # Oja: -alpha * D * eps^2 * w  — 仅在 |w| > 0.8 时介入 (突触资源物理上限)
         oja_trigger = (w.abs() > 0.8).to(torch.float16)
         oja = -oja_alpha * dopamine * (eps_post**2) * w * oja_trigger
@@ -1169,13 +1181,13 @@ class TensorNeuronPool:
         self.state[:, F_Z_PREV] = self.state[:, F_Z]
 
     def emit_active(self, current_time: int) -> torch.Tensor:
-        """扫描全网络, 更新 firing_rate, 返回活跃神经元索引.
+        """扫描全网络, 返回活跃神经元索引.
 
         firing: |eps| > threshold.
+        F_FIRING_RATE 的更新已移至 predict_all (连续 |z| EMA).
         """
         firing = (self.state[:, F_EPS].abs() > self.state[:, F_THRESHOLD]) & self.alive
         if firing.any():
-            self.state[firing, F_FIRING_RATE] = self.state[firing, F_FIRING_RATE] * 0.95 + 0.05
             self.last_active[firing] = current_time
         return torch.where(firing)[0]
 
