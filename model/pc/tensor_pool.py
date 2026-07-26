@@ -506,13 +506,20 @@ class TensorNeuronPool:
         self.state[nid, F_THRESHOLD] = min(1.0, parent_thr * 1.1)
         return child
 
-    def connect_layer(self, from_layer: int, to_layer: int, density: float = 0.5) -> int:
-        """两层间随机稀疏连接 (批量创建, 一次 GPU 写入).
+    def connect_layer(
+        self, from_layer: int, to_layer: int, density: float = 0.5, bias_strength: float = 0.7
+    ) -> int:
+        """两层间有偏置的稀疏连接 — 模拟皮层感受野结构.
+
+        每个目标神经元分配一个随机的偏好感官子集 (10%).
+        bias_strength 比例的突触来自偏好池 → 不同神经元有不同初始偏置.
+        偏置 + k-WTA 竞争 + Hebbian 放大 = 输入选择性的雪崩.
 
         Args:
             from_layer: 源层
             to_layer: 目标层
             density: 连接密度
+            bias_strength: 偏好池权重 (0=全局随机, 1=纯本地)
 
         Returns:
             创建的连接数.
@@ -525,13 +532,23 @@ class TensorNeuronPool:
         if not from_ids or not to_ids:
             return 0
 
-        # 预计算所有 (pre, post) 对
+        n_from = len(from_ids)
+        # 每个隐藏神经元的偏好感官池: 随机 10% 感官神经元
+        pref_size = max(1, int(n_from * 0.1))
+
         pre_list: list[int] = []
         post_list: list[int] = []
         for post in to_ids:
-            k = max(1, int(len(from_ids) * density))
-            sampled = random.sample(from_ids, min(k, len(from_ids)))
-            for pre in sampled:
+            k = min(self.K, max(1, int(n_from * density)))
+            n_local = int(k * bias_strength)
+            n_global = k - n_local
+
+            preferred = random.sample(from_ids, pref_size)
+            local = random.sample(preferred, min(n_local, len(preferred)))
+            rest = [x for x in from_ids if x not in preferred]
+            global_s = random.sample(rest, min(n_global, len(rest)))
+
+            for pre in local + global_s:
                 pre_list.append(pre)
                 post_list.append(post)
 
@@ -676,9 +693,15 @@ class TensorNeuronPool:
         if non_sensory.any():
             z_old = self.state[non_sensory, F_Z]
             mu_ns = self.state[non_sensory, F_MU]
-            z_new = 0.9 * z_old + 0.1 * mu_ns
+            z_new = 0.5 * z_old + 0.5 * mu_ns  # 50%历史 + 50%当前输入 → 可区分不同输入
+
+            # 微小噪声打破对称性: 模拟生物神经元的内在异质性
+            # 不同神经元有细微差异 → k-WTA 对不同输入选出不同赢家 → Hebbian 固化
+            noise = torch.randn_like(z_new) * 0.005
+            z_new = z_new + noise
 
             # 逐层 k-WTA 侧抑制: 每层独立竞争 (生物: 侧抑制在同一皮层内运作)
+            # 中心化: 减去层均值 → 只保留个体差异, 放大输入选择性
             # 效果: 每层保留 top-10% 最强神经元 → 稀疏、可分的表示
             for L in self.layer[non_sensory].unique().tolist():
                 if L <= 0:
@@ -688,6 +711,7 @@ class TensorNeuronPool:
                 if n_L <= 4:
                     continue
                 z_L = z_new[in_layer]
+                z_L = z_L - z_L.mean()  # 中心化: 去除公共分量
                 k = max(4, n_L // 10)
                 _, top_idx = torch.topk(z_L.abs(), k)
                 winners = torch.zeros(n_L, dtype=torch.bool, device=self.device)

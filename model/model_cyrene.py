@@ -47,6 +47,7 @@ class CyreneConfig:
     ach_beta_0: float = 0.0
     hidden_neurons: int = 256
     connection_density: float = 0.2
+    bias_strength: float = 0.7  # connect_layer 偏好池权重 (0=随机, 1=纯本地)
     prune_interval: int = 100
     grow_interval: int = 200
     homeostasis_interval: int = 50
@@ -380,7 +381,9 @@ class CyreneModel:
         # warmup 结束后触发延迟连接
         if not is_warmup and self._pending_connect is not None:
             from_l, to_l, density = self._pending_connect
-            n_conn = self.pool.connect_layer(from_l, to_l, density)
+            n_conn = self.pool.connect_layer(
+                from_l, to_l, density, bias_strength=self.config.bias_strength
+            )
             self._pending_connect = None
             # 确保 LM head 连接
             if self._top_layer > 0:
