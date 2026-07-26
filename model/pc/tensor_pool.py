@@ -913,16 +913,21 @@ class TensorNeuronPool:
         target_byte: int,
         eta: float,
         dopamine: float,
+        pred_byte: int = -1,
     ) -> float:
-        """LM head 权重的 Hebbian 更新.
+        """LM head 权重的生物启发更新 — 误差门控 + 异突触竞争.
 
-        目标字节连接增强, 其他字节轻微衰减.
+        机制:
+        1. 误差门控: 猜对时不强化 (防止高频字节权重发散)
+        2. 异突触可塑性: 目标字节 LTP 的同时, 错误预测字节承担 LTD
+           (同一树突上的资源守恒 — 一个增强, 另一个减弱)
 
         Args:
             top_layer: 顶层索引
-            target_byte: 目标字节 (0..255), -1 表示无目标
+            target_byte: 目标字节 (0..255), -1 = 无监督
             eta: 学习率
             dopamine: 多巴胺调制
+            pred_byte: 当前模型预测 (argmax logits), -1 = 未计算
 
         Returns:
             总绝对权重变化量.
@@ -935,12 +940,27 @@ class TensorNeuronPool:
         z_top = self.state[top_mask, F_Z]  # [n_top]
         eta_eff = eta * dopamine
 
-        # 向量化: 全部 256 logit 同时更新 (替代逐 logit Python 循环)
-        # 全部 logit 默认衰减, 目标 logit 增强
-        dw = -eta_eff * 0.01 * self.lm_weight[:, top_mask]  # [256, n_top]
-        dw[target_byte] = eta_eff * z_top
-        self.lm_weight[:, top_mask] += dw
+        # 计算预测 (若调用方未传入)
+        if pred_byte < 0:
+            logits = (self.lm_weight[:, top_mask] @ z_top)  # [256]
+            pred_byte = int(logits.argmax().item())
 
+        error = (pred_byte != target_byte)
+
+        # 误差门控: 猜对时学习率降低到 10% (避免无限制强化)
+        gate = 1.0 if error else 0.1
+
+        # 异突触可塑性: dw 初始化为零, 仅更新参与错误的字节
+        dw = torch.zeros(256, n_top, dtype=torch.float16, device=self.device)
+
+        # LTP: 目标字节增强 (不管猜对猜错都轻微调整, 门控控制强度)
+        dw[target_byte] = eta_eff * gate * z_top
+
+        if error:
+            # LTD: 错误预测字节削弱 (它"用错了资源", 需要被抑制)
+            dw[pred_byte] = -eta_eff * gate * z_top * 0.5
+
+        self.lm_weight[:, top_mask] += dw
         return float(dw.abs().sum().item())
 
     def adjust_thresholds(self, target_rate: float = 0.01, rate_eta: float = 0.01):
@@ -1011,6 +1031,21 @@ class TensorNeuronPool:
             stats["grown"] = 0
 
         return stats
+
+    def homeostasis_lm_head(self, top_layer: int):
+        """LM head 稳态缩放: 每列减去列均值 (模拟突触资源守恒).
+
+        防止高频字节权重无限增长 → 低频字节被永久锁死.
+        生物对应: 异突触长时程抑制 + 稳态缩放.
+
+        列均值归零等价于: sum_i(lm_weight[i, j]) = 0 对所有隐藏神经元 j 成立.
+        """
+        top_mask = (self.layer == top_layer) & self.alive
+        if not top_mask.any():
+            return
+        w_sub = self.lm_weight[:, top_mask]  # [256, n_top]
+        col_mean = w_sub.mean(dim=0, keepdim=True)  # [1, n_top]
+        self.lm_weight[:, top_mask] -= col_mean
 
     def compute_precision_scales(self, D: float, ACh: float, eta: float = 1.0):
         """更新精度权重 pi = 1 + eta*D*|eps| + eta*ACh*|eps|."""

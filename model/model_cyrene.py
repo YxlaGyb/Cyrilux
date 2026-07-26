@@ -52,6 +52,25 @@ class CyreneConfig:
     homeostasis_interval: int = 50
 
 
+class LMHead:
+    """LM Head 薄封装 — 委托到 TensorNeuronPool 的 lm_weight 计算."""
+
+    def __init__(self, pool):
+        self._pool = pool
+
+    def predict_logits(self, pool, top_layer: int) -> list[float]:
+        """返回 256 个字节的 logits (list[float], CPU)."""
+        logits = pool.compute_lm_logits(top_layer)
+        return logits.cpu().tolist()
+
+    def cross_entropy_loss(self, logits: list[float], target: int) -> float:
+        """计算 CE loss."""
+        import torch
+        t = torch.tensor(logits, dtype=torch.float32).unsqueeze(0)
+        target_t = torch.tensor([target])
+        return float(torch.nn.functional.cross_entropy(t, target_t).item())
+
+
 class CyreneModel:
     """Cyrene 模型 — 全张量化字节级 PC 持续学习.
 
@@ -88,6 +107,9 @@ class CyreneModel:
             K=config.K_fan,
             device=self.device,
         )
+
+        # LM Head (委托到 pool)
+        self.lm_head = LMHead(self.pool)
 
         # 事件桥接 (tensor 版本)
         self.bridge = EventBridge(
@@ -384,6 +406,9 @@ class CyreneModel:
         hs_stats: dict = {}
         if self._step % self.config.homeostasis_interval == 0:
             hs_stats = self.homeostasis_pass()
+            # LM head 稳态缩放 (列均值归零, 资源守恒)
+            if not is_warmup and self._top_layer > 0:
+                self.pool.homeostasis_lm_head(self._top_layer)
 
         if not is_warmup and free_energy > 1e-8:
             self.modulate(free_energy)
@@ -394,6 +419,7 @@ class CyreneModel:
                     self._top_layer, target_byte,
                     eta=self.config.hebbian_base_eta * 0.3,
                     dopamine=self._last_modulation,
+                    pred_byte=pred_byte,
                 )
 
         uncertainty = (
