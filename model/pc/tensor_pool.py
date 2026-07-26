@@ -146,7 +146,6 @@ class TensorNeuronPool:
         self.layer[nid] = layer
         self._occupied_neurons += 1
 
-        # 设置默认值
         thr = kwargs.get("threshold", 0.1)
         pos = kwargs.get("position", -1)
         ch = kwargs.get("channel", -1)
@@ -163,12 +162,78 @@ class TensorNeuronPool:
         self.channel[nid] = ch
         self.created_at[nid] = self._total_created
 
-        # 维护感官索引
         if pos >= 0:
             self._sensory_index[(layer, int(pos), int(ch))] = nid
 
         self._total_created += 1
         return nid
+
+    def create_neurons_batch(
+        self,
+        layers: list[int],
+        positions: list[int] | None = None,
+        channels: list[int] | None = None,
+        thresholds: list[float] | None = None,
+        z_vals: list[float] | None = None,
+    ) -> list[int]:
+        """批量创建神经元 — 一次 GPU 写入, 替代逐元素 create_neuron.
+
+        Args:
+            layers: 每神经元的逻辑层
+            positions: 每神经元序列位置 (-1 = 非感官)
+            channels: 每神经元特征通道
+            thresholds: 初始阈值
+            z_vals: 初始 z 值
+
+        Returns:
+            新神经元的 nid 列表.
+        """
+        n_create = len(layers)
+        if n_create == 0:
+            return []
+
+        # 确保有空槽
+        while len(self._free_neurons) < n_create:
+            if not self._force_recycle():
+                raise RuntimeError(f"TensorNeuronPool 空间不足: 需要 {n_create}, 仅 {len(self._free_neurons)} 空槽")
+
+        nids = [self._free_neurons.pop() for _ in range(n_create)]
+        nids_t = torch.tensor(nids, dtype=torch.int32, device=self.device)
+
+        # 批量写入 alive 和 layer
+        self.alive[nids_t] = True
+        self._occupied_neurons += n_create
+
+        pos = positions or [-1] * n_create
+        ch = channels or [-1] * n_create
+        thr = thresholds or [0.1] * n_create
+        zv = z_vals or [0.0] * n_create
+
+        pos_t = torch.tensor(pos, dtype=torch.int16, device=self.device)
+        ch_t = torch.tensor(ch, dtype=torch.int16, device=self.device)
+        layer_t = torch.tensor(layers, dtype=torch.int16, device=self.device)
+
+        self.layer[nids_t] = layer_t
+        self.position[nids_t] = pos_t
+        self.channel[nids_t] = ch_t
+        self.created_at[nids_t] = self._total_created
+
+        # 批量写入神经元状态
+        self.state[nids_t, F_THRESHOLD] = torch.tensor(thr, dtype=torch.float16, device=self.device)
+        self.state[nids_t, F_Z] = torch.tensor(zv, dtype=torch.float16, device=self.device)
+        self.state[nids_t, F_MU] = 0.0
+        self.state[nids_t, F_EPS] = 0.0
+        self.state[nids_t, F_FIRING_RATE] = 0.0
+        self.state[nids_t, F_PI] = 1.0
+        self.state[nids_t, F_Z_PREV] = 0.0
+
+        # 维护感官索引
+        for i, nid in enumerate(nids):
+            if pos[i] >= 0:
+                self._sensory_index[(layers[i], pos[i], ch[i])] = nid
+
+        self._total_created += n_create
+        return nids
 
     def create_synapse(self, pre: int, post: int, weight: float | None = None) -> int:
         """在两个神经元间创建突触.
@@ -850,58 +915,39 @@ class TensorNeuronPool:
 
     def match_sensory_events(
         self,
-        ev_pos: torch.Tensor,
-        ev_ch: torch.Tensor,
-        ev_layer: torch.Tensor,
-        ev_val: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """批量匹配感官事件到现有神经元 (O(1) hash 索引).
+        layers: list[int],
+        positions: list[int],
+        channels: list[int],
+    ) -> tuple[list[int], list[int], list[int]]:
+        """批量匹配感官事件到现有神经元 (O(1) hash 索引, 纯 Python).
 
         Args:
-            ev_pos: [E] int 序列位置
-            ev_ch: [E] int 特征通道
-            ev_layer: [E] int 逻辑层
-            ev_val: [E] fp16 事件值
+            layers: [E] 逻辑层
+            positions: [E] 序列位置
+            channels: [E] 特征通道
 
         Returns:
-            (matched_nids, unmatched_mask, matched_indices_map)
+            (matched_nids, matched_event_indices, unmatched_event_indices)
+            所有返回值均为 Python list.
         """
-        E = ev_pos.shape[0]
-        if E == 0:
-            return (
-                torch.zeros(0, dtype=torch.int32, device=self.device),
-                torch.zeros(0, dtype=torch.bool, device=self.device),
-                torch.zeros(0, dtype=torch.int32, device=self.device),
-            )
+        E = len(layers)
+        idx = self._sensory_index
 
-        # 用 hash 索引在 CPU 侧快速匹配
-        matched_list: list[int] = []
-        unmatched_mask = torch.zeros(E, dtype=torch.bool, device=self.device)
+        matched_nids: list[int] = []
+        matched_ev_idx: list[int] = []
+        unmatched_ev_idx: list[int] = []
 
         for e in range(E):
-            key = (int(ev_layer[e].item()), int(ev_pos[e].item()), int(ev_ch[e].item()))
-            nid = self._sensory_index.get(key)
-            if nid is not None and self.alive[nid]:
-                matched_list.append(nid)
+            key = (layers[e], positions[e], channels[e])
+            nid = idx.get(key)
+            if nid is not None:
+                # 索引中的神经元一定存活 (prune 时已从索引移除)
+                matched_nids.append(nid)
+                matched_ev_idx.append(e)
             else:
-                unmatched_mask[e] = True
+                unmatched_ev_idx.append(e)
 
-        matched_nids = (
-            torch.tensor(matched_list, dtype=torch.int32, device=self.device)
-            if matched_list
-            else torch.zeros(0, dtype=torch.int32, device=self.device)
-        )
-
-        # Build matched_indices_map: for each event, the index into matched_nids (-1 if unmatched)
-        # We don't need this with the new approach since we use unmatched_mask directly
-        matched_indices_map = torch.full((E,), -1, dtype=torch.int32, device=self.device)
-        matched_idx = 0
-        for e in range(E):
-            if not unmatched_mask[e]:
-                matched_indices_map[e] = matched_idx
-                matched_idx += 1
-
-        return matched_nids, unmatched_mask, matched_indices_map
+        return matched_nids, matched_ev_idx, unmatched_ev_idx
 
     # ═══════════════════════════════════════════════════════════════
     # 时序投影操作

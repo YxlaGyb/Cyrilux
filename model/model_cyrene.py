@@ -189,48 +189,48 @@ class CyreneModel:
             )
             E = max_ev
 
-        # 一次 .cpu() 转移全部, 避免逐元素 CUDA 同步
-        pos_cpu = events.pos.cpu()
-        ch_cpu = events.ch.cpu()
-        val_cpu = events.val.cpu()
-        layer_cpu = events.layer.cpu()
+        # 一次 .cpu() + .tolist() 转 Python, 零逐元素 tensor 开销
+        layers_l = events.layer.cpu().tolist()
+        positions_l = events.pos.cpu().tolist()
+        channels_l = events.ch.cpu().tolist()
+        vals_l = events.val.cpu().tolist()
 
-        # O(1) hash 匹配 + 构建目标列表 (全部在 CPU 侧)
-        matched_nids, unmatched_mask, matched_map = self.pool.match_sensory_events(
-            pos_cpu, ch_cpu, layer_cpu, val_cpu
+        # 纯 Python hash 匹配
+        matched_nids, matched_ev, unmatched_ev = self.pool.match_sensory_events(
+            layers_l, positions_l, channels_l
         )
 
-        all_nids_list: list[int] = []
-        z_new_list: list[float] = []
-
-        for e in range(E):
-            val_e = float(val_cpu[e].item())
-            if unmatched_mask[e]:
-                nid = self.pool.create_neuron(
-                    layer=int(layer_cpu[e].item()),
-                    position=int(pos_cpu[e].item()),
-                    channel=int(ch_cpu[e].item()),
-                    threshold=0.05,
-                )
-                all_nids_list.append(nid)
-                z_new_list.append(val_e)
-            else:
-                idx = int(matched_map[e].item())
-                nid = int(matched_nids[idx].item())
-                all_nids_list.append(nid)
-                z_new_list.append(val_e)
-
-        if not all_nids_list:
+        n_matched = len(matched_nids)
+        n_unmatched = len(unmatched_ev)
+        n_total = n_matched + n_unmatched
+        if n_total == 0:
             self._fire("after_sensory", n_processed=0)
             return 0
 
+        # 批量创建未匹配的神经元
+        if n_unmatched > 0:
+            new_layers = [layers_l[e] for e in unmatched_ev]
+            new_positions = [positions_l[e] for e in unmatched_ev]
+            new_channels = [channels_l[e] for e in unmatched_ev]
+            new_nids = self.pool.create_neurons_batch(
+                layers=new_layers,
+                positions=new_positions,
+                channels=new_channels,
+                thresholds=[0.05] * n_unmatched,
+            )
+        else:
+            new_nids = []
+
+        # 合并所有目标 (保持事件顺序: 先 matched, 后 unmatched)
+        all_nids_list = matched_nids + new_nids
+        all_z = [vals_l[e] for e in matched_ev] + [vals_l[e] for e in unmatched_ev]
+
         all_nids = torch.tensor(all_nids_list, dtype=torch.int32, device=self.device)
-        z_new = torch.tensor(z_new_list, dtype=torch.float16, device=self.device)
+        z_new = torch.tensor(all_z, dtype=torch.float16, device=self.device)
         self.pool.update_batch(all_nids, z_new)
 
-        n_processed = len(all_nids_list)
-        self._fire("after_sensory", n_processed=n_processed)
-        return n_processed
+        self._fire("after_sensory", n_processed=n_total)
+        return n_total
 
     @torch.inference_mode()
     def process_network_events(self, max_events: int = 10) -> int:
