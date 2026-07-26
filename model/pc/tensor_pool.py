@@ -152,7 +152,7 @@ class TensorNeuronPool:
         z_val = kwargs.get("z", 0.0)
 
         self.state[nid, F_THRESHOLD] = thr
-        self.state[nid, F_Z] = z_val
+        self.state[nid, F_Z] = z_val if z_val != 0.0 or layer == 0 else 0.1
         self.state[nid, F_MU] = 0.0
         self.state[nid, F_EPS] = 0.0
         self.state[nid, F_FIRING_RATE] = 0.0
@@ -200,11 +200,12 @@ class TensorNeuronPool:
                     f"TensorNeuronPool 空间不足: 需要 {n_create}, 无存活神经元可回收"
                 )
             need = n_create - len(self._free_neurons)
-            # 一次 topk 找到最旧的 N 个神经元, 逐个 prune (prune 本身有 .item() 但远少于 2000 次全扫描)
+            """
+            一次 topk 找到最旧的 N 个神经元
+            逐个 prune (prune 本身有 .item() 但远少于 2000 次全扫描)
+            """
             k = min(need, len(alive_ids))
-            _, oldest_rel = torch.topk(
-                self.last_active[alive_ids], k, largest=False
-            )
+            _, oldest_rel = torch.topk(self.last_active[alive_ids], k, largest=False)
             oldest_nids = alive_ids[oldest_rel]
             for nid_val in oldest_nids.tolist():
                 self.prune_neuron(int(nid_val))
@@ -322,7 +323,7 @@ class TensorNeuronPool:
             dead = torch.where(~self.syn_alive)[0]
             if len(dead) == 0:
                 raise RuntimeError(f"突触槽位不足: 需要 {n}")
-            self._free_synapses.extend(dead[:n - len(self._free_synapses)].tolist())
+            self._free_synapses.extend(dead[: n - len(self._free_synapses)].tolist())
 
         sids = [self._free_synapses.pop() for _ in range(n)]
         sids_t = torch.tensor(sids, dtype=torch.int32, device=self.device)
@@ -363,7 +364,7 @@ class TensorNeuronPool:
             in_c = int(self._in_counts[post_i].item())
             avail = min(len(syn_list), self.K - in_c)
             if avail > 0:
-                self.in_ptrs[post_i, in_c:in_c + avail] = torch.tensor(
+                self.in_ptrs[post_i, in_c : in_c + avail] = torch.tensor(
                     syn_list[:avail], dtype=torch.int32, device=self.device
                 )
                 self._in_counts[post_i] = in_c + avail
@@ -375,7 +376,7 @@ class TensorNeuronPool:
             out_c = int(self._out_counts[pre_i].item())
             avail = min(len(syn_list), self.K - out_c)
             if avail > 0:
-                self.out_ptrs[pre_i, out_c:out_c + avail] = torch.tensor(
+                self.out_ptrs[pre_i, out_c : out_c + avail] = torch.tensor(
                     syn_list[:avail], dtype=torch.int32, device=self.device
                 )
                 self._out_counts[pre_i] = out_c + avail
@@ -559,10 +560,10 @@ class TensorNeuronPool:
 
     def _remove_td_for_neuron(self, nid: int):
         """移除神经元的所有 topdown 连接 (向量化布尔索引)."""
-        td_pre_slice = self.td_pre[:self._td_count]
-        td_post_slice = self.td_post[:self._td_count]
+        td_pre_slice = self.td_pre[: self._td_count]
+        td_post_slice = self.td_post[: self._td_count]
         mask = (td_pre_slice == nid) | (td_post_slice == nid)
-        self.td_alive[:self._td_count][mask] = False
+        self.td_alive[: self._td_count][mask] = False
 
     # ═══════════════════════════════════════════════════════════════
     # 查询 (tensor 原生)
@@ -669,11 +670,32 @@ class TensorNeuronPool:
         self.state[alive, F_MU] = mu[alive] * scale.squeeze(-1)
         self.state[alive, F_EPS] = self.state[alive, F_Z] - self.state[alive, F_MU]
 
-        # 非感官层神经元: z 跟踪 mu (无直接感官输入, z_min = mu)
+        # 非感官层神经元: z 向 mu 靠拢但不瞬间跟随 (膜电位时间常数)
+        # z_new = 0.9*z_old + 0.1*mu — 神经元有自己的惯性, 不是预测的镜子
         non_sensory = alive & (self.layer > 0)
         if non_sensory.any():
-            self.state[non_sensory, F_Z] = self.state[non_sensory, F_MU]
-            self.state[non_sensory, F_EPS] = 0.0
+            z_old = self.state[non_sensory, F_Z]
+            mu_ns = self.state[non_sensory, F_MU]
+            z_new = 0.9 * z_old + 0.1 * mu_ns
+
+            # 逐层 k-WTA 侧抑制: 每层独立竞争 (生物: 侧抑制在同一皮层内运作)
+            # 效果: 每层保留 top-10% 最强神经元 → 稀疏、可分的表示
+            for L in self.layer[non_sensory].unique().tolist():
+                if L <= 0:
+                    continue
+                in_layer = self.layer[non_sensory] == L  # 在 z_new 中的位置
+                n_L = in_layer.sum().item()
+                if n_L <= 4:
+                    continue
+                z_L = z_new[in_layer]
+                k = max(4, n_L // 10)
+                _, top_idx = torch.topk(z_L.abs(), k)
+                winners = torch.zeros(n_L, dtype=torch.bool, device=self.device)
+                winners[top_idx] = True
+                z_new[in_layer] = torch.where(winners, z_L, z_L * 0.1)
+
+            self.state[non_sensory, F_Z] = z_new
+            self.state[non_sensory, F_EPS] = z_new - mu_ns
 
     def predict_neurons(self, nids: torch.Tensor) -> torch.Tensor:
         """批量预测指定神经元的 mu.
@@ -829,8 +851,9 @@ class TensorNeuronPool:
 
         # Hebb: eta * eps * z_pre
         hebb = eta_eff * eps_post * z_pre
-        # Oja: -alpha * D * eps^2 * w
-        oja = -oja_alpha * dopamine * (eps_post**2) * w
+        # Oja: -alpha * D * eps^2 * w  — 仅在 |w| > 0.8 时介入 (突触资源物理上限)
+        oja_trigger = (w.abs() > 0.8).to(torch.float16)
+        oja = -oja_alpha * dopamine * (eps_post**2) * w * oja_trigger
 
         dw = hebb + oja
         dw = torch.where(valid, dw, torch.zeros_like(dw))
@@ -942,10 +965,10 @@ class TensorNeuronPool:
 
         # 计算预测 (若调用方未传入)
         if pred_byte < 0:
-            logits = (self.lm_weight[:, top_mask] @ z_top)  # [256]
+            logits = self.lm_weight[:, top_mask] @ z_top  # [256]
             pred_byte = int(logits.argmax().item())
 
-        error = (pred_byte != target_byte)
+        error = pred_byte != target_byte
 
         # 误差门控: 猜对时学习率降低到 10% (避免无限制强化)
         gate = 1.0 if error else 0.1
@@ -969,7 +992,7 @@ class TensorNeuronPool:
         if alive.any():
             delta = rate_eta * (self.state[alive, F_FIRING_RATE] - target_rate)
             self.state[alive, F_THRESHOLD] = torch.clamp(
-                self.state[alive, F_THRESHOLD] + delta, min=1e-4
+                self.state[alive, F_THRESHOLD] + delta, min=1e-4, max=0.5
             )
 
     def homeostasis_step(
@@ -1009,7 +1032,7 @@ class TensorNeuronPool:
                 & (self.state[alive_ids, F_FIRING_RATE] < 0.001)
                 & (age > min_age)
             )
-            prune_mask = (orphan_mask | inactive_mask)
+            prune_mask = orphan_mask | inactive_mask
             candidates = alive_ids[prune_mask][:max_prune]
             for nid in candidates.tolist():
                 self.prune_neuron(int(nid))
