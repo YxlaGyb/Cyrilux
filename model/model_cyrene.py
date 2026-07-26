@@ -494,7 +494,11 @@ class CyreneModel:
         model._step = data.get("step", 0)
         model._top_layer = data.get("top_layer", 0)
         if config.num_hidden_layers > 0:
-            model._hidden_layer_created = True
+            if model.pool.get_layer_width(model._top_layer) == 0:
+                # 隐藏层被修剪: 重建神经元和连接
+                model.add_hidden_layer(config.hidden_neurons)
+            else:
+                model._hidden_layer_created = True
         model.bridge.set_warmup(max(0, config.warmup_steps - model._step))
         return model
 

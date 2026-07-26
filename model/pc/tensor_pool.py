@@ -92,8 +92,8 @@ class TensorNeuronPool:
         self.in_ptrs = torch.full((max_neurons, K), -1, dtype=torch.int32, device=self.device)
         self.out_ptrs = torch.full((max_neurons, K), -1, dtype=torch.int32, device=self.device)
         # 每神经元当前连接数 (CPU 侧辅助, 用于快速找到空槽)
-        self._in_counts = torch.zeros(max_neurons, dtype=torch.int32, device=self.device)
-        self._out_counts = torch.zeros(max_neurons, dtype=torch.int32, device=self.device)
+        self._in_counts = torch.zeros(max_neurons, dtype=torch.int32)
+        self._out_counts = torch.zeros(max_neurons, dtype=torch.int32)
 
         # ── 时序投影 ──
         self.t_weight = torch.zeros(max_neurons, dtype=torch.float16, device=self.device)
@@ -285,6 +285,73 @@ class TensorNeuronPool:
         self._total_syn_created += 1
         return sid
 
+    def create_synapses_batch(
+        self,
+        pre_ids: list[int],
+        post_ids: list[int],
+        weights: list[float] | None = None,
+    ) -> int:
+        """批量创建突触 — 一次 GPU 写入, 替代逐元素 create_synapse.
+
+        Args:
+            pre_ids: 前神经元索引列表
+            post_ids: 后神经元索引列表
+            weights: 初始权重 (None = Xavier 随机)
+
+        Returns:
+            创建数.
+        """
+        n = len(pre_ids)
+        if n == 0:
+            return 0
+
+        # 分配槽位
+        while len(self._free_synapses) < n:
+            dead = torch.where(~self.syn_alive)[0]
+            if len(dead) == 0:
+                raise RuntimeError(f"突触槽位不足: 需要 {n}")
+            self._free_synapses.extend(dead[:n - len(self._free_synapses)].tolist())
+
+        sids = [self._free_synapses.pop() for _ in range(n)]
+        sids_t = torch.tensor(sids, dtype=torch.int32, device=self.device)
+
+        # 批量写入突触数据
+        pre_t = torch.tensor(pre_ids, dtype=torch.int32, device=self.device)
+        post_t = torch.tensor(post_ids, dtype=torch.int32, device=self.device)
+
+        if weights is None:
+            w_list = []
+            for pre_i, post_i in zip(pre_ids, post_ids):
+                fan_in = max(1, int(self._in_counts[post_i].item()) + 1)
+                w = random.gauss(0, 1.0 / math.sqrt(fan_in))
+                w = max(-1.0, min(1.0, w))
+                w_list.append(w)
+            w_t = torch.tensor(w_list, dtype=torch.float16, device=self.device)
+        else:
+            w_t = torch.tensor(weights, dtype=torch.float16, device=self.device)
+
+        self.syn_alive[sids_t] = True
+        self.pre_id[sids_t] = pre_t
+        self.post_id[sids_t] = post_t
+        self.weight[sids_t] = w_t
+        self.trace[sids_t] = 0.0
+        self.syn_age[sids_t] = 0
+        self._occupied_synapses += n
+
+        # 批量更新邻接表 (CPU 侧, 每个神经元独立)
+        for i, (pre_i, post_i, sid) in enumerate(zip(pre_ids, post_ids, sids)):
+            in_c = int(self._in_counts[post_i].item())
+            out_c = int(self._out_counts[pre_i].item())
+            if in_c < self.K:
+                self.in_ptrs[post_i, in_c] = sid
+                self._in_counts[post_i] = in_c + 1
+            if out_c < self.K:
+                self.out_ptrs[pre_i, out_c] = sid
+                self._out_counts[pre_i] = out_c + 1
+
+        self._total_syn_created += n
+        return n
+
     def prune_neuron(self, nid: int, force: bool = False) -> bool:
         """惰性删除神经元: 标记 alive=False, 关联突触标记 syn_alive=False.
 
@@ -404,7 +471,7 @@ class TensorNeuronPool:
         return child
 
     def connect_layer(self, from_layer: int, to_layer: int, density: float = 0.5) -> int:
-        """两层间随机稀疏连接.
+        """两层间随机稀疏连接 (批量创建, 一次 GPU 写入).
 
         Args:
             from_layer: 源层
@@ -422,14 +489,17 @@ class TensorNeuronPool:
         if not from_ids or not to_ids:
             return 0
 
-        count = 0
+        # 预计算所有 (pre, post) 对
+        pre_list: list[int] = []
+        post_list: list[int] = []
         for post in to_ids:
             k = max(1, int(len(from_ids) * density))
             sampled = random.sample(from_ids, min(k, len(from_ids)))
             for pre in sampled:
-                self.create_synapse(pre, post)
-                count += 1
-        return count
+                pre_list.append(pre)
+                post_list.append(post)
+
+        return self.create_synapses_batch(pre_list, post_list)
 
     def _force_recycle(self) -> bool:
         """池满时回收最久未活跃的神经元."""
@@ -878,7 +948,7 @@ class TensorNeuronPool:
             alive_ids = torch.where(alive)[0]
             age = current_step - self.created_at[alive_ids]
             inactive_for = current_step - self.last_active[alive_ids]
-            in_counts = self._in_counts[alive_ids]
+            in_counts = self._in_counts[alive_ids.cpu()].to(self.device)
 
             # 隐藏层神经元需要更长 min_age
             layer_of_alive = self.layer[alive_ids]
@@ -1142,11 +1212,11 @@ class TensorNeuronPool:
         self._free_neurons = dead if dead else list(range(self.N))
         dead_syn = torch.where(~self.syn_alive)[0].tolist()
         self._free_synapses = dead_syn if dead_syn else list(range(self.S))
-        # 批量计算邻接计数
+        # 批量计算邻接计数 (CPU 侧)
         valid_in = self.in_ptrs >= 0
         valid_out = self.out_ptrs >= 0
-        self._in_counts = valid_in.sum(dim=-1).to(torch.int32)
-        self._out_counts = valid_out.sum(dim=-1).to(torch.int32)
+        self._in_counts = valid_in.sum(dim=-1).cpu().to(torch.int32)
+        self._out_counts = valid_out.sum(dim=-1).cpu().to(torch.int32)
         # 维护感官索引
         self._sensory_index.clear()
         for nid in torch.where(self.alive & (self.position >= 0))[0].tolist():

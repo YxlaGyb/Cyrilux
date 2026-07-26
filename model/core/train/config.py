@@ -125,7 +125,7 @@ class TrainingConfig:
 
     # I/O
     out_dir: str = "out_pc_unified"
-    save_interval: int = 500
+    save_interval: int = 1000
 
     # 回调
     progress_callback: Optional[ProgressCallback] = None
