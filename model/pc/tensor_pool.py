@@ -1111,10 +1111,21 @@ class TensorNeuronPool:
         self._total_syn_created = sd.get("total_syn_created", self._occupied_synapses)
         self._total_syn_pruned = sd.get("total_syn_pruned", 0)
 
-        # 重建 CPU 辅助
-        self._free_neurons = [i for i in range(self.N) if not bool(self.alive[i].item())]
-        self._free_synapses = [i for i in range(self.S) if not bool(self.syn_alive[i].item())]
-        for nid in range(self.N):
-            if self.alive[nid]:
-                self._in_counts[nid] = int((self.in_ptrs[nid] >= 0).sum().item())
-                self._out_counts[nid] = int((self.out_ptrs[nid] >= 0).sum().item())
+        # 重建 CPU 辅助 (用 tensor 操作, 避免逐元素 .item())
+        dead = torch.where(~self.alive)[0].tolist()
+        self._free_neurons = dead if dead else list(range(self.N))
+        dead_syn = torch.where(~self.syn_alive)[0].tolist()
+        self._free_synapses = dead_syn if dead_syn else list(range(self.S))
+        # 批量计算邻接计数
+        valid_in = self.in_ptrs >= 0
+        valid_out = self.out_ptrs >= 0
+        self._in_counts = valid_in.sum(dim=-1).to(torch.int32)
+        self._out_counts = valid_out.sum(dim=-1).to(torch.int32)
+        # 维护感官索引
+        self._sensory_index.clear()
+        for nid in torch.where(self.alive & (self.position >= 0))[0].tolist():
+            self._sensory_index[
+                    (int(self.layer[nid].item()), 
+                    int(self.position[nid].item()), 
+                    int(self.channel[nid].item()))
+                ] = nid
