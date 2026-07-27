@@ -117,7 +117,7 @@ def run_phase1(runner, task_paths, epochs, max_seq_len, batch_size,
                     s = runner.get_state()
                     print(f'  [{name}] Step {gs}/{total_steps} '
                           f'F={s["free_energy"]:.1f} '
-                          f'n={runner.pool.get_total_neurons()}')
+                          f'n={runner.pool.query.get_total_neurons()}')
         print(f'  [{name}] Done.')
 
         for j in range(i + 1):

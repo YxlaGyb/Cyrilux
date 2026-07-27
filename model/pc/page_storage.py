@@ -14,14 +14,7 @@ from __future__ import annotations
 
 import torch
 
-# ── 页大小常量 ──
-PAGE_NEURONS = 4096
-PAGE_SYNAPSES = 16384
-PAGE_TD = 16384
-K_FAN = 128  # 与 TensorNeuronPool.K 保持一致
-
-# ── 神经元状态列索引 (与 tensor_pool.py 共享) ──
-N_STATE_FIELDS = 9  # z, mu, eps, threshold, firing_rate, pi, z_prev, bcm_slope, bcm_zero
+from .constants import K_FAN, N_STATE_FIELDS, PAGE_NEURONS, PAGE_SYNAPSES, PAGE_TD
 
 # 默认内存预算 (2GB)
 DEFAULT_MAX_MEMORY = 2_147_483_648

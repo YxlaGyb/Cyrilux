@@ -48,4 +48,4 @@ def compute_precision_scales(
     eta: float = 1.0,
 ) -> None:
     """逐神经元精度权重: pi = 1 + eta*D*|eps| + eta*ACh*|eps| (批量 tensor)."""
-    pool.compute_precision_scales(D, ACh, eta)
+    pool.learning.compute_precision_scales(D, ACh, eta)

@@ -397,7 +397,7 @@ class AutonomousMind:
         self.last_save_step = 0
         self._log(
             f"AutonomousMind init, device={self.device}, "
-            f"neurons={self.runner.pool.get_total_neurons()}"
+            f"neurons={self.runner.pool.query.get_total_neurons()}"
         )
 
     def _log(self, msg: str):
@@ -488,7 +488,7 @@ class AutonomousMind:
             s = self.runner.get_state()
             self._log(
                 f"[PLAY] Step {self.total_steps} | F={s['free_energy']:.1f} "
-                f"D={s['D']:.3f} n={self.runner.pool.get_total_neurons()} "
+                f"D={s['D']:.3f} n={self.runner.pool.query.get_total_neurons()} "
                 f"buf={self.replay_buffer.size}"
             )
 

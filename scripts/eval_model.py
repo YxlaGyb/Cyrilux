@@ -18,7 +18,7 @@ def load_model(path: str) -> CyreneModel:
     m = CyreneModel.load(path)
     m.bridge.set_warmup(0)  # 禁用 warmup
     elapsed = time.perf_counter() - t0
-    stats = m.pool.get_activity_stats()
+    stats = m.pool.query.get_activity_stats()
     print(f"模型: {path}")
     print(f"  加载耗时: {elapsed:.1f}s")
     print(f"  步数: {m._step}")

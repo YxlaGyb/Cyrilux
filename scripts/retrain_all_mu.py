@@ -19,8 +19,8 @@ for name in ['model4', 'model5', 'model6', 'model7']:
     orig_syn = m.pool.syn_alive.sum().item()
 
     # 冻结隐藏层, 清零 LM head, 启用 MU
-    _orig = m.pool.hebbian_pass, m.pool.hebbian_temporal, m.pool.hebbian_topdown
-    m.pool.hebbian_pass = lambda *a, **kw: 0.0
+    _orig = m.pool.learning.hebbian_pass, m.pool.hebbian_temporal, m.pool.hebbian_topdown
+    m.pool.learning.hebbian_pass = lambda *a, **kw: 0.0
     m.pool.hebbian_temporal = lambda *a, **kw: 0.0
     m.pool.hebbian_topdown = lambda *a, **kw: 0.0
     m.pool.lm_weight.zero_()
@@ -50,7 +50,7 @@ for name in ['model4', 'model5', 'model6', 'model7']:
     train_time = time.perf_counter() - t_train
 
     # 恢复
-    m.pool.hebbian_pass, m.pool.hebbian_temporal, m.pool.hebbian_topdown = _orig
+    m.pool.learning.hebbian_pass, m.pool.hebbian_temporal, m.pool.hebbian_topdown = _orig
 
     # 测试 PPL (MU→MU)
     ds2 = DualChannelDataset('dataset/sft_t2t.jsonl', max_length=64, max_samples=20)
@@ -84,7 +84,7 @@ for name in ['model4', 'model5', 'model6', 'model7']:
         for _ in range(30):
             bv = torch.tensor([[b/128.0-1.0 for b in gen[-64:]]], dtype=torch.half, device=m.device)
             m.step(torch.stack([bv, torch.ones_like(bv)], dim=1))
-            logits_t = m.pool.compute_lm_logits(m._top_layer, use_mu=True).float() / 0.7
+            logits_t = m.pool.forward.compute_lm_logits(m._top_layer, use_mu=True).float() / 0.7
             topv, _ = torch.topk(logits_t, min(15, 256))
             logits_t[logits_t < topv[-1]] = -float('inf')
             probs = torch.softmax(logits_t, dim=-1)

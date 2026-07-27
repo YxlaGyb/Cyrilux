@@ -10,10 +10,10 @@ m.pool.lm_weight.zero_()
 m.config.use_mu_lm = True  # LM head 训练和推理都用 MU
 
 # 冻结隐藏层 Hebbian (只训 LM head)
-_orig = m.pool.hebbian_pass, m.pool.hebbian_temporal, m.pool.hebbian_topdown
-m.pool.hebbian_pass = lambda *a, **kw: 0.0
-m.pool.hebbian_temporal = lambda *a, **kw: 0.0
-m.pool.hebbian_topdown = lambda *a, **kw: 0.0
+_orig = m.pool.learning.hebbian_pass, m.pool.learning.hebbian_temporal, m.pool.learning.hebbian_topdown
+m.pool.learning.hebbian_pass = lambda *a, **kw: 0.0
+m.pool.learning.hebbian_temporal = lambda *a, **kw: 0.0
+m.pool.learning.hebbian_topdown = lambda *a, **kw: 0.0
 
 print(f'model5: step={m._step} neurons={m.pool.alive.sum().item()}')
 print(f'LM head training with MU (use_mu_lm=True)')
@@ -45,7 +45,7 @@ elapsed = time.perf_counter() - t0
 print(f'Trained: {total} steps in {elapsed:.1f}s ({total/elapsed:.0f} s/s)')
 
 # 恢复
-m.pool.hebbian_pass, m.pool.hebbian_temporal, m.pool.hebbian_topdown = _orig
+m.pool.learning.hebbian_pass, m.pool.learning.hebbian_temporal, m.pool.learning.hebbian_topdown = _orig
 
 # === 测试 ===
 ds2 = DualChannelDataset('dataset/sft_t2t.jsonl', max_length=64, max_samples=20)

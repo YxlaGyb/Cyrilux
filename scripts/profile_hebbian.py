@@ -54,9 +54,9 @@ for _ in range(5):
     t4 = time.perf_counter()
     free_energy, _, _ = m.compute_stats()
     t5 = time.perf_counter()
-    m.pool.emit_active(m._step)
+    m.pool.forward.emit_active(m._step)
     t6 = time.perf_counter()
-    m.pool.adjust_thresholds()
+    m.pool.learning.adjust_thresholds()
     t7 = time.perf_counter()
     m.modulate(free_energy)
     t8 = time.perf_counter()
@@ -69,5 +69,5 @@ for _ in range(5):
           f"modulate={1000*(t8-t7):.1f}ms hebbian={1000*(t9-t8):.1f}ms "
           f"total={1000*(t9-t0):.1f}ms")
 
-activity = m.pool.get_activity_stats()
+activity = m.pool.query.get_activity_stats()
 print(f"\nFinal: {activity['total_neurons']} neurons, {activity['total_synapses']} synapses")

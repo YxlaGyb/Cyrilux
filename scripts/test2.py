@@ -46,13 +46,13 @@ for _ in range(20):
         vals_l = events.val[:E].cpu().tolist()
         t2b = time.perf_counter()
 
-        matched_nids, matched_ev, unmatched_ev = m.pool.match_sensory_events(
+        matched_nids, matched_ev, unmatched_ev = m.pool.query.match_sensory_events(
             layers_l, positions_l, channels_l
         )
         t2c = time.perf_counter()
 
         if unmatched_ev:
-            new_nids = m.pool.create_neurons_batch(
+            new_nids = m.pool.neuron.create_neurons_batch(
                 layers=[layers_l[e] for e in unmatched_ev],
                 positions=[positions_l[e] for e in unmatched_ev],
                 channels=[channels_l[e] for e in unmatched_ev],
@@ -66,7 +66,7 @@ for _ in range(20):
         all_z = [vals_l[e] for e in matched_ev] + [vals_l[e] for e in unmatched_ev]
         all_nids = torch.tensor(all_nids_list, dtype=torch.int32, device=m.device)
         z_new = torch.tensor(all_z, dtype=torch.float16, device=m.device)
-        m.pool.update_batch(all_nids, z_new)
+        m.pool.forward.update_batch(all_nids, z_new)
         t2e = time.perf_counter()
     else:
         t2b = t2c = t2d = t2e = t2
@@ -77,7 +77,7 @@ for _ in range(20):
     t4 = time.perf_counter()
     m.compute_stats()
     t5 = time.perf_counter()
-    m.pool.emit_active(m._step)
+    m.pool.forward.emit_active(m._step)
     t6 = time.perf_counter()
 
     if events:

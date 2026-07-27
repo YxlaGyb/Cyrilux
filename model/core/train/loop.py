@@ -108,8 +108,8 @@ class TrainingLoop:
             "global_step": self.global_step,
             "last_F": self._last_F,
             "last_D": self._last_D,
-            "n_neurons": (self.runner.pool.get_total_neurons() if self.runner else 0),
-            "n_synapses": (self.runner.pool.get_total_synapses() if self.runner else 0),
+            "n_neurons": (self.runner.pool.query.get_total_neurons() if self.runner else 0),
+            "n_synapses": (self.runner.pool.query.get_total_synapses() if self.runner else 0),
             "temporal_connections": (
                 int(self.runner.pool.t_connected.sum().item()) if self.runner else 0
             ),
