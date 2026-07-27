@@ -130,7 +130,7 @@ class CyreneModel:
         self._step: int = 0
         self._top_layer: int = 0
         self._hidden_layer_created: bool = False
-        self._pending_connect: tuple | None = None
+        self._pending_connects: list = []
         self._free_energy_history: list[float] = []
 
         # 神经调制状态
@@ -170,23 +170,45 @@ class CyreneModel:
     # 架构构建
     # ═══════════════════════════════════════════════════════════════
 
-    def add_hidden_layer(
-        self,
-        n_neurons: int,
-        from_layer: int = 0,
-        to_layer: int = 7,
-        connection_density: float = 0.2,
-    ):
-        """添加隐藏层: 创建神经元, 分配时序投影.
+    def add_hidden_layer(self):
+        """创建 5 层皮层架构: L4(感觉输入) → L2 → L3 → L5(输出) → L6(反馈调节).
 
+        每个层有不同的惯性 (时间常数) 和 k-WTA 比例.
         连接延迟到 warmup 后 (感官神经元届时已存在).
         """
-        nids = [self.pool.create_neuron(layer=to_layer) for _ in range(n_neurons)]
-        self.pool.temporal_connect(nids)
-        self._top_layer = max(self._top_layer, to_layer)
+        from model.pc.tensor_pool import (
+            LAYER_L4,
+            LAYER_L2,
+            LAYER_L3,
+            LAYER_L5,
+            LAYER_L6,
+            LAYER_CONFIG,
+            CONN_FEEDFORWARD,
+            CONN_FEEDBACK,
+            CONN_LATERAL,
+            TOP_LAYER,
+        )
+
+        for layer, (n, alpha, kwta) in LAYER_CONFIG.items():
+            nids = [self.pool.create_neuron(layer=layer) for _ in range(n)]
+            self.pool.temporal_connect(nids)
+
+        self._top_layer = TOP_LAYER  # LM Head 从 L5 读取
         self._hidden_layer_created = True
-        # 延迟连接: warmup 结束后触发
-        self._pending_connect = (from_layer, to_layer, connection_density)
+
+        # 延迟连接 (warmup 结束后触发):
+        self._pending_connects = [
+            (0, LAYER_L4, self.config.connection_density, CONN_FEEDFORWARD),
+            (LAYER_L4, LAYER_L2, 0.25, CONN_FEEDFORWARD),
+            (LAYER_L2, LAYER_L3, 0.30, CONN_FEEDFORWARD),
+            (LAYER_L3, LAYER_L5, 0.30, CONN_FEEDFORWARD),
+            (LAYER_L5, LAYER_L6, 0.30, CONN_FEEDFORWARD),
+            (LAYER_L6, LAYER_L5, 0.20, CONN_FEEDBACK),
+            (LAYER_L5, LAYER_L3, 0.20, CONN_FEEDBACK),
+            (LAYER_L3, LAYER_L2, 0.15, CONN_FEEDBACK),
+            (LAYER_L2, LAYER_L4, 0.15, CONN_FEEDBACK),
+        ]
+        # 横向连接在 connect 触发时单独处理
 
     # ═══════════════════════════════════════════════════════════════
     # 显式阶段方法
@@ -256,7 +278,7 @@ class CyreneModel:
                 thresholds=[0.05] * n_unmatched,
             )
             # 动态连接新感官神经元到隐藏层 (批量创建, 一次 GPU 写入)
-            if self._top_layer > 0 and not self._pending_connect:
+            if self._top_layer > 0 and not self._pending_connects:
                 hidden_nids = self.pool.get_neurons_by_layer(self._top_layer)
                 if len(hidden_nids) > 0:
                     h_list = hidden_nids.tolist()
@@ -297,9 +319,11 @@ class CyreneModel:
 
     @torch.inference_mode()
     def predict_pass(self):
-        """Stage 5: 前馈预测 + 时序 + 自上而下预测."""
+        """Stage 5: 逐层前馈预测 + 时序 + 自上而下预测."""
         self._fire("before_predict")
-        self.pool.predict_all()  # 前馈: sensory → hidden
+        # 自底向上: 每层用下层预测当前层
+        self.pool.predict_all()
+        # 时序 + topdown (保留)
         self.pool.temporal_topdown_pass(self._top_layer)
         self._fire("after_predict")
 
@@ -384,12 +408,21 @@ class CyreneModel:
         is_warmup = self._step <= self.config.warmup_steps
 
         # warmup 结束后触发延迟连接
-        if not is_warmup and self._pending_connect is not None:
-            from_l, to_l, density = self._pending_connect
-            n_conn = self.pool.connect_layer(
-                from_l, to_l, density, bias_strength=self.config.bias_strength
-            )
-            self._pending_connect = None
+        if not is_warmup and self._pending_connects:
+            for from_l, to_l, density, conn_type in self._pending_connects:
+                if conn_type == 1:  # CONN_FEEDBACK
+                    self.pool.topdown_connect_layer(from_l, to_l, density=density)
+                elif conn_type == 2:  # CONN_LATERAL
+                    self.pool.lateral_connect(to_l, density=density)
+                else:
+                    self.pool.connect_layer(
+                        from_l,
+                        to_l,
+                        density,
+                        bias_strength=self.config.bias_strength,
+                        conn_type=conn_type,
+                    )
+            self._pending_connects = []
             # 确保 LM head 连接
             if self._top_layer > 0:
                 self.pool.lm_ensure_top_connected(self._top_layer)

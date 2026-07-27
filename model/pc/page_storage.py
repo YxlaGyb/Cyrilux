@@ -21,7 +21,7 @@ PAGE_TD = 16384
 K_FAN = 128  # 与 TensorNeuronPool.K 保持一致
 
 # ── 神经元状态列索引 (与 tensor_pool.py 共享) ──
-N_STATE_FIELDS = 7
+N_STATE_FIELDS = 9  # z, mu, eps, threshold, firing_rate, pi, z_prev, bcm_slope, bcm_zero
 
 # 默认内存预算 (2GB)
 DEFAULT_MAX_MEMORY = 2_147_483_648
@@ -86,6 +86,9 @@ class PageStorage:
         self.trace = torch.zeros(self._S, dtype=torch.float16, device=self.device)
         self.syn_age = torch.zeros(self._S, dtype=torch.int32, device=self.device)
         self.syn_alive = torch.zeros(self._S, dtype=torch.bool, device=self.device)
+        self.conn_type = torch.zeros(
+            self._S, dtype=torch.int8, device=self.device
+        )  # 0=feedforward, 1=feedback, 2=lateral
 
         # ── Topdown 张量 (合并视图) ──
         self.td_pre = torch.zeros(self._S_td, dtype=torch.int32, device=self.device)
@@ -238,7 +241,13 @@ class PageStorage:
     def _check_budget_after_expand_synapses(self, new_s: int) -> bool:
         add_s = new_s - self._S
         add_bytes = add_s * (
-            4 + 4 + 2 + 2 + 4 + 1  # pre_id, post_id, weight, trace, syn_age, syn_alive
+            4
+            + 4
+            + 2
+            + 2
+            + 4
+            + 1
+            + 1  # pre_id, post_id, weight, trace, syn_age, syn_alive, conn_type
         )
         return (self.total_allocated_bytes() + add_bytes) > self.max_memory_bytes
 
@@ -295,6 +304,7 @@ class PageStorage:
         self.trace = _expand_1d(self.trace, new_s)
         self.syn_age = _expand_1d(self.syn_age, new_s)
         self.syn_alive = _expand_1d(self.syn_alive, new_s)
+        self.conn_type = _expand_1d(self.conn_type, new_s)
         self._S = new_s
 
     # ═══════════════════════════════════════════════════════════════

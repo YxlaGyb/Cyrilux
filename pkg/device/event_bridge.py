@@ -116,7 +116,7 @@ class EventBridge:
             SensoryEventBatch, 或 None (无事件).
         """
         is_warmup = self._warmup_remaining > 0
-        threshold = -1.0 if is_warmup else self.sensory_threshold
+        threshold = 0.02 if is_warmup else self.sensory_threshold
 
         all_pos = []
         all_ch = []

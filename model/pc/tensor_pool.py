@@ -43,7 +43,34 @@ F_THRESHOLD = 3
 F_FIRING_RATE = 4
 F_PI = 5
 F_Z_PREV = 6
-N_STATE_FIELDS = 7
+F_BCM_SLOPE = 7  # 每个神经元自己的 BCM 斜率 (2.8~5.2)
+F_BCM_ZERO = 8  # 每个神经元自己的 BCM 零点 (0.15~0.45)
+N_STATE_FIELDS = 9
+
+# ── 6 层皮层架构层常量 (10-14, 避开感官前端 0-6) ──
+LAYER_SENSORY = 0
+LAYER_L4 = 10  # 颗粒层: 感觉输入接收 (快)
+LAYER_L2 = 11  # 外颗粒层: 横向连接, 局部处理
+LAYER_L3 = 12  # 外锥体层: 前馈集成
+LAYER_L5 = 13  # 内锥体层: 深度输出, LM Head 读取
+LAYER_L6 = 14  # 多形层: 反馈调节, 最慢
+
+HIDDEN_LAYERS = [LAYER_L4, LAYER_L2, LAYER_L3, LAYER_L5, LAYER_L6]
+TOP_LAYER = LAYER_L5  # LM Head 输出层
+
+# 每层配置: (神经元数, 惯性α, k-WTA比例)
+LAYER_CONFIG = {
+    LAYER_L4: (256, 0.2, 0.10),
+    LAYER_L2: (192, 0.4, 0.10),
+    LAYER_L3: (128, 0.6, 0.08),
+    LAYER_L5: (96, 0.8, 0.05),
+    LAYER_L6: (64, 0.95, 0.05),
+}
+
+# 连接类型
+CONN_FEEDFORWARD = 0
+CONN_FEEDBACK = 1
+CONN_LATERAL = 2
 
 
 class TensorNeuronPool:
@@ -91,6 +118,7 @@ class TensorNeuronPool:
         self.trace = self._storage.trace
         self.syn_age = self._storage.syn_age
         self.syn_alive = self._storage.syn_alive
+        self.conn_type = self._storage.conn_type
         self.in_ptrs = self._storage.in_ptrs
         self.out_ptrs = self._storage.out_ptrs
         self._in_counts = self._storage._in_counts
@@ -150,6 +178,7 @@ class TensorNeuronPool:
         self.trace = self._storage.trace
         self.syn_age = self._storage.syn_age
         self.syn_alive = self._storage.syn_alive
+        self.conn_type = self._storage.conn_type
         self.in_ptrs = self._storage.in_ptrs
         self.out_ptrs = self._storage.out_ptrs
         self._in_counts = self._storage._in_counts
@@ -196,6 +225,13 @@ class TensorNeuronPool:
         self.state[nid, F_FIRING_RATE] = 0.0
         self.state[nid, F_PI] = 1.0
         self.state[nid, F_Z_PREV] = 0.0
+        # BCM 个性化: 隐藏神经元随机斜率/零点, 感官神经元默认值
+        if layer > 0:
+            self.state[nid, F_BCM_SLOPE] = 2.8 + 2.4 * random.random()
+            self.state[nid, F_BCM_ZERO] = 0.15 + 0.30 * random.random()
+        else:
+            self.state[nid, F_BCM_SLOPE] = 4.0
+            self.state[nid, F_BCM_ZERO] = 0.25
         self.position[nid] = pos
         self.channel[nid] = ch
         self.created_at[nid] = self._total_created
@@ -239,7 +275,7 @@ class TensorNeuronPool:
                 # 预算耗尽: 回收最旧神经元腾空间
                 alive_ids = torch.where(self.alive)[0]
                 if len(alive_ids) == 0:
-                    raise RuntimeError(f"TensorNeuronPool 内存预算耗尽, 且无存活神经元可回收")
+                    raise RuntimeError("TensorNeuronPool 内存预算耗尽, 且无存活神经元可回收")
                 need = n_create - len(nids)
                 k = min(need, len(alive_ids))
                 _, oldest_rel = torch.topk(self.last_active[alive_ids], k, largest=False)
@@ -280,6 +316,14 @@ class TensorNeuronPool:
         self.state[nids_t, F_FIRING_RATE] = 0.0
         self.state[nids_t, F_PI] = 1.0
         self.state[nids_t, F_Z_PREV] = 0.0
+        # BCM 个性化: 按层分配随机斜率/零点
+        for i, L in enumerate(layers):
+            if L > 0:
+                self.state[nids_t[i], F_BCM_SLOPE] = 2.8 + 2.4 * random.random()
+                self.state[nids_t[i], F_BCM_ZERO] = 0.15 + 0.30 * random.random()
+            else:
+                self.state[nids_t[i], F_BCM_SLOPE] = 4.0
+                self.state[nids_t[i], F_BCM_ZERO] = 0.25
 
         # 维护感官索引
         for i, nid in enumerate(nids):
@@ -306,7 +350,7 @@ class TensorNeuronPool:
             # 预算耗尽: 搜索死槽位
             dead = torch.where(~self.syn_alive)[0]
             if len(dead) == 0:
-                raise RuntimeError(f"TensorNeuronPool 突触内存预算耗尽, 无死槽位可回收")
+                raise RuntimeError("TensorNeuronPool 突触内存预算耗尽, 无死槽位可回收")
             sid = int(dead[0].item())
         self._sync_storage_refs()
 
@@ -343,6 +387,7 @@ class TensorNeuronPool:
         pre_ids: list[int],
         post_ids: list[int],
         weights: list[float] | None = None,
+        conn_type: int = 0,
     ) -> int:
         """批量创建突触 — 一次 GPU 写入, 替代逐元素 create_synapse.
 
@@ -350,6 +395,7 @@ class TensorNeuronPool:
             pre_ids: 前神经元索引列表
             post_ids: 后神经元索引列表
             weights: 初始权重 (None = Xavier 随机)
+            conn_type: 连接类型 (0=前馈, 1=反馈, 2=横向)
 
         Returns:
             创建数.
@@ -398,6 +444,7 @@ class TensorNeuronPool:
         self.weight[sids_t] = w_t
         self.trace[sids_t] = 0.0
         self.syn_age[sids_t] = 0
+        self.conn_type[sids_t] = conn_type
         self._occupied_synapses += n
 
         # 批量更新邻接表 — 按神经元分组, 每神经元仅一次 .item()
@@ -551,7 +598,12 @@ class TensorNeuronPool:
         return child
 
     def connect_layer(
-        self, from_layer: int, to_layer: int, density: float = 0.5, bias_strength: float = 0.7
+        self,
+        from_layer: int,
+        to_layer: int,
+        density: float = 0.5,
+        bias_strength: float = 0.7,
+        conn_type: int = 0,
     ) -> int:
         """两层间有偏置的稀疏连接 — 模拟皮层感受野结构.
 
@@ -596,7 +648,7 @@ class TensorNeuronPool:
                 pre_list.append(pre)
                 post_list.append(post)
 
-        return self.create_synapses_batch(pre_list, post_list)
+        return self.create_synapses_batch(pre_list, post_list, conn_type=conn_type)
 
     def _force_recycle(self) -> bool:
         """池满时回收最久未活跃的神经元."""
@@ -926,10 +978,11 @@ class TensorNeuronPool:
 
         # Hebb: eta * eps * z_pre
         hebb = eta_eff * eps_post * z_pre
-        # BCM 滑动阈值: 每个神经元根据近期平均活动量调节学习率
-        # 活跃过多 → 学习率下降/LTD, 活跃过少 → 学习率升高
-        bcm_avg = self.state[active_nids.long(), F_FIRING_RATE].unsqueeze(-1)  # [A, 1]
-        bcm_gain = 1.0 - 4.0 * bcm_avg
+        # BCM 滑动阈值 (个性化): 每个神经元有自己的饱食曲线
+        bcm_avg = self.state[active_nids.long(), F_FIRING_RATE].unsqueeze(-1)
+        bcm_slope = self.state[active_nids.long(), F_BCM_SLOPE].unsqueeze(-1)
+        bcm_zero = self.state[active_nids.long(), F_BCM_ZERO].unsqueeze(-1)
+        bcm_gain = 1.0 - bcm_slope * (bcm_avg - bcm_zero)
         bcm_gain = torch.clamp(bcm_gain, -1.0, 1.0)
         hebb = hebb * bcm_gain
         # Oja: -alpha * D * eps^2 * w  — 仅在 |w| > 0.8 时介入 (突触资源物理上限)
@@ -1079,6 +1132,78 @@ class TensorNeuronPool:
                 self.state[alive, F_THRESHOLD] + delta, min=1e-4, max=0.5
             )
 
+    def synapse_turnover(self, step: int, rate: float = 0.02) -> int:
+        """剪掉最弱的 rate% 突触, 创建等量新试探突触.
+
+        对所有连接类型 (前馈/反馈/横向) 统一执行.
+        新突触权重小 (Xavier), Hebbian 活跃→留下, 不活跃→下次被剪.
+        """
+        alive = self.syn_alive
+        if not alive.any():
+            return 0
+
+        # 评分: 权重小 + trace 低 = 弱突触
+        w_abs = self.weight[alive].abs()
+        trace_val = self.trace[alive]
+        score = 0.5 * w_abs + 0.5 * trace_val
+
+        n_total = alive.sum().item()
+        n_turnover = max(1, int(n_total * rate))
+
+        alive_indices = torch.where(alive)[0]
+        _, weak_idx = torch.topk(score, n_turnover, largest=False)
+        dead_sids = alive_indices[weak_idx]
+
+        # 按连接类型分组重建
+        types_present = self.conn_type[dead_sids].unique()
+
+        total_rebuilt = 0
+        for ct in types_present.tolist():
+            type_mask = self.conn_type[dead_sids] == ct
+            if not type_mask.any():
+                continue
+
+            type_dead = dead_sids[type_mask]
+            type_posts = self.post_id[type_dead]
+
+            # 标记死亡, 回收槽位
+            self.syn_alive[type_dead] = False
+            self._occupied_synapses -= len(type_dead)
+            for sid in type_dead.tolist():
+                self._free_synapses.append(sid)
+
+            # 为每个受影响神经元创建新试探突触
+            pre_list, post_list = [], []
+            for post in type_posts.unique().tolist():
+                n_dead = (type_posts == post).sum().item()
+                if n_dead == 0:
+                    continue
+                post_layer = int(self.layer[post].item())
+
+                # 根据连接类型确定源层
+                if ct == CONN_FEEDFORWARD:   # 前馈: 下一层→当前层
+                    from_layer = LAYER_SENSORY if post_layer == LAYER_L4 else post_layer - 1
+                elif ct == CONN_FEEDBACK:     # 反馈: 上一层→当前层
+                    from_layer = post_layer + 1
+                else:                         # 横向: 同层
+                    from_layer = post_layer
+
+                from_mask = (self.layer == from_layer) & self.alive
+                from_ids = torch.where(from_mask)[0].tolist()
+                if not from_ids:
+                    continue
+
+                new_pres = random.sample(from_ids, min(n_dead, len(from_ids)))
+                for pre in new_pres:
+                    pre_list.append(pre)
+                    post_list.append(post)
+
+            if pre_list:
+                self.create_synapses_batch(pre_list, post_list, conn_type=ct)
+                total_rebuilt += len(pre_list)
+
+        return total_rebuilt
+
     def homeostasis_step(
         self,
         current_step: int,
@@ -1138,6 +1263,10 @@ class TensorNeuronPool:
             stats["pruned"] = len(candidates)
         else:
             stats["pruned"] = 0
+
+        # 1.5 突触 turnover (每 500 步: 替换 2% 最弱突触)
+        if current_step % 500 == 0:
+            stats["turnover"] = self.synapse_turnover(current_step)
 
         # 2. 生长 (分裂高误差神经元)
         if _max_grow > 0 and current_step % _grow_interval == 0:
@@ -1276,6 +1405,36 @@ class TensorNeuronPool:
         if idx == self._td_count:
             self._td_count += 1
         return idx
+
+    def topdown_connect_layer(
+        self, upper_layer: int, lower_layer: int, density: float = 0.2
+    ) -> int:
+        """上层所有神经元 → 下层所有神经元的 topdown 连接 (批量, 免扫描)."""
+        upper = self.get_neurons_by_layer(upper_layer).tolist()
+        lower = self.get_neurons_by_layer(lower_layer).tolist()
+        if not upper or not lower:
+            return 0
+
+        count = 0
+        k = max(1, int(len(lower) * density))
+        for pre in upper:
+            candidates = random.sample(lower, min(k, len(lower)))
+            for post in candidates:
+                idx = self._td_count
+                if idx >= self.S_td:
+                    dead = torch.where(~self.td_alive)[0]
+                    if len(dead) > 0:
+                        idx = int(dead[0].item())
+                    else:
+                        continue
+                self.td_pre[idx] = pre
+                self.td_post[idx] = post
+                self.td_weight[idx] = random.gauss(0, 0.05)
+                self.td_alive[idx] = True
+                if idx == self._td_count:
+                    self._td_count += 1
+                count += 1
+        return count
 
     def topdown_connect_active(
         self,

@@ -53,12 +53,7 @@ class TrainingLoop:
         )
         runner = CyreneModel(cfg)
         runner.frontend = runner.frontend.to(self.device)
-        runner.add_hidden_layer(
-            n_neurons=min(self.cfg.hidden_size * 4, 512),
-            from_layer=0,
-            to_layer=7,
-            connection_density=self.cfg.connection_density,
-        )
+        runner.add_hidden_layer()
         self._log(
             f"CyreneModel built: h_front={self.cfg.hidden_size}, "
             f"budget={runner.pool._storage.total_allocated_bytes() / 1e6:.0f}MB / "
