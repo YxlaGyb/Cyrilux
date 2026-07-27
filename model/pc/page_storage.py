@@ -91,6 +91,7 @@ class PageStorage:
 
         # ── LM Head (合并视图, 列方向 = N) ──
         self.lm_weight = torch.zeros(256, self._N, dtype=torch.float16, device=self.device)
+        self.lm_bias = torch.zeros(256, dtype=torch.float16, device=self.device)  # 字节频次偏置
 
         # ── Freelists ──
         self._free_neurons: list[int] = list(range(self._N))
@@ -144,6 +145,7 @@ class PageStorage:
             self.td_weight,
             self.td_alive,
             self.lm_weight,
+            self.lm_bias,
         ]:
             total += t.numel() * t.element_size()
         return total
@@ -228,7 +230,7 @@ class PageStorage:
             + 1  # t_connected bool
             + 8  # _in_counts, _out_counts int32 (CPU, 但保守计入)
             + 256 * 2  # lm_weight 列 fp16
-        )
+        ) + 256 * 2  # lm_bias fp16 (固定大小, 与 _N 无关)
         return (self.total_allocated_bytes() + add_bytes) > self.max_memory_bytes
 
     def _check_budget_after_expand_synapses(self, new_s: int) -> bool:
@@ -276,7 +278,7 @@ class PageStorage:
         self.t_weight = _expand(self.t_weight, new_n)
         self.t_connected = _expand(self.t_connected, new_n)
 
-        # lm_weight: [256, old_n] → [256, new_n]
+        # lm_weight: [256, old_n] → [256, new_n] (新列零初始化)
         new_lm = torch.zeros(256, new_n, dtype=torch.float16, device=self.device)
         new_lm[:, :old_n] = self.lm_weight
         self.lm_weight = new_lm

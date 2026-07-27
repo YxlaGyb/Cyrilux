@@ -1,18 +1,13 @@
 """Cyrene 模型 — 全张量化 PC 持续学习.
 
-基于 TensorNeuronPool + EventBridge 的 device-agnostic 实现.
-可在 CPU 或 CUDA 上运行, 所有计算批量执行, 零逐元素传输.
-
 架构:
-    SensoryFrontend (Conv1D) → EventBridge (GPU top-k)
-    → TensorNeuronPool (scatter_add 预测 + 批量 Hebbian)
+    TensorNeuronPool (scatter_add 预测 + 批量 Hebbian)
     + 时序/topdown/LM 投影 + 神经调制 + 稳态
 """
 
 from __future__ import annotations
 
 import os
-import random
 from dataclasses import dataclass, fields
 from typing import Callable
 
@@ -25,11 +20,9 @@ from model.pc.neuromodulation import (
     compute_precision_scales,
     compute_uncertainty,
 )
-from model.pc.constants import F_EPS, F_Z
 from model.pc.tensor_pool import TensorNeuronPool
+from model.pc.constants import F_Z
 from pkg.device.cuda import setup_cuda_device
-from pkg.device.event_bridge import EventBridge, SensoryEventBatch
-from pkg.device.sensory_frontend import SensoryFrontend
 
 
 @dataclass
@@ -47,7 +40,7 @@ class CyreneConfig:
     hidden_neurons: int = 256
     connection_density: float = 0.2
     bias_strength: float = 0.7  # connect_layer 偏好池权重 (0=随机, 1=纯本地)
-    use_mu_lm: bool = False  # True=LM head 用 MU (有选择性), False=用 Z
+    use_mu_lm: bool = True  # LM head 用 MU (有更强的输入选择性)
     prune_interval: int = 100
     grow_interval: int = 200
     homeostasis_interval: int = 50
@@ -79,7 +72,7 @@ class CyreneModel:
     Usage:
         config = CyreneConfig(hidden_size=64)
         model = CyreneModel(config)
-        model.add_hidden_layer(256)
+        model.add_hidden_layer()
         stats = model.step(byte_seq)
     """
 
@@ -104,11 +97,6 @@ class CyreneModel:
         self.config = config
         self.device = setup_cuda_device()
 
-        # GPU 感官前端
-        self.frontend = SensoryFrontend(h_front=config.hidden_size)
-        self.frontend.eval()
-        self.frontend = self.frontend.to(self.device)
-
         # 页式动态神经元池 (自组织, 2GB 约束内生长/修剪)
         self.pool = TensorNeuronPool(
             K=config.K_fan,
@@ -118,13 +106,6 @@ class CyreneModel:
 
         # LM Head (委托到 pool)
         self.lm_head = LMHead(self.pool)
-
-        # 事件桥接 (tensor 版本)
-        self.bridge = EventBridge(
-            h_front=config.hidden_size,
-            sensory_threshold=0.05,
-            device=self.device,
-        )
 
         # 运行状态
         self._step: int = 0
@@ -138,9 +119,6 @@ class CyreneModel:
         self._last_ACh: float = 0.5
         self._last_modulation: float = 0.5
         self._last_pred_byte: int = -1
-
-        # warmup
-        self.bridge.set_warmup(config.warmup_steps)
 
         # hook 系统
         self._hooks: dict[str, list[Callable]] = {e: [] for e in self._EVENTS}
@@ -171,10 +149,12 @@ class CyreneModel:
     # ═══════════════════════════════════════════════════════════════
 
     def add_hidden_layer(self):
-        """创建 5 层皮层架构: L4(感觉输入) → L2 → L3 → L5(输出) → L6(反馈调节).
+        """创建 5 层皮层架构: 
+        L4(感觉输入) → L2 → L3 → L5(输出) → L6(反馈调节).
 
         每个层有不同的惯性 (时间常数) 和 k-WTA 比例.
         连接延迟到 warmup 后 (感官神经元届时已存在).
+        隐藏层神经元按 nid % 8 分组, 保留字节分组通路.
         """
         from model.pc.constants import (
             LAYER_L4,
@@ -185,15 +165,18 @@ class CyreneModel:
             LAYER_CONFIG,
             CONN_FEEDFORWARD,
             CONN_FEEDBACK,
-            CONN_LATERAL,
             TOP_LAYER,
         )
 
         for layer, (n, alpha, kwta) in LAYER_CONFIG.items():
             nids = [self.pool.neuron.create_neuron(layer=layer) for _ in range(n)]
             self.pool.projections.temporal_connect(nids)
+            # 隐藏层神经元分配信道标签 (n % 8), 用于前馈连接分组偏置
+            if layer > 0:
+                for i, nid in enumerate(nids):
+                    self.pool.channel[nid] = i % 8
 
-        self._top_layer = TOP_LAYER  # LM Head 从 L5 读取
+        self._top_layer = TOP_LAYER
         self._hidden_layer_created = True
 
         # 延迟连接 (warmup 结束后触发):
@@ -208,114 +191,97 @@ class CyreneModel:
             (LAYER_L3, LAYER_L2, 0.15, CONN_FEEDBACK),
             (LAYER_L2, LAYER_L4, 0.15, CONN_FEEDBACK),
         ]
-        # 横向连接在 connect 触发时单独处理
 
     # ═══════════════════════════════════════════════════════════════
     # 显式阶段方法
     # ═══════════════════════════════════════════════════════════════
 
-    @torch.inference_mode()
-    def encode(self, byte_seq: torch.Tensor) -> list[torch.Tensor]:
-        """Stage 1: GPU 感官编码."""
-        self._fire("before_encode", byte_seq=byte_seq)
-        h_list = self.frontend(byte_seq)
-        self._fire("after_encode", h_list=h_list)
-        return h_list
+    def encode(self, byte_ids: torch.Tensor) -> list[tuple[int, int]]:
+        """
+        Stage 1: 
+            字节ID → (position, byte_value) 对列表.
+        byte_ids: 
+            [1, S] long (0..255).
+        """
+        vals = byte_ids.squeeze(0).tolist()  # [S]
+        return [(pos, int(v)) for pos, v in enumerate(vals) if v != 0]
 
-    @torch.inference_mode()
-    def ingest(self, h_list: list[torch.Tensor], top_k: int = 0) -> SensoryEventBatch | None:
-        """Stage 2: 特征 → 事件 batch (GPU top-k, 零 .item())."""
-        return self.bridge.ingest_hlist(h_list, top_k=top_k)
-
-    @torch.inference_mode()
-    def process_sensory_events(self, events: SensoryEventBatch | None) -> int:
-        """Stage 3: 批量处理感官事件 — 匹配/创建神经元 + 预测 + 更新."""
+    def process_sensory_events(self, byte_events: list[tuple[int, int]]) -> int:
+        """
+        Stage 2+3: 按 (position, byte_value) 匹配/创建 L0 神经元.
+        每个字节值在每个位置有专属神经元 — 纯离散, 零嵌入.
+        """
         self._fire("before_sensory")
-        if events is None or len(events) == 0:
+        if not byte_events:
             self._fire("after_sensory", n_processed=0)
             return 0
 
-        E = len(events)
+        is_warmup_now = self._step <= self.config.warmup_steps
+
         is_warmup_now = self._step <= self.config.warmup_steps
         max_ev = 2000 if is_warmup_now else 500
-        if E > max_ev:
-            events = SensoryEventBatch(
-                pos=events.pos[:max_ev],
-                ch=events.ch[:max_ev],
-                val=events.val[:max_ev],
-                layer=events.layer[:max_ev],
-                block_id=events.block_id[:max_ev],
-            )
-            E = max_ev
+        if len(byte_events) > max_ev:
+            byte_events = byte_events[:max_ev]
 
-        # 一次 .cpu() + .tolist() 转 Python, 零逐元素 tensor 开销
-        layers_l = events.layer.cpu().tolist()
-        positions_l = events.pos.cpu().tolist()
-        channels_l = events.ch.cpu().tolist()
-        vals_l = events.val.cpu().tolist()
+        positions_l = [p for p, _ in byte_events]
+        byte_vals_l = [b for _, b in byte_events]
 
-        # 纯 Python hash 匹配
-        matched_nids, matched_ev, unmatched_ev = self.pool.query.match_sensory_events(
-            layers_l, positions_l, channels_l
+        # 匹配: key = (layer=0, position, byte_value)
+        matched_nids, matched_idx, unmatched_idx = self.pool.query.match_sensory_events(
+            [0] * len(byte_events), positions_l, byte_vals_l
         )
 
-        n_matched = len(matched_nids)
-        n_unmatched = len(unmatched_ev)
-        n_total = n_matched + n_unmatched
+        n_total = len(matched_nids) + len(unmatched_idx)
         if n_total == 0:
             self._fire("after_sensory", n_processed=0)
             return 0
 
-        # 批量创建未匹配的神经元
-        if n_unmatched > 0:
-            new_layers = [layers_l[e] for e in unmatched_ev]
-            new_positions = [positions_l[e] for e in unmatched_ev]
-            new_channels = [channels_l[e] for e in unmatched_ev]
+        # 创建未匹配的神经元
+        if unmatched_idx:
             new_nids = self.pool.neuron.create_neurons_batch(
-                layers=new_layers,
-                positions=new_positions,
-                channels=new_channels,
-                thresholds=[0.05] * n_unmatched,
+                layers=[0] * len(unmatched_idx),
+                positions=[positions_l[i] for i in unmatched_idx],
+                channels=[byte_vals_l[i] for i in unmatched_idx],
+                thresholds=[0.05] * len(unmatched_idx),
             )
-            # 动态连接新感官神经元到隐藏层 (批量创建, 一次 GPU 写入)
             if self._top_layer > 0 and not self._pending_connects:
-                hidden_nids = self.pool.query.get_neurons_by_layer(self._top_layer)
-                if len(hidden_nids) > 0:
-                    h_list = hidden_nids.tolist()
-                    pre_list: list[int] = []
-                    post_list: list[int] = []
-                    for snid in new_nids:
-                        k = max(1, int(len(h_list) * 0.2))
-                        sampled = random.sample(h_list, min(k, len(h_list)))
-                        for hnid in sampled:
+                l4_nids = self.pool.query.get_neurons_by_layer(10)  # LAYER_L4
+                if len(l4_nids) > 0:
+                    hl = l4_nids.tolist()
+                    pre_list, post_list = [], []
+                    # 构建 L4 信道索引 (仅需一次, 纯 Python)
+                    l4_ch = {h: int(self.pool.channel[h].item()) for h in hl}
+                    for snid, bv in zip(new_nids, [byte_vals_l[i] for i in unmatched_idx]):
+                        k = max(1, int(len(hl) * 0.25))
+                        group = bv % 8
+                        preferred = [h for h in hl if l4_ch[h] == group]
+                        rest = [h for h in hl if l4_ch[h] != group]
+                        ordered = preferred + rest
+                        for hnid in ordered[:k]:
                             pre_list.append(snid)
                             post_list.append(hnid)
                     if pre_list:
-                        self.pool.synapse.create_synapses_batch(pre_list, post_list)
+                        self.pool.synapse.create_synapses_batch(pre_list, post_list, init_scale=5.0)
         else:
             new_nids = []
 
-        # 合并所有目标 (保持事件顺序: 先 matched, 后 unmatched)
-        all_nids_list = matched_nids + new_nids
-        all_z = [vals_l[e] for e in matched_ev] + [vals_l[e] for e in unmatched_ev]
+        all_nids = matched_nids + new_nids
+        # z=1.0 纯离散 on/off: 神经元身份本身编码字节值, 不需要嵌入
 
-        all_nids = torch.tensor(all_nids_list, dtype=torch.int32, device=self.device)
-        z_new = torch.tensor(all_z, dtype=torch.float16, device=self.device)
-        self.pool.forward.update_batch(all_nids, z_new)
+        all_nids_t = torch.tensor(all_nids, dtype=torch.int32, device=self.device)
+        z_new_t = torch.ones(len(all_nids), dtype=torch.float16, device=self.device)
+        self.pool.forward.update_batch(all_nids_t, z_new_t)
 
         self._fire("after_sensory", n_processed=n_total)
         return n_total
 
     @torch.inference_mode()
     def process_network_events(self, max_events: int = 10) -> int:
-        """Stage 4: 批量处理网络事件."""
-        nids, eps = self.bridge.pop_network_events(max_events)
-        if nids.shape[0] == 0:
-            return 0
-
-        # 更新 (使用当前 z, 重算预测)
-        self.pool.forward.update_batch(nids, self.pool.state[nids.long(), F_Z])
-        return nids.shape[0]
+        """
+        Stage 4: 网络事件处理
+        已简化, 不再使用 EventBridge.
+        """
+        return 0
 
     @torch.inference_mode()
     def predict_pass(self):
@@ -363,8 +329,10 @@ class CyreneModel:
         active = self.pool.query.get_active_neurons()
         if active.shape[0] > 0:
             eta = self.config.hebbian_base_eta
+            # 前馈 eta 提升至 base 的 60x (L5 表征不分化根因: Hebbian 每步 dw~5e-6)
+            eta_ff = eta * 60.0
             self.pool.learning.hebbian_pass(
-                active, eta=eta, oja_alpha=self.config.oja_alpha, dopamine=modulation
+                active, eta=eta_ff, oja_alpha=self.config.oja_alpha, dopamine=modulation
             )
             eta_t = eta * 0.3
             self.pool.learning.hebbian_temporal(active, eta=eta_t, dopamine=modulation)
@@ -373,15 +341,103 @@ class CyreneModel:
 
     @torch.inference_mode()
     def homeostasis_pass(self) -> dict:
-        """Stage 8b: 稳态可塑性."""
+        """Stage 8b: 稳态可塑性 + 隐藏层动态生长."""
         self._fire("before_homeostasis")
         hs = self.pool.learning.homeostasis_step(
             self._step,
             prune_interval=self.config.prune_interval,
             grow_interval=self.config.grow_interval,
         )
+
+        # 隐藏层动态生长: 自动补充修剪损失, 维持层容量
+        if self._step % max(1, self.config.grow_interval) == 0:
+            from model.pc.constants import HIDDEN_LAYERS, LAYER_CONFIG
+
+            for layer in HIDDEN_LAYERS:
+                base_n = LAYER_CONFIG[layer][0]
+                alive_nids = self.pool.query.get_neurons_by_layer(layer)
+                current_n = len(alive_nids)
+                if current_n < base_n:
+                    # 补充至 base_n
+                    to_grow = base_n - current_n
+                    new_nids = self.pool.neuron.grow_hidden_neurons(layer, to_grow)
+                    # 将新神经元连入网络
+                    self._wire_hidden_neurons(layer, new_nids)
+                    hs.setdefault("grown_hidden", 0)
+                    hs["grown_hidden"] += len(new_nids)
+                # 长期: 允许层生长超出 base_n (1.5x 上限, 基于高误差)
+                max_n = int(base_n * 1.5)
+                if current_n < max_n and current_n >= base_n:
+                    alive = self.pool.alive[alive_nids]
+                    if alive.any():
+                        high_err = self.pool.state[alive_nids[alive], 2].abs() > 0.3
+                        n_extra = int(high_err.sum().item())
+                        if n_extra > max(1, (max_n - current_n) // 2):
+                            to_grow = min(n_extra // 2, max_n - current_n)
+                            new_nids = self.pool.neuron.grow_hidden_neurons(layer, to_grow)
+                            self._wire_hidden_neurons(layer, new_nids)
+                            hs["grown_hidden"] = hs.get("grown_hidden", 0) + len(new_nids)
+
         self._fire("after_homeostasis", hs_stats=hs)
         return hs
+
+    def _wire_hidden_neurons(self, layer: int, nids: list[int]):
+        """将新神经元连入现有前馈网络.
+        根据层的上下游关系创建对应连接.
+        """
+        from model.pc.constants import (
+            LAYER_L4, LAYER_L2, LAYER_L3, LAYER_L5, LAYER_L6,
+            LAYER_SENSORY, CONN_FEEDFORWARD,
+        )
+
+        if not nids:
+            return
+
+        # 前馈: 前一层 → 本层
+        feedforward_src = {
+            LAYER_L4: LAYER_SENSORY,
+            LAYER_L2: LAYER_L4,
+            LAYER_L3: LAYER_L2,
+            LAYER_L5: LAYER_L3,
+            LAYER_L6: LAYER_L5,
+        }
+        src_layer = feedforward_src.get(layer)
+        if src_layer is not None:
+            src_nids = self.pool.query.get_neurons_by_layer(src_layer)
+            if len(src_nids) > 0:
+                src_list = src_nids.tolist()
+                pre_list, post_list = [], []
+                density = 0.25 if layer == LAYER_L4 else 0.30
+                for dst in nids:
+                    k = max(1, int(len(src_list) * density))
+                    chosen = src_list[:k]
+                    for pre in chosen:
+                        pre_list.append(pre)
+                        post_list.append(dst)
+                if pre_list:
+                    is_sensory = (src_layer == LAYER_SENSORY)
+                    self.pool.synapse.create_synapses_batch(
+                        pre_list, post_list,
+                        init_scale=5.0 if is_sensory else 3.0,
+                        conn_type=CONN_FEEDFORWARD,
+                    )
+
+        # 反馈: 本层 → 前一层 (如果本层高于前一层)
+        feedback_src = {
+            LAYER_L6: LAYER_L5,
+            LAYER_L5: LAYER_L3,
+            LAYER_L3: LAYER_L2,
+            LAYER_L2: LAYER_L4,
+        }
+        fb_src = feedback_src.get(layer)
+        if fb_src is not None:
+            fb_nids = self.pool.query.get_neurons_by_layer(fb_src)
+            if len(fb_nids) > 0:
+                self.pool.projections.topdown_connect_layer(layer, fb_src, density=0.2)
+
+        # L4 → LM head (TOP_LAYER)
+        if layer == self._top_layer:
+            self.pool.projections.lm_ensure_top_connected(self._top_layer)
 
     @torch.inference_mode()
     def finalize_step(self):
@@ -413,13 +469,35 @@ class CyreneModel:
                     self.pool.projections.topdown_connect_layer(from_l, to_l, density=density)
                 elif conn_type == 2:  # CONN_LATERAL
                     self.pool.synapse.connect_layer(to_l, to_l, density, conn_type=conn_type)
+                elif from_l > 0 and conn_type == 0:  # 前馈: 信道分组连接
+                    src = self.pool.query.get_neurons_by_layer(from_l).tolist()
+                    dst = self.pool.query.get_neurons_by_layer(to_l).tolist()
+                    if src and dst:
+                        dst_ch = {d: int(self.pool.channel[d].item()) for d in dst}
+                        pre_list, post_list = [], []
+                        for s in src:
+                            k = max(1, int(len(dst) * density))
+                            sg = int(self.pool.channel[s].item())
+                            preferred = [d for d in dst if dst_ch[d] == sg]
+                            rest = [d for d in dst if dst_ch[d] != sg]
+                            chosen = (preferred + rest)[:k]
+                            for d in chosen:
+                                pre_list.append(s)
+                                post_list.append(d)
+                        if pre_list:
+                            self.pool.synapse.create_synapses_batch(
+                                pre_list, post_list, init_scale=3.0
+                            )
                 else:
+                    # L0→L4 感官输入连接: init_scale=5.0 确保 L4 首次就发放
+                    is_sensory = (from_l == 0)
                     self.pool.synapse.connect_layer(
                         from_l,
                         to_l,
                         density,
                         bias_strength=self.config.bias_strength,
                         conn_type=conn_type,
+                        init_scale=5.0 if is_sensory else 3.0,
                     )
             self._pending_connects = []
             # 确保 LM head 连接
@@ -428,39 +506,37 @@ class CyreneModel:
 
         self._fire("before_step", byte_seq=byte_seq)
 
-        h_list = self.encode(byte_seq)
-        events = self.ingest(h_list, top_k=(0 if is_warmup else 4))
-        self.process_sensory_events(events)
+        byte_events = self.encode(byte_seq)
+        self.process_sensory_events(byte_events)
         self.process_network_events(max_events=10)
         self.predict_pass()
         free_energy, lm_loss, pred_byte = self.compute_stats()
 
-        # 发射活跃神经元作为网络事件 (传给下一步)
-        active = self.pool.forward.emit_active(self._step)
-        if active.shape[0] > 0:
-            self.bridge.push_network_events(active, self.pool.state[active.long(), F_EPS])
-
         # 每步阈值调节 (不管 homeostasis 间隔, 强反馈压制过度发放)
         self.pool.learning.adjust_thresholds(target_rate=0.15, rate_eta=0.05)
+
+        # LM head 软稳态: 逐列 L2 上限约束 (保留列间幅度差异, 每步执行)
+        if not is_warmup and self._top_layer > 0:
+            self.pool.learning.homeostasis_lm_head(self._top_layer)
 
         hs_stats: dict = {}
         if self._step % self.config.homeostasis_interval == 0:
             hs_stats = self.homeostasis_pass()
-            # LM head 稳态缩放 (列均值归零, 资源守恒)
-            if not is_warmup and self._top_layer > 0:
-                self.pool.learning.homeostasis_lm_head(self._top_layer)
+            # LM head 稳态: 已禁用, 误差门控 Hebbian 本身有自调节 (正确时 gate=0.1)
+            # L2 归一化破坏条件权重不对称性, 导致退化为全局频率预测
+            # if not is_warmup and self._top_layer > 0:
+            #     self.pool.learning.homeostasis_lm_head(self._top_layer)
 
         if not is_warmup and free_energy > 1e-8:
             self.modulate(free_energy)
             self.hebbian_pass(self._last_modulation)
-            # LM head Hebbian (仅当有监督信号时)
+            # LM head: 纯 Hebbian (pre-post 共现, 无误差信号)
             if target_byte >= 0 and self._top_layer > 0:
                 self.pool.learning.hebbian_lm_head(
                     self._top_layer,
                     target_byte,
-                    eta=self.config.hebbian_base_eta * 0.3,
+                    eta=self.config.hebbian_base_eta * 1000.0,
                     dopamine=self._last_modulation,
-                    pred_byte=pred_byte,
                     use_mu=self.config.use_mu_lm,
                 )
 
@@ -470,6 +546,11 @@ class CyreneModel:
             else compute_uncertainty(self._free_energy_history[-20:])
         )
         self.finalize_step()
+
+        # 每步结尾重置感官层 z=0: 只保留当前步的 L0 信号, 旧 L0 不干扰前馈
+        sensory_mask = (self.pool.layer == 0) & self.pool.alive
+        if sensory_mask.any():
+            self.pool.state[sensory_mask, F_Z] = 0.0
 
         activity = self.pool.query.get_activity_stats()
         stats = {
@@ -510,14 +591,10 @@ class CyreneModel:
             chunk = byte_stream[t : t + positions_per_step + 12]
             if len(chunk) < 13:
                 break
-            byte_vals = (
-                torch.tensor([b / 128.0 - 1.0 for b in chunk], dtype=torch.half)
-                .unsqueeze(0)
-                .unsqueeze(0)
-            )
-            mask = torch.ones_like(byte_vals)
-            seq = torch.cat([byte_vals, mask], dim=1)
-            self.step(seq)
+            byte_ids = torch.tensor(
+                [b for b in chunk], dtype=torch.long, device=self.device
+            ).unsqueeze(0)
+            self.step(byte_ids)
             processed += 1
         return processed
 
@@ -530,7 +607,7 @@ class CyreneModel:
         return {
             "step": self._step,
             "pool_stats": activity,
-            "bridge_stats": self.bridge.get_stats(),
+            "bridge_stats": {},
             "free_energy": (self._free_energy_history[-1] if self._free_energy_history else 0.0),
             "warmup_remaining": max(0, self.config.warmup_steps - self._step),
             "D": self._last_D,
@@ -542,7 +619,7 @@ class CyreneModel:
         }
 
     def warmup(self, n_steps: int = 20):
-        dummy = torch.zeros(1, 2, self.config.hidden_size, dtype=torch.half, device=self.device)
+        dummy = torch.zeros(1, self.config.hidden_size, dtype=torch.long, device=self.device)
         for _ in range(n_steps):
             self.step(dummy)
 
@@ -569,10 +646,10 @@ class CyreneModel:
         if config.num_hidden_layers > 0:
             if model.pool.get_layer_width(model._top_layer) == 0:
                 # 隐藏层被修剪: 重建神经元和连接
-                model.add_hidden_layer(config.hidden_neurons)
+                model.add_hidden_layer()
             else:
                 model._hidden_layer_created = True
-        model.bridge.set_warmup(max(0, config.warmup_steps - model._step))
+        # warmup 已在 step() 中自动处理 (is_warmup = _step <= warmup_steps)
         return model
 
     @property
@@ -594,7 +671,7 @@ def create_cyrene(config: CyreneConfig | None = None) -> CyreneModel:
     config = config or CyreneConfig()
     model = CyreneModel(config)
     if config.num_hidden_layers > 0:
-        model.add_hidden_layer(config.hidden_neurons)
+        model.add_hidden_layer()
     return model
 
 

@@ -8,7 +8,8 @@ from .constants import F_EPS, F_MU, F_THRESHOLD, F_Z
 
 
 class ForwardEngine:
-    """前向传播引擎: 全网预测、层预测、误差、logits、兴奋发射.
+    """前向传播引擎:
+    全网预测、层预测、误差、logits、兴奋发射.
 
     通过 self.pool 引用访问共享张量, 扩容后自动指向新张量.
     """
@@ -16,8 +17,38 @@ class ForwardEngine:
     def __init__(self, pool):
         self.pool = pool
 
+        # k-WTA 查表 (CPU 侧, 避免每步 float() GPU sync)
+        self._kwta_cpu = [0.0] * 16
+        self._kwta_cpu[10] = 0.10
+        self._kwta_cpu[11] = 0.10
+        self._kwta_cpu[12] = 0.15
+        self._kwta_cpu[13] = 0.20
+        self._kwta_cpu[14] = 0.10
+
+        # 持久 scatter_add 缓冲区 (懒分配, N 增长时自动重建)
+        self._mu_buf = None
+        self._mu_td_buf = None
+
+        # k-WTA 缓存 (层 ID 在 warmup 后不变, 每 50 步刷新)
+        self._cached_layer_list = None
+        self._layer_refresh_counter = 0
+
+    def _ensure_buffers(self):
+        """
+        确保持久缓冲区大小 ≥ pool.N (扩容后自动重建).
+        """
+        N = self.pool.N
+        dev = self.pool.device
+        if self._mu_buf is None or self._mu_buf.shape[0] < N:
+            self._mu_buf = torch.zeros(N, dtype=torch.float16, device=dev)
+        if self._mu_td_buf is None or self._mu_td_buf.shape[0] < N:
+            self._mu_td_buf = torch.zeros(N, dtype=torch.float16, device=dev)
+
     def predict_all(self) -> None:
-        """全网 scatter-add 预测: mu = 1/sqrt(K) * scatter_add(weight * z_pre, post)."""
+        """
+        全网 scatter-add 预测: 
+        mu = 1/sqrt(K) * scatter_add(weight * z_pre, post).
+        """
         alive_syn = self.pool.syn_alive
         if not alive_syn.any():
             return
@@ -28,13 +59,20 @@ class ForwardEngine:
         w = self.pool.weight[syn_mask]
         z_pre = self.pool.state[pre.long(), F_Z]
 
-        # z_pre RMSNorm (投影前归一化, 防止上游激活值爆炸)
-        rms = (z_pre * z_pre).mean().sqrt()
-        rms = rms + 1e-6
-        z_pre = z_pre / rms
+        # z_pre RMSNorm (跳过感官层 L0 — 值固定为 ±1, 稀疏时会过度放大)
+        # 非感官层 z_pre 归一化防止上游激活值爆炸
+        non_sensory_mask = self.pool.layer[pre.long()] > 0
+        if non_sensory_mask.any():
+            z_sub = z_pre[non_sensory_mask]
+            rms = (z_sub * z_sub).mean().sqrt()
+            rms = rms + 1e-6
+            z_pre = z_pre.clone()  # avoid in-place
+            z_pre[non_sensory_mask] = z_sub / rms
 
         contrib = w * z_pre
-        mu = torch.zeros(self.pool.N, dtype=torch.float16, device=self.pool.device)
+        self._ensure_buffers()
+        self._mu_buf.zero_()
+        mu = self._mu_buf
         mu.scatter_add_(0, post.long(), contrib)
 
         # 1/sqrt(K) 缩放 (K = 每神经元入连接数)
@@ -52,19 +90,22 @@ class ForwardEngine:
             z_new = 0.3 * z_old + 0.7 * mu_ns  # 30%历史 + 70%当前输入
 
             # 微小噪声打破对称性
-            noise = torch.randn_like(z_new) * 0.005
-            z_new = z_new + noise
+            z_new = z_new + torch.randn_like(z_new) * 0.005
 
-            # 逐层 k-WTA 侧抑制
-            for L in self.pool.layer[non_sensory].unique().tolist():
-                if L <= 0:
-                    continue
-                in_layer = self.pool.layer[non_sensory] == L
-                n_L = in_layer.sum().item()
-                if n_L <= 4:
+            # 逐层 k-WTA 侧抑制 (层 ID 缓存, 每 50 步刷新)
+            layer_ids = self.pool.layer[non_sensory]
+            self._layer_refresh_counter += 1
+            if self._layer_refresh_counter % 50 == 1 or self._cached_layer_list is None:
+                unique_layers = layer_ids.unique()
+                self._cached_layer_list = unique_layers.tolist()
+
+            for L in self._cached_layer_list:
+                in_layer = layer_ids == L
+                n_L = int(in_layer.sum().item())
+                if L <= 0 or n_L <= 4:
                     continue
                 z_L = z_new[in_layer]
-                k = max(4, n_L // 10)
+                k = max(4, int(n_L * self._kwta_cpu[L]))
                 _, top_idx = torch.topk(z_L.abs(), k)
                 winners = torch.zeros(n_L, dtype=torch.bool, device=self.pool.device)
                 winners[top_idx] = True
@@ -79,7 +120,9 @@ class ForwardEngine:
         )  # F_FIRING_RATE=4
 
     def predict_neurons(self, nids: torch.Tensor) -> torch.Tensor:
-        """批量预测指定神经元的 mu."""
+        """
+        批量预测指定神经元的 mu.
+        """
         E = nids.shape[0]
         if E == 0:
             return torch.zeros(0, dtype=torch.float16, device=self.pool.device)
@@ -97,7 +140,9 @@ class ForwardEngine:
         return mu
 
     def update_batch(self, nids: torch.Tensor, z_new: torch.Tensor) -> None:
-        """批量更新 z, 重算 mu 和 eps."""
+        """
+        批量更新 z, 重算 mu 和 eps.
+        """
         if nids.shape[0] == 0:
             return
         self.pool.state[nids.long(), F_Z] = z_new
@@ -106,7 +151,9 @@ class ForwardEngine:
         self.pool.state[nids.long(), F_EPS] = z_new - mu
 
     def temporal_topdown_pass(self, top_layer: int):
-        """时序预测 + 自上而下预测, 更新 mu/epsilon."""
+        """
+        时序预测 + 自上而下预测, 更新 mu/epsilon.
+        """
         alive = self.pool.alive
 
         # 时序预测: mu += t_weight * z_prev
@@ -133,7 +180,9 @@ class ForwardEngine:
         z_upper = self.pool.state[td_pre, F_Z]
 
         contrib = td_w * z_upper
-        mu_td = torch.zeros(self.pool.N, dtype=torch.float16, device=self.pool.device)
+        self._ensure_buffers()
+        self._mu_td_buf.zero_()
+        mu_td = self._mu_td_buf
         mu_td.scatter_add_(0, td_post, contrib)
 
         sensory = (self.pool.layer == 0) & alive
@@ -147,17 +196,16 @@ class ForwardEngine:
         """F = sum(epsilon^2) over alive neurons."""
         return (self.pool.state[self.pool.alive, F_EPS] ** 2).sum()
 
-    def compute_lm_logits(self, top_layer: int, use_mu: bool = False) -> torch.Tensor:
+    def compute_lm_logits(self, top_layer: int, use_mu: bool = True) -> torch.Tensor:
         """计算 256 个字节 logits. logits = lm_weight @ z[top_layer_mask]."""
         top_mask = (self.pool.layer == top_layer) & self.pool.alive
-        n_top = int(top_mask.sum().item())
-        if n_top == 0:
+        if not top_mask.any():
             return torch.zeros(256, dtype=torch.float16, device=self.pool.device)
 
         state_col = F_MU if use_mu else F_Z
-        z_top = self.pool.state[top_mask, state_col]  # [n_top]
-        w_sub = self.pool.lm_weight[:, top_mask]  # [256, n_top]
-        logits = w_sub @ z_top  # [256]
+        z_top = self.pool.state[top_mask, state_col]
+        w_sub = self.pool.lm_weight[:, top_mask]
+        logits = w_sub @ z_top + self.pool.lm_bias
         return logits
 
     def compute_cross_entropy(self, logits: torch.Tensor, target_byte: int) -> torch.Tensor:
@@ -168,7 +216,9 @@ class ForwardEngine:
         )
 
     def emit_active(self, current_time: int) -> torch.Tensor:
-        """扫描全网络, 返回活跃神经元索引. firing: |eps| > threshold."""
+        """
+        扫描全网络, 返回活跃神经元索引. firing: |eps| > threshold.
+        """
         firing = (
             self.pool.state[:, F_EPS].abs() > self.pool.state[:, F_THRESHOLD]
         ) & self.pool.alive

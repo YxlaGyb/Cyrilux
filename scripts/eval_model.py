@@ -16,7 +16,7 @@ torch.set_grad_enabled(False)
 def load_model(path: str) -> CyreneModel:
     t0 = time.perf_counter()
     m = CyreneModel.load(path)
-    m.bridge.set_warmup(0)  # 禁用 warmup
+    # warmup 在 step() 中自动处理 (_step <= warmup_steps)
     elapsed = time.perf_counter() - t0
     stats = m.pool.query.get_activity_stats()
     print(f"模型: {path}")
@@ -55,11 +55,11 @@ def test_perplexity(model: CyreneModel, data_path: str, max_samples: int = 100):
             if target == -100:  # padding
                 continue
 
-            context = byte_seq[:, :, :pos].contiguous()
+            context = byte_seq[:, :pos].contiguous()
             if context.shape[-1] < 13:
                 continue
 
-            model.step(context)
+            model.step(context, target_byte=int(target))
 
             logits = model.lm_head.predict_logits(model.pool, model._top_layer)
             loss = model.lm_head.cross_entropy_loss(logits, int(target))
@@ -117,18 +117,9 @@ def test_generation(model: CyreneModel, prompts: list[str], max_tokens: int = 80
         generated_bytes = []
 
         for _ in range(max_tokens):
-            byte_vals = torch.tensor(
-                [[b / 128.0 - 1.0 for b in byte_seq + generated_bytes]],
-                dtype=torch.half,
-                device=model.device,
-            )
-            role_mask = torch.ones_like(byte_vals)
-            seq = torch.stack([byte_vals, role_mask], dim=1)
-            # 如果序列太长, 截断最后 128 个位置
-            if seq.shape[-1] > 128:
-                seq = seq[:, :, -128:]
-
-            model.step(seq)
+            all_bytes = (byte_seq + generated_bytes)[-128:]
+            byte_ids = torch.tensor([all_bytes], dtype=torch.long, device=model.device)
+            model.step(byte_ids)
             logits = model.lm_head.predict_logits(model.pool, model._top_layer)
 
             # Top-k 采样 (temperature=0.8, top_k=20)
@@ -176,15 +167,8 @@ def test_memory(model: CyreneModel, text: str, repeats: int = 5):
                 continue
             target = byte_seq[i + 1]
 
-            byte_vals = torch.tensor(
-                [[b / 128.0 - 1.0 for b in context]],
-                dtype=torch.half,
-                device=model.device,
-            )
-            role_mask = torch.ones_like(byte_vals)
-            seq = torch.stack([byte_vals, role_mask], dim=1)
-
-            model.step(seq)
+            byte_ids = torch.tensor([context], dtype=torch.long, device=model.device)
+            model.step(byte_ids, target_byte=target)
             logits = model.lm_head.predict_logits(model.pool, model._top_layer)
             pred = max(range(256), key=lambda i: logits[i])
 
@@ -205,15 +189,8 @@ def test_memory(model: CyreneModel, text: str, repeats: int = 5):
         if len(context) < 13:
             continue
         target = byte_seq[i + 1]
-        byte_vals = torch.tensor(
-            [[b / 128.0 - 1.0 for b in context]],
-            dtype=torch.half,
-            device=model.device,
-        )
-        role_mask = torch.ones_like(byte_vals)
-        seq = torch.stack([byte_vals, role_mask], dim=1)
-
-        model.step(seq)
+        byte_ids = torch.tensor([context], dtype=torch.long, device=model.device)
+        model.step(byte_ids)
         logits = model.lm_head.predict_logits(model.pool, model._top_layer)
         pred = max(range(256), key=lambda i: logits[i])
         target_char = chr(target) if 32 <= target < 127 else f"\\x{target:02x}"

@@ -109,8 +109,9 @@ class ProjectionManager:
             return
 
         for nid in top_ids:
-            if self.pool.lm_weight[:, nid].abs().sum() > 0:
+            if self.pool.lm_weight[:, nid].abs().sum() > 0.001:
                 continue
-            chosen = random.sample(range(256), min(connections_per_logit, 256))
-            for logit_idx in chosen:
-                self.pool.lm_weight[logit_idx, nid] = random.gauss(0, 0.02)
+            # 全连接: 每个 L5 神经元连到所有 256 个 logit (零初始化, Hebbian 从零起步)
+            self.pool.lm_weight[:, nid] = torch.zeros(
+                256, dtype=torch.float16, device=self.pool.device
+            )

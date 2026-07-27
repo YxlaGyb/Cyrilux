@@ -1,8 +1,5 @@
 """EventBridge — GPU → CPU 事件桥接 (张量化).
 
-将 SensoryFrontend 的 GPU 张量输出转换为批量事件 tensor,
-供 TensorNeuronPool 消费。不再使用逐元素 .item() 和 Python 对象。
-
 事件以 tensor batch 传递: (pos, ch, val, layer, block_id) 各为 [E] tensor.
 """
 
@@ -50,7 +47,7 @@ class EventBridge:
     """事件桥接 — GPU 端 top-k 过滤 + 事件 batch 管理.
 
     职责:
-      - 从 SensoryFrontend h_list 提取事件 (GPU top-k 过滤)
+      - 从 SensoryFrontend h_list 提取事件
       - 管理感官/网络事件队列 (tensor ring buffer)
       - 统计
     """

@@ -1,12 +1,14 @@
-"""LearningEngine — Hebbian 可塑性 + 稳态 + 阈值调节."""
+"""
+LearningEngine
+
+Hebbian 可塑性 + 稳态 + 阈值调节.
+"""
 
 from __future__ import annotations
 
 import torch
 
 from .constants import (
-    CONN_FEEDBACK,
-    CONN_FEEDFORWARD,
     F_BCM_SLOPE,
     F_BCM_ZERO,
     F_EPS,
@@ -16,13 +18,12 @@ from .constants import (
     F_THRESHOLD,
     F_Z,
     F_Z_PREV,
-    LAYER_L4,
-    LAYER_SENSORY,
 )
 
 
 class LearningEngine:
-    """学习与稳态引擎: Hebbian 更新、LM head 学习、阈值调节、稳态步骤.
+    """学习与稳态引擎
+    Hebbian 更新、LM head 学习、阈值调节、稳态步骤.
 
     通过 self.pool 引用访问共享张量, 扩容后自动指向新张量.
     """
@@ -92,7 +93,9 @@ class LearningEngine:
         eta: float,
         dopamine: float,
     ) -> float:
-        """时序权重的 Hebbian 更新: dw = eta * D * eps * z_prev - 0.01 * w."""
+        """
+        时序权重的 Hebbian 更新: dw = eta * D * eps * z_prev - 0.01 * w.
+        """
         A = active_nids.shape[0]
         if A == 0:
             return 0.0
@@ -149,31 +152,49 @@ class LearningEngine:
         pred_byte: int = -1,
         use_mu: bool = False,
     ) -> float:
-        """LM head 权重的生物启发更新 — 误差门控 + 异突触竞争."""
+        """
+        误差门控 Hebbian: 
+        +dw[target]=gate*z, -dw[pred]=gate*z.
+        """
         top_mask = (self.pool.layer == top_layer) & self.pool.alive
         n_top = int(top_mask.sum().item())
         if n_top == 0:
             return 0.0
 
         state_col = F_MU if use_mu else F_Z
-        z_top = self.pool.state[top_mask, state_col]  # [n_top]
+        z_top = self.pool.state[top_mask, state_col]
+        z_use = z_top
         eta_eff = eta * dopamine
 
         if pred_byte < 0:
-            logits = self.pool.lm_weight[:, top_mask] @ z_top  # [256]
+            logits = self.pool.lm_weight[:, top_mask] @ z_top
             pred_byte = int(logits.argmax().item())
 
         error = pred_byte != target_byte
         gate = 1.0 if error else 0.1
 
+        # symmetric ±dw: 创造目标/预测列之间的竞争
         dw = torch.zeros(256, n_top, dtype=torch.float16, device=self.pool.device)
-        dw[target_byte] = eta_eff * gate * z_top
-
+        dw[target_byte] = eta_eff * gate * z_use
         if error:
-            dw[pred_byte] = -eta_eff * gate * z_top * 0.5
+            dw[pred_byte] = -eta_eff * gate * z_use
 
-        self.pool.lm_weight[:, top_mask] += dw
-        return float(dw.abs().sum().item())
+        full_new = self.pool.lm_weight.clone()
+        full_new[:, top_mask] += dw
+        self.pool.lm_weight.copy_(full_new)
+
+        # bias: 纯频次先验, ±1 限幅 (防止 runaway 且不压倒 W@z)
+        new_bias = self.pool.lm_bias.clone()
+        new_bias[target_byte] = torch.clamp(
+            self.pool.lm_bias[target_byte] + 1e-4, min=-1.0, max=1.0
+        )
+        if error:
+            new_bias[pred_byte] = torch.clamp(
+                self.pool.lm_bias[pred_byte] - 1e-4, min=-1.0, max=1.0
+            )
+        self.pool.lm_bias.copy_(new_bias)
+
+        return 0.0
 
     def adjust_thresholds(self, target_rate: float = 0.01, rate_eta: float = 0.01):
         """每步阈值调节 (稳态 homeostatic plasticity)."""
@@ -196,13 +217,19 @@ class LearningEngine:
         self.pool.state[:, F_Z_PREV] = self.pool.state[:, F_Z]
 
     def homeostasis_lm_head(self, top_layer: int):
-        """LM head 稳态缩放: 每列减去列均值 (模拟突触资源守恒)."""
+        """
+        LM head 稳态: 
+        逐列 L2 上限约束 (保留列间幅度差异, 只防爆炸).
+        """
         top_mask = (self.pool.layer == top_layer) & self.pool.alive
         if not top_mask.any():
             return
         w_sub = self.pool.lm_weight[:, top_mask]  # [256, n_top]
-        col_mean = w_sub.mean(dim=0, keepdim=True)  # [1, n_top]
-        self.pool.lm_weight[:, top_mask] -= col_mean
+        col_norm = w_sub.norm(dim=0)  # [n_top]
+        over = col_norm > 8.0
+        if over.any():
+            scale = torch.where(over, 8.0 / (col_norm + 1e-6), 1.0)
+            self.pool.lm_weight[:, top_mask] = w_sub * scale.unsqueeze(0)
 
     def homeostasis_step(
         self,
@@ -215,7 +242,10 @@ class LearningEngine:
         max_grow: int = 2,
         max_inactive: int = 1000,
     ) -> dict:
-        """周期性维护: 修剪 + 生长 (阈值调节已移至每步 adjust_thresholds)."""
+        """
+        周期性维护: 
+        修剪 + 生长 (阈值调节已移至每步 adjust_thresholds).
+        """
         stats: dict = {"threshold_adjusted": 0}
 
         alive = self.pool.alive

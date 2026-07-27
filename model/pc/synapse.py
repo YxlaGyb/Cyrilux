@@ -1,4 +1,7 @@
-"""SynapseManager — 突触生命周期管理 (创建/批量创建/层连接/周转)."""
+"""
+SynapseManager
+突触生命周期管理 (创建/批量创建/层连接/周转).
+"""
 
 from __future__ import annotations
 
@@ -64,6 +67,7 @@ class SynapseManager:
         post_ids: list[int],
         weights: list[float] | None = None,
         conn_type: int = 0,
+        init_scale: float = 1.0,
     ) -> int:
         """批量创建突触 — 一次 GPU 写入, 替代逐元素 create_synapse."""
         n = len(pre_ids)
@@ -94,7 +98,7 @@ class SynapseManager:
                     fan_in_cache[post_i] = max(1, int(self.pool._in_counts[post_i].item()) + 1)
             for pre_i, post_i in zip(pre_ids, post_ids):
                 fan_in = fan_in_cache[post_i]
-                w = random.gauss(0, 1.0 / math.sqrt(fan_in))
+                w = random.gauss(0, init_scale / math.sqrt(fan_in))
                 w = max(-1.0, min(1.0, w))
                 w_list.append(w)
             w_t = torch.tensor(w_list, dtype=torch.float16, device=self.pool.device)
@@ -144,6 +148,7 @@ class SynapseManager:
         density: float = 0.5,
         bias_strength: float = 0.7,
         conn_type: int = 0,
+        init_scale: float = 1.0,
     ) -> int:
         """两层间有偏置的稀疏连接 — 模拟皮层感受野结构."""
         from_mask = (self.pool.layer == from_layer) & self.pool.alive
@@ -173,7 +178,9 @@ class SynapseManager:
                 pre_list.append(pre)
                 post_list.append(post)
 
-        return self.create_synapses_batch(pre_list, post_list, conn_type=conn_type)
+        return self.create_synapses_batch(
+            pre_list, post_list, conn_type=conn_type, init_scale=init_scale
+        )
 
     def synapse_turnover(self, step: int, rate: float = 0.02) -> int:
         """剪掉最弱的 rate% 突触, 创建等量新试探突触."""

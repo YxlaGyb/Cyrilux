@@ -52,7 +52,6 @@ class TrainingLoop:
             bias_strength=self.cfg.bias_strength,
         )
         runner = CyreneModel(cfg)
-        runner.frontend = runner.frontend.to(self.device)
         runner.add_hidden_layer()
         self._log(
             f"CyreneModel built: h_front={self.cfg.hidden_size}, "
@@ -64,14 +63,13 @@ class TrainingLoop:
     def warmup(self):
         assert self.runner is not None
         with torch.no_grad():
-            dummy = torch.zeros(1, 2, 64, dtype=torch.half, device=self.device)
+            dummy = torch.zeros(1, 64, dtype=torch.long, device=self.device)
             for _ in range(getattr(self.cfg, "warmup_steps", 20)):
                 self.runner.step(dummy)
         self._log("Warmup done")
 
     def train_step(self, byte_seq: torch.Tensor, labels: torch.Tensor) -> dict:
         assert self.runner is not None
-        # labels 是 [1, S] tensor, 取首个非 padding 字节作为 target
         target = int(labels[0, 0].item()) if labels.numel() > 0 else -1
         stats = self.runner.step(byte_seq, target_byte=target)
         F_curr = stats.get("free_energy", 0.0)

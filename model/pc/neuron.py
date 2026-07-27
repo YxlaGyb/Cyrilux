@@ -259,6 +259,20 @@ class NeuronManager:
         mask = (td_pre_slice == nid) | (td_post_slice == nid)
         self.pool.td_alive[: self.pool._td_count][mask] = False
 
+    def grow_hidden_neurons(self, layer: int, count: int) -> list[int]:
+        """在隐藏层创建 count 个新神经元 (含 BCM 初始化 + 时序自连接 + 信道标签)."""
+        nids = self.create_neurons_batch(
+            layers=[layer] * count,
+            thresholds=[0.1] * count,
+        )
+        # 信道标签, 用于前馈分组偏置
+        start_ch = self.pool._total_created % 8
+        for i, nid in enumerate(nids):
+            self.pool.channel[nid] = (start_ch + i) % 8
+        # 时序自连接
+        self.pool.projections.temporal_connect(nids)
+        return nids
+
     def _force_recycle(self) -> bool:
         """池满时回收最久未活跃的神经元."""
         alive_ids = torch.where(self.pool.alive)[0]

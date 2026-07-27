@@ -97,6 +97,7 @@ class TensorNeuronPool:
         self.td_weight = self._storage.td_weight
         self.td_alive = self._storage.td_alive
         self.lm_weight = self._storage.lm_weight
+        self.lm_bias = self._storage.lm_bias
 
         # ── 容量属性 (代理到 _storage) ──
         self._free_neurons: list[int] = self._storage._free_neurons
@@ -165,6 +166,7 @@ class TensorNeuronPool:
         self.td_weight = self._storage.td_weight
         self.td_alive = self._storage.td_alive
         self.lm_weight = self._storage.lm_weight
+        self.lm_bias = self._storage.lm_bias
         self._free_neurons = self._storage._free_neurons
         self._free_synapses = self._storage._free_synapses
 
@@ -392,8 +394,9 @@ class TensorNeuronPool:
             "td_post": self.td_post[td_idx].cpu().clone(),
             "td_weight": self.td_weight[td_idx].cpu().clone(),
             "td_idx": td_idx.cpu().clone(),
-            # ── LM Head (只存 alive 列) ──
+            # ── LM Head (只存 alive 列 + bias) ──
             "lm_weight": self.lm_weight[:, alive_idx].cpu().clone(),
+            "lm_bias": self.lm_bias.cpu().clone(),
             # ── 统计 ──
             "occupied_neurons": self._occupied_neurons,
             "occupied_synapses": self._occupied_synapses,
@@ -448,6 +451,9 @@ class TensorNeuronPool:
 
         # LM Head
         self.lm_weight[:, alive_idx] = sd["lm_weight"].to(self.device)
+        if "lm_bias" in sd:
+            self.lm_bias[:] = sd["lm_bias"].to(self.device)
+        # 旧 checkpoint 无 lm_bias → 保持零初始化 (自动学到频次)
 
         # 统计
         self._occupied_neurons = sd.get("occupied_neurons", int(self.alive.sum().item()))

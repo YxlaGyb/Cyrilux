@@ -2,10 +2,8 @@
 
 ## 参考指令文件
 
-- `CLAUDE.md` — 主代理指令 (fp16 规则、架构守则、沟通偏好)
-- `.github/instructions/` 你应该遵循的指令
-  - `.github/instructions/专业术语.instructions.md` — 领域术语规范
-  - `.github/instructions/工具.instructions.md` — 工具链规范 (uv/ruff/git)
+- 领域术语规范 @.github/instructions/专业术语.instructions.md
+- 工具链规范 @.github/instructions/工具.instructions.md
 
 ## 沟通偏好
 
@@ -40,22 +38,22 @@
 
 ### FP16 死令、永久生效
 
-- **本项目永远只用 fp16**
-  模型权重、激活、梯度、Hebbian 更新——一切张量必须保持 fp16
-- **永远不准提议/使用 fp32**
-  不允许在任何函数内写 `.float()`，不允许在训练循环中转 fp32，不允许讨论"要不要换 fp32"——这个选项不存在
-- **不准再提"fp16 vs fp32"话题**
-  用户已经做了最终决定，无权再议
+**本项目永远只用 fp16**
+
+模型权重、激活、梯度、Hebbian 更新——一切张量必须保持 fp16
+不允许在任何函数内写 `.float()`，不允许在训练循环中转 fp32，不允许讨论"要不要换 fp32"——这个选项不存在
+不准再提"fp16 vs fp32"话题
 
 ### FP16 数值稳定性准则
 
 ### 核心禁令
 
-- **禁止使用 clamp 解决 fp16 溢出** — clamp 是暴力手段，破坏梯度信息，掩盖根因
-- 正确的做法: pre-norm (RMSNorm/LayerNorm)、权重缩放、梯度裁剪等结构化手段
+**禁止使用 clamp 解决 fp16 溢出**
 
-### 允许的 clamp (仅限日志/指标)
+clamp 是暴力手段，破坏梯度信息，掩盖根因
+正确的做法: pre-norm (RMSNorm/LayerNorm)、权重缩放、梯度裁剪等结构化手段
 
+**允许的 clamp**:
 - `loss.clamp(max=100.0)` 仅在日志打印前使用，不影响梯度
 - 所有参与梯度的 tensor 不得 clamp
 
@@ -70,3 +68,4 @@
 ## 口令
 
 数值不稳是诡辩,生物大脑没有这么大的数值和溢出
+
