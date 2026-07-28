@@ -33,6 +33,12 @@ class ForwardEngine:
         self._cached_layer_list = None
         self._layer_refresh_counter = 0
 
+        # 持久 k-WTA winners 缓冲 + 噪声模板缓存
+        self._kwta_winners = None
+        self._noise_cache = None
+        self._noise_idx = 0
+        self._NOISE_TEMPLATES = 8
+
     def _ensure_buffers(self):
         """
         确保持久缓冲区大小 ≥ pool.N (扩容后自动重建).
@@ -43,10 +49,17 @@ class ForwardEngine:
             self._mu_buf = torch.zeros(N, dtype=torch.float16, device=dev)
         if self._mu_td_buf is None or self._mu_td_buf.shape[0] < N:
             self._mu_td_buf = torch.zeros(N, dtype=torch.float16, device=dev)
+        if self._kwta_winners is None or self._kwta_winners.shape[0] < N:
+            self._kwta_winners = torch.zeros(N, dtype=torch.bool, device=dev)
+        if self._noise_cache is None or self._noise_cache.shape[0] < N:
+            self._noise_cache = torch.stack([
+                torch.randn(N, dtype=torch.float16, device=dev) * 0.005
+                for _ in range(self._NOISE_TEMPLATES)
+            ], dim=0)  # [8, N]
 
     def predict_all(self) -> None:
         """
-        全网 scatter-add 预测: 
+        全网 scatter-add 预测:
         mu = 1/sqrt(K) * scatter_add(weight * z_pre, post).
         """
         alive_syn = self.pool.syn_alive
@@ -75,11 +88,14 @@ class ForwardEngine:
         mu = self._mu_buf
         mu.scatter_add_(0, post.long(), contrib)
 
-        # 1/sqrt(K) 缩放 (K = 每神经元入连接数)
+        # 1/sqrt(K) 缩放 — 使用缓存的扇入数
         alive = self.pool.alive
-        fan_in = (self.pool.in_ptrs[alive] >= 0).sum(dim=-1, keepdim=True).to(torch.float16)
-        scale = torch.rsqrt(fan_in + 1e-6)
-        self.pool.state[alive, F_MU] = mu[alive] * scale.squeeze(-1)
+        if self.pool._fan_in_dirty:
+            fan_in = (self.pool.in_ptrs[alive] >= 0).sum(dim=-1).to(torch.float16)
+            self.pool._fan_in_cache[alive] = fan_in
+            self.pool._fan_in_dirty = False
+        scale = torch.rsqrt(self.pool._fan_in_cache[alive] + 1e-6)
+        self.pool.state[alive, F_MU] = mu[alive] * scale
         self.pool.state[alive, F_EPS] = self.pool.state[alive, F_Z] - self.pool.state[alive, F_MU]
 
         # 非感官层神经元: z 向 mu 靠拢但不瞬间跟随 (膜电位时间常数)
@@ -89,10 +105,11 @@ class ForwardEngine:
             mu_ns = self.pool.state[non_sensory, F_MU]
             z_new = 0.3 * z_old + 0.7 * mu_ns  # 30%历史 + 70%当前输入
 
-            # 微小噪声打破对称性
-            z_new = z_new + torch.randn_like(z_new) * 0.005
+            # 噪声轮换: 免 randn kernel launch
+            self._noise_idx = (self._noise_idx + 1) % self._NOISE_TEMPLATES
+            z_new = z_new + self._noise_cache[self._noise_idx][non_sensory]
 
-            # 逐层 k-WTA 侧抑制 (层 ID 缓存, 每 50 步刷新)
+            # 逐层 k-WTA 侧抑制 — 持久 winners 缓冲
             layer_ids = self.pool.layer[non_sensory]
             self._layer_refresh_counter += 1
             if self._layer_refresh_counter % 50 == 1 or self._cached_layer_list is None:
@@ -101,15 +118,15 @@ class ForwardEngine:
 
             for L in self._cached_layer_list:
                 in_layer = layer_ids == L
-                n_L = int(in_layer.sum().item())
+                z_L = z_new[in_layer]
+                n_L = z_L.shape[0]
                 if L <= 0 or n_L <= 4:
                     continue
-                z_L = z_new[in_layer]
                 k = max(4, int(n_L * self._kwta_cpu[L]))
                 _, top_idx = torch.topk(z_L.abs(), k)
-                winners = torch.zeros(n_L, dtype=torch.bool, device=self.pool.device)
-                winners[top_idx] = True
-                z_new[in_layer] = torch.where(winners, z_L, z_L * 0.1)
+                self._kwta_winners[:n_L].zero_()
+                self._kwta_winners[:n_L][top_idx] = True
+                z_new[in_layer] = torch.where(self._kwta_winners[:n_L], z_L, z_L * 0.1)
 
             self.pool.state[non_sensory, F_Z] = z_new
             self.pool.state[non_sensory, F_EPS] = z_new - mu_ns
@@ -165,7 +182,7 @@ class ForwardEngine:
                 self.pool.state[connected, F_Z] - self.pool.state[connected, F_MU]
             )
 
-        # 自上而下预测: 对感觉层 (layer==0) 做 scatter_add
+        # 自上而下预测: 只对感觉层 (layer==0) 做 scatter_add
         if top_layer <= 0:
             return
 
@@ -173,10 +190,19 @@ class ForwardEngine:
         if not td_alive.any():
             return
 
+        # 只取 topdown 到 L0 的连接 (td_post 指向感觉层)
         td_mask = td_alive
-        td_pre = self.pool.td_pre[td_mask].long()
-        td_post = self.pool.td_post[td_mask].long()
-        td_w = self.pool.td_weight[td_mask]
+        td_post_all = self.pool.td_post[td_mask].long()
+        td_to_sensory = self.pool.layer[td_post_all] == 0
+        if not td_to_sensory.any():
+            return
+
+        # 编译缩减: 只对感光层的连接做 scatter_add
+        td_idx_all = torch.where(td_mask)[0]
+        td_idx = td_idx_all[td_to_sensory]
+        td_pre = self.pool.td_pre[td_idx].long()
+        td_post = self.pool.td_post[td_idx].long()
+        td_w = self.pool.td_weight[td_idx]
         z_upper = self.pool.state[td_pre, F_Z]
 
         contrib = td_w * z_upper

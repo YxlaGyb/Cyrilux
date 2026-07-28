@@ -179,20 +179,17 @@ class LearningEngine:
         if error:
             dw[pred_byte] = -eta_eff * gate * z_use
 
-        full_new = self.pool.lm_weight.clone()
-        full_new[:, top_mask] += dw
-        self.pool.lm_weight.copy_(full_new)
+        # 原地累加 lm_weight / bias (省克隆 ~32MB)
+        self.pool.lm_weight[:, top_mask] += dw
 
-        # bias: 纯频次先验, ±1 限幅 (防止 runaway 且不压倒 W@z)
-        new_bias = self.pool.lm_bias.clone()
-        new_bias[target_byte] = torch.clamp(
+        # bias: 纯频次先验, ±1 限幅
+        self.pool.lm_bias[target_byte] = torch.clamp(
             self.pool.lm_bias[target_byte] + 1e-4, min=-1.0, max=1.0
         )
         if error:
-            new_bias[pred_byte] = torch.clamp(
+            self.pool.lm_bias[pred_byte] = torch.clamp(
                 self.pool.lm_bias[pred_byte] - 1e-4, min=-1.0, max=1.0
             )
-        self.pool.lm_bias.copy_(new_bias)
 
         return 0.0
 

@@ -90,6 +90,7 @@ class TensorNeuronPool:
         self.out_ptrs = self._storage.out_ptrs
         self._in_counts = self._storage._in_counts
         self._out_counts = self._storage._out_counts
+        self._fan_in_cache = self._storage._fan_in_cache
         self.t_weight = self._storage.t_weight
         self.t_connected = self._storage.t_connected
         self.td_pre = self._storage.td_pre
@@ -159,6 +160,7 @@ class TensorNeuronPool:
         self.out_ptrs = self._storage.out_ptrs
         self._in_counts = self._storage._in_counts
         self._out_counts = self._storage._out_counts
+        self._fan_in_cache = self._storage._fan_in_cache
         self.t_weight = self._storage.t_weight
         self.t_connected = self._storage.t_connected
         self.td_pre = self._storage.td_pre
@@ -371,32 +373,32 @@ class TensorNeuronPool:
             "S_td": self.S_td,
             "K": self.K,
             # ── 神经元 (只存 alive 行 + 原始索引) ──
-            "state": self.state[alive_idx].cpu().clone(),
-            "alive_idx": alive_idx.cpu().clone(),
-            "layer": self.layer[alive_idx].cpu().clone(),
-            "position": self.position[alive_idx].cpu().clone(),
-            "channel": self.channel[alive_idx].cpu().clone(),
-            "created_at": self.created_at[alive_idx].cpu().clone(),
-            "last_active": self.last_active[alive_idx].cpu().clone(),
-            "t_weight": self.t_weight[alive_idx].cpu().clone(),
-            "t_connected": self.t_connected[alive_idx].cpu().clone(),
-            "in_ptrs": self.in_ptrs[alive_idx].cpu().clone(),
-            "out_ptrs": self.out_ptrs[alive_idx].cpu().clone(),
+            "state": self.state[alive_idx].cpu(),
+            "alive_idx": alive_idx.cpu(),
+            "layer": self.layer[alive_idx].cpu(),
+            "position": self.position[alive_idx].cpu(),
+            "channel": self.channel[alive_idx].cpu(),
+            "created_at": self.created_at[alive_idx].cpu(),
+            "last_active": self.last_active[alive_idx].cpu(),
+            "t_weight": self.t_weight[alive_idx].cpu(),
+            "t_connected": self.t_connected[alive_idx].cpu(),
+            "in_ptrs": self.in_ptrs[alive_idx].cpu(),
+            "out_ptrs": self.out_ptrs[alive_idx].cpu(),
             # ── 突触 (只存 alive 行 + 原始索引) ──
-            "pre_id": self.pre_id[syn_idx].cpu().clone(),
-            "post_id": self.post_id[syn_idx].cpu().clone(),
-            "weight": self.weight[syn_idx].cpu().clone(),
-            "trace": self.trace[syn_idx].cpu().clone(),
-            "syn_age": self.syn_age[syn_idx].cpu().clone(),
-            "syn_idx": syn_idx.cpu().clone(),
+            "pre_id": self.pre_id[syn_idx].cpu(),
+            "post_id": self.post_id[syn_idx].cpu(),
+            "weight": self.weight[syn_idx].cpu(),
+            "trace": self.trace[syn_idx].cpu(),
+            "syn_age": self.syn_age[syn_idx].cpu(),
+            "syn_idx": syn_idx.cpu(),
             # ── Topdown (只存 alive 行 + 原始索引) ──
-            "td_pre": self.td_pre[td_idx].cpu().clone(),
-            "td_post": self.td_post[td_idx].cpu().clone(),
-            "td_weight": self.td_weight[td_idx].cpu().clone(),
-            "td_idx": td_idx.cpu().clone(),
+            "td_pre": self.td_pre[td_idx].cpu(),
+            "td_post": self.td_post[td_idx].cpu(),
+            "td_weight": self.td_weight[td_idx].cpu(),
+            "td_idx": td_idx.cpu(),
             # ── LM Head (只存 alive 列 + bias) ──
-            "lm_weight": self.lm_weight[:, alive_idx].cpu().clone(),
-            "lm_bias": self.lm_bias.cpu().clone(),
+            "lm_weight": self.lm_weight[:, alive_idx].cpu(),
+            "lm_bias": self.lm_bias.cpu(),
             # ── 统计 ──
             "occupied_neurons": self._occupied_neurons,
             "occupied_synapses": self._occupied_synapses,

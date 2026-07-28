@@ -69,6 +69,8 @@ class PageStorage:
         self.out_ptrs = torch.full((self._N, K_FAN), -1, dtype=torch.int32, device=self.device)
         self._in_counts = torch.zeros(self._N, dtype=torch.int32)
         self._out_counts = torch.zeros(self._N, dtype=torch.int32)
+        self._fan_in_cache = torch.zeros(self._N, dtype=torch.float16, device=self.device)
+        self._fan_in_dirty = True  # construction 后需要初始化
         self.t_weight = torch.zeros(self._N, dtype=torch.float16, device=self.device)
         self.t_connected = torch.zeros(self._N, dtype=torch.bool, device=self.device)
 
@@ -229,6 +231,7 @@ class PageStorage:
             + 2  # t_weight fp16
             + 1  # t_connected bool
             + 8  # _in_counts, _out_counts int32 (CPU, 但保守计入)
+            + 2  # _fan_in_cache fp16
             + 256 * 2  # lm_weight 列 fp16
         ) + 256 * 2  # lm_bias fp16 (固定大小, 与 _N 无关)
         return (self.total_allocated_bytes() + add_bytes) > self.max_memory_bytes
@@ -275,6 +278,8 @@ class PageStorage:
         self.out_ptrs = _expand(self.out_ptrs, new_n, fill=-1)
         self._in_counts = _expand(self._in_counts, new_n)
         self._out_counts = _expand(self._out_counts, new_n)
+        self._fan_in_cache = _expand(self._fan_in_cache, new_n)
+        self._fan_in_dirty = True  # 扩容后需要全部重建
         self.t_weight = _expand(self.t_weight, new_n)
         self.t_connected = _expand(self.t_connected, new_n)
 

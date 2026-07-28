@@ -1,5 +1,9 @@
 # 你应该遵守的规范
 
+# git
+
+禁止使用git
+
 ## 参考指令文件
 
 - 领域术语规范 @.github/instructions/专业术语.instructions.md
@@ -68,4 +72,16 @@ clamp 是暴力手段，破坏梯度信息，掩盖根因
 ## 口令
 
 数值不稳是诡辩,生物大脑没有这么大的数值和溢出
+
+
+# 张量代码规范
+
+**一次 GPU 传输 > N 次 `.item()` 同步。**
+
+- 禁止 `.item()` 读 GPU tensor——用 `.shape[0]` 替代 `.sum().item()`
+- 禁止热路径新建 GPU tensor——持久预分配，循环内 `.zero_()`
+- 禁止 `clone() + copy_()` 写切片——一律原地 `+=` 或 `scatter_add_`
+- 禁止 for 循环写 GPU tensor 标量——用 `torch.rand` / 批量索引替代
+- 禁止 `.cpu().clone()`——`.cpu()` 已返回新 tensor
+- 禁止用 PyTorch 算标量——`math.tanh`/`math.exp` 替代 `torch.tensor(x).item()`
 

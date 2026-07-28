@@ -128,13 +128,23 @@ class NeuronManager:
         self.pool.state[nids_t, F_FIRING_RATE] = 0.0
         self.pool.state[nids_t, F_PI] = 1.0
         self.pool.state[nids_t, F_Z_PREV] = 0.0
-        for i, L in enumerate(layers):
-            if L > 0:
-                self.pool.state[nids_t[i], F_BCM_SLOPE] = 2.8 + 2.4 * random.random()
-                self.pool.state[nids_t[i], F_BCM_ZERO] = 0.15 + 0.30 * random.random()
-            else:
-                self.pool.state[nids_t[i], F_BCM_SLOPE] = 4.0
-                self.pool.state[nids_t[i], F_BCM_ZERO] = 0.25
+        # BCM 初始化 (向量化, 免 Python loop)
+        layer_t_gpu = layer_t.to(device=self.pool.device)
+        hidden_mask = layer_t_gpu > 0
+        n_hidden = int(hidden_mask.sum().item())
+        slopes = torch.full((n_create,), 4.0, dtype=torch.float16, device=self.pool.device)
+        zeros = torch.full((n_create,), 0.25, dtype=torch.float16, device=self.pool.device)
+        if n_hidden > 0:
+            slopes = slopes.index_put(
+                (torch.arange(n_create, device=self.pool.device)[hidden_mask],),
+                2.8 + 2.4 * torch.rand(n_hidden, dtype=torch.float16, device=self.pool.device)
+            )
+            zeros = zeros.index_put(
+                (torch.arange(n_create, device=self.pool.device)[hidden_mask],),
+                0.15 + 0.30 * torch.rand(n_hidden, dtype=torch.float16, device=self.pool.device)
+            )
+        self.pool.state[nids_t, F_BCM_SLOPE] = slopes
+        self.pool.state[nids_t, F_BCM_ZERO] = zeros
 
         for i, nid in enumerate(nids):
             if pos[i] >= 0:
@@ -158,16 +168,17 @@ class NeuronManager:
         self.pool._occupied_neurons -= 1
         self.pool._storage.free_neuron_slot(nid)
 
-        in_c = int(self.pool._in_counts[nid].item())
-        for i in range(min(in_c, self.pool.K)):
-            sid = int(self.pool.in_ptrs[nid, i].item())
+        in_ptr_slice = self.pool.in_ptrs[nid].cpu()
+        for i in range(self.pool.K):
+            sid = int(in_ptr_slice[i].item())
             if sid >= 0:
                 self.pool.syn_alive[sid] = False
                 self.pool._storage.free_synapse_slot(sid)
                 self.pool._occupied_synapses -= 1
-        out_c = int(self.pool._out_counts[nid].item())
-        for i in range(min(out_c, self.pool.K)):
-            sid = int(self.pool.out_ptrs[nid, i].item())
+        self.pool._fan_in_dirty = True
+        out_ptr_slice = self.pool.out_ptrs[nid].cpu()
+        for i in range(self.pool.K):
+            sid = int(out_ptr_slice[i].item())
             if sid >= 0:
                 self.pool.syn_alive[sid] = False
                 self.pool._storage.free_synapse_slot(sid)
@@ -265,10 +276,16 @@ class NeuronManager:
             layers=[layer] * count,
             thresholds=[0.1] * count,
         )
-        # 信道标签, 用于前馈分组偏置
-        start_ch = self.pool._total_created % 8
+        # 信道标签: 优先填补该层非满的通道
+        alive_nids = torch.where((self.pool.layer == layer) & self.pool.alive)[0]
+        ch_counts = torch.zeros(8, dtype=torch.int32)
+        for nid in alive_nids.tolist():
+            ch = int(self.pool.channel[nid].item())
+            if ch >= 0:
+                ch_counts[ch] += 1
+        target_ch = int(ch_counts.argmin().item())
         for i, nid in enumerate(nids):
-            self.pool.channel[nid] = (start_ch + i) % 8
+            self.pool.channel[nid] = (target_ch + i) % 8
         # 时序自连接
         self.pool.projections.temporal_connect(nids)
         return nids

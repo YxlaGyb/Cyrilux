@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .tensor_pool import TensorNeuronPool
@@ -21,19 +23,19 @@ def compute_uncertainty(F_hist: list[float], window: int = 10) -> float:
         return 0.0
     var_F = sum((f - mean_F) ** 2 for f in recent) / window
     cv = (var_F ** 0.5) / mean_F
-    return float(torch.tanh(torch.tensor(cv * 3.0)).item())
+    return float(math.tanh(cv * 3.0))
 
 
 def compute_dopamine(F_curr: float, F_prev: float, beta: float = 0.5) -> float:
     """多巴胺 RPE: D = sigmoid(beta * (F_prev - F_curr))."""
-    if not (torch.isfinite(torch.tensor(F_curr)) and torch.isfinite(torch.tensor(F_prev))):
+    if not (math.isfinite(F_curr) and math.isfinite(F_prev)):
         return 0.5
-    return float(torch.sigmoid(torch.tensor(beta * (F_prev - F_curr))).item())
+    return 1.0 / (1.0 + math.exp(-beta * (F_prev - F_curr)))
 
 
 def compute_ach(uncertainty: float, beta_0: float = 0.0) -> float:
     """乙酰胆碱: ACh = sigmoid(-uncertainty + beta_0)."""
-    return float(torch.sigmoid(torch.tensor(-uncertainty + beta_0)).item())
+    return 1.0 / (1.0 + math.exp(uncertainty - beta_0))
 
 
 def combine_modulation(D: float, ACh: float) -> float:

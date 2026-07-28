@@ -19,6 +19,11 @@ class PoolQuery:
         mask = (self.pool.layer == layer) & self.pool.alive
         return torch.where(mask)[0]
 
+    def get_neurons_by_layer_channel(self, layer: int, channel: int) -> torch.Tensor:
+        """返回指定层和通道的神经元索引 (用于通道感知连接)."""
+        mask = (self.pool.layer == layer) & (self.pool.channel == channel) & self.pool.alive
+        return torch.where(mask)[0]
+
     def get_layer_width(self, layer: int) -> int:
         """返回指定层宽度."""
         return int(((self.pool.layer == layer) & self.pool.alive).sum().item())

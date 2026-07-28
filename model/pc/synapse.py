@@ -48,6 +48,7 @@ class SynapseManager:
         self.pool.trace[sid] = 0.0
         self.pool.syn_age[sid] = 0
         self.pool._occupied_synapses += 1
+        self.pool._fan_in_dirty = True
 
         in_c = int(self.pool._in_counts[post].item())
         out_c = int(self.pool._out_counts[pre].item())
@@ -113,6 +114,7 @@ class SynapseManager:
         self.pool.syn_age[sids_t] = 0
         self.pool.conn_type[sids_t] = conn_type
         self.pool._occupied_synapses += n
+        self.pool._fan_in_dirty = True
 
         _post_to_sids: dict[int, list[int]] = {}
         for sid, post_i in zip(sids, post_ids):
@@ -150,33 +152,51 @@ class SynapseManager:
         conn_type: int = 0,
         init_scale: float = 1.0,
     ) -> int:
-        """两层间有偏置的稀疏连接 — 模拟皮层感受野结构."""
+        """两层间有偏置的稀疏连接 — 纯 GPU 向量化."""
         from_mask = (self.pool.layer == from_layer) & self.pool.alive
         to_mask = (self.pool.layer == to_layer) & self.pool.alive
-        from_ids = torch.where(from_mask)[0].tolist()
-        to_ids = torch.where(to_mask)[0].tolist()
-
-        if not from_ids or not to_ids:
+        from_ids = torch.where(from_mask)[0]
+        to_ids = torch.where(to_mask)[0]
+        n_from = len(from_ids)
+        n_to = len(to_ids)
+        if n_from == 0 or n_to == 0:
             return 0
 
-        n_from = len(from_ids)
+        k = min(self.pool.K, max(1, int(n_from * density)))
+        n_local = int(k * bias_strength)
+        n_global = k - n_local
+
+        # 每个后神经元: 取 n_local 个偏好源 + n_global 个随机源
+        # 偏好 = 在所有源中随机取 10%
         pref_size = max(1, int(n_from * 0.1))
 
-        pre_list: list[int] = []
-        post_list: list[int] = []
-        for post in to_ids:
-            k = min(self.pool.K, max(1, int(n_from * density)))
-            n_local = int(k * bias_strength)
-            n_global = k - n_local
+        # 纯 torch 采样替代 random.sample Python 循环
+        device = self.pool.device
+        to_ids_t = to_ids.to(device)
 
-            preferred = random.sample(from_ids, pref_size)
-            local = random.sample(preferred, min(n_local, len(preferred)))
-            rest = [x for x in from_ids if x not in preferred]
-            global_s = random.sample(rest, min(n_global, len(rest)))
+        pre_list = []
+        post_list = []
 
-            for pre in local + global_s:
-                pre_list.append(pre)
-                post_list.append(post)
+        perm = torch.randperm(n_from, device=device)
+        pref_mask = perm[:pref_size]  # [pref_size]
+        rest_mask = perm[pref_size:]  # [n_from - pref_size]
+        pref_ids = from_ids[pref_mask]
+        rest_ids = from_ids[rest_mask]
+
+        n_pref = min(n_local, pref_size)
+        n_rest = min(n_global, len(rest_ids))
+
+        # 全向量化: 用广播生成所有连接
+        # 每个后神经元独立随机取 n_pref 个偏好源 + n_rest 个随机源
+        all_pre = torch.cat([
+            pref_ids[torch.randint(0, len(pref_ids), (n_to, n_pref), device=device)],
+            rest_ids[torch.randint(0, len(rest_ids), (n_to, n_rest), device=device)],
+        ], dim=1)  # [n_to, n_pref + n_rest]
+
+        all_post = to_ids_t.unsqueeze(1).expand(-1, n_pref + n_rest)  # [n_to, k]
+
+        pre_list = all_pre.reshape(-1).tolist()
+        post_list = all_post.reshape(-1).tolist()
 
         return self.create_synapses_batch(
             pre_list, post_list, conn_type=conn_type, init_scale=init_scale
@@ -234,7 +254,15 @@ class SynapseManager:
                 if not from_ids:
                     continue
 
-                new_pres = random.sample(from_ids, min(n_dead, len(from_ids)))
+                # 通道感知替换: 优先从同通道源取
+                post_ch = int(self.pool.channel[post].item())
+                same_ch = [p for p in from_ids if int(self.pool.channel[p].item()) == post_ch]
+                diff_ch = [p for p in from_ids if int(self.pool.channel[p].item()) != post_ch]
+                k = min(n_dead, len(from_ids))
+                if len(same_ch) >= k:
+                    new_pres = random.sample(same_ch, k)
+                else:
+                    new_pres = same_ch + random.sample(diff_ch, k - len(same_ch))
                 for pre in new_pres:
                     pre_list.append(pre)
                     post_list.append(post)

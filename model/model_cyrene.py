@@ -173,8 +173,9 @@ class CyreneModel:
             self.pool.projections.temporal_connect(nids)
             # 隐藏层神经元分配信道标签 (n % 8), 用于前馈连接分组偏置
             if layer > 0:
+                per_ch = n // 8
                 for i, nid in enumerate(nids):
-                    self.pool.channel[nid] = i % 8
+                    self.pool.channel[nid] = i // per_ch
 
         self._top_layer = TOP_LAYER
         self._hidden_layer_created = True
@@ -406,11 +407,15 @@ class CyreneModel:
             src_nids = self.pool.query.get_neurons_by_layer(src_layer)
             if len(src_nids) > 0:
                 src_list = src_nids.tolist()
+                src_ch = {s: int(self.pool.channel[s].item()) for s in src_list}
                 pre_list, post_list = [], []
                 density = 0.25 if layer == LAYER_L4 else 0.30
                 for dst in nids:
                     k = max(1, int(len(src_list) * density))
-                    chosen = src_list[:k]
+                    dg = int(self.pool.channel[dst].item())
+                    preferred = [s for s in src_list if src_ch[s] == dg]
+                    rest = [s for s in src_list if src_ch[s] != dg]
+                    chosen = (preferred + rest)[:k]
                     for pre in chosen:
                         pre_list.append(pre)
                         post_list.append(dst)
