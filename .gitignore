@@ -9,6 +9,10 @@ out*
 /.ruff_cache
 /.idea
 /build
+instructions
+.claude
+py_models
+
 
 *.pt
 *.jsonl

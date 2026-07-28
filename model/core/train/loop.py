@@ -7,6 +7,7 @@ D/ACh/pi 调制 -> Hebbian 更新. 训练循环仅负责数据注入 + 监控.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Optional
 
@@ -129,6 +130,7 @@ class TrainingLoop:
 
         max_steps = getattr(self.cfg, "max_steps", 0)
         log_interval = getattr(self.cfg, "log_interval", 50)
+        VIZ_STATE_PATH = ".viz_state.json"
 
         for task_id, dataset in task_pipelines:
             loader = torch.utils.data.DataLoader(
@@ -146,6 +148,19 @@ class TrainingLoop:
                 byte_seq = byte_seq.to(self.device)
                 labels = labels.to(self.device)
                 self.train_step(byte_seq, labels)
+
+                # 每 50 步写 viz 状态文件 (给 scripts/viz.py 吃)
+                if self.global_step % 50 == 0:
+                    try:
+                        s = self.get_state()
+                        s["lm_norm"] = float(self.runner.pool.lm_weight.norm(dim=0).mean().item())
+                        s["lm_bias_nz"] = int((self.runner.pool.lm_bias != 0).sum().item())
+                        s["temporal_w"] = float(self.runner.pool.t_weight[self.runner.pool.t_connected].float().abs().mean().item()) if self.runner.pool.t_connected.any() else 0
+                        s["feedback_w"] = float(self.runner.pool.td_weight[self.runner.pool.td_alive].float().abs().mean().item()) if self.runner.pool.td_alive.any() else 0
+                        s["step"] = self.global_step
+                        with open(VIZ_STATE_PATH, "w") as f:
+                            json.dump(s, f)
+                    except: pass
 
                 if self.global_step % log_interval == 0:
                     self._log(f"[{self.global_step}] F={self._last_F:.1f}")

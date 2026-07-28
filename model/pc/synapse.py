@@ -238,7 +238,7 @@ class SynapseManager:
         types_present = self.pool.conn_type[dead_sids].unique()
 
         total_rebuilt = 0
-        if not types_present:
+        if types_present.numel() == 0:
             return 0
 
         # 按 (from_layer, ct) 合并后批量重建

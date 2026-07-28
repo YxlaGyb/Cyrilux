@@ -30,12 +30,20 @@ def compute_dopamine(F_curr: float, F_prev: float, beta: float = 0.5) -> float:
     """多巴胺 RPE: D = sigmoid(beta * (F_prev - F_curr))."""
     if not (math.isfinite(F_curr) and math.isfinite(F_prev)):
         return 0.5
-    return 1.0 / (1.0 + math.exp(-beta * (F_prev - F_curr)))
+    x = -beta * (F_prev - F_curr)
+    if x > 50:
+        return 1.0
+    if x < -50:
+        return 0.0
+    return 1.0 / (1.0 + math.exp(-x))
 
 
 def compute_ach(uncertainty: float, beta_0: float = 0.0) -> float:
     """乙酰胆碱: ACh = sigmoid(-uncertainty + beta_0)."""
-    return 1.0 / (1.0 + math.exp(uncertainty - beta_0))
+    x = uncertainty - beta_0
+    if abs(x) > 50:
+        return 1.0 if x < 0 else 0.0
+    return 1.0 / (1.0 + math.exp(x))
 
 
 def combine_modulation(D: float, ACh: float) -> float:

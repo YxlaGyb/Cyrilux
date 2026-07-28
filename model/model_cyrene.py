@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass, fields
 from typing import Callable
 
@@ -149,7 +150,7 @@ class CyreneModel:
     # ═══════════════════════════════════════════════════════════════
 
     def add_hidden_layer(self):
-        """创建 5 层皮层架构: 
+        """创建 5 层皮层架构:
         L4(感觉输入) → L2 → L3 → L5(输出) → L6(反馈调节).
 
         每个层有不同的惯性 (时间常数) 和 k-WTA 比例.
@@ -180,7 +181,7 @@ class CyreneModel:
         self._top_layer = TOP_LAYER
         self._hidden_layer_created = True
 
-        # 延迟连接 (warmup 结束后触发):
+        # 延迟连接 (warmup 结束后触发)
         self._pending_connects = [
             (0, LAYER_L4, self.config.connection_density, CONN_FEEDFORWARD),
             (LAYER_L4, LAYER_L2, 0.25, CONN_FEEDFORWARD),
@@ -199,9 +200,9 @@ class CyreneModel:
 
     def encode(self, byte_ids: torch.Tensor) -> list[tuple[int, int]]:
         """
-        Stage 1: 
+        Stage 1:
             字节ID → (position, byte_value) 对列表.
-        byte_ids: 
+        byte_ids:
             [1, S] long (0..255).
         """
         vals = byte_ids.squeeze(0).tolist()  # [S]
@@ -286,11 +287,9 @@ class CyreneModel:
 
     @torch.inference_mode()
     def predict_pass(self):
-        """Stage 5: 逐层前馈预测 + 时序 + 自上而下预测."""
+        """Stage 5: 前馈预测 + 时序/topdown."""
         self._fire("before_predict")
-        # 自底向上: 每层用下层预测当前层
         self.pool.forward.predict_all()
-        # 时序 + topdown (保留)
         self.pool.forward.temporal_topdown_pass(self._top_layer)
         self._fire("after_predict")
 
@@ -330,13 +329,12 @@ class CyreneModel:
         active = self.pool.query.get_active_neurons()
         eta = self.config.hebbian_base_eta
         if active.shape[0] > 0:
-            # 前馈 eta 提升至 base 的 60x (L5 表征不分化根因: Hebbian 每步 dw~5e-6)
+            # 全量 Hebbian (前馈+反馈共用 weight 数组, hebbian_pass 通过 in_ptrs 全覆盖)
             eta_ff = eta * 60.0
             self.pool.learning.hebbian_pass(
                 active, eta=eta_ff, oja_alpha=self.config.oja_alpha, dopamine=modulation
             )
-            self.pool.learning.hebbian_topdown(active, eta=eta * 50.0, dopamine=modulation)
-        # 时序学习: 覆盖所有隐藏层 (不仅是活跃神经元), 确保每步都有时序信号
+        # 时序学习: 覆盖所有隐藏层
         hidden_mask = (self.pool.layer > 0) & self.pool.alive
         hidden_active = torch.where(hidden_mask)[0]
         if hidden_active.shape[0] > 0:
@@ -390,8 +388,14 @@ class CyreneModel:
         根据层的上下游关系创建对应连接.
         """
         from model.pc.constants import (
-            LAYER_L4, LAYER_L2, LAYER_L3, LAYER_L5, LAYER_L6,
-            LAYER_SENSORY, CONN_FEEDFORWARD,
+            LAYER_L4,
+            LAYER_L2,
+            LAYER_L3,
+            LAYER_L5,
+            LAYER_L6,
+            LAYER_SENSORY,
+            CONN_FEEDFORWARD,
+            CONN_FEEDBACK,
         )
 
         if not nids:
@@ -410,27 +414,22 @@ class CyreneModel:
             src_nids = self.pool.query.get_neurons_by_layer(src_layer)
             if len(src_nids) > 0:
                 src_list = src_nids.tolist()
-                src_ch = {s: int(self.pool.channel[s].item()) for s in src_list}
                 pre_list, post_list = [], []
                 density = 0.25 if layer == LAYER_L4 else 0.30
                 for dst in nids:
                     k = max(1, int(len(src_list) * density))
-                    dg = int(self.pool.channel[dst].item())
-                    preferred = [s for s in src_list if src_ch[s] == dg]
-                    rest = [s for s in src_list if src_ch[s] != dg]
-                    chosen = (preferred + rest)[:k]
-                    for pre in chosen:
+                    for pre in random.sample(src_list, k):
                         pre_list.append(pre)
                         post_list.append(dst)
                 if pre_list:
-                    is_sensory = (src_layer == LAYER_SENSORY)
+                    is_sensory = src_layer == LAYER_SENSORY
                     self.pool.synapse.create_synapses_batch(
                         pre_list, post_list,
                         init_scale=7.5 if is_sensory else 3.0,
                         conn_type=CONN_FEEDFORWARD,
                     )
 
-        # 反馈: 本层 → 前一层 (如果本层高于前一层)
+        # 反馈: 本层 → 前一层 (独立 td 通路)
         feedback_src = {
             LAYER_L6: LAYER_L5,
             LAYER_L5: LAYER_L3,
@@ -439,9 +438,7 @@ class CyreneModel:
         }
         fb_src = feedback_src.get(layer)
         if fb_src is not None:
-            fb_nids = self.pool.query.get_neurons_by_layer(fb_src)
-            if len(fb_nids) > 0:
-                self.pool.projections.topdown_connect_layer(layer, fb_src, density=0.2)
+            self.pool.projections.topdown_connect_layer(layer, fb_src, density=0.2)
 
         # L4 → LM head (TOP_LAYER)
         if layer == self._top_layer:
@@ -480,39 +477,15 @@ class CyreneModel:
         self._step += 1
         is_warmup = self._step <= self.config.warmup_steps
 
-        # warmup 结束后触发延迟连接
+        # warmup 结束后触发延迟连接 (全密度双向, 共用 weight 数组)
         if not is_warmup and self._pending_connects:
             for from_l, to_l, density, conn_type in self._pending_connects:
-                if conn_type == 1:  # CONN_FEEDBACK
+                is_sensory = from_l == 0
+                if conn_type == 1:
                     self.pool.projections.topdown_connect_layer(from_l, to_l, density=density)
-                elif conn_type == 2:  # CONN_LATERAL
-                    self.pool.synapse.connect_layer(to_l, to_l, density, conn_type=conn_type)
-                elif from_l > 0 and conn_type == 0:  # 前馈: 信道分组连接
-                    src = self.pool.query.get_neurons_by_layer(from_l).tolist()
-                    dst = self.pool.query.get_neurons_by_layer(to_l).tolist()
-                    if src and dst:
-                        dst_ch = {d: int(self.pool.channel[d].item()) for d in dst}
-                        pre_list, post_list = [], []
-                        for s in src:
-                            k = max(1, int(len(dst) * density))
-                            sg = int(self.pool.channel[s].item())
-                            preferred = [d for d in dst if dst_ch[d] == sg]
-                            rest = [d for d in dst if dst_ch[d] != sg]
-                            chosen = (preferred + rest)[:k]
-                            for d in chosen:
-                                pre_list.append(s)
-                                post_list.append(d)
-                        if pre_list:
-                            self.pool.synapse.create_synapses_batch(
-                                pre_list, post_list, init_scale=3.0
-                            )
                 else:
-                    # L0→L4 感官输入连接: init_scale=7.5 确保 L4 首次就有足够信号
-                    is_sensory = (from_l == 0)
                     self.pool.synapse.connect_layer(
-                        from_l,
-                        to_l,
-                        density,
+                        from_l, to_l, density=density,
                         bias_strength=self.config.bias_strength,
                         conn_type=conn_type,
                         init_scale=7.5 if is_sensory else 3.0,
@@ -565,12 +538,10 @@ class CyreneModel:
         )
         self.finalize_step()
 
-        # 每步结尾: 只清 64 步前的旧 L0 z, 保留窗口内 L0 供 L4 累积
+        # 每步结尾重置感官层 z=0: 只保留当前步的 L0 信号, 旧 L0 不干扰前馈
         sensory_mask = (self.pool.layer == 0) & self.pool.alive
         if sensory_mask.any():
-            old_l0 = sensory_mask & (self.pool.last_active < self._step - 64)
-            if old_l0.any():
-                self.pool.state[old_l0, F_Z] = 0.0
+            self.pool.state[sensory_mask, F_Z] = 0.0
 
         activity = self.pool.query.get_activity_stats()
         stats = {
