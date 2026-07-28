@@ -251,7 +251,7 @@ class TensorNeuronPool:
     def compute_free_energy(self) -> torch.Tensor:
         return self.forward.compute_free_energy()
 
-    def compute_lm_logits(self, top_layer: int, use_mu: bool = False) -> torch.Tensor:
+    def compute_lm_logits(self, top_layer: int, use_mu: bool = True) -> torch.Tensor:
         return self.forward.compute_lm_logits(top_layer, use_mu)
 
     def compute_cross_entropy(self, logits: torch.Tensor, target_byte: int) -> torch.Tensor:
@@ -492,3 +492,6 @@ class TensorNeuronPool:
                     int(self.channel[nid].item()),
                 )
             ] = nid
+
+        # 标记 fan_in 缓存脏: 需要首次 predict 时重建
+        self._fan_in_dirty = True

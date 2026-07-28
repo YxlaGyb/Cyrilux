@@ -48,6 +48,7 @@ def test_perplexity(model: CyreneModel, data_path: str, max_samples: int = 100):
     for batch_idx, (byte_seq, labels) in enumerate(loader):
         byte_seq = byte_seq.to(model.device)
         labels = labels.to(model.device)
+        model.reset_hidden_state()
         S = byte_seq.shape[-1]
 
         for pos in range(1, S):
@@ -113,6 +114,7 @@ def test_generation(model: CyreneModel, prompts: list[str], max_tokens: int = 80
 
     results = []
     for prompt in prompts:
+        model.reset_hidden_state()
         byte_seq = list(prompt.encode("utf-8"))
         generated_bytes = []
 
@@ -157,6 +159,7 @@ def test_memory(model: CyreneModel, text: str, repeats: int = 5):
     n_bytes = len(byte_seq) - 1  # 预测时用前 N 个预测后 1 个
 
     for rep in range(repeats):
+        model.reset_hidden_state()
         correct = 0
         total = 0
         t0 = time.perf_counter()

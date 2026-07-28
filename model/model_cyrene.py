@@ -52,7 +52,7 @@ class LMHead:
     def __init__(self, pool):
         self._pool = pool
 
-    def predict_logits(self, pool, top_layer: int, use_mu: bool = False) -> list[float]:
+    def predict_logits(self, pool, top_layer: int, use_mu: bool = True) -> list[float]:
         """返回 256 个字节的 logits (list[float], CPU)."""
         logits = pool.compute_lm_logits(top_layer, use_mu=use_mu)
         return logits.cpu().tolist()
@@ -262,7 +262,7 @@ class CyreneModel:
                             pre_list.append(snid)
                             post_list.append(hnid)
                     if pre_list:
-                        self.pool.synapse.create_synapses_batch(pre_list, post_list, init_scale=5.0)
+                        self.pool.synapse.create_synapses_batch(pre_list, post_list, init_scale=7.5)
         else:
             new_nids = []
 
@@ -423,7 +423,7 @@ class CyreneModel:
                     is_sensory = (src_layer == LAYER_SENSORY)
                     self.pool.synapse.create_synapses_batch(
                         pre_list, post_list,
-                        init_scale=5.0 if is_sensory else 3.0,
+                        init_scale=7.5 if is_sensory else 3.0,
                         conn_type=CONN_FEEDFORWARD,
                     )
 
@@ -448,6 +448,16 @@ class CyreneModel:
     def finalize_step(self):
         """Stage 9: 保存 z_prev."""
         self.pool.learning.finalize_step()
+
+    @torch.inference_mode()
+    def reset_hidden_state(self):
+        """重置隐藏层状态 (layer>0) 为 0. 感官层不改动."""
+        from model.pc.constants import F_EPS, F_MU, F_Z, F_Z_PREV
+
+        mask = (self.pool.layer > 0) & self.pool.alive
+        if mask.any():
+            for col in (F_Z, F_MU, F_EPS, F_Z_PREV):
+                self.pool.state[mask, col] = 0.0
 
     # ═══════════════════════════════════════════════════════════════
     # 核心 step
@@ -494,7 +504,7 @@ class CyreneModel:
                                 pre_list, post_list, init_scale=3.0
                             )
                 else:
-                    # L0→L4 感官输入连接: init_scale=5.0 确保 L4 首次就发放
+                    # L0→L4 感官输入连接: init_scale=7.5 确保 L4 首次就有足够信号
                     is_sensory = (from_l == 0)
                     self.pool.synapse.connect_layer(
                         from_l,
@@ -502,7 +512,7 @@ class CyreneModel:
                         density,
                         bias_strength=self.config.bias_strength,
                         conn_type=conn_type,
-                        init_scale=5.0 if is_sensory else 3.0,
+                        init_scale=7.5 if is_sensory else 3.0,
                     )
             self._pending_connects = []
             # 确保 LM head 连接
@@ -540,7 +550,7 @@ class CyreneModel:
                 self.pool.learning.hebbian_lm_head(
                     self._top_layer,
                     target_byte,
-                    eta=self.config.hebbian_base_eta * 1000.0,
+                    eta=self.config.hebbian_base_eta * 5000.0,
                     dopamine=self._last_modulation,
                     use_mu=self.config.use_mu_lm,
                 )

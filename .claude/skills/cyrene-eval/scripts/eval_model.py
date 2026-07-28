@@ -57,8 +57,9 @@ def test_sensitivity(m, texts=None):
     print("\n  [敏感度]")
     for text in texts:
         bv = _byte_tensor(text, m.device)
+        m.reset_hidden_state()
         m.step(bv)
-        logits_t = m.pool.forward.compute_lm_logits(m._top_layer).float()
+        logits_t = m.pool.forward.compute_lm_logits(m._top_layer, use_mu=True).float()
         probs = torch.softmax(logits_t, dim=-1)
         ent = -(probs * (probs + 1e-12).log()).sum().item()
         top3 = torch.topk(probs, 3)
@@ -91,6 +92,7 @@ def test_ppl(m, data_path="dataset/sft_t2t.jsonl", max_samples=15, max_tokens=50
     correct = 0
     t0 = time.perf_counter()
     for text in texts:
+        m.reset_hidden_state()
         bs = text.encode("utf-8")
         if len(bs) < 14:
             continue
@@ -101,7 +103,7 @@ def test_ppl(m, data_path="dataset/sft_t2t.jsonl", max_samples=15, max_tokens=50
             tgt = bs[pos]
             bv = torch.tensor([list(ctx)], dtype=torch.long, device=m.device)
             m.step(bv)
-            logits_t = m.pool.forward.compute_lm_logits(m._top_layer).float()
+            logits_t = m.pool.forward.compute_lm_logits(m._top_layer, use_mu=True).float()
             loss_sum += float(
                 torch.nn.functional.cross_entropy(
                     logits_t.unsqueeze(0), torch.tensor([tgt], device=m.device)
@@ -129,6 +131,7 @@ def test_memory(m, text=None, repeats=3):
     print(f'\n  [记忆] "{text[:40]}..."')
     bs = list(text.encode("utf-8"))
     for rep in range(repeats):
+        m.reset_hidden_state()
         correct = 0
         total = 0
         for i in range(min(len(bs) - 1, 25)):
@@ -138,7 +141,7 @@ def test_memory(m, text=None, repeats=3):
             tgt = bs[i + 1]
             bv = torch.tensor([ctx], dtype=torch.long, device=m.device)
             m.step(bv)
-            logits_t = m.pool.forward.compute_lm_logits(m._top_layer).float()
+            logits_t = m.pool.forward.compute_lm_logits(m._top_layer, use_mu=True).float()
             if int(logits_t.argmax().item()) == tgt:
                 correct += 1
             total += 1
@@ -150,11 +153,12 @@ def test_generation(m, prompts=None, n_tokens=40):
         prompts = ["Hello", "import ", "The quick"]
     print("\n  [生成]")
     for prompt in prompts:
+        m.reset_hidden_state()
         gen = list(prompt.encode("utf-8"))
         for _ in range(n_tokens):
             bv = torch.tensor([gen[-64:]], dtype=torch.long, device=m.device)
             m.step(bv)
-            logits_t = m.pool.forward.compute_lm_logits(m._top_layer).float() / 0.7
+            logits_t = m.pool.forward.compute_lm_logits(m._top_layer, use_mu=True).float() / 0.7
             topv, _ = torch.topk(logits_t, min(15, 256))
             logits_t[logits_t < topv[-1]] = -float("inf")
             probs = torch.softmax(logits_t, dim=-1)
@@ -174,6 +178,7 @@ def test_selectivity(m, texts=None):
     print("\n  [选择性]")
     results = {}
     for label, text in texts:
+        m.reset_hidden_state()
         bv = _byte_tensor(text, m.device)
         m.step(bv)
         top_mask = (m.pool.layer == m._top_layer) & m.pool.alive

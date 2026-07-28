@@ -222,11 +222,13 @@ class SynapseManager:
         types_present = self.pool.conn_type[dead_sids].unique()
 
         total_rebuilt = 0
+        if not types_present:
+            return 0
+
+        # 按 (from_layer, ct) 合并后批量重建
+        rebuild_map: dict[int, tuple[int, list[int], list[int]]] = {}
         for ct in types_present.tolist():
             type_mask = self.pool.conn_type[dead_sids] == ct
-            if not type_mask.any():
-                continue
-
             type_dead = dead_sids[type_mask]
             type_posts = self.pool.post_id[type_dead]
 
@@ -235,40 +237,36 @@ class SynapseManager:
             for sid in type_dead.tolist():
                 self.pool._free_synapses.append(sid)
 
-            pre_list, post_list = [], []
-            for post in type_posts.unique().tolist():
-                n_dead = (type_posts == post).sum().item()
-                if n_dead == 0:
-                    continue
-                post_layer = int(self.pool.layer[post].item())
+            # 获取 from_layer
+            sample_post = int(type_posts[0].item())
+            post_layer = int(self.pool.layer[sample_post].item())
+            if ct == CONN_FEEDFORWARD:
+                from_layer = LAYER_SENSORY if post_layer == LAYER_L4 else post_layer - 1
+            elif ct == CONN_FEEDBACK:
+                from_layer = post_layer + 1
+            else:
+                from_layer = post_layer
 
-                if ct == CONN_FEEDFORWARD:
-                    from_layer = LAYER_SENSORY if post_layer == LAYER_L4 else post_layer - 1
-                elif ct == CONN_FEEDBACK:
-                    from_layer = post_layer + 1
-                else:
-                    from_layer = post_layer
+            # 统计每个 post 被删的突触数
+            uniq, counts = type_posts.unique(return_counts=True)
+            rebuild_map[ct] = (from_layer, uniq.tolist(), counts.tolist())
 
-                from_mask = (self.pool.layer == from_layer) & self.pool.alive
-                from_ids = torch.where(from_mask)[0].tolist()
-                if not from_ids:
-                    continue
+        for ct, (from_layer, posts, counts) in rebuild_map.items():
+            from_mask = (self.pool.layer == from_layer) & self.pool.alive
+            from_ids = torch.where(from_mask)[0]
+            if len(from_ids) == 0:
+                continue
 
-                # 通道感知替换: 优先从同通道源取
-                post_ch = int(self.pool.channel[post].item())
-                same_ch = [p for p in from_ids if int(self.pool.channel[p].item()) == post_ch]
-                diff_ch = [p for p in from_ids if int(self.pool.channel[p].item()) != post_ch]
-                k = min(n_dead, len(from_ids))
-                if len(same_ch) >= k:
-                    new_pres = random.sample(same_ch, k)
-                else:
-                    new_pres = same_ch + random.sample(diff_ch, k - len(same_ch))
-                for pre in new_pres:
-                    pre_list.append(pre)
-                    post_list.append(post)
+            n_pairs = sum(counts)
+            # 向量化一次构造所有 pre-post 对
+            posts_expanded = torch.tensor(posts, device=self.pool.device).repeat_interleave(
+                torch.tensor(counts, device=self.pool.device))
+            pre_indices = torch.randint(0, len(from_ids), (n_pairs,), device=self.pool.device)
+            pre_alist = from_ids[pre_indices].tolist()
 
-            if pre_list:
-                self.create_synapses_batch(pre_list, post_list, conn_type=ct)
-                total_rebuilt += len(pre_list)
+            if pre_alist:
+                self.create_synapses_batch(
+                    pre_alist, posts_expanded.tolist(), conn_type=ct)
+                total_rebuilt += len(pre_alist)
 
         return total_rebuilt

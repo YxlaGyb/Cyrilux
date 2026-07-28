@@ -90,7 +90,7 @@ class ForwardEngine:
 
         # 1/sqrt(K) 缩放 — 使用缓存的扇入数
         alive = self.pool.alive
-        if self.pool._fan_in_dirty:
+        if getattr(self.pool, '_fan_in_dirty', True):
             fan_in = (self.pool.in_ptrs[alive] >= 0).sum(dim=-1).to(torch.float16)
             self.pool._fan_in_cache[alive] = fan_in
             self.pool._fan_in_dirty = False
@@ -126,7 +126,7 @@ class ForwardEngine:
                 _, top_idx = torch.topk(z_L.abs(), k)
                 self._kwta_winners[:n_L].zero_()
                 self._kwta_winners[:n_L][top_idx] = True
-                z_new[in_layer] = torch.where(self._kwta_winners[:n_L], z_L, z_L * 0.1)
+                z_new[in_layer] = torch.where(self._kwta_winners[:n_L], z_L, z_L * 0.15)
 
             self.pool.state[non_sensory, F_Z] = z_new
             self.pool.state[non_sensory, F_EPS] = z_new - mu_ns

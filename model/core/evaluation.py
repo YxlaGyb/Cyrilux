@@ -63,6 +63,8 @@ def compute_perplexity(
         if batch_idx >= max_batches:
             break
 
+        runner.reset_hidden_state()
+
         S = byte_seq.shape[-1]
 
         for pos in range(1, S):
@@ -72,7 +74,7 @@ def compute_perplexity(
 
             runner.step(context)
 
-            logits = runner.lm_head.predict_logits(runner.pool, runner._top_layer)
+            logits = runner.lm_head.predict_logits(runner.pool, runner._top_layer, use_mu=True)
 
             target = labels[0, pos - 1].item()
             if target == -100:
@@ -101,6 +103,7 @@ def generate_text(
     top_k: int = 20,
 ) -> str:
     """字节级自回归文本生成 — StreamRunner lm_head."""
+    runner.reset_hidden_state()
     byte_seq = list(prompt.encode("utf-8"))
 
     for _ in range(max_new_tokens):
@@ -113,7 +116,7 @@ def generate_text(
 
         runner.step(seq)
 
-        logits = runner.lm_head.predict_logits(runner.pool, runner._top_layer)
+        logits = runner.lm_head.predict_logits(runner.pool, runner._top_layer, use_mu=True)
         logits_t = torch.tensor(logits, dtype=torch.half)
 
         if temperature > 0:
