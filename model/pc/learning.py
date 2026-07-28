@@ -6,6 +6,8 @@ Hebbian 可塑性 + 稳态 + 阈值调节.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .constants import (
@@ -153,7 +155,7 @@ class LearningEngine:
         use_mu: bool = False,
     ) -> float:
         """
-        误差门控 Hebbian: 
+        误差门控 Hebbian:
         +dw[target]=gate*z, -dw[pred]=gate*z.
         """
         top_mask = (self.pool.layer == top_layer) & self.pool.alive
@@ -179,19 +181,68 @@ class LearningEngine:
         if error:
             dw[pred_byte] = -eta_eff * gate * z_use
 
-        # 原地累加 lm_weight / bias (省克隆 ~32MB)
-        self.pool.lm_weight[:, top_mask] += dw
+        self.pool.lm_weight.data[:, top_mask] += dw
 
-        # bias: 纯频次先验, ±1 限幅
-        self.pool.lm_bias[target_byte] = torch.clamp(
-            self.pool.lm_bias[target_byte] + 1e-4, min=-1.0, max=1.0
+        self.pool.lm_bias.data[target_byte] = torch.clamp(
+            self.pool.lm_bias.data[target_byte] + 1e-4, min=-1.0, max=1.0
         )
         if error:
-            self.pool.lm_bias[pred_byte] = torch.clamp(
-                self.pool.lm_bias[pred_byte] - 1e-4, min=-1.0, max=1.0
+            self.pool.lm_bias.data[pred_byte] = torch.clamp(
+                self.pool.lm_bias.data[pred_byte] - 1e-4, min=-1.0, max=1.0
             )
 
         return 0.0
+
+    def hebbian_lm_head_batched(
+        self,
+        top_layer: int,
+        targets: torch.Tensor,
+        eta: float,
+        dopamine: float,
+        use_mu: bool = False,
+    ) -> float:
+        """批量 LM head Hebbian — 零循环, 零 .item().
+
+        Args:
+            targets: [B] long tensor of target byte values (0-255).
+        """
+        top_mask = (self.pool.layer == top_layer) & self.pool.alive
+        n_top = int(top_mask.sum().item())
+        if n_top == 0 or targets.shape[0] == 0:
+            return 0.0
+
+        state_col = F_MU if use_mu else F_Z
+        z_top = self.pool.state[top_mask, state_col]
+        B = targets.shape[0]
+
+        # 单步平均更新幅度 ≈ eta * 5000 * 0.04 ≈ 200
+        # 重复 target 叠加时 / sqrt(B) 保持稳定
+        eta_eff = eta * dopamine * (1.0 / math.sqrt(max(B, 1)))
+
+        logits = self.pool.lm_weight[:, top_mask] @ z_top + self.pool.lm_bias
+        pred = logits.argmax()
+        n_e = (pred != targets).sum().item()
+        n_c = B - n_e
+
+        # 全张量 dw — 零 .item() 每列统一 gate
+        # gate_error = 1.0, gate_correct = 0.1
+        pos_src = eta_eff * z_top.unsqueeze(0)  # [1, n_top], gate=1.0 for error targets
+        dw = torch.zeros(256, n_top, dtype=torch.float16, device=self.pool.device)
+        if n_e > 0:
+            err_mask = (pred != targets)
+            err_t = targets[err_mask]
+            pos_e = pos_src.expand(int(n_e), -1).to(torch.float16)
+            dw.index_add_(0, err_t, pos_e)
+            neg_src = (-pos_src.expand(int(n_e), -1)).to(torch.float16)
+            dw.index_add_(0, pred.expand(int(n_e)), neg_src)
+        if n_c > 0:
+            corr_t = targets[pred == targets]
+            pos_c = (eta_eff * 0.1 * z_top).unsqueeze(0).expand(int(n_c), -1).to(torch.float16)
+            dw.index_add_(0, corr_t, pos_c)
+
+        self.pool.lm_weight.data[:, top_mask] += dw
+
+        self.pool.lm_bias.data[targets] += 1e-4
 
     def adjust_thresholds(self, target_rate: float = 0.01, rate_eta: float = 0.01):
         """每步阈值调节 (稳态 homeostatic plasticity)."""

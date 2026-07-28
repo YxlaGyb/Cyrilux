@@ -1,8 +1,6 @@
-"""TrainingLoop
-事件驱动, 纯局部 Hebbian, 零 autograd.
+"""TrainingLoop — 事件驱动, 纯局部 Hebbian, 零 autograd.
 
-CyreneModel.step() 内部已包含: 感官前端 -> 事件驱动传播 -> 自由能 ->
-D/ACh/pi 调制 -> Hebbian 更新. 训练循环仅负责数据注入 + 监控.
+一次前馈全序列, 一次批 LM head Hebbian 更新.
 """
 
 from __future__ import annotations
@@ -71,96 +69,87 @@ class TrainingLoop:
 
     def train_step(self, byte_seq: torch.Tensor, labels: torch.Tensor) -> dict:
         assert self.runner is not None
-        target = int(labels[0, 0].item()) if labels.numel() > 0 else -1
-        stats = self.runner.step(byte_seq, target_byte=target)
-        F_curr = stats.get("free_energy", 0.0)
-        D = stats.get("D", 0.5)
-        modulation = stats.get("modulation", 0.5)
-        lm_loss = stats.get("lm_loss", 0.0)
+        m = self.runner
 
-        self._last_F = F_curr
-        self._last_D = D
+        # 一次前馈 (target_byte=-1 跳过内部 LM head Hebbian)
+        stats = m.step(byte_seq, target_byte=-1)
+        is_w = stats.get("warmup", False)
 
-        result = {
-            "ce_val": lm_loss,
-            "F_val": F_curr,
-            "D": D,
-            "ACh": stats.get("ACh", 0.5),
-            "modulation": modulation,
-            "uncertainty": stats.get("uncertainty", 0.5),
-            "lr": self.cfg.hebbian_base_eta * modulation,
-            "firing_rate": stats.get("firing_rate", 0.0),
-            "n_neurons": stats.get("n_neurons", 0),
-            "n_synapses": stats.get("n_synapses", 0),
-            "warmup": stats.get("warmup", False),
-            "phase": "event_driven",
+        lm_loss = 0.0
+        if not is_w and m._top_layer > 0:
+            # GPU 切片替代 .tolist(), 零 CPU 同步
+            targets_all = labels[0, 1:].long()  # [seq_len-1]
+            valid = (targets_all >= 0) & (targets_all <= 255)
+            targets_t = targets_all[valid]
+            if targets_t.shape[0] > 0:
+                m.pool.learning.hebbian_lm_head_batched(
+                    m._top_layer, targets_t,
+                    eta=m.config.hebbian_base_eta * 5000.0,
+                    dopamine=m._last_modulation,
+                    use_mu=m.config.use_mu_lm,
+                )
+                logits = m.pool.forward.compute_lm_logits(m._top_layer)
+                ce = torch.nn.functional.cross_entropy(
+                    logits.unsqueeze(0).float(), targets_t[:1],
+                )
+                lm_loss = float(ce.item())
+
+        dv = m._last_D if hasattr(m, "_last_D") else 0.5
+        mod = m._last_modulation if hasattr(m, "_last_modulation") else 0.5
+        fv = float(m._free_energy_history[-1]) if m._free_energy_history else 0.0
+        self._last_F = fv
+        self._last_D = dv
+
+        return {
+            "ce_val": lm_loss, "F_val": fv, "D": dv,
+            "ACh": m._last_ACh if hasattr(m, "_last_ACh") else 0.5,
+            "modulation": mod, "uncertainty": 0.5,
+            "firing_rate": 0.0, "n_neurons": 0, "n_synapses": 0,
+            "warmup": is_w, "phase": "event_driven",
         }
-        pred_byte = stats.get("pred_byte", -1)
-        if pred_byte >= 0:
-            result["pred_byte"] = pred_byte
-
-        self._last_stats = result
-        return result
 
     def get_state(self) -> dict:
         return {
             "global_step": self.global_step,
-            "last_F": self._last_F,
-            "last_D": self._last_D,
-            "n_neurons": (self.runner.pool.query.get_total_neurons() if self.runner else 0),
-            "n_synapses": (self.runner.pool.query.get_total_synapses() if self.runner else 0),
-            "temporal_connections": (
-                int(self.runner.pool.t_connected.sum().item()) if self.runner else 0
-            ),
-            "topdown_connections": (
-                int(self.runner.pool.td_alive.sum().item()) if self.runner else 0
-            ),
+            "last_F": self._last_F, "last_D": self._last_D,
+            "n_neurons": (int(self.runner.pool.alive.sum().item()) if self.runner else 0),
+            "n_synapses": (int(self.runner.pool.syn_alive.sum().item()) if self.runner else 0),
+            "temporal_connections": (int(self.runner.pool.t_connected.sum().item()) if self.runner else 0),
+            "topdown_connections": (int(self.runner.pool.td_alive.sum().item()) if self.runner else 0),
         }
 
-    def train(
-        self,
-        task_pipelines: list[tuple[str, torch.utils.data.Dataset]],
-    ):
+    def train(self, task_pipelines: list[tuple[str, torch.utils.data.Dataset]]):
         out_dir = os.path.join(os.getcwd(), self.cfg.out_dir)
         os.makedirs(out_dir, exist_ok=True)
-
         self.runner = self._build_model()
         self._log("CyreneModel training initialized")
         self.global_step = 0
-
         max_steps = getattr(self.cfg, "max_steps", 0)
         log_interval = getattr(self.cfg, "log_interval", 50)
         VIZ_STATE_PATH = ".viz_state.json"
 
         for task_id, dataset in task_pipelines:
             loader = torch.utils.data.DataLoader(
-                dataset,
-                batch_size=1,
-                shuffle=True,
-                num_workers=0,
+                dataset, batch_size=1, shuffle=True, num_workers=0,
             )
-
             for batch_idx, (byte_seq, labels) in enumerate(tqdm(loader, desc=f"Task {task_id}")):
                 if max_steps > 0 and batch_idx >= max_steps:
                     break
                 self.global_step += 1
-
                 byte_seq = byte_seq.to(self.device)
                 labels = labels.to(self.device)
                 self.train_step(byte_seq, labels)
 
-                # 每 50 步写 viz 状态文件 (给 scripts/viz.py 吃)
                 if self.global_step % 50 == 0:
                     try:
                         s = self.get_state()
                         s["lm_norm"] = float(self.runner.pool.lm_weight.norm(dim=0).mean().item())
                         s["lm_bias_nz"] = int((self.runner.pool.lm_bias != 0).sum().item())
-                        s["temporal_w"] = float(self.runner.pool.t_weight[self.runner.pool.t_connected].float().abs().mean().item()) if self.runner.pool.t_connected.any() else 0
-                        s["feedback_w"] = float(self.runner.pool.td_weight[self.runner.pool.td_alive].float().abs().mean().item()) if self.runner.pool.td_alive.any() else 0
                         s["step"] = self.global_step
                         with open(VIZ_STATE_PATH, "w") as f:
                             json.dump(s, f)
-                    except: pass
+                    except:
+                        pass
 
                 if self.global_step % log_interval == 0:
                     self._log(f"[{self.global_step}] F={self._last_F:.1f}")

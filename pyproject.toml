@@ -67,10 +67,20 @@ reportPrivateImportUsage = "none"
 
 
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py312"
 
-lint.ignore = ["E301", "E302", "E303", "E304", "E305", "E306", "E741", "E702"]
+lint.ignore = [
+    "E301",
+    "E302",
+    "E303",
+    "E304",
+    "E305",
+    "E306",
+    "E741",
+    "E702",
+    "E701",
+]
 
 lint.select = [
     "F", # Pyflakes — 未定义变量、未使用导入/变量等真正错误

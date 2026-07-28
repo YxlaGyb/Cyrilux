@@ -2,23 +2,14 @@
 from __future__ import annotations
 
 import torch
-from .constants import F_EPS, F_MU, F_THRESHOLD, F_Z
+from .constants import F_EPS, F_MU, F_THRESHOLD, F_Z, F_FIRING_RATE
 
 
 class ForwardEngine:
     def __init__(self, pool):
         self.pool = pool
-        self._kwta_cpu = [0.0] * 16
-        self._kwta_cpu[10] = 0.10
-        self._kwta_cpu[11] = 0.10
-        self._kwta_cpu[12] = 0.15
-        self._kwta_cpu[13] = 0.20
-        self._kwta_cpu[14] = 0.10
         self._mu_buf = None
         self._mu_td_buf = None
-        self._cached_layer_list = None
-        self._layer_refresh_counter = 0
-        self._kwta_winners = None
         self._noise_cache = None
         self._noise_idx = 0
         self._NOISE_TEMPLATES = 8
@@ -29,8 +20,6 @@ class ForwardEngine:
             self._mu_buf = torch.zeros(N, dtype=torch.float16, device=dev)
         if self._mu_td_buf is None or self._mu_td_buf.shape[0] < N:
             self._mu_td_buf = torch.zeros(N, dtype=torch.float16, device=dev)
-        if self._kwta_winners is None or self._kwta_winners.shape[0] < N:
-            self._kwta_winners = torch.zeros(N, dtype=torch.bool, device=dev)
         if self._noise_cache is None or self._noise_cache.shape[0] < N:
             self._noise_cache = torch.stack([
                 torch.randn(N, dtype=torch.float16, device=dev) * 0.005
@@ -39,24 +28,17 @@ class ForwardEngine:
 
     def predict_all(self) -> None:
         alive_syn = self.pool.syn_alive
-        if not alive_syn.any():
-            return
+        if not alive_syn.any(): return
         syn_mask = alive_syn
         pre = self.pool.pre_id[syn_mask]
         post = self.pool.post_id[syn_mask]
         w = self.pool.weight[syn_mask]
         z_pre = self.pool.state[pre.long(), F_Z]
-        non_sensory_mask = self.pool.layer[pre.long()] > 0
-        if non_sensory_mask.any():
-            z_sub = z_pre[non_sensory_mask]
-            rms = (z_sub * z_sub).mean().sqrt() + 1e-6
-            z_pre = z_pre.clone()
-            z_pre[non_sensory_mask] = z_sub / rms
         self._ensure_buffers()
         self._mu_buf.zero_()
         self._mu_buf.scatter_add_(0, post.long(), w * z_pre)
         alive = self.pool.alive
-        if getattr(self.pool, '_fan_in_dirty', True):
+        if getattr(self.pool, "_fan_in_dirty", True):
             fan_in = (self.pool.in_ptrs[alive] >= 0).sum(dim=-1).to(torch.float16)
             self.pool._fan_in_cache[alive] = fan_in
             self.pool._fan_in_dirty = False
@@ -68,23 +50,9 @@ class ForwardEngine:
             z_new = 0.3 * self.pool.state[non_sensory, F_Z] + 0.7 * self.pool.state[non_sensory, F_MU]
             self._noise_idx = (self._noise_idx + 1) % self._NOISE_TEMPLATES
             z_new = z_new + self._noise_cache[self._noise_idx][non_sensory]
-            layer_ids = self.pool.layer[non_sensory]
-            self._layer_refresh_counter += 1
-            if self._layer_refresh_counter % 50 == 1 or self._cached_layer_list is None:
-                unique_layers = layer_ids.unique()
-                self._cached_layer_list = unique_layers.tolist()
-            for L in self._cached_layer_list:
-                in_layer = layer_ids == L
-                z_L = z_new[in_layer]; n_L = z_L.shape[0]
-                if L <= 0 or n_L <= 4: continue
-                k = max(4, int(n_L * self._kwta_cpu[L]))
-                _, top_idx = torch.topk(z_L.abs(), k)
-                self._kwta_winners[:n_L].zero_()
-                self._kwta_winners[:n_L][top_idx] = True
-                z_new[in_layer] = torch.where(self._kwta_winners[:n_L], z_L, z_L * 0.15)
             self.pool.state[non_sensory, F_Z] = z_new
             self.pool.state[non_sensory, F_EPS] = z_new - self.pool.state[non_sensory, F_MU]
-        self.pool.state[:, 4] = 0.995 * self.pool.state[:, 4] + 0.005 * self.pool.state[:, F_Z].abs()
+        self.pool.state[:, F_FIRING_RATE] = 0.995 * self.pool.state[:, F_FIRING_RATE] + 0.005 * self.pool.state[:, F_Z].abs()
 
     def temporal_topdown_pass(self, top_layer: int):
         alive = self.pool.alive
