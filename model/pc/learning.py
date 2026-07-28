@@ -109,7 +109,7 @@ class LearningEngine:
         eps = self.pool.state[nids_c.long(), F_EPS]
         z_prev = self.pool.state[nids_c.long(), F_Z_PREV]
 
-        dw = eta * dopamine * eps * z_prev - 0.01 * w
+        dw = eta * dopamine * eps * z_prev
         self.pool.t_weight[nids_c.long()] += dw
         return float(dw.abs().sum().item())
 

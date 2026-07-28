@@ -16,7 +16,7 @@ class ProjectionManager:
     def __init__(self, pool):
         self.pool = pool
 
-    def temporal_connect(self, nids: list[int], init_scale: float = 0.1):
+    def temporal_connect(self, nids: list[int], init_scale: float = 1.0):
         """为神经元建立时序自连接."""
         for nid in nids:
             self.pool.t_connected[nid] = True

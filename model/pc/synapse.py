@@ -116,6 +116,7 @@ class SynapseManager:
         self.pool._occupied_synapses += n
         self.pool._fan_in_dirty = True
 
+        # in_ptrs: 分组后逐后神经元写入 (满时向量化置换)
         _post_to_sids: dict[int, list[int]] = {}
         for sid, post_i in zip(sids, post_ids):
             _post_to_sids.setdefault(post_i, []).append(sid)
@@ -127,7 +128,22 @@ class SynapseManager:
                     syn_list[:avail], dtype=torch.int32, device=self.pool.device
                 )
                 self.pool._in_counts[post_i] = in_c + avail
+            remain = syn_list[avail:]
+            if not remain:
+                continue
+            # K 满了: 向量化置换 — randint 选 slot, 批量杀旧写新
+            n_r = len(remain)
+            dev = self.pool.device
+            evict = torch.randint(0, self.pool.K, (n_r,), device=dev)
+            old_sids = self.pool.in_ptrs[post_i, evict]  # [n_r]
+            self.pool.syn_alive[old_sids.long()] = False
+            self.pool._occupied_synapses -= n_r
+            self.pool.in_ptrs[post_i, evict] = torch.tensor(
+                remain, dtype=torch.int32, device=dev
+            )
+            # _in_counts[post_i] 保持 K (已满)
 
+        # out_ptrs: 分组后逐前神经元写入
         _pre_to_sids: dict[int, list[int]] = {}
         for sid, pre_i in zip(sids, pre_ids):
             _pre_to_sids.setdefault(pre_i, []).append(sid)

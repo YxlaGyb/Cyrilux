@@ -325,19 +325,22 @@ class CyreneModel:
 
     @torch.inference_mode()
     def hebbian_pass(self, modulation: float):
-        """Stage 8: Hebbian + Oja 更新."""
+        """Stage 8: Hebbian + Oja + 时序更新."""
         self._fire("before_hebbian", modulation=modulation)
         active = self.pool.query.get_active_neurons()
+        eta = self.config.hebbian_base_eta
         if active.shape[0] > 0:
-            eta = self.config.hebbian_base_eta
             # 前馈 eta 提升至 base 的 60x (L5 表征不分化根因: Hebbian 每步 dw~5e-6)
             eta_ff = eta * 60.0
             self.pool.learning.hebbian_pass(
                 active, eta=eta_ff, oja_alpha=self.config.oja_alpha, dopamine=modulation
             )
-            eta_t = eta * 0.3
-            self.pool.learning.hebbian_temporal(active, eta=eta_t, dopamine=modulation)
-            self.pool.learning.hebbian_topdown(active, eta=eta_t, dopamine=modulation)
+            self.pool.learning.hebbian_topdown(active, eta=eta * 50.0, dopamine=modulation)
+        # 时序学习: 覆盖所有隐藏层 (不仅是活跃神经元), 确保每步都有时序信号
+        hidden_mask = (self.pool.layer > 0) & self.pool.alive
+        hidden_active = torch.where(hidden_mask)[0]
+        if hidden_active.shape[0] > 0:
+            self.pool.learning.hebbian_temporal(hidden_active, eta=eta * 50.0, dopamine=modulation)
         self._fire("after_hebbian", n_active=int(active.shape[0]))
 
     @torch.inference_mode()
@@ -562,10 +565,12 @@ class CyreneModel:
         )
         self.finalize_step()
 
-        # 每步结尾重置感官层 z=0: 只保留当前步的 L0 信号, 旧 L0 不干扰前馈
+        # 每步结尾: 只清 64 步前的旧 L0 z, 保留窗口内 L0 供 L4 累积
         sensory_mask = (self.pool.layer == 0) & self.pool.alive
         if sensory_mask.any():
-            self.pool.state[sensory_mask, F_Z] = 0.0
+            old_l0 = sensory_mask & (self.pool.last_active < self._step - 64)
+            if old_l0.any():
+                self.pool.state[old_l0, F_Z] = 0.0
 
         activity = self.pool.query.get_activity_stats()
         stats = {
