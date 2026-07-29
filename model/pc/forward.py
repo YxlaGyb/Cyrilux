@@ -102,7 +102,7 @@ class ForwardEngine:
         top_mask = (self.pool.layer == top_layer) & self.pool.alive
         if not top_mask.any(): return torch.zeros(256, dtype=torch.float16, device=self.pool.device)
         z_top = self.pool.state[top_mask, F_MU if use_mu else F_Z]
-        return self.pool.lm_weight[:, top_mask] @ z_top + self.pool.lm_bias
+        return self.pool.lm_weight[:, top_mask] @ (z_top * 10.0) + self.pool.lm_bias
 
     def compute_cross_entropy(self, logits, target_byte):
         return torch.nn.functional.cross_entropy(logits.unsqueeze(0).float(), torch.tensor([target_byte], device=self.pool.device))

@@ -201,10 +201,9 @@ class LearningEngine:
         dopamine: float,
         use_mu: bool = False,
     ) -> float:
-        """批量 LM head Hebbian — 零循环, 零 .item().
-
-        Args:
-            targets: [B] long tensor of target byte values (0-255).
+        """
+        批量 LM head Hebbian
+        零循环, 零 .item().
         """
         top_mask = (self.pool.layer == top_layer) & self.pool.alive
         n_top = int(top_mask.sum().item())
@@ -213,36 +212,23 @@ class LearningEngine:
 
         state_col = F_MU if use_mu else F_Z
         z_top = self.pool.state[top_mask, state_col]
-        B = targets.shape[0]
-
-        # 单步平均更新幅度 ≈ eta * 5000 * 0.04 ≈ 200
-        # 重复 target 叠加时 / sqrt(B) 保持稳定
-        eta_eff = eta * dopamine * (1.0 / math.sqrt(max(B, 1)))
+        eta_eff = eta * dopamine
 
         logits = self.pool.lm_weight[:, top_mask] @ z_top + self.pool.lm_bias
         pred = logits.argmax()
         n_e = (pred != targets).sum().item()
-        n_c = B - n_e
 
-        # 全张量 dw — 零 .item() 每列统一 gate
-        # gate_error = 1.0, gate_correct = 0.1
-        pos_src = eta_eff * z_top.unsqueeze(0)  # [1, n_top], gate=1.0 for error targets
         dw = torch.zeros(256, n_top, dtype=torch.float16, device=self.pool.device)
+        gate = torch.where(pred != targets, 1.0, 0.1)
+        pos = (eta_eff * gate.unsqueeze(1) * z_top.unsqueeze(0)).to(torch.float16)
+        dw.index_add_(0, targets, pos)
         if n_e > 0:
-            err_mask = (pred != targets)
-            err_t = targets[err_mask]
-            pos_e = pos_src.expand(int(n_e), -1).to(torch.float16)
-            dw.index_add_(0, err_t, pos_e)
-            neg_src = (-pos_src.expand(int(n_e), -1)).to(torch.float16)
-            dw.index_add_(0, pred.expand(int(n_e)), neg_src)
-        if n_c > 0:
-            corr_t = targets[pred == targets]
-            pos_c = (eta_eff * 0.1 * z_top).unsqueeze(0).expand(int(n_c), -1).to(torch.float16)
-            dw.index_add_(0, corr_t, pos_c)
+            neg = (-eta_eff * z_top.unsqueeze(0).expand(int(n_e), -1)).to(torch.float16)
+            dw.index_add_(0, pred.expand(int(n_e)), neg)
 
         self.pool.lm_weight.data[:, top_mask] += dw
-
         self.pool.lm_bias.data[targets] += 1e-4
+        return 0.0
 
     def adjust_thresholds(self, target_rate: float = 0.01, rate_eta: float = 0.01):
         """每步阈值调节 (稳态 homeostatic plasticity)."""
@@ -313,7 +299,7 @@ class LearningEngine:
         if usage > 0.9:
             _max_grow = 0
 
-        # 1. 修剪 (包含孤儿检查 + 不活跃检查)
+        # 1. 修剪, 包含孤儿检查 + 不活跃检查
         if current_step % _prune_interval == 0:
             alive_ids = torch.where(alive)[0]
             age = current_step - self.pool.created_at[alive_ids]

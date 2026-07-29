@@ -1,6 +1,7 @@
 """TrainingLoop — 事件驱动, 纯局部 Hebbian, 零 autograd.
 
-一次前馈全序列, 一次批 LM head Hebbian 更新.
+一次前馈全序列, 批 LM head Hebbian (唯一 target 去重, 防高频列垄断).
+z*10 仅推理 compute_lm_logits 生效, 训练时用原生 z.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from tqdm import tqdm
 from pkg.utils.trainer_utils import setup_seed
 from pkg.device.cuda import setup_cuda_device
 from model.model_cyrene import CyreneConfig, CyreneModel
+from model.pc.constants import F_MU, F_Z
 
 from .config import TrainingConfig
 
@@ -71,23 +73,27 @@ class TrainingLoop:
         assert self.runner is not None
         m = self.runner
 
-        # 一次前馈 (target_byte=-1 跳过内部 LM head Hebbian)
         stats = m.step(byte_seq, target_byte=-1)
         is_w = stats.get("warmup", False)
 
         lm_loss = 0.0
         if not is_w and m._top_layer > 0:
-            # GPU 切片替代 .tolist(), 零 CPU 同步
-            targets_all = labels[0, 1:].long()  # [seq_len-1]
+            targets_all = labels[0, 1:].long()
             valid = (targets_all >= 0) & (targets_all <= 255)
             targets_t = targets_all[valid]
             if targets_t.shape[0] > 0:
-                m.pool.learning.hebbian_lm_head_batched(
-                    m._top_layer, targets_t,
-                    eta=m.config.hebbian_base_eta * 5000.0,
-                    dopamine=m._last_modulation,
-                    use_mu=m.config.use_mu_lm,
-                )
+                top_mask = (m.pool.layer == m._top_layer) & m.pool.alive
+                n_top = int(top_mask.sum().item())
+                if n_top > 0:
+                    z_top = m.pool.state[top_mask, F_MU if m.config.use_mu_lm else F_Z]
+                    uniq = targets_t.unique()
+                    eta_eff = m.config.hebbian_base_eta * 5000.0 * m._last_modulation
+                    dw = torch.zeros(256, n_top, dtype=torch.float16, device=m.device)
+                    pos = (eta_eff * z_top.unsqueeze(0)).to(torch.float16)
+                    dw.index_add_(0, uniq, pos.expand(uniq.shape[0], -1))
+                    m.pool.lm_weight.data[:, top_mask] += dw
+                    m.pool.lm_bias.data[uniq] += 1e-4
+
                 logits = m.pool.forward.compute_lm_logits(m._top_layer)
                 ce = torch.nn.functional.cross_entropy(
                     logits.unsqueeze(0).float(), targets_t[:1],
