@@ -1,4 +1,8 @@
-"""CUDA 设备初始化 — cuDNN, tf32, matmul precision 配置."""
+"""
+CUDA 设备初始化
+
+cuDNN, tf32, matmul precision 配置.
+"""
 
 from __future__ import annotations
 

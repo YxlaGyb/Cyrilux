@@ -122,7 +122,7 @@ class TrainingConfig:
     gate_target_high: float = 0.10
 
     # I/O
-    out_dir: str = "out_pc_unified"
+    out_dir: str = "out"
     save_interval: int = 10000
 
     # 回调

@@ -1,4 +1,8 @@
-"""NeuronManager — 神经元生命周期管理 (创建/删除/分裂)."""
+"""
+NeuronManager
+
+神经元生命周期管理 (创建/删除/分裂).
+"""
 
 from __future__ import annotations
 
@@ -73,7 +77,7 @@ class NeuronManager:
         thresholds: list[float] | None = None,
         z_vals: list[float] | None = None,
     ) -> list[int]:
-        """批量创建神经元 — 一次 GPU 写入, 替代逐元素 create_neuron."""
+        """批量创建神经元, 一次 GPU 写入, 替代逐元素 create_neuron."""
         n_create = len(layers)
         if n_create == 0:
             return []
@@ -154,7 +158,11 @@ class NeuronManager:
         return nids
 
     def prune_neuron(self, nid: int, force: bool = False) -> bool:
-        """惰性删除神经元: 标记 alive=False, 关联突触标记 syn_alive=False."""
+        """
+        惰性删除神经元: 
+
+        标记 alive=False, 关联突触标记 syn_alive=False.
+        """
         if not self.pool.alive[nid]:
             return False
 
@@ -195,7 +203,11 @@ class NeuronManager:
         return True
 
     def split_neuron(self, nid: int, noise_scale: float = 0.05) -> int | None:
-        """分裂神经元: 创建子神经元, 平分入突触."""
+        """
+        分裂神经元: 
+        
+        创建子神经元, 平分入突触.
+        """
         if not self.pool.alive[nid]:
             return None
 

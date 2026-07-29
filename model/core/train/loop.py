@@ -16,7 +16,7 @@ from tqdm import tqdm
 from pkg.utils.trainer_utils import setup_seed
 from pkg.device.cuda import setup_cuda_device
 from model.model_cyrene import CyreneConfig, CyreneModel
-from model.pc.constants import F_MU, F_Z
+from model.pc.constants import F_MU
 
 from .config import TrainingConfig
 
@@ -81,24 +81,47 @@ class TrainingLoop:
             targets_all = labels[0, 1:].long()
             valid = (targets_all >= 0) & (targets_all <= 255)
             targets_t = targets_all[valid]
-            if targets_t.shape[0] > 0:
-                top_mask = (m.pool.layer == m._top_layer) & m.pool.alive
-                n_top = int(top_mask.sum().item())
-                if n_top > 0:
-                    z_top = m.pool.state[top_mask, F_MU if m.config.use_mu_lm else F_Z]
-                    uniq = targets_t.unique()
-                    eta_eff = m.config.hebbian_base_eta * 5000.0 * m._last_modulation
-                    dw = torch.zeros(256, n_top, dtype=torch.float16, device=m.device)
-                    pos = (eta_eff * z_top.unsqueeze(0)).to(torch.float16)
-                    dw.index_add_(0, uniq, pos.expand(uniq.shape[0], -1))
-                    m.pool.lm_weight.data[:, top_mask] += dw
-                    m.pool.lm_bias.data[uniq] += 1e-4
+            B = min(targets_t.shape[0], 255)
+            if B == 0:
+                return {"ce_val": 0}
 
-                logits = m.pool.forward.compute_lm_logits(m._top_layer)
-                ce = torch.nn.functional.cross_entropy(
-                    logits.unsqueeze(0).float(), targets_t[:1],
-                )
-                lm_loss = float(ce.item())
+            top_mask = (m.pool.layer == m._top_layer) & m.pool.alive
+            n_top = int(top_mask.sum().item())
+            if n_top == 0:
+                return {"ce_val": 0}
+
+            eta_eff = m.config.hebbian_base_eta * 5000.0 * m._last_modulation
+
+            # 255 步循环: 只前馈推理, 记录 z_top 和 pred
+            preds = []
+            z_ts = []
+
+            with torch.inference_mode():
+                for t in range(B):
+                    if t > 0:
+                        nid = torch.where((m.pool.layer == 0) & m.pool.alive & (m.pool.position == t))[0]
+                        if nid.numel() > 0:
+                            m.pool.state[nid[0], 0] = 1.0
+                        m.pool.forward.predict_all()
+                        sm = (m.pool.layer == 0) & m.pool.alive
+                        if sm.any():
+                            m.pool.state[sm, 0] = 0.0
+                        m.finalize_step()
+
+                    z_cur = m.pool.state[top_mask, F_MU if m.config.use_mu_lm else 1]
+                    z_ts.append(z_cur)
+                    preds.append((m.pool.lm_weight[:, top_mask] @ z_cur + m.pool.lm_bias).argmax())
+
+            # 一次性竞争更新: 直接在 lm_weight.data 上 scatter_add_
+            zs = torch.stack(z_ts)  # [B, n_top]
+            pt = torch.stack(preds)
+            tg = targets_t[:B]
+
+            # zf 扩展到 [B, N], 只在 top_mask 列有值
+            zf = torch.zeros(B, m.pool.N, dtype=torch.float16, device=m.device)
+            zf[:, top_mask] = zs.to(torch.float16)
+            m.pool.lm_weight.data.scatter_add_(0, tg.unsqueeze(1).expand(-1, m.pool.N), eta_eff * zf)
+            m.pool.lm_weight.data.scatter_add_(0, pt.unsqueeze(1).expand(-1, m.pool.N), -eta_eff * zf)
 
         dv = m._last_D if hasattr(m, "_last_D") else 0.5
         mod = m._last_modulation if hasattr(m, "_last_modulation") else 0.5
@@ -132,7 +155,7 @@ class TrainingLoop:
         self.global_step = 0
         max_steps = getattr(self.cfg, "max_steps", 0)
         log_interval = getattr(self.cfg, "log_interval", 50)
-        VIZ_STATE_PATH = ".viz_state.json"
+        VIZ_STATE_PATH = os.path.join(out_dir, ".viz_state.json")
 
         for task_id, dataset in task_pipelines:
             loader = torch.utils.data.DataLoader(
@@ -149,8 +172,6 @@ class TrainingLoop:
                 if self.global_step % 50 == 0:
                     try:
                         s = self.get_state()
-                        s["lm_norm"] = float(self.runner.pool.lm_weight.norm(dim=0).mean().item())
-                        s["lm_bias_nz"] = int((self.runner.pool.lm_bias != 0).sum().item())
                         s["step"] = self.global_step
                         with open(VIZ_STATE_PATH, "w") as f:
                             json.dump(s, f)
