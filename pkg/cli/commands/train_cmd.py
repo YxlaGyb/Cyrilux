@@ -89,7 +89,8 @@ def train_main(
     ),
     auto_phase2: bool = typer.Option(False, "--auto-phase2", help="训练后自动进入 Phase 2"),
     resume: bool = typer.Option(False, "--resume", help="从断点恢复"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志"),
+    backend: str = typer.Option("sparse", "--backend", help="sparse=event-driven(default) / dense=full-GPU matmul"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="verbose logging"),
 ):
     """直接训练模式 (纯 Hebbian, 零反向传播)."""
     if ctx.invoked_subcommand is not None:
@@ -100,6 +101,36 @@ def train_main(
 
     device = ctx.obj.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     data_file_list = [resolve_path(f.strip()) for f in data_files.split(",") if f.strip()]
+
+    if backend == "dense":
+        from model.pc.dense import DensePCNet, DensePCConfig
+        from torch.utils.data import DataLoader
+
+        ratio = hidden_size / 1024.0
+        d_cfg = DensePCConfig(
+            d_l4=hidden_size,
+            d_l2=max(64, int(384 * ratio)),
+            d_l3=max(64, int(384 * ratio)),
+            d_l5=max(64, int(256 * ratio)),
+            d_l6=max(64, int(128 * ratio)),
+            hebbian_base_eta=lr if lr != 3e-4 else 3e-4,
+        )
+        net = DensePCNet(d_cfg).to(device)
+        print(f"Dense training  L4={d_cfg.d_l4}  params={d_cfg.param_count():,}  device={device}")
+
+        for epoch in range(epochs):
+            for fp in data_file_list:
+                ds = DualChannelDataset(fp, max_length=max_seq_len,
+                                        max_samples=subset if subset else None)
+                loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+                for bi, (b, l) in enumerate(loader):
+                    b, l = b.to(device), l.to(device)
+                    logits = net(b)
+                    stats = net.learn(b, l[:, 1:].long())
+                    if verbose and bi % 100 == 0:
+                        print(f"  epoch {epoch} batch {bi}: logits_norm={stats.get('logits_norm', 0):.2f}")
+        net.save(os.path.join(out_dir, "final.pt"))
+        return
 
     config = TrainingConfig(
         checkpoint_path=resolve_path(checkpoint) if checkpoint else None,

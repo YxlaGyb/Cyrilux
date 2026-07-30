@@ -23,8 +23,8 @@ class DensePCConfig:
     """密集 PC 网络配置."""
 
     # 层维度和
-    d_input: int = 256       # 输入字节维度 (固定 vocab_size)
-    d_pe: int = 256          # 位置编码维度
+    d_input: int = 256  # 输入字节维度 (固定 vocab_size)
+    d_pe: int = 256  # 位置编码维度
     d_l4: int = 1024
     d_l2: int = 384
     d_l3: int = 384
@@ -36,7 +36,7 @@ class DensePCConfig:
     hebbian_base_eta: float = 3e-4
     oja_alpha: float = 0.05
     column_dropout: float = 0.25
-    dopamine: float = 1.0    # 固定调制 (后续可扩展)
+    dopamine: float = 1.0  # 固定调制 (后续可扩展)
 
     # 时间惯性 alpha (per-layer, per-neuron)
     inertia_alpha: float = 0.3
@@ -91,8 +91,7 @@ class DensePCNet(nn.Module):
         # ── 位置编码 (固定 sin/cos) ──
         pe = torch.zeros(S, self.cfg.d_pe, dtype=torch.float16)
         pos = torch.arange(S, dtype=torch.float32).unsqueeze(1)
-        div = torch.exp(torch.arange(0, self.cfg.d_pe, 2, dtype=torch.float32) *
-                        (-math.log(10000.0) / self.cfg.d_pe))
+        div = torch.exp(torch.arange(0, self.cfg.d_pe, 2, dtype=torch.float32) * (-math.log(10000.0) / self.cfg.d_pe))
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
         self.register_buffer("pos_encoding", pe)  # [S, d_pe]
@@ -126,10 +125,8 @@ class DensePCNet(nn.Module):
         self.bias_l6 = nn.Parameter(torch.zeros(d["l6"], dtype=torch.float16))
 
         # ── BCM 参数 (per-neuron) ──
-        self.bcm_slope = nn.Parameter(torch.empty(d["l4"] + d["l2"] + d["l3"] + d["l5"] + d["l6"],
-                                                   dtype=torch.float16))
-        self.bcm_zero = nn.Parameter(torch.empty(d["l4"] + d["l2"] + d["l3"] + d["l5"] + d["l6"],
-                                                  dtype=torch.float16))
+        self.bcm_slope = nn.Parameter(torch.empty(d["l4"] + d["l2"] + d["l3"] + d["l5"] + d["l6"], dtype=torch.float16))
+        self.bcm_zero = nn.Parameter(torch.empty(d["l4"] + d["l2"] + d["l3"] + d["l5"] + d["l6"], dtype=torch.float16))
 
         self._init_weights()
 
@@ -163,31 +160,26 @@ class DensePCNet(nn.Module):
         d = self.cfg.dims()
         alpha = self.cfg.inertia_alpha
 
-        # ── L0: one-hot + 位置编码 ──
-        one_hot = F.one_hot(byte_ids, num_classes=256).to(torch.float16)  # [N, S, 256]
-        pe = self.pos_encoding[:S].unsqueeze(0)  # [1, S, d_pe]
-        z0 = torch.cat([one_hot, pe.expand(N, -1, -1)], dim=-1)  # [N, S, d_input+d_pe]
+        # ── L0: one-hot + 位置编码 (固定幅度 0.5) ──
+        one_hot = F.one_hot(byte_ids, num_classes=256).to(torch.float16)
+        pe = self.pos_encoding[:S].unsqueeze(0) * 0.5
+        z0 = torch.cat([one_hot, pe.expand(N, -1, -1)], dim=-1)
 
         # ── 前馈预测 (每层: matmul(÷√dim) + 偏置 + 时间惯性 + k-WTA) ──
         mu4 = z0 @ self.W_04.T / (d["l0"] ** 0.5) + self.bias_l4
-        z4, z4_all = self._layer_step(N, S, d["l4"], mu4, alpha, dev,
-                                      self.W_t4, self.cfg.kwta_ratio)
+        z4, z4_all = self._layer_step(N, S, d["l4"], mu4, alpha, dev, self.W_t4, 0.80)
 
         mu2 = z4 @ self.W_42.T / (d["l4"] ** 0.5) + self.bias_l2
-        z2, z2_all = self._layer_step(N, S, d["l2"], mu2, alpha, dev,
-                                      self.W_t2, self.cfg.kwta_ratio)
+        z2, z2_all = self._layer_step(N, S, d["l2"], mu2, alpha, dev, self.W_t2, 0.80)
 
         mu3 = z2 @ self.W_23.T / (d["l2"] ** 0.5) + self.bias_l3
-        z3, z3_all = self._layer_step(N, S, d["l3"], mu3, alpha, dev,
-                                      self.W_t3, self.cfg.kwta_ratio)
+        z3, z3_all = self._layer_step(N, S, d["l3"], mu3, alpha, dev, self.W_t3, 0.80)
 
         mu5 = z3 @ self.W_35.T / (d["l3"] ** 0.5) + self.bias_l5
-        z5, z5_all = self._layer_step(N, S, d["l5"], mu5, alpha, dev,
-                                      self.W_t5, 0.20)
+        z5, z5_all = self._layer_step(N, S, d["l5"], mu5, alpha, dev, self.W_t5, 1.0)  # L5 全保留
 
         mu6 = z5 @ self.W_56.T / (d["l5"] ** 0.5) + self.bias_l6
-        z6, z6_all = self._layer_step(N, S, d["l6"], mu6, alpha, dev,
-                                      self.W_t6, 0.10)
+        z6, z6_all = self._layer_step(N, S, d["l6"], mu6, alpha, dev, self.W_t6, 1.0)
 
         if store_state:
             self._z0 = z0
@@ -197,33 +189,42 @@ class DensePCNet(nn.Module):
             self._z5 = z5_all
             self._z6 = z6_all
 
-        # ── LM Head ──
-        logits = z5 @ self.W_LM.T + self.bias_lm
+        # ── LM Head (行归一化防高字节垄断) ──
+        rn = self.W_LM.norm(dim=1, keepdim=True) + 1e-8
+        logits = (self.W_LM / rn) @ z5.transpose(-2, -1) + self.bias_lm.unsqueeze(1)
+        logits = logits.transpose(-2, -1)  # [N, S, 256]
         return logits
 
-    def _layer_step(self, N: int, S: int, dim: int, mu: torch.Tensor,
-                    alpha: float, dev: torch.device,
-                    W_t: torch.Tensor, kwta: float) -> tuple[torch.Tensor, torch.Tensor]:
-        """单层前馈: 时间惯性 + k-WTA + 时序投影.
-
-        Returns:
-            z: [N, S, dim] 更新后活动值.
-            z_all: [N, S, dim] 保存用于 Hebbian 学习.
-        """
-        # 初始化 z
+    def _layer_step(
+        self,
+        N: int,
+        S: int,
+        dim: int,
+        mu: torch.Tensor,
+        alpha: float,
+        dev: torch.device,
+        W_t: torch.Tensor,
+        kwta: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """单层前馈: z = mu (活动值), 返回 mu 用于 Hebbian."""
         z = torch.zeros(N, S, dim, dtype=torch.float16, device=dev)
         z[:, 0] = mu[:, 0]
+        z[:, 1:] = mu[:, 1:]  # z=mu (基础)
+        # 时序：z[t] += 0.1 * W_t @ z[t-1] (让模型学"h后面是e")
         temporal = z[:, :-1] @ W_t.T
-        z[:, 1:] = alpha * z[:, :-1] + (1 - alpha) * mu[:, 1:] + temporal
+        z[:, 1:] = z[:, 1:] + temporal * 0.1
 
-        # k-WTA（t=0 全保留防全零）
+        # 每帧归一化防爆炸
+        z = z / (z.norm(dim=-1, keepdim=True) + 1e-8)
+
+        mu_ret = z.clone()
         if kwta > 0 and kwta < 1.0:
             k = max(1, int(dim * kwta))
             vals, idxs = z.topk(k, dim=-1)
             mask = torch.zeros_like(z)
             mask.scatter_(-1, idxs, 1.0)
             z = z * mask + (1.0 - mask) * 1e-5 * z
-        return z, z
+        return z, mu_ret
 
     def learn(self, byte_ids: torch.Tensor, targets: torch.Tensor) -> dict:
         """Hebbian 学习 (前馈 + 外积更新).
@@ -256,23 +257,29 @@ class DensePCNet(nn.Module):
         eps5 = self._z5 - (self._z3 @ self.W_35.T / (d["l3"] ** 0.5) + self.bias_l5)
         eps6 = self._z6 - (self._z5 @ self.W_56.T / (d["l5"] ** 0.5) + self.bias_l6)
 
-        # ── Hebbian 外积 ──
-        # dW[post, pre] = sum_{N,S}(eps_post * z_pre) = eps_post.T @ z_pre → [post_dim, pre_dim]
-        self.W_04.data += (eps4.transpose(-2, -1) @ z0).sum(dim=0).to(torch.float16) * eta
-        self.W_42.data += (eps2.transpose(-2, -1) @ self._z4).sum(dim=0).to(torch.float16) * eta
-        self.W_23.data += (eps3.transpose(-2, -1) @ self._z2).sum(dim=0).to(torch.float16) * eta
-        self.W_35.data += (eps5.transpose(-2, -1) @ self._z3).sum(dim=0).to(torch.float16) * eta
-        self.W_56.data += (eps6.transpose(-2, -1) @ self._z5).sum(dim=0).to(torch.float16) * eta
+        # ── Hebbian 外积 + 列 dropout ──
+        # dW[post, pre] = sum_{N,S}(eps_post * z_pre)
+        dW_list = [
+            (eps4.transpose(-2, -1) @ z0).sum(dim=0).to(torch.float16),
+            (eps2.transpose(-2, -1) @ self._z4).sum(dim=0).to(torch.float16),
+            (eps3.transpose(-2, -1) @ self._z2).sum(dim=0).to(torch.float16),
+            (eps5.transpose(-2, -1) @ self._z3).sum(dim=0).to(torch.float16),
+            (eps6.transpose(-2, -1) @ self._z5).sum(dim=0).to(torch.float16),
+        ]
+        W_list = [self.W_04, self.W_42, self.W_23, self.W_35, self.W_56]
+        for dW, W in zip(dW_list, W_list):
+            col_mask = torch.rand(W.shape[0], 1, device=dev) < self.cfg.column_dropout
+            W.data += (dW * (~col_mask).to(torch.float16)) * eta
 
         # ── LM Head Hebbian ──
         # targets [N, S'], logits [N, S, 256], _z5 [N, S, d_l5]
         # S' 可能比 S 少 1 (labels[:, 1:]), 对齐
         S_t = targets.shape[-1]
-        z5_lm = self._z5[:, :S_t]      # [N, S', d_l5]
-        logits_lm = logits[:, :S_t]     # [N, S', 256]
+        z5_lm = self._z5[:, :S_t]  # [N, S', d_l5]
+        logits_lm = logits[:, :S_t]  # [N, S', 256]
         valid = targets >= 0
         if valid.any():
-            z5_valid = z5_lm[valid]     # [V, d_l5]
+            z5_valid = z5_lm[valid]  # [V, d_l5]
             tg_valid = targets[valid]
             preds = logits_lm[valid].argmax(dim=-1)
             err = preds != tg_valid
@@ -288,9 +295,13 @@ class DensePCNet(nn.Module):
             dw_lm[~col_mask] = 0.0
             self.W_LM.data += dw_lm
 
-        # ── Oja 归一化 (仅权重过大的列) ──
-        for name, W in [("04", self.W_04), ("42", self.W_42), ("23", self.W_23),
-                        ("35", self.W_35), ("56", self.W_56)]:
+        # ── LM Head 列 Oja: 每步单位列范数 (平权竞争) ──
+        col_norm = self.W_LM.data.norm(dim=0, keepdim=True)
+        col_norm = torch.where(col_norm > 1e-8, col_norm, torch.ones_like(col_norm))
+        self.W_LM.data = self.W_LM.data / col_norm
+
+        # ── 前馈 Oja 上限约束 ──
+        for name, W in [("04", self.W_04), ("42", self.W_42), ("23", self.W_23), ("35", self.W_35), ("56", self.W_56)]:
             col_norm = W.data.norm(dim=1, keepdim=True)
             over = col_norm > 8.0
             if over.any():
@@ -298,3 +309,16 @@ class DensePCNet(nn.Module):
                 W.data *= scale
 
         return {"logits_norm": logits.norm().item()}
+
+    def save(self, path: str):
+        """保存模型权重."""
+        import os
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save(self.state_dict(), path)
+
+    @classmethod
+    def load(cls, path: str, config: DensePCConfig | None = None) -> DensePCNet:
+        """加载模型权重."""
+        net = cls(config or DensePCConfig())
+        net.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+        return net

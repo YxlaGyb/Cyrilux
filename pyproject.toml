@@ -14,9 +14,6 @@ dependencies = [
     "matplotlib>=3.10.9",
     "requests>=2.34.2",
     "pillow>=12.2.0",
-    "maliang>=3.1.5",
-    "PyQt6>=6.8.0",
-    "ninja>=1.13.0",
 ]
 
 [project.scripts]
