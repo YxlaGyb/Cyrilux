@@ -172,8 +172,12 @@ class CyreneModel:
         for layer, (n, alpha, kwta) in LAYER_CONFIG.items():
             nids = [self.pool.neuron.create_neuron(layer=layer) for _ in range(n)]
             self.pool.projections.temporal_connect(nids)
-            # 隐藏层神经元分配信道标签 (n % 8), 用于前馈连接分组偏置
-            if layer > 0:
+            # 隐藏层神经元分配信道标签, L4 按列分配 (0-255)
+            if layer == LAYER_L4:
+                per_ch = max(1, n // 256)
+                for i, nid in enumerate(nids):
+                    self.pool.channel[nid] = i // per_ch
+            elif layer > 0:
                 per_ch = n // 8
                 for i, nid in enumerate(nids):
                     self.pool.channel[nid] = i // per_ch
@@ -183,7 +187,7 @@ class CyreneModel:
 
         # 延迟连接 (warmup 结束后触发)
         self._pending_connects = [
-            (0, LAYER_L4, self.config.connection_density, CONN_FEEDFORWARD),
+            (0, LAYER_L4, 0.25, CONN_FEEDFORWARD),
             (LAYER_L4, LAYER_L2, 0.25, CONN_FEEDFORWARD),
             (LAYER_L2, LAYER_L3, 0.30, CONN_FEEDFORWARD),
             (LAYER_L3, LAYER_L5, 0.30, CONN_FEEDFORWARD),
@@ -499,16 +503,30 @@ class CyreneModel:
 
         byte_events = self.encode(byte_seq)
         self.process_sensory_events(byte_events)
+
+        # warmup 结束后触发延迟连接 (必须在 sensory 存在之后)
+        if not is_warmup and self._pending_connects:
+            for from_l, to_l, density, conn_type in self._pending_connects:
+                is_sensory = from_l == 0
+                if conn_type == 1:
+                    self.pool.projections.topdown_connect_layer(from_l, to_l, density=density)
+                else:
+                    self.pool.synapse.connect_layer(
+                        from_l, to_l, density=density,
+                        bias_strength=self.config.bias_strength,
+                        conn_type=conn_type,
+                        init_scale=7.5 if is_sensory else 3.0,
+                    )
+            self._pending_connects = []
+            if self._top_layer > 0:
+                self.pool.projections.lm_ensure_top_connected(self._top_layer)
+
         self.process_network_events(max_events=10)
         self.predict_pass()
         free_energy, lm_loss, pred_byte = self.compute_stats()
 
         # 每步阈值调节 (不管 homeostasis 间隔, 强反馈压制过度发放)
         self.pool.learning.adjust_thresholds(target_rate=0.15, rate_eta=0.05)
-
-        # LM head 软稳态: 逐列 L2 上限约束 (保留列间幅度差异, 每步执行)
-        if not is_warmup and self._top_layer > 0:
-            self.pool.learning.homeostasis_lm_head(self._top_layer)
 
         hs_stats: dict = {}
         if self._step % self.config.homeostasis_interval == 0:
@@ -624,6 +642,60 @@ class CyreneModel:
         }
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         torch.save(state, path)
+
+    def encode_and_predict(self, byte_seq: torch.Tensor):
+        """只做感官编码和前馈预测，跳过 Hebbian 学习（用于外部 train_step）."""
+        self._step += 1
+        is_warmup = self._step <= self.config.warmup_steps
+        byte_events = self.encode(byte_seq)
+        self.process_sensory_events(byte_events)
+        if not is_warmup and self._pending_connects:
+            for from_l, to_l, density, conn_type in self._pending_connects:
+                if conn_type == 1:
+                    self.pool.projections.topdown_connect_layer(from_l, to_l, density=density)
+                else:
+                    self.pool.synapse.connect_layer(from_l, to_l, density=density,
+                        bias_strength=self.config.bias_strength, conn_type=conn_type,
+                        init_scale=7.5 if from_l == 0 else 3.0)
+            self._pending_connects = []
+            if self._top_layer > 0:
+                self.pool.projections.lm_ensure_top_connected(self._top_layer)
+        self.process_network_events(max_events=10)
+        self.predict_pass()
+        sensory_mask = (self.pool.layer == 0) & self.pool.alive
+        if sensory_mask.any():
+            self.pool.state[sensory_mask, 0] = 0.0
+
+    def encode_and_predict_l4_only(self, byte_seq: torch.Tensor):
+        """只做感官创建 + L4 预测，跳过全量 predict_pass（30x 加速）."""
+        from model.pc.constants import F_MU, F_Z, F_EPS
+
+        self._step += 1
+        is_warmup = self._step <= self.config.warmup_steps
+        byte_events = self.encode(byte_seq)
+        self.process_sensory_events(byte_events)
+        if not is_warmup and self._pending_connects:
+            for from_l, to_l, density, conn_type in self._pending_connects:
+                if conn_type == 1:
+                    self.pool.projections.topdown_connect_layer(from_l, to_l, density=density)
+                else:
+                    self.pool.synapse.connect_layer(from_l, to_l, density=density,
+                        bias_strength=self.config.bias_strength, conn_type=conn_type,
+                        init_scale=7.5 if from_l == 0 else 3.0)
+            self._pending_connects = []
+            if self._top_layer > 0:
+                self.pool.projections.lm_ensure_top_connected(self._top_layer)
+        self.process_network_events(max_events=10)
+        # 只对 L4 做预测
+        l4_mask = (self.pool.layer == self._top_layer) & self.pool.alive
+        if l4_mask.any():
+            l4_nids = torch.where(l4_mask)[0]
+            mu = self.pool.forward.predict_neurons(l4_nids)
+            self.pool.state[l4_nids, F_MU] = mu
+            self.pool.state[l4_nids, F_EPS] = self.pool.state[l4_nids, F_Z] - mu
+        sensory_mask = (self.pool.layer == 0) & self.pool.alive
+        if sensory_mask.any():
+            self.pool.state[sensory_mask, 0] = 0.0
 
     @classmethod
     def load(cls, path: str) -> CyreneModel:

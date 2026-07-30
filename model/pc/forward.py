@@ -1,4 +1,5 @@
 """ForwardEngine — 前向传播: 预测、误差计算、logits、发射."""
+
 from __future__ import annotations
 
 import torch
@@ -15,20 +16,21 @@ class ForwardEngine:
         self._NOISE_TEMPLATES = 8
 
     def _ensure_buffers(self):
-        N = self.pool.N; dev = self.pool.device
+        N = self.pool.N
+        dev = self.pool.device
         if self._mu_buf is None or self._mu_buf.shape[0] < N:
             self._mu_buf = torch.zeros(N, dtype=torch.float16, device=dev)
         if self._mu_td_buf is None or self._mu_td_buf.shape[0] < N:
             self._mu_td_buf = torch.zeros(N, dtype=torch.float16, device=dev)
         if self._noise_cache is None or self._noise_cache.shape[0] < N:
-            self._noise_cache = torch.stack([
-                torch.randn(N, dtype=torch.float16, device=dev) * 0.005
-                for _ in range(self._NOISE_TEMPLATES)
-            ], dim=0)
+            self._noise_cache = torch.stack(
+                [torch.randn(N, dtype=torch.float16, device=dev) * 0.005 for _ in range(self._NOISE_TEMPLATES)], dim=0
+            )
 
     def predict_all(self) -> None:
         alive_syn = self.pool.syn_alive
-        if not alive_syn.any(): return
+        if not alive_syn.any():
+            return
         syn_mask = alive_syn
         pre = self.pool.pre_id[syn_mask]
         post = self.pool.post_id[syn_mask]
@@ -52,7 +54,9 @@ class ForwardEngine:
             z_new = z_new + self._noise_cache[self._noise_idx][non_sensory]
             self.pool.state[non_sensory, F_Z] = z_new
             self.pool.state[non_sensory, F_EPS] = z_new - self.pool.state[non_sensory, F_MU]
-        self.pool.state[:, F_FIRING_RATE] = 0.995 * self.pool.state[:, F_FIRING_RATE] + 0.005 * self.pool.state[:, F_Z].abs()
+        self.pool.state[:, F_FIRING_RATE] = (
+            0.995 * self.pool.state[:, F_FIRING_RATE] + 0.005 * self.pool.state[:, F_Z].abs()
+        )
 
     def temporal_topdown_pass(self, top_layer: int):
         alive = self.pool.alive
@@ -60,12 +64,15 @@ class ForwardEngine:
         if connected.any():
             self.pool.state[connected, F_MU] += self.pool.t_weight[connected] * self.pool.state[connected, 6]
             self.pool.state[connected, F_EPS] = self.pool.state[connected, F_Z] - self.pool.state[connected, F_MU]
-        if top_layer <= 0: return
+        if top_layer <= 0:
+            return
         td_alive = self.pool.td_alive
-        if not td_alive.any(): return
+        if not td_alive.any():
+            return
         td_post_all = self.pool.td_post[td_alive].long()
         td_to_sensory = self.pool.layer[td_post_all] == 0
-        if not td_to_sensory.any(): return
+        if not td_to_sensory.any():
+            return
         td_idx_all = torch.where(td_alive)[0]
         td_idx = td_idx_all[td_to_sensory]
         td_pre = self.pool.td_pre[td_idx].long()
@@ -81,15 +88,20 @@ class ForwardEngine:
             self.pool.state[sensory, F_EPS] = self.pool.state[sensory, F_Z] - self.pool.state[sensory, F_MU]
 
     def predict_neurons(self, nids):
-        if nids.shape[0] == 0: return torch.zeros(0, dtype=torch.float16, device=self.pool.device)
-        in_s = self.pool.in_ptrs[nids.long()]; valid = (in_s >= 0) & self.pool.syn_alive[in_s.long()]
-        in_s = in_s.long(); pre_ids = self.pool.pre_id[in_s]; valid &= pre_ids >= 0
+        if nids.shape[0] == 0:
+            return torch.zeros(0, dtype=torch.float16, device=self.pool.device)
+        in_s = self.pool.in_ptrs[nids.long()]
+        valid = (in_s >= 0) & self.pool.syn_alive[in_s.long()]
+        in_s = in_s.long()
+        pre_ids = self.pool.pre_id[in_s]
+        valid &= pre_ids >= 0
         w = self.pool.weight[in_s]
         z_pre = torch.where(valid, self.pool.state[pre_ids.long(), F_Z], torch.zeros_like(w))
         return (torch.where(valid, w, torch.zeros_like(w)) * z_pre).sum(dim=-1)
 
     def update_batch(self, nids, z_new):
-        if nids.shape[0] == 0: return
+        if nids.shape[0] == 0:
+            return
         self.pool.state[nids.long(), F_Z] = z_new
         mu = self.predict_neurons(nids)
         self.pool.state[nids.long(), F_MU] = mu
@@ -100,14 +112,26 @@ class ForwardEngine:
 
     def compute_lm_logits(self, top_layer, use_mu=True):
         top_mask = (self.pool.layer == top_layer) & self.pool.alive
-        if not top_mask.any(): return torch.zeros(256, dtype=torch.float16, device=self.pool.device)
+        if not top_mask.any():
+            return torch.zeros(256, dtype=torch.float16, device=self.pool.device)
         z_top = self.pool.state[top_mask, F_MU if use_mu else F_Z]
-        return self.pool.lm_weight[:, top_mask] @ (z_top * 10.0) + self.pool.lm_bias
+        return self.pool.lm_weight[:, top_mask] @ z_top + self.pool.lm_bias
+
+    @staticmethod
+    def sample_topk_uniform(logits, k=8, temperature=1.0):
+        """纯侧抑制采样: top-k 公平抽签."""
+        probs = torch.softmax((logits.float() / temperature), dim=-1)
+        vals, idxs = probs.topk(k)
+        chosen = torch.randint(0, k, (1,)).item()
+        return int(idxs[chosen].item())
 
     def compute_cross_entropy(self, logits, target_byte):
-        return torch.nn.functional.cross_entropy(logits.unsqueeze(0).float(), torch.tensor([target_byte], device=self.pool.device))
+        return torch.nn.functional.cross_entropy(
+            logits.unsqueeze(0).float(), torch.tensor([target_byte], device=self.pool.device)
+        )
 
     def emit_active(self, current_time):
         firing = (self.pool.state[:, F_EPS].abs() > self.pool.state[:, F_THRESHOLD]) & self.pool.alive
-        if firing.any(): self.pool.last_active[firing] = current_time
+        if firing.any():
+            self.pool.last_active[firing] = current_time
         return torch.where(firing)[0]

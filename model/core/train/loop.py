@@ -16,7 +16,6 @@ from tqdm import tqdm
 from pkg.utils.trainer_utils import setup_seed
 from pkg.device.cuda import setup_cuda_device
 from model.model_cyrene import CyreneConfig, CyreneModel
-from model.pc.constants import F_MU
 
 from .config import TrainingConfig
 
@@ -69,78 +68,116 @@ class TrainingLoop:
                 self.runner.step(dummy)
         self._log("Warmup done")
 
+    def _build_mu_table(self, m, top_mask):
+        """预计算 [255, n_top] mu 表 — 向量化批处理, 零 Python 循环."""
+        n_top = int(top_mask.sum().item())
+        top_idx = torch.where(top_mask)[0]
+        sensory = (m.pool.layer == 0) & m.pool.alive
+        s_nids = torch.where(sensory)[0]
+        s_pos = m.pool.position[s_nids]
+        if len(s_nids) == 0:
+            return torch.zeros(255, n_top, dtype=torch.float16, device=m.device)
+
+        # 映射 position → position index (0-based)
+        pos_idx = torch.zeros(256, dtype=torch.long, device=m.device) - 1
+        pos_idx[s_pos.long()] = torch.arange(len(s_nids), device=m.device)
+        valid_p = pos_idx >= 0
+        pos_t = torch.where(valid_p)[0]  # [n_pos_used], 0-255
+
+        all_out = m.pool.out_ptrs[s_nids].long()  # [n_s, K]
+        all_valid = (all_out >= 0) & m.pool.syn_alive[all_out]  # [n_s, K]
+        post_all = m.pool.post_id[all_out]  # [n_s, K]
+        w_all = m.pool.weight[all_out]  # [n_s, K]
+        fan_all = m.pool._fan_in_cache[post_all]  # [n_s, K]
+        in_top = torch.isin(post_all, top_idx) & all_valid  # [n_s, K]
+
+        mu_t = torch.zeros(255, n_top, dtype=torch.float16, device=m.device)
+        for pi in range(255):
+            si = pos_idx[pi + 1]  # position (pi+1) → sensory index
+            if si < 0:
+                continue
+            mask = in_top[si]
+            if not mask.any():
+                continue
+            post_si = post_all[si][mask]
+            w_si = w_all[si][mask]
+            fan_si = fan_all[si][mask]
+            col = torch.searchsorted(top_idx, post_si)
+            mu_t[pi, col] = (w_si * torch.rsqrt(fan_si + 1e-6)).to(torch.float16)
+        return mu_t
+
+    def _compute_prefix_M(self, B: int) -> torch.Tensor:
+        idx = torch.arange(B, device=self.device)
+        M = 0.7 * (0.3 ** (idx.unsqueeze(1) - idx.unsqueeze(0)))
+        M = torch.tril(M).to(torch.float16)
+        return M
+
     def train_step(self, byte_seq: torch.Tensor, labels: torch.Tensor) -> dict:
         assert self.runner is not None
         m = self.runner
 
-        stats = m.step(byte_seq, target_byte=-1)
-        is_w = stats.get("warmup", False)
+        # 前馈序列：感官创建 + 只对 L4 做预测（跳过全量 predict_pass）
+        m.encode_and_predict_l4_only(byte_seq)
 
-        lm_loss = 0.0
-        if not is_w and m._top_layer > 0:
-            targets_all = labels[0, 1:].long()
-            valid = (targets_all >= 0) & (targets_all <= 255)
-            targets_t = targets_all[valid]
-            B = min(targets_t.shape[0], 255)
-            if B == 0:
-                return {"ce_val": 0}
+        targets_all = labels[0, 1:].long()
+        valid = (targets_all >= 0) & (targets_all <= 255)
+        targets_t = targets_all[valid]
+        B = min(targets_t.shape[0], 255)
+        if B == 0:
+            return {"ce_val": 0}
 
-            top_mask = (m.pool.layer == m._top_layer) & m.pool.alive
-            n_top = int(top_mask.sum().item())
-            if n_top == 0:
-                return {"ce_val": 0}
+        top_mask = (m.pool.layer == m._top_layer) & m.pool.alive
+        n_top = int(top_mask.sum().item())
+        if n_top == 0:
+            return {"ce_val": 0}
+        top_idx = torch.where(top_mask)[0]
 
-            eta_eff = m.config.hebbian_base_eta * 5000.0 * m._last_modulation
+        eta_eff = m.config.hebbian_base_eta * 5000.0 * 0.5
 
-            # 255 步循环: 只前馈推理, 记录 z_top 和 pred
-            preds = []
-            z_ts = []
+        # ── mu_table (每步重建 — 不同 batch 有不同感官神经元) ──
+        mu_mat = self._build_mu_table(m, top_mask)[:B]
 
-            with torch.inference_mode():
-                for t in range(B):
-                    if t > 0:
-                        nid = torch.where((m.pool.layer == 0) & m.pool.alive & (m.pool.position == t))[0]
-                        if nid.numel() > 0:
-                            m.pool.state[nid[0], 0] = 1.0
-                        m.pool.forward.predict_all()
-                        sm = (m.pool.layer == 0) & m.pool.alive
-                        if sm.any():
-                            m.pool.state[sm, 0] = 0.0
-                        m.finalize_step()
+        M = self._compute_prefix_M(B)
+        zs = M @ mu_mat
 
-                    z_cur = m.pool.state[top_mask, F_MU if m.config.use_mu_lm else 1]
-                    z_ts.append(z_cur)
-                    preds.append((m.pool.lm_weight[:, top_mask] @ z_cur + m.pool.lm_bias).argmax())
+        # ── 列 dropout Hebbian: 每步只更新随机 25% 的列 ──
+        tg = targets_t[:B]
+        logits = zs.float() @ m.pool.lm_weight[:, top_idx].float().T + m.pool.lm_bias
+        preds = logits.argmax(dim=-1)
 
-            # 一次性竞争更新: 直接在 lm_weight.data 上 scatter_add_
-            zs = torch.stack(z_ts)  # [B, n_top]
-            pt = torch.stack(preds)
-            tg = targets_t[:B]
+        lw = m.pool.lm_weight.data.clone()
+        lw_top = lw[:, top_idx].clone()
 
-            # zf 扩展到 [B, N], 只在 top_mask 列有值
-            zf = torch.zeros(B, m.pool.N, dtype=torch.float16, device=m.device)
-            zf[:, top_mask] = zs.to(torch.float16)
-            m.pool.lm_weight.data.scatter_add_(0, tg.unsqueeze(1).expand(-1, m.pool.N), eta_eff * zf)
-            m.pool.lm_weight.data.scatter_add_(0, pt.unsqueeze(1).expand(-1, m.pool.N), -eta_eff * zf)
+        # ---- column-dropout Hebbian ----
+        err_mask = preds != tg
+        dw = torch.zeros(256, n_top, dtype=torch.float16, device=m.device)
+        if (~err_mask).any():
+            dw.index_add_(0, tg[~err_mask], (0.1 * eta_eff * zs[~err_mask]).to(torch.float16))
+        if err_mask.any():
+            dw.index_add_(0, tg[err_mask], (eta_eff * zs[err_mask]).to(torch.float16))
+            dw.index_add_(0, preds[err_mask], (-eta_eff * zs[err_mask]).to(torch.float16))
+        # column dropout: 25% columns randomly get zero update per step
+        col_mask = torch.rand(256, device=m.device) < 0.25
+        dw[~col_mask] = 0.0
+        dw[~col_mask] = 0.0
 
-        dv = m._last_D if hasattr(m, "_last_D") else 0.5
-        mod = m._last_modulation if hasattr(m, "_last_modulation") else 0.5
-        fv = float(m._free_energy_history[-1]) if m._free_energy_history else 0.0
-        self._last_F = fv
-        self._last_D = dv
+        lw_top += dw
 
-        return {
-            "ce_val": lm_loss, "F_val": fv, "D": dv,
-            "ACh": m._last_ACh if hasattr(m, "_last_ACh") else 0.5,
-            "modulation": mod, "uncertainty": 0.5,
-            "firing_rate": 0.0, "n_neurons": 0, "n_synapses": 0,
-            "warmup": is_w, "phase": "event_driven",
-        }
+        lw[:, top_idx] = lw_top
+        m.pool.lm_weight.data[:] = lw
+
+        # ── bias Hebbian ──
+        m.pool.lm_bias.data[tg[~err_mask]] += 5e-5
+        m.pool.lm_bias.data[tg[err_mask]] += 1e-4
+        m.pool.lm_bias.data[preds[err_mask]] -= 1e-4
+
+        return {"ce_val": 0.0}
 
     def get_state(self) -> dict:
         return {
             "global_step": self.global_step,
-            "last_F": self._last_F, "last_D": self._last_D,
+            "last_F": self._last_F,
+            "last_D": self._last_D,
             "n_neurons": (int(self.runner.pool.alive.sum().item()) if self.runner else 0),
             "n_synapses": (int(self.runner.pool.syn_alive.sum().item()) if self.runner else 0),
             "temporal_connections": (int(self.runner.pool.t_connected.sum().item()) if self.runner else 0),
@@ -159,7 +196,10 @@ class TrainingLoop:
 
         for task_id, dataset in task_pipelines:
             loader = torch.utils.data.DataLoader(
-                dataset, batch_size=1, shuffle=True, num_workers=0,
+                dataset,
+                batch_size=1,
+                shuffle=True,
+                num_workers=0,
             )
             for batch_idx, (byte_seq, labels) in enumerate(tqdm(loader, desc=f"Task {task_id}")):
                 if max_steps > 0 and batch_idx >= max_steps:

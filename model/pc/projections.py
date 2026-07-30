@@ -117,17 +117,32 @@ class ProjectionManager:
                 count += 1
         return count
 
-    def lm_ensure_top_connected(self, top_layer: int, connections_per_logit: int = 16):
-        """确保顶层神经元已连接到 LM head."""
+    def lm_ensure_top_connected(self, top_layer: int, connections_per_logit: int = 4):
+        """确保顶层神经元已连接到 LM head.
+        每列分配 connections_per_logit 个专属 L4 神经元, 不重叠.
+        """
         top_mask = (self.pool.layer == top_layer) & self.pool.alive
         top_ids = torch.where(top_mask)[0].tolist()
         if not top_ids:
             return
 
-        for nid in top_ids:
-            if self.pool.lm_weight[:, nid].abs().sum() > 0.001:
-                continue
-            # 全连接: 每个 L5 神经元连到所有 256 个 logit (零初始化, Hebbian 从零起步)
-            self.pool.lm_weight[:, nid] = torch.zeros(
-                256, dtype=torch.float16, device=self.pool.device
-            )
+        n_top = len(top_ids)
+        per_col = max(1, connections_per_logit)
+        n_use = min(n_top, 256 * per_col)
+        perm = torch.randperm(n_top, device=self.pool.device)[:n_use]
+
+        for c in range(256):
+            s = c * per_col
+            e = s + per_col
+            for i in range(s, e):
+                if i >= n_use:
+                    break
+                nid = top_ids[perm[i]]
+                if self.pool.lm_weight[:, nid].abs().sum() > 0.001:
+                    continue
+                self.pool.lm_weight[:, nid] = torch.zeros(
+                    256, dtype=torch.float16, device=self.pool.device
+                )
+                self.pool.lm_weight[c, nid] = torch.randn(
+                    1, dtype=torch.float16, device=self.pool.device
+                ) * 0.01

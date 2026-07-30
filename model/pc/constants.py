@@ -25,7 +25,7 @@ TOP_LAYER = LAYER_L4  # LM Head 输出层 — L4 有输入区分度, L5 经过3�
 
 # 每层配置 (神经元数, 惯性α, k-WTA比例)
 LAYER_CONFIG = {
-    LAYER_L4: (256, 0.2, 0.10),
+    LAYER_L4: (1024, 0.2, 0.10),
     LAYER_L2: (192, 0.4, 0.10),
     LAYER_L3: (192, 0.6, 0.15),
     LAYER_L5: (128, 0.8, 0.20),
