@@ -117,8 +117,10 @@ def train_main(
             lr_hebbian=lr,
         )
         net = DensePCNet(d_cfg).to(device)
-        print(f"Dense training  L4={d_cfg.d_l4}  params={d_cfg.param_count():,}  device={device}")
+        print(f"PPA dense training  L4={d_cfg.d_l4}  params={d_cfg.param_count():,}  device={device}")
 
+        fe_sum = 0.0
+        fe_n = 0
         for epoch in range(epochs):
             for di, fp in enumerate(data_file_list):
                 ds = DualChannelDataset(fp, max_length=max_seq_len,
@@ -126,11 +128,17 @@ def train_main(
                 loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
                 fname = os.path.basename(fp).replace(".jsonl", "")
                 for b, l in tqdm(loader, desc=f"{di+1}/{len(data_file_list)}  {fname}"):
-                    b, l = b.to(device), l.to(device)
-                    net.learn(b, l[:, 1:].long())
+                    b = b.to(device)
+                    stats = net.learn(b)  # PPA: 自由能驱动, 无 targets
+                    fe_sum += stats["free_energy"].item()
+                    fe_n += 1
+                    if fe_n % 100 == 0:
+                        print(f"    free_energy_avg={fe_sum/fe_n:.4f}  "
+                              f"future_err={stats['future_err'].item():.4f}  "
+                              f"dop={stats['dop_gain'].item():.2f}  ach={stats['ach_gain'].item():.2f}")
         os.makedirs(out_dir, exist_ok=True)
         net.save(os.path.join(out_dir, "final.pt"))
-        print(f"Model saved to {out_dir}/final.pt")
+        print(f"PPA model saved to {out_dir}/final.pt  final_free_energy_avg={fe_sum/max(fe_n,1):.4f}")
         return
 
     config = TrainingConfig(

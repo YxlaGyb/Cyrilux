@@ -1,4 +1,4 @@
-"""Track dynamic neuron growth on real data — cos(Z5) oscillation."""
+"""Track dynamic neuron growth on real data — cos(Z5) differentiation + free energy."""
 import torch
 from model.pc.dense.core import DensePCNet, DensePCConfig
 from model.core.dataset import DualChannelDataset
@@ -14,10 +14,6 @@ cfg = DensePCConfig(
     lr_hebbian=3e-4,
     death_threshold=5e-5,
     active_size_lower_bound=32,
-    l5_kwta_ratio=0.10,
-    l5_rank_gain=True,
-    l5_oja_norm_high=1.3,
-    l5_oja_norm_low=0.6,
 )
 net = DensePCNet(cfg).to(dev)
 print(f"params={cfg.param_count():,}")
@@ -30,16 +26,15 @@ cos_history = []
 active_history = {k: [] for k in ("l4", "l2", "l3", "l5", "l6")}
 step = 0
 
-# Measure cos(Z5) between two different contexts from the same batch
 while step < 2000:
     try:
-        b, l = next(it)
+        b, _ = next(it)
     except StopIteration:
         it = iter(loader)
-        b, l = next(it)
-    b, l = b.to(dev), l.to(dev)
+        b, _ = next(it)
+    b = b.to(dev)
 
-    net.learn(b, l[:, 1:].long())
+    stats = net.learn(b)
     step += 1
 
     if step % 10 == 0:
@@ -51,10 +46,14 @@ while step < 2000:
         cos_history.append((step, cos_z))
 
     if step % 200 == 0:
-        sz = f"l4={net.active_size['l4']} l2={net.active_size['l2']} l3={net.active_size['l3']} l5={net.active_size['l5']} l6={net.active_size['l6']}"
-        print(f"  step {step:4d}  cos(Z5)={cos_history[-1][1]:.4f}  active=[{sz}]")
+        a = net.active_size
+        sz = (f"l4={a['l4']} l2={a['l2']} l3={a['l3']} "
+              f"l5={a['l5']} l6={a['l6']}")
+        fe = float(stats["free_energy"])
+        print(f"  step {step:4d}  cos(Z5)={cos_history[-1][1]:.4f}  "
+              f"free_energy={fe:.4f}  active=[{sz}]")
 
-print(f"\ncos(Z5) over time:")
+print("\ncos(Z5) over time:")
 for step, c in cos_history[::10]:
     print(f"  {step:4d}: {c:.4f}")
 

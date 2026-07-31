@@ -1,4 +1,4 @@
-"""Cyrene 模型 — 全张量化 PC 持续学习.
+"""Cyrene 模型
 
 架构:
     TensorNeuronPool (scatter_add 预测 + 批量 Hebbian)

@@ -1,13 +1,13 @@
-"""密集 GPU PC 网络 — 全 matmul, 零事件驱动, 零 Python 循环.
+"""密集 GPU PPA 闭环网络 — 全 matmul, 零事件驱动, 零 Python 循环.
 
-与现有稀疏/事件驱动版本 `model/pc/` 完全独立。保留相同的 6 层 PC 算法，
-但全部用密集 matmul 表达，GPU 利用率目标 >90%。
+与现有稀疏/事件驱动版本 `model/pc/` 完全独立。PPA: 感知-预测-行动闭环,
+全 fp16, 零反向传播, 自由能驱动。
 
 Usage:
     from model.pc.dense import DensePCNet
     net = DensePCNet().cuda()
-    logits = net(byte_ids)           # [N, S, 256]
-    stats = net.learn(byte_ids, targets)
+    out = net(byte_ids)                # dict: mu4_top / eps4 / rpe / free_energy
+    stats = net.learn(byte_ids)        # Hebbian 更新, 返回 free_energy 等
 """
 
 from .core import DensePCNet, DensePCConfig
