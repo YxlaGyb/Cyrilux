@@ -19,18 +19,27 @@ from torch.utils.data import Dataset
 
 
 class DualChannelDataset(Dataset):
-    """
-    双通道数据集:
-    ch0=原始字节值
-    ch1=角色编码 0:pad/1:user/2:assistant/3:system.
-    """
-
-    ROLE_MAP = {"padding": 0, "user": 1, "assistant": 2, "system": 3, "tool": 2}
-
-    def __init__(self, data_path: str, max_length: int = 128, max_samples: int = None):
+    def __init__(self, data_path: str, max_length: int = 128, max_samples: int = None, lazy: bool = False):
         super().__init__()
-        self.dual_tensors: list[torch.Tensor] = []  # list of [2, max_length] float32
+        self.data_path = data_path
+        self.max_length = max_length
+        self.max_samples = max_samples
+        self.lazy = lazy
+        self.dual_tensors: list[torch.Tensor] = []  # list of [max_length] long
         self.label_tensors: list[torch.Tensor] = []  # list of [max_length] long
+
+        if lazy:
+            # 流式模式: 只记录每行的字节偏移 (二进制读, 字节偏移), 不加载内容
+            # 1.2GB 大文件不再一次性读入, __getitem__ 按需 seek 读取单行
+            self._offsets: list[int] = []
+            with open(data_path, "rb") as f:
+                offset = 0
+                for i, line in enumerate(f):
+                    if max_samples and i >= max_samples:
+                        break
+                    self._offsets.append(offset)
+                    offset += len(line)
+            return
 
         with open(data_path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f):
@@ -50,6 +59,29 @@ class DualChannelDataset(Dataset):
                 # 字节 ID: [max_length] long (0-255), padding 处为 0
                 byte_ids = byte_raw.clone().long()
                 self.dual_tensors.append(byte_ids)
+
+    def __len__(self):
+        if self.lazy:
+            return len(self._offsets)
+        return len(self.dual_tensors)
+
+    def __getitem__(self, index):
+        if self.lazy:
+            # 流式: 二进制模式 seek 字节偏移, 只读一行解码 (UTF-8 seek 会错位)
+            with open(self.data_path, "rb") as f:
+                f.seek(self._offsets[index])
+                line = f.readline().decode("utf-8", errors="replace")
+            sample = json.loads(line)
+            raw_text, _ = self._extract_with_roles(sample)
+            byte_seq = raw_text.encode("utf-8")[: self.max_length]
+            padded = byte_seq.ljust(self.max_length, b"\x00")
+            byte_raw = torch.frombuffer(bytearray(padded), dtype=torch.uint8).clone()
+            lbl = byte_raw.clone().long()
+            lbl[byte_raw == 0x00] = -100
+            byte_ids = byte_raw.clone().long()
+            return byte_ids, lbl
+        # 非 lazy: 张量在 DataLoader 中会被正确复制到 GPU，clone 是冗余的 CPU 开销
+        return self.dual_tensors[index], self.label_tensors[index]
 
     @staticmethod
     def _extract_with_roles(sample: dict) -> tuple[str, list]:
@@ -129,13 +161,6 @@ class DualChannelDataset(Dataset):
         else:
             roles = [(0, len(raw), "assistant")]
         return raw, roles
-
-    def __len__(self):
-        return len(self.dual_tensors)
-
-    def __getitem__(self, index):
-        # 不再 clone() — 张量在 DataLoader 中会被正确复制到 GPU，clone 是冗余的 CPU 开销
-        return self.dual_tensors[index], self.label_tensors[index]
 
 
 def load_datasets(

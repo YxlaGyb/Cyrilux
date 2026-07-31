@@ -1,31 +1,29 @@
 """
-list — 信息查询子命令.
+list
+
+信息查询子命令.
 """
 
 import os
-from typing import Optional
 
-import typer
+import click
 from pkg.cli.utils import resolve_path
 
-app = typer.Typer(name="list", help="信息查询", no_args_is_help=True)
+app = click.Group(name="list", help="信息查询")
 
 
 @app.command()
-def checkpoints(
-    ctx: typer.Context,
-    directory: Optional[str] = typer.Argument(None, help="检查点目录 (默认: out_pc_unified)"),
-    detail: bool = typer.Option(False, "--detail", help="显示详细信息 (加载检查点)"),
-):
+@click.argument("directory", required=False, default=None)
+@click.option("--detail", is_flag=True, default=False, help="显示详细信息 (加载检查点)")
+def checkpoints(directory, detail):
     """列出检查点文件."""
     import torch
 
     ckpt_dir = resolve_path(directory or "out_pc_unified")
     if not os.path.exists(ckpt_dir):
-        print(f"✗ 目录不存在: {ckpt_dir}")
-        raise typer.Exit(1)
+        raise click.ClickException(f"目录不存在: {ckpt_dir}")
 
-    pt_files = sorted([f for f in os.listdir(ckpt_dir) if f.endswith(('.pt', '.pth'))])
+    pt_files = sorted([f for f in os.listdir(ckpt_dir) if f.endswith((".pt", ".pth"))])
     if not pt_files:
         print(f"没有检查点文件: {ckpt_dir}")
         return
@@ -50,22 +48,17 @@ def checkpoints(
             except Exception:
                 pass
 
-        pass
-
 
 @app.command()
-def datasets(
-    ctx: typer.Context,
-    directory: Optional[str] = typer.Option(None, "--directory", "-d", help="数据集目录 (默认: datasets/)"),
-    pattern: str = typer.Option("*.jsonl", "--pattern", "-p", help="文件匹配模式"),
-):
+@click.option("--directory", "-d", default=None, help="数据集目录 (默认: datasets/)")
+@click.option("--pattern", "-p", default="*.jsonl", help="文件匹配模式")
+def datasets(directory, pattern):
     """列出数据集文件."""
     import glob
 
     data_dir = resolve_path(directory or "datasets")
     if not os.path.exists(data_dir):
-        print(f"✗ 目录不存在: {data_dir}")
-        raise typer.Exit(1)
+        raise click.ClickException(f"目录不存在: {data_dir}")
 
     files = sorted(glob.glob(os.path.join(data_dir, pattern)))
     if not files:
@@ -84,7 +77,7 @@ def datasets(
         lines = 0
         ftype = "未知"
         try:
-            with open(fpath, 'r', encoding='utf-8') as f:
+            with open(fpath, "r", encoding="utf-8") as f:
                 for i, line in enumerate(f):
                     if i == 0:
                         if '"text"' in line[:200]:

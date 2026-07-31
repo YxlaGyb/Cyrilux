@@ -10,10 +10,11 @@ dependencies = [
     "torchao>=0.17.0",
     "bitsandbytes>=0.43.0",
     "accelerate>=1.13.0",
-    "typer>=0.15.0",
     "matplotlib>=3.10.9",
     "requests>=2.34.2",
     "pillow>=12.2.0",
+    "click>=8.4.2",
+    "rich>=15.0.0",
 ]
 
 [project.scripts]

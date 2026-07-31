@@ -1,145 +1,103 @@
 """
 train
-训练子命令
 """
 
 import os
-from typing import Optional, List
 
+import click
 import torch
 
-import typer
 from pkg.cli.utils import resolve_path, load_config
 
-app = typer.Typer(name="train", help="Phase 1: 模型训练", no_args_is_help=True)
+
+def _dense_cfg(hidden_size: int, lr: float):
+    from model.pc.dense import DensePCNet, DensePCConfig
+
+    ratio = hidden_size / 1024.0
+    d_cfg = DensePCConfig(
+        d_l4=hidden_size,
+        d_l2=max(64, int(384 * ratio)),
+        d_l3=max(64, int(384 * ratio)),
+        d_l5=max(64, int(256 * ratio)),
+        d_l6=max(64, int(128 * ratio)),
+        lr_hebbian=lr,
+    )
+    return DensePCNet(d_cfg), d_cfg
 
 
-def training_options(
-    model_type: str = typer.Option("pc_unified", "--model-type", help="模型类型"),
-    hidden_size: int = typer.Option(256, "--hidden-size", help="隐藏层维度"),
-    num_hidden_layers: int = typer.Option(4, "--num-layers", help="Transformer/Pyra 层数"),
-    data_files: List[str] = typer.Option([], "--data-files", "-d", help="数据文件 (可多个)"),
-    combined_training: bool = typer.Option(True, "--combined/--no-combined", help="是否联合训练"),
-    batch_size: int = typer.Option(48, "--batch-size", "-b", help="批大小"),
-    max_seq_len: int = typer.Option(128, "--max-seq-len", help="最大序列长度"),
-    lr: float = typer.Option(3e-4, "--lr", help="学习率"),
-    epochs: int = typer.Option(1, "--epochs", "-e", help="训练轮数"),
-    subset: int = typer.Option(0, "--subset", "-n", help="子集大小 (0=全部)"),
-    T_infer: int = typer.Option(1, "--T-infer", help="Inference time steps"),
-    gamma: float = typer.Option(0.1, "--gamma", help="Dopamine discount factor"),
-    enable_dopamine: bool = typer.Option(True, "--dopamine/--no-dopamine", help="启用多巴胺调制"),
-    dopamine_eta: float = typer.Option(1.0, "--dopamine-eta", help="Dopamine learning rate"),
-    dopamine_beta: float = typer.Option(0.5, "--dopamine-beta", help="Dopamine 灵敏度"),
-    dopamine_gamma: float = typer.Option(0.3, "--dopamine-gamma", help="Dopamine 衰减"),
-    out_dir: str = typer.Option("out_pc_unified", "--out-dir", "-o", help="输出目录"),
-    save_interval: int = typer.Option(10000, "--save-interval", help="保存间隔步数"),
-    use_abstraction_bank: bool = typer.Option(
-        False, "--abstraction-bank/--no-abstraction-bank", help="启用抽象记忆库"
-    ),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志"),
+def _train_dense(data_files, out_dir, batch_size, max_seq_len, lr, epochs, hidden_size, device, subset):
+    """dense"""
+    import json as _json
+    from tqdm import tqdm
+
+    torch.set_grad_enabled(False)
+    net, d_cfg = _dense_cfg(hidden_size, lr)
+    net = net.to(device)
+    print(f"PPA dense training  L4={d_cfg.d_l4}  params={d_cfg.param_count():,}  device={device}")
+
+    step = 0
+    fe_sum = 0.0
+    batch_ids: list = []
+    for epoch in range(epochs):
+        for fp in data_files:
+            fname = os.path.basename(fp)
+            # 先扫总行数 (一次, 秒级), 供 tqdm 显示百分比/剩余时间
+            with open(fp, "r", encoding="utf-8") as f:
+                total = sum(1 for _ in f)
+            n_lines = 0
+            with open(fp, "r", encoding="utf-8") as f:
+                pbar = tqdm(total=total, desc=f"    {fname}", unit="it")
+                for line in f:
+                    try:
+                        s = _json.loads(line)
+                        t = s.get("text", "")
+                        if "conversations" in s:
+                            t = "".join(m.get("content", m.get("value", "")) for m in s["conversations"])
+                        bs = t.encode("utf-8")[:max_seq_len]
+                        ids = torch.zeros(max_seq_len, dtype=torch.long)
+                        ids[: len(bs)] = torch.tensor(list(bs), dtype=torch.long)
+                        batch_ids.append(ids)
+                    except Exception:
+                        continue
+                    n_lines += 1
+                    pbar.update(1)
+                    if len(batch_ids) < batch_size:
+                        continue
+                    b = torch.stack(batch_ids).to(device)
+                    stats = net.learn(b)
+                    step += 1
+                    fe_sum += float(stats["future_err"])
+                    batch_ids = []
+                    pbar.set_postfix({"step": step, "fe": f"{fe_sum / step:.4f}"})
+                pbar.close()
+            print(f"    {fname} 全文件跑完: {n_lines} 行")
+    os.makedirs(out_dir, exist_ok=True)
+    net.save(os.path.join(out_dir, "final.pt"))
+    print(f"PPA model saved to {out_dir}/final.pt  final_free_energy_avg={fe_sum / max(step, 1):.4f}")
+
+
+def _train_sparse(
+    data_files,
+    out_dir,
+    batch_size,
+    max_seq_len,
+    lr,
+    epochs,
+    subset,
+    hidden_size,
+    save_interval,
+    device,
+    checkpoint=None,
+    num_hidden_layers=4,
+    T_infer=1,
+    gamma=0.1,
+    dopamine_eta=1.0,
+    dopamine_beta=0.5,
+    dopamine_gamma=0.3,
 ):
-    """整理参数字典."""
-    return dict(
-        model_type=model_type,
-        hidden_size=hidden_size,
-        num_hidden_layers=num_hidden_layers,
-        data_files=[resolve_path(f) for f in data_files],
-        combined_training=combined_training,
-        batch_size=batch_size,
-        max_seq_len=max_seq_len,
-        lr=lr,
-        epochs=epochs,
-        subset=subset,
-        T_infer=T_infer,
-        gamma=gamma,
-        enable_dopamine=enable_dopamine,
-        dopamine_eta=dopamine_eta,
-        dopamine_beta=dopamine_beta,
-        dopamine_gamma=dopamine_gamma,
-        out_dir=out_dir,
-        save_interval=save_interval,
-        use_abstraction_bank=use_abstraction_bank,
-    ), verbose
-
-
-@app.callback(invoke_without_command=True)
-def train_main(
-    ctx: typer.Context,
-    model_type: str = typer.Option("pc_unified", "--model-type", help="模型类型"),
-    checkpoint: Optional[str] = typer.Option(None, "--checkpoint", "-c", help="初始检查点"),
-    hidden_size: int = typer.Option(256, "--hidden-size", help="隐藏层维度"),
-    num_hidden_layers: int = typer.Option(4, "--num-layers", help="层数"),
-    data_files: str = typer.Option("", "--data-files", "-d", help="数据文件 (逗号分隔)"),
-    combined_training: bool = typer.Option(True, "--combined/--no-combined", help="联合训练"),
-    batch_size: int = typer.Option(48, "--batch-size", "-b", help="批大小"),
-    max_seq_len: int = typer.Option(128, "--max-seq-len", help="最大序列长度"),
-    lr: float = typer.Option(3e-4, "--lr", help="学习率"),
-    epochs: int = typer.Option(1, "--epochs", "-e", help="训练轮数"),
-    subset: int = typer.Option(0, "--subset", "-n", help="子集大小 (0=全部)"),
-    T_infer: int = typer.Option(1, "--T-infer", help="Inference time steps"),
-    gamma: float = typer.Option(0.1, "--gamma", help="多巴胺折扣因子"),
-    enable_dopamine: bool = typer.Option(True, "--dopamine/--no-dopamine", help="启用多巴胺"),
-    dopamine_eta: float = typer.Option(1.0, "--dopamine-eta", help="多巴胺学习率"),
-    dopamine_beta: float = typer.Option(0.5, "--dopamine-beta", help="多巴胺灵敏度"),
-    dopamine_gamma: float = typer.Option(0.3, "--dopamine-gamma", help="多巴胺衰减"),
-    out_dir: str = typer.Option("out_pc_unified", "--out-dir", "-o", help="输出目录"),
-    save_interval: int = typer.Option(10000, "--save-interval", help="保存间隔"),
-    use_abstraction_bank: bool = typer.Option(
-        False, "--abstraction-bank/--no-abstraction-bank", help="抽象记忆库"
-    ),
-    auto_phase2: bool = typer.Option(False, "--auto-phase2", help="训练后自动进入 Phase 2"),
-    resume: bool = typer.Option(False, "--resume", help="从断点恢复"),
-    backend: str = typer.Option("sparse", "--backend", help="sparse=event-driven(default) / dense=full-GPU matmul"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="verbose logging"),
-):
-    """直接训练模式 (纯 Hebbian, 零反向传播)."""
-    if ctx.invoked_subcommand is not None:
-        return
-
+    """sparse"""
     from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
-
-    device = ctx.obj.get("device", "cuda" if torch.cuda.is_available() else "cpu")
-    data_file_list = [resolve_path(f.strip()) for f in data_files.split(",") if f.strip()]
-
-    if backend == "dense":
-        from model.pc.dense import DensePCNet, DensePCConfig
-        from torch.utils.data import DataLoader
-        from tqdm import tqdm
-
-        ratio = hidden_size / 1024.0
-        d_cfg = DensePCConfig(
-            d_l4=hidden_size,
-            d_l2=max(64, int(384 * ratio)),
-            d_l3=max(64, int(384 * ratio)),
-            d_l5=max(64, int(256 * ratio)),
-            d_l6=max(64, int(128 * ratio)),
-            lr_hebbian=lr,
-        )
-        net = DensePCNet(d_cfg).to(device)
-        print(f"PPA dense training  L4={d_cfg.d_l4}  params={d_cfg.param_count():,}  device={device}")
-
-        fe_sum = 0.0
-        fe_n = 0
-        for epoch in range(epochs):
-            for di, fp in enumerate(data_file_list):
-                ds = DualChannelDataset(fp, max_length=max_seq_len,
-                                        max_samples=subset if subset else None)
-                loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
-                fname = os.path.basename(fp).replace(".jsonl", "")
-                for b, l in tqdm(loader, desc=f"{di+1}/{len(data_file_list)}  {fname}"):
-                    b = b.to(device)
-                    stats = net.learn(b)  # PPA: 自由能驱动, 无 targets
-                    fe_sum += stats["free_energy"].item()
-                    fe_n += 1
-                    if fe_n % 100 == 0:
-                        print(f"    free_energy_avg={fe_sum/fe_n:.4f}  "
-                              f"future_err={stats['future_err'].item():.4f}  "
-                              f"dop={stats['dop_gain'].item():.2f}  ach={stats['ach_gain'].item():.2f}")
-        os.makedirs(out_dir, exist_ok=True)
-        net.save(os.path.join(out_dir, "final.pt"))
-        print(f"PPA model saved to {out_dir}/final.pt  final_free_energy_avg={fe_sum/max(fe_n,1):.4f}")
-        return
 
     config = TrainingConfig(
         checkpoint_path=resolve_path(checkpoint) if checkpoint else None,
@@ -158,41 +116,110 @@ def train_main(
         out_dir=out_dir,
         save_interval=save_interval,
     )
-
     print(f"Phase 1 Training  hidden={config.hidden_size}  device={device}")
-
-    # 构建任务管道
     task_pipelines = []
-    for i, fp in enumerate(data_file_list):
-        tid = f"task_{i}"
-        ds = DualChannelDataset(
-            fp,
-            max_length=max_seq_len,
-            max_samples=subset if subset else None,  # type: ignore[arg-type]
-        )
-        task_pipelines.append((tid, ds))
-
+    for i, fp in enumerate(data_files):
+        ds = DualChannelDataset(fp, max_length=max_seq_len, max_samples=subset if subset else None)
+        task_pipelines.append((f"task_{i}", ds))
     loop = TrainingLoop(config)
     loop.train(task_pipelines)
 
 
-@app.command()
-def from_config(
-    ctx: typer.Context,
-    config: str = typer.Argument(..., help="配置文件路径"),
-    # 可选覆写
-    batch_size: Optional[int] = typer.Option(None, "--batch-size", "-b", help="覆盖批大小"),
-    lr: Optional[float] = typer.Option(None, "--lr", help="覆盖学习率"),
-    epochs: Optional[int] = typer.Option(None, "--epochs", "-e", help="覆盖训练轮数"),
-    out_dir: Optional[str] = typer.Option(None, "--out-dir", "-o", help="覆盖输出目录"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志"),
+@click.command(name="train", help="直接训练模式 (纯 Hebbian, 零反向传播)")
+@click.option("--model-type", default="pc_unified", help="模型类型")
+@click.option("--checkpoint", "-c", default=None, help="初始检查点")
+@click.option("--hidden-size", default=256, type=int, help="隐藏层维度")
+@click.option("--num-layers", default=4, type=int, help="层数")
+@click.option("--data", "-d", multiple=True, help="数据文件 (可多个)")
+@click.option("--combined/--no-combined", default=True, help="是否联合训练")
+@click.option("--batch-size", "-b", default=48, type=int, help="批大小")
+@click.option("--max-seq-len", default=128, type=int, help="最大序列长度")
+@click.option("--lr", default=3e-4, type=float, help="学习率")
+@click.option("--epochs", "-e", default=1, type=int, help="训练轮数")
+@click.option("--subset", "-n", default=0, type=int, help="子集大小 (0=全部)")
+@click.option("--T-infer", default=1, type=int, help="Inference time steps")
+@click.option("--gamma", default=0.1, type=float, help="多巴胺折扣因子")
+@click.option("--dopamine/--no-dopamine", default=True, help="启用多巴胺")
+@click.option("--dopamine-eta", default=1.0, type=float, help="多巴胺学习率")
+@click.option("--dopamine-beta", default=0.5, type=float, help="多巴胺灵敏度")
+@click.option("--dopamine-gamma", default=0.3, type=float, help="多巴胺衰减")
+@click.option("--out-dir", "-o", default="out_pc_unified", help="输出目录")
+@click.option("--save-interval", default=10000, type=int, help="保存间隔")
+@click.option("--abstraction-bank/--no-abstraction-bank", default=False, help="抽象记忆库")
+@click.option("--auto-phase2", is_flag=True, default=False, help="训练后自动进入 Phase 2")
+@click.option("--resume", is_flag=True, default=False, help="从断点恢复")
+@click.option("--backend", default="sparse", help="sparse=event-driven(default) / dense=full-GPU matmul")
+@click.option("--verbose", "-v", is_flag=True, default=False, help="verbose logging")
+def train(
+    model_type,
+    checkpoint,
+    hidden_size,
+    num_layers,
+    data,
+    combined,
+    batch_size,
+    max_seq_len,
+    lr,
+    epochs,
+    subset,
+    t_infer,
+    gamma,
+    dopamine,
+    dopamine_eta,
+    dopamine_beta,
+    dopamine_gamma,
+    out_dir,
+    save_interval,
+    abstraction_bank,
+    auto_phase2,
+    resume,
+    backend,
+    verbose,
 ):
+
+    if not data:
+        raise click.ClickException("请用 -d 指定数据文件 (可多个)")
+    data_files = [resolve_path(f.strip()) for f in data]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if backend == "dense":
+        _train_dense(data_files, out_dir, batch_size, max_seq_len, lr, epochs, hidden_size, device, subset)
+        return
+
+    _train_sparse(
+        data_files,
+        out_dir,
+        batch_size,
+        max_seq_len,
+        lr,
+        epochs,
+        subset,
+        hidden_size,
+        save_interval,
+        device,
+        checkpoint=checkpoint,
+        num_hidden_layers=num_layers,
+        T_infer=t_infer,
+        gamma=gamma,
+        dopamine_eta=dopamine_eta,
+        dopamine_beta=dopamine_beta,
+        dopamine_gamma=dopamine_gamma,
+    )
+
+
+@click.command(name="from-config", help="从 JSON 配置文件加载参数并训练 (纯 Hebbian, 零反向传播)")
+@click.argument("config", type=click.Path(exists=True))
+@click.option("--batch-size", "-b", type=int, default=None, help="覆盖批大小")
+@click.option("--lr", type=float, default=None, help="覆盖学习率")
+@click.option("--epochs", "-e", type=int, default=None, help="覆盖训练轮数")
+@click.option("--out-dir", "-o", default=None, help="覆盖输出目录")
+@click.option("--verbose", "-v", is_flag=True, default=False, help="详细日志")
+def from_config(config, batch_size, lr, epochs, out_dir, verbose):
     """从 JSON 配置文件加载参数并训练 (纯 Hebbian, 零反向传播)."""
     from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
 
     cfg = load_config(config)
-
     model_cfg = cfg.get("model", {})
     data_cfg = cfg.get("data", {})
     train_cfg = cfg.get("training", {})
@@ -201,7 +228,6 @@ def from_config(
     out_cfg = cfg.get("output", {})
 
     data_file_list = [resolve_path(f) for f in data_cfg.get("data_files", [])]
-
     config_obj = TrainingConfig(
         checkpoint_path=model_cfg.get("checkpoint_path"),
         hidden_size=model_cfg.get("hidden_size", 256),
@@ -219,41 +245,31 @@ def from_config(
         out_dir=out_cfg.get("out_dir", "out_pc_unified"),
         save_interval=out_cfg.get("save_interval", 10000),
     )
-
     print(f"从配置启动训练: {config}")
-
-    # 构建任务管道
     task_pipelines = []
     for i, fp in enumerate(data_file_list):
-        tid = f"task_{i}"
         ds = DualChannelDataset(
-            fp,
-            max_length=config_obj.max_seq_len,
-            max_samples=config_obj.subset if config_obj.subset else None,  # type: ignore[arg-type]
+            fp, max_length=config_obj.max_seq_len, max_samples=config_obj.subset if config_obj.subset else None
         )
-        task_pipelines.append((tid, ds))
-
+        task_pipelines.append((f"task_{i}", ds))
     loop = TrainingLoop(config_obj)
     loop.train(task_pipelines)
 
 
-@app.command()
-def resume(
-    ctx: typer.Context,
-    checkpoint: str = typer.Argument(..., help="检查点文件 (.pt)"),
-    batch_size: int = typer.Option(48, "--batch-size", "-b", help="批大小"),
-    max_seq_len: int = typer.Option(128, "--max-seq-len", help="最大序列长度"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志"),
-):
+@click.command(name="resume", help="从检查点文件恢复训练 (纯 Hebbian, 零反向传播)")
+@click.argument("checkpoint", type=click.Path(exists=True))
+@click.option("--batch-size", "-b", default=48, type=int, help="批大小")
+@click.option("--max-seq-len", default=128, type=int, help="最大序列长度")
+@click.option("--verbose", "-v", is_flag=True, default=False, help="详细日志")
+def resume(checkpoint, batch_size, max_seq_len, verbose):
     """从检查点文件恢复训练 (纯 Hebbian, 零反向传播)."""
     from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
 
     ckpt_path = resolve_path(checkpoint)
-
     if not os.path.exists(ckpt_path):
         print(f"✗ 检查点不存在: {ckpt_path}")
-        raise typer.Exit(1)
+        raise click.ClickException(f"检查点不存在: {ckpt_path}")
 
     print(f"恢复训练 — 检查点: {ckpt_path}")
     out_dir = os.path.dirname(ckpt_path)
@@ -265,26 +281,26 @@ def resume(
         batch_size=batch_size,
         max_seq_len=max_seq_len,
     )
-
-    # 从检查点元数据推断数据文件
     ckpt_data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     data_files = []
     if "config" in ckpt_data and "data_files" in ckpt_data["config"]:
         data_files = ckpt_data["config"]["data_files"]
     if not data_files:
-        print("⚠ 检查点中无 data_files 信息, 请使用 `train` 命令指定数据")
-        # 创建空管道 — TrainingLoop 仍能加载模型权重
+        print("检查点中无 data_files 信息, 请使用 `train` 命令指定数据")
         task_pipelines = []
     else:
         task_pipelines = []
         for i, fp in enumerate(data_files):
-            tid = f"task_{i}"
             resolved = resolve_path(fp)
             ds = DualChannelDataset(resolved, max_length=max_seq_len, max_samples=None)
-            task_pipelines.append((tid, ds))
+            task_pipelines.append((f"task_{i}", ds))
 
     loop = TrainingLoop(config)
     if task_pipelines:
         loop.train(task_pipelines)
     else:
         print("Model loaded. 请提供数据文件继续训练.")
+
+
+if __name__ == "__main__":
+    train()

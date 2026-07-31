@@ -1,6 +1,6 @@
-"""CLI — Typer 入口"""
+import sys
 
-import typer
+import click
 
 from .commands import (
     autonomous_cmd,
@@ -12,25 +12,28 @@ from .commands import (
     test_cmd,
     train_cmd,
 )
-from .utils import PROJECT_ROOT
-
-app = typer.Typer(
-    name="cyrilux",
-    help="Cyrilux CLI — Predictive Coding 局部动态小语言模型",
-    no_args_is_help=True,
-)
 
 
-@app.callback()
-def _main(ctx: typer.Context):
-    ctx.obj = {"project_root": PROJECT_ROOT}
+@click.group()
+@click.pass_context
+def app(ctx):
+    for stream in (sys.stdout, sys.stderr):
+        if stream.encoding.lower() != "utf-8":
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    ctx.ensure_object(dict)
 
 
-app.add_typer(data_cmd.app, name="data", help="数据管理 (转换/分割/扫描)")
-app.add_typer(train_cmd.app, name="train", help="Phase 1: 模型训练")
-app.add_typer(eval_cmd.app, name="eval", help="模型评估")
-app.add_typer(test_cmd.app, name="test", help="遗忘压力测试")
-app.add_typer(prepare_cmd.app, name="prepare", help="数据准备")
-app.add_typer(config_cmd.app, name="config", help="配置文件管理")
-app.add_typer(list_cmd.app, name="list", help="信息查询")
-app.add_typer(autonomous_cmd.app, name="autonomous", help="Phase 2: 持续自主运行")
+app.add_command(train_cmd.train)
+app.add_command(train_cmd.from_config)
+app.add_command(train_cmd.resume)
+app.add_command(autonomous_cmd.autonomous)
+app.add_command(data_cmd.app)
+app.add_command(eval_cmd.app)
+app.add_command(list_cmd.app)
+app.add_command(prepare_cmd.app)
+app.add_command(config_cmd.app)
+app.add_command(test_cmd.app)
+
+
+if __name__ == "__main__":
+    app()

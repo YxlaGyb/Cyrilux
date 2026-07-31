@@ -1,14 +1,14 @@
 """
-config — 配置管理子命令.
+config
 """
 
-import os, json
-from typing import Optional
+import json
+import os
 
-import typer
+import click
 from pkg.cli.utils import resolve_path, save_config, load_config
 
-app = typer.Typer(name="config", help="配置管理", no_args_is_help=True)
+app = click.Group(name="config", help="配置管理")
 
 
 TRAIN_TEMPLATE = {
@@ -56,55 +56,45 @@ AUTO_TEMPLATE = {
 
 
 @app.command()
-def init(
-    ctx: typer.Context,
-    output: str = typer.Option("cyrilux_config.json", "--output", "-o", help="输出路径"),
-    template: str = typer.Option("train", "--template", "-t", help="模板类型: train|autonomous"),
-):
+@click.option("--output", "-o", default="cyrilux_config.json", help="输出路径")
+@click.option("--template", "-t", default="train", help="模板类型: train|autonomous")
+def init(output, template):
     """生成默认配置文件模板."""
     if template == "train":
         config = TRAIN_TEMPLATE
     elif template == "autonomous":
         config = AUTO_TEMPLATE
     else:
-        print(f"✗ 未知模板类型: {template} (可选: train, autonomous)")
-        raise typer.Exit(1)
+        raise click.ClickException(f"未知模板类型: {template} (可选: train, autonomous)")
 
     save_config(config, output)
     print(f"✓ {template} 配置模板已生成: {output}")
 
 
 @app.command()
-def show(
-    ctx: typer.Context,
-    config: str = typer.Argument(..., help="配置文件路径"),
-):
+@click.argument("config")
+def show(config):
     """显示配置文件内容."""
     path = resolve_path(config)
     if not os.path.exists(path):
-        print(f"✗ 文件不存在: {path}")
-        raise typer.Exit(1)
+        raise click.ClickException(f"文件不存在: {path}")
 
     data = load_config(config)
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
 @app.command()
-def validate(
-    ctx: typer.Context,
-    config: str = typer.Argument(..., help="配置文件路径"),
-):
+@click.argument("config")
+def validate(config):
     """验证配置文件格式."""
     path = resolve_path(config)
     if not os.path.exists(path):
-        print(f"✗ 文件不存在: {path}")
-        raise typer.Exit(1)
+        raise click.ClickException(f"文件不存在: {path}")
 
     try:
         data = load_config(config)
     except json.JSONDecodeError as e:
-        print(f"✗ JSON 格式错误: {e}")
-        raise typer.Exit(1)
+        raise click.ClickException(f"JSON 格式错误: {e}")
 
     warnings = []
     if "training" in data:

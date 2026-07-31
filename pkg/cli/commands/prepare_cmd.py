@@ -1,22 +1,18 @@
 """
-prepare — 数据准备子命令 (委托至 Cyrilux.core.prepare_tasks).
+prepare
+
+数据准备子命令
 """
 
-from typing import Optional
+import click
 
-import typer
-
-app = typer.Typer(name="prepare", help="数据准备命令", no_args_is_help=True)
+app = click.Group(name="prepare", help="数据准备命令")
 
 
-@app.command()
-def four_task(
-    ctx: typer.Context,
-    subset: Optional[int] = typer.Option(
-        None, "--subset", "-n", help="每任务采样数 (默认 20000)"
-    ),
-    seed: int = typer.Option(42, "--seed", "-s", help="随机种子"),
-):
+@app.command(name="four-task")
+@click.option("--subset", "-n", type=int, default=None, help="每任务采样数 (默认 20000)")
+@click.option("--seed", "-s", default=42, type=int, help="随机种子")
+def four_task(subset, seed):
     """按领域切分 4 个任务数据集 (A/B/C/D)."""
     from pkg.utils.prepare_tasks import prepare_4tasks
 
@@ -26,9 +22,7 @@ def four_task(
 
 
 @app.command()
-def hetero(
-    ctx: typer.Context,
-):
+def hetero():
     """异构数据集统一格式转换."""
     from pkg.utils.prepare_tasks import prepare_hetero
 

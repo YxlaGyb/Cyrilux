@@ -1,21 +1,20 @@
-"""eval — 模型评估子命令 (委托至 model.core.evaluation).
+"""
+eval
+
+模型评估子命令.
 """
 
-from typing import Optional
-
-import typer
+import click
 
 from pkg.cli.utils import resolve_path
 
-app = typer.Typer(name="eval", help="模型评估命令", no_args_is_help=True)
+app = click.Group(name="eval", help="模型评估命令")
 
 
 @app.command()
-def all(
-    ctx: typer.Context,
-    checkpoint: Optional[str] = typer.Option(None, "--checkpoint", "-c", help="检查点路径"),
-    device: str = typer.Option("cuda:0", "--device", "-d", help="计算设备"),
-):
+@click.option("--checkpoint", "-c", default=None, help="检查点路径")
+@click.option("--device", "-d", default="cuda:0", help="计算设备")
+def all(checkpoint, device):
     """全面评估: Perplexity + 文本生成."""
 
     from model.core.evaluation import create_eval_runner_loader, run_full_evaluation
@@ -32,19 +31,18 @@ def all(
 
     loader = create_eval_runner_loader("dataset/sft_t2t.jsonl", max_length=128, max_samples=200)
     run_full_evaluation(
-        runner, loader,
+        runner,
+        loader,
         max_batches=20,
         prompts=["人工智能的未来在于", "小明今天去了公园", "深度学习是一种"],
     )
 
 
 @app.command()
-def language(
-    ctx: typer.Context,
-    checkpoint: str = typer.Argument(..., help="检查点路径"),
-    local: bool = typer.Option(False, "--local", help="使用 Conv1 骨干网络"),
-    device: str = typer.Option("cuda:0", "--device", "-d", help="计算设备"),
-):
+@click.argument("checkpoint")
+@click.option("--local", is_flag=True, default=False, help="使用 Conv1 骨干网络")
+@click.option("--device", "-d", default="cuda:0", help="计算设备")
+def language(checkpoint, local, device):
     """语言能力评估: Perplexity + 文本生成."""
 
     from model.core.evaluation import create_eval_runner_loader, run_full_evaluation
@@ -57,7 +55,8 @@ def language(
 
     loader = create_eval_runner_loader("dataset/sft_t2t.jsonl", max_length=128, max_samples=500)
     run_full_evaluation(
-        runner, loader,
+        runner,
+        loader,
         max_batches=20,
         prompts=["人工智能的未来在于", "小明今天去了公园", "深度学习是一种"],
     )
