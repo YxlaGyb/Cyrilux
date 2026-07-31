@@ -165,33 +165,36 @@ class DensePCNet(nn.Module):
         pe = self.pos_encoding[:S].unsqueeze(0) * 0.5
         z0 = torch.cat([one_hot, pe.expand(N, -1, -1)], dim=-1)
 
-        # ── 前馈预测 (每层: matmul(÷√dim) + 偏置 + 时间惯性 + k-WTA) ──
+        # ── 前馈预测 (每层: matmul(÷√dim) + 偏置 + 时间惯性) ──
         mu4 = z0 @ self.W_04.T / (d["l0"] ** 0.5) + self.bias_l4
-        z4, z4_all = self._layer_step(N, S, d["l4"], mu4, alpha, dev, self.W_t4, 0.80)
+        z4 = self._layer_step(N, S, d["l4"], mu4, alpha, dev, self.W_t4, 0.80)
 
         mu2 = z4 @ self.W_42.T / (d["l4"] ** 0.5) + self.bias_l2
-        z2, z2_all = self._layer_step(N, S, d["l2"], mu2, alpha, dev, self.W_t2, 0.80)
+        z2 = self._layer_step(N, S, d["l2"], mu2, alpha, dev, self.W_t2, 0.80)
 
         mu3 = z2 @ self.W_23.T / (d["l2"] ** 0.5) + self.bias_l3
-        z3, z3_all = self._layer_step(N, S, d["l3"], mu3, alpha, dev, self.W_t3, 0.80)
+        z3 = self._layer_step(N, S, d["l3"], mu3, alpha, dev, self.W_t3, 0.80)
 
         mu5 = z3 @ self.W_35.T / (d["l3"] ** 0.5) + self.bias_l5
-        z5, z5_all = self._layer_step(N, S, d["l5"], mu5, alpha, dev, self.W_t5, 1.0)  # L5 全保留
+        z5 = self._layer_step(N, S, d["l5"], mu5, alpha, dev, self.W_t5, 1.0)  # L5 全保留
+        # L5 软侧抑制: 减去均值压低平均活跃度，保留残存信号
+        z5 = z5 - 0.3 * z5.mean(dim=-1, keepdim=True)
 
         mu6 = z5 @ self.W_56.T / (d["l5"] ** 0.5) + self.bias_l6
-        z6, z6_all = self._layer_step(N, S, d["l6"], mu6, alpha, dev, self.W_t6, 1.0)
+        z6 = self._layer_step(N, S, d["l6"], mu6, alpha, dev, self.W_t6, 1.0)
 
         if store_state:
             self._z0 = z0
-            self._z4 = z4_all
-            self._z2 = z2_all
-            self._z3 = z3_all
-            self._z5 = z5_all
-            self._z6 = z6_all
+            self._z4 = z4
+            self._z2 = z2
+            self._z3 = z3
+            self._z5 = z5
+            self._z6 = z6
 
-        # ── LM Head (行归一化防高字节垄断) ──
-        rn = self.W_LM.norm(dim=1, keepdim=True) + 1e-8
-        logits = (self.W_LM / rn) @ z5.transpose(-2, -1) + self.bias_lm.unsqueeze(1)
+        # ── LM Head ──
+        z5 = torch.nan_to_num(z5)
+        z5 = z5 / (z5.norm(dim=-1, keepdim=True) + 1e-4)  # ponytail: 单位化防 logit 幅度爆炸
+        logits = self.W_LM @ z5.transpose(-2, -1) + self.bias_lm.unsqueeze(1)
         logits = logits.transpose(-2, -1)  # [N, S, 256]
         return logits
 
@@ -205,26 +208,22 @@ class DensePCNet(nn.Module):
         dev: torch.device,
         W_t: torch.Tensor,
         kwta: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """单层前馈: z = mu (活动值), 返回 mu 用于 Hebbian."""
+    ) -> torch.Tensor:
+        """单层前馈: z = mu + 时序惯性, 返回 z 用于后续 Hebbian."""
         z = torch.zeros(N, S, dim, dtype=torch.float16, device=dev)
         z[:, 0] = mu[:, 0]
-        z[:, 1:] = mu[:, 1:]  # z=mu (基础)
-        # 时序：z[t] += 0.1 * W_t @ z[t-1] (让模型学"h后面是e")
+        z[:, 1:] = mu[:, 1:]
         temporal = z[:, :-1] @ W_t.T
-        z[:, 1:] = z[:, 1:] + temporal * 0.1
+        z[:, 1:] = z[:, 1:] + torch.nan_to_num(temporal) * 0.1
+        z = torch.nan_to_num(z)
 
-        # 每帧归一化防爆炸
-        z = z / (z.norm(dim=-1, keepdim=True) + 1e-8)
-
-        mu_ret = z.clone()
         if kwta > 0 and kwta < 1.0:
             k = max(1, int(dim * kwta))
             vals, idxs = z.topk(k, dim=-1)
             mask = torch.zeros_like(z)
             mask.scatter_(-1, idxs, 1.0)
-            z = z * mask + (1.0 - mask) * 1e-5 * z
-        return z, mu_ret
+            z = z * mask + (1.0 - mask) * 1e-4 * z
+        return z
 
     def learn(self, byte_ids: torch.Tensor, targets: torch.Tensor) -> dict:
         """Hebbian 学习 (前馈 + 外积更新).
@@ -258,28 +257,44 @@ class DensePCNet(nn.Module):
         eps6 = self._z6 - (self._z5 @ self.W_56.T / (d["l5"] ** 0.5) + self.bias_l6)
 
         # ── Hebbian 外积 + 列 dropout ──
-        # dW[post, pre] = sum_{N,S}(eps_post * z_pre)
+        # dW[post, pre] = mean_{N,S}(eps_post * z_pre)
+        # 仅对 z（突触前）做 RMSNorm 防 fp16 溢出；eps 保持原始幅度（误差=学习信号强度）
+        def _rms_z(x):
+            sq = x.square().mean(dim=-1, keepdim=True)
+            alive = (sq > 1e-6).to(x.dtype)
+            return x * alive / (sq + 1e-4).sqrt()
         dW_list = [
-            (eps4.transpose(-2, -1) @ z0).sum(dim=0).to(torch.float16),
-            (eps2.transpose(-2, -1) @ self._z4).sum(dim=0).to(torch.float16),
-            (eps3.transpose(-2, -1) @ self._z2).sum(dim=0).to(torch.float16),
-            (eps5.transpose(-2, -1) @ self._z3).sum(dim=0).to(torch.float16),
-            (eps6.transpose(-2, -1) @ self._z5).sum(dim=0).to(torch.float16),
+            (eps4.transpose(-2, -1) @ _rms_z(z0)).mean(dim=0).to(torch.float16),
+            (eps2.transpose(-2, -1) @ _rms_z(self._z4)).mean(dim=0).to(torch.float16),
+            (eps3.transpose(-2, -1) @ _rms_z(self._z2)).mean(dim=0).to(torch.float16),
+            (eps5.transpose(-2, -1) @ _rms_z(self._z3)).mean(dim=0).to(torch.float16),
+            (eps6.transpose(-2, -1) @ _rms_z(self._z5)).mean(dim=0).to(torch.float16),
         ]
         W_list = [self.W_04, self.W_42, self.W_23, self.W_35, self.W_56]
         for dW, W in zip(dW_list, W_list):
             col_mask = torch.rand(W.shape[0], 1, device=dev) < self.cfg.column_dropout
             W.data += (dW * (~col_mask).to(torch.float16)) * eta
 
+        # ── 时序 Hebbian (5× 放大，时序误差信号天然弱) ──
+        eta_t = eta * 5.0
+        # dW_t[post, pre] = sum_{N,S-1}(z[t] * z[t-1])  时序邻帧共现
+        for z_cur, W_t in [(self._z4, self.W_t4), (self._z2, self.W_t2),
+                           (self._z3, self.W_t3), (self._z5, self.W_t5),
+                           (self._z6, self.W_t6)]:
+            # z[t-1] 预测 z[t]: dW = sum(z_pre[t-1] * z_post[t])
+            pre = z_cur[:, :-1]  # [N, S-1, D]
+            post = z_cur[:, 1:]   # [N, S-1, D]
+            dW_t = (pre.transpose(-2, -1) @ _rms_z(post)).mean(dim=0).to(torch.float16)
+            W_t.data += dW_t * eta_t
+
         # ── LM Head Hebbian ──
-        # targets [N, S'], logits [N, S, 256], _z5 [N, S, d_l5]
-        # S' 可能比 S 少 1 (labels[:, 1:]), 对齐
         S_t = targets.shape[-1]
-        z5_lm = self._z5[:, :S_t]  # [N, S', d_l5]
-        logits_lm = logits[:, :S_t]  # [N, S', 256]
+        z5_lm = self._z5[:, :S_t]
+        logits_lm = logits[:, :S_t]
         valid = targets >= 0
         if valid.any():
-            z5_valid = z5_lm[valid]  # [V, d_l5]
+            z5_valid = z5_lm[valid]
+            z5_valid = _rms_z(z5_valid)  # z 做 RMSNorm，eps 保持原始幅度
             tg_valid = targets[valid]
             preds = logits_lm[valid].argmax(dim=-1)
             err = preds != tg_valid
@@ -291,22 +306,32 @@ class DensePCNet(nn.Module):
                 x = z5_valid[err]
                 dw_lm.index_add_(0, tg_valid[err], (eta * x).to(torch.float16))
                 dw_lm.index_add_(0, preds[err], (-eta * x).to(torch.float16))
-            col_mask = torch.rand(256, device=dev) < self.cfg.column_dropout
-            dw_lm[~col_mask] = 0.0
-            self.W_LM.data += dw_lm
+            # 15% 随机掩码: 每列被迫看 L5 的不同子集，方向被打散
+            lm_mask = torch.rand_like(self.W_LM) > 0.15
+            self.W_LM.data += dw_lm * lm_mask.to(torch.float16)
 
         # ── LM Head 列 Oja: 每步单位列范数 (平权竞争) ──
         col_norm = self.W_LM.data.norm(dim=0, keepdim=True)
-        col_norm = torch.where(col_norm > 1e-8, col_norm, torch.ones_like(col_norm))
+        col_norm = torch.where(col_norm > 1e-4, col_norm, torch.ones_like(col_norm))
         self.W_LM.data = self.W_LM.data / col_norm
 
-        # ── 前馈 Oja 上限约束 ──
-        for name, W in [("04", self.W_04), ("42", self.W_42), ("23", self.W_23), ("35", self.W_35), ("56", self.W_56)]:
-            col_norm = W.data.norm(dim=1, keepdim=True)
-            over = col_norm > 8.0
-            if over.any():
-                scale = torch.where(over, 8.0 / (col_norm + 1e-6), 1.0)
-                W.data *= scale
+        # ── 唤醒休眠列: 范数近乎零的列用微弱噪声激活 ──
+        dead_cols = self.W_LM.data.norm(dim=0) < 1e-4
+        if dead_cols.any():
+            self.W_LM.data[:, dead_cols] = torch.randn_like(self.W_LM.data[:, dead_cols]) * 1e-3
+
+        # ── 前馈行 Oja: 所有投射矩阵统一行归一化（神经元方向竞争）──
+        # 级联网络中无例外层，零范数行跳过（静息神经元不参与归一化）
+        for W in [self.W_04, self.W_42, self.W_23, self.W_35, self.W_56]:
+            rn = W.data.norm(dim=1, keepdim=True)
+            alive = rn > 1e-4
+            rn_safe = torch.where(alive, rn, torch.ones_like(rn))
+            scale = torch.where(alive, 1.0 / rn_safe, torch.zeros_like(rn_safe))
+            W.data = W.data * scale
+
+        # ── Oja 自衰减: 权重比例负漂移，打破死亡锁 ──
+        for W in [self.W_04, self.W_42, self.W_23, self.W_35, self.W_56]:
+            W.data -= W.data * 3e-4  # 极慢泄漏，让静息神经元恢复活动
 
         return {"logits_norm": logits.norm().item()}
 

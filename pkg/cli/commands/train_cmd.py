@@ -105,6 +105,7 @@ def train_main(
     if backend == "dense":
         from model.pc.dense import DensePCNet, DensePCConfig
         from torch.utils.data import DataLoader
+        from tqdm import tqdm
 
         ratio = hidden_size / 1024.0
         d_cfg = DensePCConfig(
@@ -113,23 +114,23 @@ def train_main(
             d_l3=max(64, int(384 * ratio)),
             d_l5=max(64, int(256 * ratio)),
             d_l6=max(64, int(128 * ratio)),
-            hebbian_base_eta=lr if lr != 3e-4 else 3e-4,
+            lr_hebbian=lr,
         )
         net = DensePCNet(d_cfg).to(device)
         print(f"Dense training  L4={d_cfg.d_l4}  params={d_cfg.param_count():,}  device={device}")
 
         for epoch in range(epochs):
-            for fp in data_file_list:
+            for di, fp in enumerate(data_file_list):
                 ds = DualChannelDataset(fp, max_length=max_seq_len,
                                         max_samples=subset if subset else None)
                 loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
-                for bi, (b, l) in enumerate(loader):
+                fname = os.path.basename(fp).replace(".jsonl", "")
+                for b, l in tqdm(loader, desc=f"{di+1}/{len(data_file_list)}  {fname}"):
                     b, l = b.to(device), l.to(device)
-                    logits = net(b)
-                    stats = net.learn(b, l[:, 1:].long())
-                    if verbose and bi % 100 == 0:
-                        print(f"  epoch {epoch} batch {bi}: logits_norm={stats.get('logits_norm', 0):.2f}")
+                    net.learn(b, l[:, 1:].long())
+        os.makedirs(out_dir, exist_ok=True)
         net.save(os.path.join(out_dir, "final.pt"))
+        print(f"Model saved to {out_dir}/final.pt")
         return
 
     config = TrainingConfig(
