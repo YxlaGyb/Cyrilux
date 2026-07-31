@@ -1,7 +1,10 @@
-"""密集 GPU PPA 闭环网络 — 全 matmul, 零事件驱动, 零 Python 循环.
+"""密集 GPU PPA 闭环网络
 
-与现有稀疏/事件驱动版本 `model/pc/` 完全独立。PPA: 感知-预测-行动闭环,
-全 fp16, 零反向传播, 自由能驱动。
+全 matmul, 零事件驱动, 零 Python 循环.
+
+与稀疏/事件驱动版本 `model/pc/sparse/`
+
+完全独立。PPA: 感知-预测-行动闭环, 全 fp16, 零反向传播, 自由能驱动。
 
 Usage:
     from model.pc.dense import DensePCNet

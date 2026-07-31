@@ -1,6 +1,9 @@
-"""神经调制 — 张量化多巴胺/乙酰胆碱/精度调度.
+"""model.pc 共享
 
-基于 torch tensor 操作, 替代旧的 Python math 标量循环.
+神经调制 (参数化) + 自由能 + 软范数保持.
+
+dense (全 matmul) 与 sparse (页式槽位) 两个后端共用的公式.
+系数参数化, 各后端传自己验证过的数值, 行为不变.
 """
 
 from __future__ import annotations
@@ -8,8 +11,6 @@ from __future__ import annotations
 import math
 
 import torch
-
-from .tensor_pool import TensorNeuronPool
 
 
 def compute_uncertainty(F_hist: list[float], window: int = 10) -> float:
@@ -22,7 +23,7 @@ def compute_uncertainty(F_hist: list[float], window: int = 10) -> float:
     if mean_F < 1e-8:
         return 0.0
     var_F = sum((f - mean_F) ** 2 for f in recent) / window
-    cv = (var_F ** 0.5) / mean_F
+    cv = (var_F**0.5) / mean_F
     return float(math.tanh(cv * 3.0))
 
 
@@ -51,11 +52,22 @@ def combine_modulation(D: float, ACh: float) -> float:
     return 0.5 * D + 0.5 * ACh
 
 
-def compute_precision_scales(
-    pool: TensorNeuronPool,
-    D: float,
-    ACh: float,
-    eta: float = 1.0,
-) -> None:
-    """逐神经元精度权重: pi = 1 + eta*D*|eps| + eta*ACh*|eps| (批量 tensor)."""
-    pool.learning.compute_precision_scales(D, ACh, eta)
+def compute_dopamine_gain(rel: float, lo: float = 0.3, hi: float = 5.0) -> float:
+    """多巴胺增益: rel 相对惊喜比的线性夹取 (dense 侧 5 万步验证范围 [0.3, 5.0])."""
+    return min(max(rel, lo), hi)
+
+
+def compute_ach_gain(rel: float, max_gain: float = 3.0) -> float:
+    """ACh 增益: 低惊喜 → 高增益 (记忆巩固), 上限 max_gain."""
+    return min(1.0 / (rel + 1e-4), max_gain)
+
+
+def compute_free_energy(eps_list: list[torch.Tensor]) -> torch.Tensor:
+    """自由能 F = Σ ε² 各层均方和 (fp16 进出, 零 .float())."""
+    return sum(eps.square().mean() for eps in eps_list)
+
+
+def soft_norm_preserve(W: torch.Tensor) -> None:
+    """行范数保持 0.8-1.2, 结构化非 clamp: 幅度差异保留, 权重有界防 fp16 溢出."""
+    rn = W.norm(dim=1, keepdim=True)
+    W.mul_(0.8 + 0.2 * (rn / (rn + 1e-4)).clamp(0.8, 1.2))

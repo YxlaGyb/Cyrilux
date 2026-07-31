@@ -1,5 +1,6 @@
 """
 SynapseManager
+
 突触生命周期管理 (创建/批量创建/层连接/周转).
 """
 
@@ -10,12 +11,13 @@ import random
 
 import torch
 
-from .constants import CONN_FEEDBACK, CONN_FEEDFORWARD, LAYER_L4, LAYER_SENSORY
+from ..constants import CONN_FEEDBACK, CONN_FEEDFORWARD, LAYER_L4, LAYER_SENSORY
 from .page_storage import MemoryBudgetError
 
 
 class SynapseManager:
-    """突触 CRUD: 创建、批量创建、层连接、突触周转.
+    """
+    突触 CRUD: 创建、批量创建、层连接、突触周转.
 
     通过 self.pool 引用访问共享张量, 扩容后自动指向新张量.
     """
@@ -70,7 +72,7 @@ class SynapseManager:
         conn_type: int = 0,
         init_scale: float = 1.0,
     ) -> int:
-        """批量创建突触 — 一次 GPU 写入, 替代逐元素 create_synapse."""
+        """批量创建突触, 一次 GPU 写入, 替代逐元素 create_synapse."""
         n = len(pre_ids)
         if n == 0:
             return 0
@@ -168,7 +170,7 @@ class SynapseManager:
         conn_type: int = 0,
         init_scale: float = 1.0,
     ) -> int:
-        """两层间有偏置的稀疏连接 — 纯 GPU 向量化."""
+        """两层间有偏置的稀疏连接, 纯 GPU 向量化."""
         from_mask = (self.pool.layer == from_layer) & self.pool.alive
         to_mask = (self.pool.layer == to_layer) & self.pool.alive
         from_ids = torch.where(from_mask)[0]

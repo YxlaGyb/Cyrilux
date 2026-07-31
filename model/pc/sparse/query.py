@@ -1,4 +1,8 @@
-"""PoolQuery — 只读查询与统计 (委托到 TensorNeuronPool 的张量)."""
+"""
+PoolQuery
+
+只读查询与统计 (委托到 TensorNeuronPool 的张量).
+"""
 
 from __future__ import annotations
 
@@ -34,9 +38,7 @@ class PoolQuery:
         Args:
             layer: 限定层 (None = 全网络)
         """
-        active_mask = (
-            self.pool.state[:, 2].abs() > self.pool.state[:, 3]
-        ) & self.pool.alive  # F_EPS=2, F_THRESHOLD=3
+        active_mask = (self.pool.state[:, 2].abs() > self.pool.state[:, 3]) & self.pool.alive  # F_EPS=2, F_THRESHOLD=3
         if layer is not None:
             active_mask &= self.pool.layer == layer
         return torch.where(active_mask)[0]

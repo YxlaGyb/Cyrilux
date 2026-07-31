@@ -1,4 +1,9 @@
-# model.pc — Predictive Coding 核心模块 (全张量化)
+"""model.pc
+
+预测编码双后端门面 
+
+(dense: 全 matmul / sparse: 页式槽位).
+"""
 
 from .constants import (
     CONN_FEEDBACK,
@@ -14,6 +19,7 @@ from .constants import (
     F_Z,
     F_Z_PREV,
     HIDDEN_LAYERS,
+    K_FAN,
     LAYER_CONFIG,
     LAYER_L2,
     LAYER_L3,
@@ -22,22 +28,35 @@ from .constants import (
     LAYER_L6,
     LAYER_SENSORY,
     N_STATE_FIELDS,
+    PAGE_NEURONS,
+    PAGE_SYNAPSES,
+    PAGE_TD,
     TOP_LAYER,
 )
-from .tensor_pool import TensorNeuronPool
-from .neuromodulation import (
+from .modulation import (
     combine_modulation,
     compute_ach,
+    compute_ach_gain,
     compute_dopamine,
-    compute_precision_scales,
+    compute_dopamine_gain,
+    compute_free_energy,
     compute_uncertainty,
+    soft_norm_preserve,
 )
+from .sparse import TensorNeuronPool, compute_precision_scales
+from .dense import DensePCNet, DensePCConfig
 
 __all__ = [
+    "DensePCNet",
+    "DensePCConfig",
     "TensorNeuronPool",
     "compute_uncertainty",
     "compute_dopamine",
     "compute_ach",
     "combine_modulation",
     "compute_precision_scales",
+    "compute_dopamine_gain",
+    "compute_ach_gain",
+    "compute_free_energy",
+    "soft_norm_preserve",
 ]

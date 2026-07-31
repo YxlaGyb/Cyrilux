@@ -1,4 +1,8 @@
-"""ProjectionManager — 时序/topdown/LM head 结构连接."""
+"""
+ProjectionManager
+
+时序/topdown/LM head 结构连接.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,8 @@ import torch
 
 
 class ProjectionManager:
-    """投影连接管理: 时序自连接、topdown 连接、LM head 连接.
+    """
+    投影连接管理: 时序自连接、topdown 连接、LM head 连接.
 
     通过 self.pool 引用访问共享张量, 扩容后自动指向新张量.
     """

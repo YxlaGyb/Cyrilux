@@ -14,15 +14,15 @@ from typing import Callable
 
 import torch
 
-from model.pc.neuromodulation import (
+from model.pc import (
     combine_modulation,
     compute_ach,
     compute_dopamine,
     compute_precision_scales,
     compute_uncertainty,
+    TensorNeuronPool,
+    F_Z,
 )
-from model.pc.tensor_pool import TensorNeuronPool
-from model.pc.constants import F_Z
 from pkg.device.cuda import setup_cuda_device
 
 
@@ -157,7 +157,7 @@ class CyreneModel:
         连接延迟到 warmup 后 (感官神经元届时已存在).
         隐藏层神经元按 nid % 8 分组, 保留字节分组通路.
         """
-        from model.pc.constants import (
+        from model.pc import (
             LAYER_L4,
             LAYER_L2,
             LAYER_L3,
@@ -357,7 +357,7 @@ class CyreneModel:
 
         # 隐藏层动态生长: 自动补充修剪损失, 维持层容量
         if self._step % max(1, self.config.grow_interval) == 0:
-            from model.pc.constants import HIDDEN_LAYERS, LAYER_CONFIG
+            from model.pc import HIDDEN_LAYERS, LAYER_CONFIG
 
             for layer in HIDDEN_LAYERS:
                 base_n = LAYER_CONFIG[layer][0]
@@ -391,7 +391,7 @@ class CyreneModel:
         """将新神经元连入现有前馈网络.
         根据层的上下游关系创建对应连接.
         """
-        from model.pc.constants import (
+        from model.pc import (
             LAYER_L4,
             LAYER_L2,
             LAYER_L3,
@@ -399,7 +399,6 @@ class CyreneModel:
             LAYER_L6,
             LAYER_SENSORY,
             CONN_FEEDFORWARD,
-            CONN_FEEDBACK,
         )
 
         if not nids:
@@ -456,7 +455,7 @@ class CyreneModel:
     @torch.inference_mode()
     def reset_hidden_state(self):
         """重置隐藏层状态 (layer>0) 为 0. 感官层不改动."""
-        from model.pc.constants import F_EPS, F_MU, F_Z, F_Z_PREV
+        from model.pc import F_EPS, F_MU, F_Z, F_Z_PREV
 
         mask = (self.pool.layer > 0) & self.pool.alive
         if mask.any():
@@ -668,7 +667,7 @@ class CyreneModel:
 
     def encode_and_predict_l4_only(self, byte_seq: torch.Tensor):
         """只做感官创建 + L4 预测，跳过全量 predict_pass（30x 加速）."""
-        from model.pc.constants import F_MU, F_Z, F_EPS
+        from model.pc import F_MU, F_Z, F_EPS
 
         self._step += 1
         is_warmup = self._step <= self.config.warmup_steps

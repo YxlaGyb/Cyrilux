@@ -6,11 +6,9 @@ Hebbian 可塑性 + 稳态 + 阈值调节.
 
 from __future__ import annotations
 
-import math
-
 import torch
 
-from .constants import (
+from ..constants import (
     F_BCM_SLOPE,
     F_BCM_ZERO,
     F_EPS,
@@ -82,9 +80,7 @@ class LearningEngine:
             in_s[valid].long(),
             dw[valid],
         )
-        self.pool.trace[in_s[valid].long()] = (
-            self.pool.trace[in_s[valid].long()] * 0.9 + z_pre[valid].abs() * 0.1
-        )
+        self.pool.trace[in_s[valid].long()] = self.pool.trace[in_s[valid].long()] * 0.9 + z_pre[valid].abs() * 0.1
         self.pool.syn_age[in_s[valid].long()] += 1
 
         return float(dw.abs().sum().item())
@@ -107,7 +103,6 @@ class LearningEngine:
             return 0.0
 
         nids_c = active_nids[connected]
-        w = self.pool.t_weight[nids_c.long()]
         eps = self.pool.state[nids_c.long(), F_EPS]
         z_prev = self.pool.state[nids_c.long(), F_Z_PREV]
 
@@ -183,13 +178,9 @@ class LearningEngine:
 
         self.pool.lm_weight.data[:, top_mask] += dw
 
-        self.pool.lm_bias.data[target_byte] = torch.clamp(
-            self.pool.lm_bias.data[target_byte] + 1e-4, min=-1.0, max=1.0
-        )
+        self.pool.lm_bias.data[target_byte] = torch.clamp(self.pool.lm_bias.data[target_byte] + 1e-4, min=-1.0, max=1.0)
         if error:
-            self.pool.lm_bias.data[pred_byte] = torch.clamp(
-                self.pool.lm_bias.data[pred_byte] - 1e-4, min=-1.0, max=1.0
-            )
+            self.pool.lm_bias.data[pred_byte] = torch.clamp(self.pool.lm_bias.data[pred_byte] - 1e-4, min=-1.0, max=1.0)
 
         return 0.0
 
@@ -252,7 +243,7 @@ class LearningEngine:
 
     def homeostasis_lm_head(self, top_layer: int):
         """
-        LM head 稳态: 
+        LM head 稳态:
         逐列 L2 上限约束 (保留列间幅度差异, 只防爆炸).
         """
         top_mask = (self.pool.layer == top_layer) & self.pool.alive
@@ -277,7 +268,7 @@ class LearningEngine:
         max_inactive: int = 1000,
     ) -> dict:
         """
-        周期性维护: 
+        周期性维护:
         修剪 + 生长 (阈值调节已移至每步 adjust_thresholds).
         """
         stats: dict = {"threshold_adjusted": 0}
@@ -311,9 +302,7 @@ class LearningEngine:
 
             orphan_mask = (in_counts == 0) & (age > 500)
             inactive_mask = (
-                (inactive_for > max_inactive)
-                & (self.pool.state[alive_ids, F_FIRING_RATE] < 0.001)
-                & (age > min_age)
+                (inactive_for > max_inactive) & (self.pool.state[alive_ids, F_FIRING_RATE] < 0.001) & (age > min_age)
             )
             prune_mask = orphan_mask | inactive_mask
             candidates = alive_ids[prune_mask][:_max_prune]
@@ -330,10 +319,7 @@ class LearningEngine:
         # 2. 生长 (分裂高误差神经元)
         if _max_grow > 0 and current_step % _grow_interval == 0:
             alive_ids = torch.where(alive)[0]
-            high_err = (
-                self.pool.state[alive_ids, F_EPS].abs()
-                > self.pool.state[alive_ids, F_THRESHOLD] * 3.0
-            )
+            high_err = self.pool.state[alive_ids, F_EPS].abs() > self.pool.state[alive_ids, F_THRESHOLD] * 3.0
             candidates = alive_ids[high_err][:_max_grow]
             grown = 0
             for nid in candidates.tolist():

@@ -1,4 +1,4 @@
-"""TensorNeuronPool — 全张量化神经元池.
+"""TensorNeuronPool, 全张量化神经元池.
 
 替代旧的 NeuronPool (dict/dataclass), 所有状态存储为 device-agnostic tensor.
 可在 CPU 或 CUDA 上运行, 计算操作批量执行.

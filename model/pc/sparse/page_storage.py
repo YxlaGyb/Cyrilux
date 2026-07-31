@@ -1,4 +1,6 @@
-"""PageStorage — 页式 GPU 张量分配器.
+"""PageStorage
+
+页式 GPU 张量分配器.
 
 管理 TensorNeuronPool 中所有张量的页式存储:
 - 神经元页 (4096 个/页): state, layer, position, channel, in_ptrs, out_ptrs, ...
@@ -14,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from .constants import K_FAN, N_STATE_FIELDS, PAGE_NEURONS, PAGE_SYNAPSES, PAGE_TD
+from ..constants import K_FAN, N_STATE_FIELDS, PAGE_NEURONS, PAGE_SYNAPSES, PAGE_TD
 
 # 默认内存预算 (2GB)
 DEFAULT_MAX_MEMORY = 2_147_483_648

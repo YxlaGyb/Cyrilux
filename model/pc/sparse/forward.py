@@ -1,9 +1,14 @@
-"""ForwardEngine — 前向传播: 预测、误差计算、logits、发射."""
+"""
+ForwardEngine
+
+前向传播:
+    预测、误差计算、logits、发射.
+"""
 
 from __future__ import annotations
 
 import torch
-from .constants import F_EPS, F_MU, F_THRESHOLD, F_Z, F_FIRING_RATE
+from ..constants import F_EPS, F_MU, F_THRESHOLD, F_Z, F_FIRING_RATE
 
 
 class ForwardEngine:
