@@ -600,7 +600,7 @@ class CyreneModel:
             if len(chunk) < 13:
                 break
             byte_ids = torch.tensor(
-                [b for b in chunk], dtype=torch.long, device=self.device
+                list(chunk), dtype=torch.long, device=self.device
             ).unsqueeze(0)
             self.step(byte_ids)
             processed += 1

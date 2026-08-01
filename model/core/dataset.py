@@ -20,7 +20,7 @@ from torch.utils.data import Dataset
 
 
 class DualChannelDataset(Dataset):
-    def __init__(self, data_path: str, max_length: int = 128, max_samples: int = None, lazy: bool = False):
+    def __init__(self, data_path: str, max_length: int = 128, max_samples: int | None = None, lazy: bool = False):
         super().__init__()
         self.data_path = data_path
         self.max_length = max_length

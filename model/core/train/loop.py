@@ -81,7 +81,7 @@ class TrainingLoop:
         pos_idx = torch.zeros(256, dtype=torch.long, device=m.device) - 1
         pos_idx[s_pos.long()] = torch.arange(len(s_nids), device=m.device)
         valid_p = pos_idx >= 0
-        pos_t = torch.where(valid_p)[0]  # [n_pos_used], 0-255
+        torch.where(valid_p)[0]  # [n_pos_used], 0-255
 
         all_out = m.pool.out_ptrs[s_nids].long()  # [n_s, K]
         all_valid = (all_out >= 0) & m.pool.syn_alive[all_out]  # [n_s, K]
@@ -214,7 +214,7 @@ class TrainingLoop:
                         s["step"] = self.global_step
                         with open(VIZ_STATE_PATH, "w") as f:
                             json.dump(s, f)
-                    except:
+                    except Exception:  # noqa: S110 — viz 状态写入失败不阻塞训练
                         pass
 
                 if self.global_step % log_interval == 0:

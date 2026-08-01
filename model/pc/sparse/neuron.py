@@ -159,7 +159,7 @@ class NeuronManager:
 
     def prune_neuron(self, nid: int, force: bool = False) -> bool:
         """
-        惰性删除神经元: 
+        惰性删除神经元:
 
         标记 alive=False, 关联突触标记 syn_alive=False.
         """
@@ -204,8 +204,8 @@ class NeuronManager:
 
     def split_neuron(self, nid: int, noise_scale: float = 0.05) -> int | None:
         """
-        分裂神经元: 
-        
+        分裂神经元:
+
         创建子神经元, 平分入突触.
         """
         if not self.pool.alive[nid]:

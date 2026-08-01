@@ -1,6 +1,6 @@
 """model.pc
 
-预测编码双后端门面 
+预测编码双后端门面
 
 (dense: 全 matmul / sparse: 页式槽位).
 """

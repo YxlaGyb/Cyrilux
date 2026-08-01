@@ -21,7 +21,8 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
-    "coverage>=7.15.2"
+    "coverage>=7.15.2",
+    "ty>=0.0.65",
 ]
 
 [project.scripts]

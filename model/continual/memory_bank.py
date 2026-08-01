@@ -123,7 +123,7 @@ class MemoryBank:
                 scored.append((score, i))
             scored.sort(key=lambda x: x[0])
             n_evict = len(buf) - self.max_per_task
-            evict_indices = set(i for _, i in scored[:n_evict])
+            evict_indices = {i for _, i in scored[:n_evict]}
             buf[:] = [ex for i, ex in enumerate(buf) if i not in evict_indices]
         else:
             # FIFO 回退

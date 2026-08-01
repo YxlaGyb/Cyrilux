@@ -26,7 +26,7 @@ def all(checkpoint, device):
         runner = CyreneModel.load(resolve_path(checkpoint))
     else:
         runner = CyreneModel(CyreneConfig(hidden_size=64, warmup_steps=50))
-        runner.add_hidden_layer(n_neurons=256, from_layer=0, to_layer=7, connection_density=0.2)
+        runner.add_hidden_layer()
         runner.warmup(20)
 
     loader = create_eval_runner_loader("dataset/sft_t2t.jsonl", max_length=128, max_samples=200)

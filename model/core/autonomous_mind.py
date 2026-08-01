@@ -376,8 +376,8 @@ class AutonomousMind:
     def __init__(
         self,
         runner: CyreneModel,
-        cfg: dict = None,
-        log_callback: Callable = None,
+        cfg: dict | None = None,
+        log_callback: Callable | None = None,
     ):
         self.cfg = {**DEFAULT_CFG, **(cfg or {})}
         self.log_callback = log_callback or (lambda msg: Logger(msg))
