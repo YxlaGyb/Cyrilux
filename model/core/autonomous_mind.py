@@ -21,7 +21,7 @@ import os
 import threading
 import time
 import traceback
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import torch
 
@@ -98,7 +98,7 @@ class CuriositySampler:
             results.append((gen.clone(), entropy))
         return results
 
-    def _generate(self, prompt_bytes: torch.Tensor) -> Optional[torch.Tensor]:
+    def _generate(self, prompt_bytes: torch.Tensor) -> torch.Tensor | None:
         """自回归生成, 使用 runner.step() + lm_head."""
         try:
             seq = prompt_bytes.clone().to(self.device)
@@ -183,7 +183,7 @@ class ExperienceReplayBuffer:
         for i in range(byte_seq.size(0)):
             self.add(byte_seq[i], labels[i], D)
 
-    def sample(self, batch_size: int, device: str = "cpu") -> Optional[tuple]:
+    def sample(self, batch_size: int, device: str = "cpu") -> tuple | None:
         if len(self.buffer) < batch_size:
             return None
         if self._dopamine_sum > 0 and len(self.buffer) > batch_size * 2:
@@ -347,7 +347,7 @@ class DataRotator:
         )
         self._pos = 0
 
-    def get_batch(self, batch_size: int) -> Optional[tuple]:
+    def get_batch(self, batch_size: int) -> tuple | None:
         if not self._current_data and self.files:
             self._load_next()
         if not self._current_data:
@@ -548,7 +548,7 @@ class IntrinsicMetaController(MetaController):
         self.competence_drive: float = 0.5
         self.boredom_signal: float = 0.0
         self._icm_history: list[dict] = []
-        self.concept_discovery: Optional[ConceptDiscovery] = None
+        self.concept_discovery: ConceptDiscovery | None = None
 
     def update_intrinsic(self, icm_output: dict):
         self._icm_history.append(icm_output)

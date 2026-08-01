@@ -7,6 +7,7 @@ list
 import os
 
 import click
+
 from pkg.cli.utils import resolve_path
 
 app = click.Group(name="list", help="信息查询")
@@ -45,7 +46,7 @@ def checkpoints(directory, detail):
                 state = torch.load(fpath, map_location="cpu", weights_only=True)
                 if isinstance(state, dict) and "step" in state:
                     print(f"  {fname}: step={state.get('step', '?')}  ce={state.get('ce_loss', '?')}")
-            except Exception:
+            except Exception:  # noqa: S110
                 pass
 
 

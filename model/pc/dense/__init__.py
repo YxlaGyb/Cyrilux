@@ -13,6 +13,6 @@ Usage:
     stats = net.learn(byte_ids)        # Hebbian 更新, 返回 free_energy 等
 """
 
-from .core import DensePCNet, DensePCConfig
+from .core import DensePCConfig, DensePCNet
 
 __all__ = ["DensePCNet", "DensePCConfig"]

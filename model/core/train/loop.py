@@ -8,14 +8,13 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional
 
 import torch
 from tqdm import tqdm
 
-from pkg.utils.trainer_utils import setup_seed
-from pkg.device.cuda import setup_cuda_device
 from model.model_cyrene import CyreneConfig, CyreneModel
+from pkg.device.cuda import setup_cuda_device
+from pkg.utils.trainer_utils import setup_seed
 
 from .config import TrainingConfig
 
@@ -25,7 +24,7 @@ class TrainingLoop:
         self.cfg = config
         self.device = setup_cuda_device()
         self._setup_environment()
-        self.runner: Optional[CyreneModel] = None
+        self.runner: CyreneModel | None = None
         self.global_step = 0
         self._last_stats: dict = {}
         self._last_F: float = float("inf")

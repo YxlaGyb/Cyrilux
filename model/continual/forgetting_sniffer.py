@@ -13,8 +13,6 @@ Ponytail: 嗅探器只做 T=0 纯前向 — 无 PC 推理, 开销约 = 1 步训�
 
 from __future__ import annotations
 
-from typing import List, Optional
-
 import torch
 from torch import nn
 
@@ -125,7 +123,7 @@ class ForgettingSniffer:
 
     # ── 核心 ──────────────────────────────────────────────────────────
 
-    def check(self, global_step: int, device: str) -> Optional[List[str]]:
+    def check(self, global_step: int, device: str) -> list[str] | None:
         """嗅探: 检测是否有任务被遗忘. (当前未实现.)"""
         return None
 
@@ -152,7 +150,7 @@ class ForgettingSniffer:
             ratios[cid] = sum(ratios_list) / max(len(ratios_list), 1)
         self._last_concept_ratios = ratios
         forgotten_c = [cid for cid, r in ratios.items() if r > self.concept_threshold]
-        return forgotten_c if forgotten_c else None
+        return forgotten_c or None
 
     def repair_begin(self, optimizer, current_lr: float, device: str) -> float:
         """进入修复模式: 降低 LR, 准备强制回放.

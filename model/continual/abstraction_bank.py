@@ -13,8 +13,6 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
-
 import torch
 import torch.nn.functional as F
 
@@ -75,7 +73,7 @@ def _kmeans_cosine(
     k: int,
     max_iter: int = 20,
     tol: float = 1e-4,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Cosine-distance k-means 聚类."""
     n = points.size(0)
     if n <= k:
@@ -103,19 +101,19 @@ def _kmeans_cosine(
 class AbstractionEntry:
     """单条抽象记忆 — 神经元活动快照."""
 
-    def __init__(self, z_states: Dict[int, float], task_id: str, step: int):
+    def __init__(self, z_states: dict[int, float], task_id: str, step: int):
         self.z_states = z_states
         self.task_id = task_id
         self.step = step
         self.visit_count = 0
-        self.prototype_similarity: Optional[float] = None
+        self.prototype_similarity: float | None = None
 
-    def to_vector(self, all_nids: List[int]) -> torch.Tensor:
+    def to_vector(self, all_nids: list[int]) -> torch.Tensor:
         vals = [self.z_states.get(nid, 0.0) for nid in all_nids]
         return torch.tensor(vals, dtype=torch.half)
 
     def update_prototype_similarity(
-        self, prototype: torch.Tensor, all_nids: List[int]
+        self, prototype: torch.Tensor, all_nids: list[int]
     ):
         vec = self.to_vector(all_nids).unsqueeze(0)
         sim = F.cosine_similarity(vec, prototype.unsqueeze(0)).item()
@@ -128,9 +126,9 @@ class AbstractionBank:
     def __init__(self, max_per_task: int = 1000, k_prototypes: int = 16):
         self.max_per_task = max_per_task
         self.k_prototypes = k_prototypes
-        self.entries: Dict[str, List[AbstractionEntry]] = {}
-        self.prototypes: Dict[str, torch.Tensor] = {}
-        self._all_nids: List[int] = []
+        self.entries: dict[str, list[AbstractionEntry]] = {}
+        self.prototypes: dict[str, torch.Tensor] = {}
+        self._all_nids: list[int] = []
 
     def update_neuron_ids(self, runner: CyreneModel):
         self._all_nids = sorted(runner.pool.neurons.keys())
@@ -155,7 +153,7 @@ class AbstractionBank:
         self.add_entry(entry)
         return entry
 
-    def compute_prototypes(self, task_id: str) -> Optional[torch.Tensor]:
+    def compute_prototypes(self, task_id: str) -> torch.Tensor | None:
         entries = self.entries.get(task_id, [])
         if not entries or not self._all_nids:
             return None
@@ -165,12 +163,12 @@ class AbstractionBank:
         self.prototypes[task_id] = centers.mean(dim=0)
         return self.prototypes[task_id]
 
-    def get_prototype(self, task_id: str) -> Optional[torch.Tensor]:
+    def get_prototype(self, task_id: str) -> torch.Tensor | None:
         return self.prototypes.get(task_id)
 
     def replay(
         self, runner: CyreneModel, task_id: str, n_samples: int = 4
-    ) -> List[AbstractionEntry]:
+    ) -> list[AbstractionEntry]:
         """从任务的原型记忆中采样, 通过 runner 回放."""
         entries = self.entries.get(task_id, [])
         if not entries:
@@ -219,7 +217,7 @@ class VariationalReplayer:
     @torch.no_grad()
     def replay_variations(
         self, runner: CyreneModel, task_id: str, n_variations: int = 2
-    ) -> List[AbstractionEntry]:
+    ) -> list[AbstractionEntry]:
         """从原型生成变体并通过 runner 回放."""
         proto = self.bank.get_prototype(task_id)
         if proto is None:
@@ -251,7 +249,7 @@ class AbstractionSniffer:
         self.bank = abstraction_bank
         self.threshold = threshold
         self.window = window
-        self._history: Dict[str, List[float]] = {}
+        self._history: dict[str, list[float]] = {}
 
     def check(self, runner: CyreneModel, task_id: str) -> bool:
         proto = self.bank.get_prototype(task_id)

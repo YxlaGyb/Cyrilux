@@ -33,6 +33,7 @@ from .constants import (
     PAGE_TD,
     TOP_LAYER,
 )
+from .dense import DensePCConfig, DensePCNet
 from .modulation import (
     combine_modulation,
     compute_ach,
@@ -44,7 +45,6 @@ from .modulation import (
     soft_norm_preserve,
 )
 from .sparse import TensorNeuronPool, compute_precision_scales
-from .dense import DensePCNet, DensePCConfig
 
 __all__ = [
     "DensePCNet",

@@ -1,3 +1,3 @@
 # AGENTS
 
-你应该读取: @CLAUDE.md
+You should read and follow: @.github/CLAUDE.md

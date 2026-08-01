@@ -2,8 +2,8 @@
 TrainingConfig + ProgressCallback.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 ProgressCallback = Callable[[dict], None]
 """训练进度回调.
@@ -26,7 +26,7 @@ class TrainingConfig:
     num_hidden_layers: int = 4
     use_moe: bool = False
     vocab_size: int = 256  # 字节级默认 256; 词元级可覆盖
-    checkpoint_path: Optional[str] = None  # 从 checkpoint 恢复
+    checkpoint_path: str | None = None  # 从 checkpoint 恢复
 
     # 训练
     batch_size: int = 48
@@ -126,7 +126,7 @@ class TrainingConfig:
     save_interval: int = 10000
 
     # 回调
-    progress_callback: Optional[ProgressCallback] = None
+    progress_callback: ProgressCallback | None = None
 
     # Phase 1: 依赖阈值发放
     act_threshold_init: float = 0.3

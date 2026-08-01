@@ -315,11 +315,11 @@ class PageStorage:
 
     def ensure_neuron_capacity(self, min_n: int):
         """确保神经元容量 ≥ min_n (迁移脚本使用)."""
-        while self._N < min_n:
+        while min_n > self._N:
             self._expand_neurons()
 
     def ensure_synapse_capacity(self, min_s: int):
-        while self._S < min_s:
+        while min_s > self._S:
             self._expand_synapses()
 
     # ═══════════════════════════════════════════════════════════════

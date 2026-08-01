@@ -7,11 +7,11 @@ import os
 import click
 import torch
 
-from pkg.cli.utils import resolve_path, load_config
+from pkg.cli.utils import load_config, resolve_path
 
 
 def _dense_cfg(hidden_size: int, lr: float):
-    from model.pc.dense import DensePCNet, DensePCConfig
+    from model.pc.dense import DensePCConfig, DensePCNet
 
     ratio = hidden_size / 1024.0
     d_cfg = DensePCConfig(
@@ -28,6 +28,7 @@ def _dense_cfg(hidden_size: int, lr: float):
 def _train_dense(data_files, out_dir, batch_size, max_seq_len, lr, epochs, hidden_size, device, subset):
     """dense"""
     import json as _json
+
     from tqdm import tqdm
 
     torch.set_grad_enabled(False)
@@ -96,8 +97,8 @@ def _train_sparse(
     dopamine_gamma=0.3,
 ):
     """sparse"""
-    from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
+    from model.core.train import TrainingConfig, TrainingLoop
 
     config = TrainingConfig(
         checkpoint_path=resolve_path(checkpoint) if checkpoint else None,
@@ -119,7 +120,7 @@ def _train_sparse(
     print(f"Phase 1 Training  hidden={config.hidden_size}  device={device}")
     task_pipelines = []
     for i, fp in enumerate(data_files):
-        ds = DualChannelDataset(fp, max_length=max_seq_len, max_samples=subset if subset else None)
+        ds = DualChannelDataset(fp, max_length=max_seq_len, max_samples=subset or None)
         task_pipelines.append((f"task_{i}", ds))
     loop = TrainingLoop(config)
     loop.train(task_pipelines)
@@ -216,8 +217,8 @@ def train(
 @click.option("--verbose", "-v", is_flag=True, default=False, help="详细日志")
 def from_config(config, batch_size, lr, epochs, out_dir, verbose):
     """从 JSON 配置文件加载参数并训练 (纯 Hebbian, 零反向传播)."""
-    from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
+    from model.core.train import TrainingConfig, TrainingLoop
 
     cfg = load_config(config)
     model_cfg = cfg.get("model", {})
@@ -249,7 +250,7 @@ def from_config(config, batch_size, lr, epochs, out_dir, verbose):
     task_pipelines = []
     for i, fp in enumerate(data_file_list):
         ds = DualChannelDataset(
-            fp, max_length=config_obj.max_seq_len, max_samples=config_obj.subset if config_obj.subset else None
+            fp, max_length=config_obj.max_seq_len, max_samples=config_obj.subset or None
         )
         task_pipelines.append((f"task_{i}", ds))
     loop = TrainingLoop(config_obj)
@@ -263,8 +264,8 @@ def from_config(config, batch_size, lr, epochs, out_dir, verbose):
 @click.option("--verbose", "-v", is_flag=True, default=False, help="详细日志")
 def resume(checkpoint, batch_size, max_seq_len, verbose):
     """从检查点文件恢复训练 (纯 Hebbian, 零反向传播)."""
-    from model.core.train import TrainingLoop, TrainingConfig
     from model.core.dataset import DualChannelDataset
+    from model.core.train import TrainingConfig, TrainingLoop
 
     ckpt_path = resolve_path(checkpoint)
     if not os.path.exists(ckpt_path):

@@ -8,7 +8,8 @@ ForwardEngine
 from __future__ import annotations
 
 import torch
-from ..constants import F_EPS, F_MU, F_THRESHOLD, F_Z, F_FIRING_RATE
+
+from ..constants import F_EPS, F_FIRING_RATE, F_MU, F_THRESHOLD, F_Z
 
 
 class ForwardEngine:

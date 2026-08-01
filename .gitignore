@@ -1,28 +1,28 @@
-/ola_out
-out*
-/docs
-
-
 # venv
 /.venv
-/dataset
 /.ruff_cache
-/.idea
 /build
+/ola_out
+out*
 instructions
-.claude
 py_models
 
-
+# data
+/dataset
+/docs
 *.pt
 *.jsonl
 *.egg-info
 
-
 # Python
 /__pycache__
+/.pytest_cache
 *.pyc
-
+.coverage
 
 # IDE
 /.vscode
+/.idea
+
+# AI
+.claude

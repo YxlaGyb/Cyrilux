@@ -14,6 +14,7 @@ ch1 = 角色编码: pad=0 / user=1 / assistant=2 / system=3
 
 import json
 import re
+
 import torch
 from torch.utils.data import Dataset
 
@@ -93,7 +94,7 @@ class DualChannelDataset(Dataset):
         if "conversations" in sample:
             raw = ""
             roles = []
-            gt = sample.get("gt", None)
+            gt = sample.get("gt")
             for m in sample["conversations"]:
                 role = m.get("role", "assistant")
                 content = m.get("content", m.get("value", ""))

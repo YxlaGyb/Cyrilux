@@ -18,7 +18,6 @@
 """
 
 from __future__ import annotations
-from typing import Tuple, Optional
 
 import torch
 
@@ -163,7 +162,7 @@ class ConceptDiscovery:
             # 创建新概念
             return self._create_concept(z_pooled, intrinsic_value)
 
-    def _find_nearest(self, z_pooled: torch.Tensor) -> Tuple[Optional[str], float]:
+    def _find_nearest(self, z_pooled: torch.Tensor) -> tuple[str | None, float]:
         """找到最接近的概念。"""
         if not self._concepts:
             return None, 0.0
@@ -259,7 +258,7 @@ class ConceptDiscovery:
 
     # ── 查询 ──
 
-    def get_concept_summary(self, concept_id: str) -> Optional[dict]:
+    def get_concept_summary(self, concept_id: str) -> dict | None:
         c = self._concepts.get(concept_id)
         if c is None:
             return None

@@ -27,16 +27,14 @@ Tensor 布局:
 
 from __future__ import annotations
 
-
 import torch
 
-
-from .neuron import NeuronManager
-from .page_storage import PAGE_NEURONS, PAGE_SYNAPSES, PageStorage
-from .query import PoolQuery
 from .forward import ForwardEngine
 from .learning import LearningEngine
+from .neuron import NeuronManager
+from .page_storage import PAGE_NEURONS, PAGE_SYNAPSES, PageStorage
 from .projections import ProjectionManager
+from .query import PoolQuery
 from .synapse import SynapseManager
 
 
@@ -468,12 +466,12 @@ class TensorNeuronPool:
         # 重建 freelists: 取 alive_mask 反向填充
         dead = torch.where(~self.alive)[0].tolist()
         self._storage._free_neurons.clear()
-        self._storage._free_neurons.extend(dead if dead else list(range(self.N)))
+        self._storage._free_neurons.extend(dead or list(range(self.N)))
         self._free_neurons = self._storage._free_neurons
 
         dead_syn = torch.where(~self.syn_alive)[0].tolist()
         self._storage._free_synapses.clear()
-        self._storage._free_synapses.extend(dead_syn if dead_syn else list(range(self.S)))
+        self._storage._free_synapses.extend(dead_syn or list(range(self.S)))
         self._free_synapses = self._storage._free_synapses
 
         # 批量计算邻接计数

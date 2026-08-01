@@ -1,8 +1,5 @@
 """Cyrilux.core — 核心逻辑层"""
 
-from . import train
-from . import dataset
-from . import evaluation
-
+from . import dataset, evaluation, train
 
 __all__ = ["train", "dataset", "evaluation"]

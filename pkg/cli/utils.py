@@ -2,13 +2,8 @@
 CLI 共享工具: 路径处理 & 配置加载.
 """
 
-import os
 import json
-
-from rich.layout import Layout
-from rich.panel import Panel
-from rich.text import Text
-from rich.table import Table
+import os
 
 # 项目根目录 — 相对于 pkg/cli/utils.py 向上 3 层
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -43,101 +38,6 @@ def merge_config(config: dict, cli_overrides: dict) -> dict:
         if v is not None:
             merged[k] = v
     return merged
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Rich 训练进度面板
-# ═══════════════════════════════════════════════════════════════════
-
-
-class RichTrainingPanel:
-    """4 区域 Rich Layout 实时训练监控面板."""
-
-    def __init__(self, device: str = "cuda:0"):
-        self.layout = Layout()
-        self.layout.split_column(
-            Layout(name="status", size=3),
-            Layout(name="progress", size=5),
-            Layout(name="log"),
-        )
-        self.log_lines: list[str] = []
-        self._init_panels(device)
-
-    def _init_panels(self, device: str):
-        self.layout["status"].update(Panel("[yellow]等待启动...[/]", title="[bold]Status"))
-        self.layout["progress"].update(Panel("", title="[bold]Progress"))
-        self.layout["log"].update(Panel("", title="[bold]Log"))
-
-    def update(self, data: dict):
-        """从 TrainManager 回调更新面板."""
-        t = data.get("type", "")
-
-        if t == "log":
-            msg = data.get("message", "")
-            self.log_lines.append(f"[dim]{msg}[/]")
-            if len(self.log_lines) > 200:
-                self.log_lines = self.log_lines[-100:]
-            self.layout["log"].update(Panel("\n".join(self.log_lines[-25:]), title="[bold]Log"))
-
-        elif t == "progress":
-            step = data.get("step", 0)
-            total = data.get("total_steps", 1)
-            epoch = data.get("epoch", 1)
-            total_epochs = data.get("total_epochs", 1)
-            ce = data.get("ce_loss", 0.0)
-            F = data.get("F", 0.0)
-            D = data.get("D", 0.0)
-            lr = data.get("lr", 0.0)
-
-            pct = step / max(total, 1)
-            bar_w = 40
-            filled = int(bar_w * pct)
-            bar = "█" * filled + "░" * (bar_w - filled)
-            pct_str = f"{pct * 100:.0f}%"
-
-            # 状态面板
-            status = Panel(
-                Text.from_markup(
-                    f"Epoch [bold]{epoch}[/]/[bold]{total_epochs}[/]  "
-                    f"Step [bold]{step}[/]/[bold]{total}[/]  "
-                    f"Device: cuda:0"
-                ),
-                title="[bold]Status",
-            )
-
-            # 指标表格
-            table = Table.grid(padding=(0, 2))
-            table.add_row("CE Loss", f"[cyan]{ce:.4f}[/]")
-            table.add_row("F (Pred)", f"[magenta]{F:.2f}[/]")
-            table.add_row("Dopamine D", f"[green]{D:.4f}[/]")
-            table.add_row("Learning Rate", f"[yellow]{lr:.2e}[/]")
-
-            progress = Panel(
-                Text.from_markup(f"{bar} [bold]{pct_str}[/]\n") + table,
-                title="[bold]Progress",
-            )
-
-            self.layout["status"].update(status)
-            self.layout["progress"].update(progress)
-
-        elif t == "checkpoint":
-            ckpt = data.get("checkpoint_path", "")
-            self.log_lines.append(f"[green]✓[/] 检查点: {ckpt}")
-            self.layout["log"].update(Panel("\n".join(self.log_lines[-25:]), title="[bold]Log"))
-
-        elif t == "phase":
-            msg = data.get("message", "")
-            self.log_lines.append(f"[blue]◆[/] {msg}")
-            self.layout["log"].update(Panel("\n".join(self.log_lines[-25:]), title="[bold]Log"))
-
-        elif t == "done":
-            self.log_lines.append("[bold green]══════════════════════════════[/]")
-            self.log_lines.append("[bold green]✓ 训练完成![/]")
-            self.layout["log"].update(Panel("\n".join(self.log_lines[-25:]), title="[bold]Log"))
-
-        elif t == "error":
-            self.log_lines.append(f"[bold red]✗ 错误: {data.get('message', '')}[/]")
-            self.layout["log"].update(Panel("\n".join(self.log_lines[-25:]), title="[bold]Log"))
 
 
 # ═══════════════════════════════════════════════════════════════════

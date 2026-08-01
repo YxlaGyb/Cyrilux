@@ -9,10 +9,9 @@ Ponytail: 存张量而非文本 — 反序列化零解析开销, 直接喂模型
 """
 
 from __future__ import annotations
-import math
 
 import dataclasses
-from typing import List, Tuple
+import math
 
 import torch
 
@@ -42,13 +41,13 @@ class MemoryBank:
     ):
         self.max_per_task = max_per_task
         self.enable_intrinsic_eviction = enable_intrinsic_eviction
-        self._store: dict[str, List[Exemplar]] = {}
+        self._store: dict[str, list[Exemplar]] = {}
         self._global_age: int = 0
 
     # ── 属性 ──────────────────────────────────────────────────────────
 
     @property
-    def tasks(self) -> List[str]:
+    def tasks(self) -> list[str]:
         return list(self._store.keys())
 
     @property
@@ -66,7 +65,7 @@ class MemoryBank:
     def add_samples(
         self,
         task_id: str,
-        samples: List[Tuple[torch.Tensor, torch.Tensor]],
+        samples: list[tuple[torch.Tensor, torch.Tensor]],
         dopamine_score: float,
         baseline_loss: float,
         transition_surprise: float = 0.0,
@@ -131,7 +130,7 @@ class MemoryBank:
             while len(buf) > self.max_per_task:
                 buf.pop(0)
 
-    def sample(self, batch_size: int, strategy: str = "dopamine") -> List[Exemplar]:
+    def sample(self, batch_size: int, strategy: str = "dopamine") -> list[Exemplar]:
         """按策略采样 exemplars.
 
         Args:

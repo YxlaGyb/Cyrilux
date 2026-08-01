@@ -6,7 +6,8 @@ import json
 import os
 
 import click
-from pkg.cli.utils import resolve_path, save_config, load_config
+
+from pkg.cli.utils import load_config, resolve_path, save_config
 
 app = click.Group(name="config", help="配置管理")
 

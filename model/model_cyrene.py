@@ -9,19 +9,19 @@ from __future__ import annotations
 
 import os
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, fields
-from typing import Callable
 
 import torch
 
 from model.pc import (
+    F_Z,
+    TensorNeuronPool,
     combine_modulation,
     compute_ach,
     compute_dopamine,
     compute_precision_scales,
     compute_uncertainty,
-    TensorNeuronPool,
-    F_Z,
 )
 from pkg.device.cuda import setup_cuda_device
 
@@ -158,14 +158,14 @@ class CyreneModel:
         隐藏层神经元按 nid % 8 分组, 保留字节分组通路.
         """
         from model.pc import (
-            LAYER_L4,
+            CONN_FEEDBACK,
+            CONN_FEEDFORWARD,
+            LAYER_CONFIG,
             LAYER_L2,
             LAYER_L3,
+            LAYER_L4,
             LAYER_L5,
             LAYER_L6,
-            LAYER_CONFIG,
-            CONN_FEEDFORWARD,
-            CONN_FEEDBACK,
             TOP_LAYER,
         )
 
@@ -392,13 +392,13 @@ class CyreneModel:
         根据层的上下游关系创建对应连接.
         """
         from model.pc import (
-            LAYER_L4,
+            CONN_FEEDFORWARD,
             LAYER_L2,
             LAYER_L3,
+            LAYER_L4,
             LAYER_L5,
             LAYER_L6,
             LAYER_SENSORY,
-            CONN_FEEDFORWARD,
         )
 
         if not nids:
@@ -667,7 +667,7 @@ class CyreneModel:
 
     def encode_and_predict_l4_only(self, byte_seq: torch.Tensor):
         """只做感官创建 + L4 预测，跳过全量 predict_pass（30x 加速）."""
-        from model.pc import F_MU, F_Z, F_EPS
+        from model.pc import F_EPS, F_MU, F_Z
 
         self._step += 1
         is_warmup = self._step <= self.config.warmup_steps

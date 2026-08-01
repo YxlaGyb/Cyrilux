@@ -25,8 +25,6 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
-
 import torch
 
 
@@ -37,7 +35,7 @@ class HippocampusEntry:
 
     def __init__(
         self,
-        z_states: List[torch.Tensor],
+        z_states: list[torch.Tensor],
         byte_tensor: torch.Tensor,
         label_tensor: torch.Tensor,
         info_gain: float,
@@ -61,7 +59,7 @@ class HippocampusBuffer:
     def __init__(self, capacity: int = 200, min_info_gain: float = 0.03):
         self.capacity = capacity
         self.min_info_gain = min_info_gain
-        self._buffer: List[HippocampusEntry] = []
+        self._buffer: list[HippocampusEntry] = []
         self._step_counter: int = 0
 
     @property
@@ -74,11 +72,11 @@ class HippocampusBuffer:
 
     def add(
         self,
-        z_states: List[torch.Tensor],
+        z_states: list[torch.Tensor],
         byte_tensor: torch.Tensor,
         label_tensor: torch.Tensor,
         info_gain: float,
-        step: Optional[int] = None,
+        step: int | None = None,
     ):
         """添加新条目。低信息增益直接丢弃; 满时驱逐最低增益条目。"""
         # 低增益过滤
@@ -114,7 +112,7 @@ class HippocampusBuffer:
 
     def sample_for_replay(
         self, n: int, device: str = "cuda:0"
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """按信息增益加权采样 N 条条目, 返回 (byte_tensor, label_tensor) batch。
 
         Returns:

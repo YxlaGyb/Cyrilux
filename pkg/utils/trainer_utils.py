@@ -1,21 +1,31 @@
 """
-训练工具函数: Logger / 学习率调度 / 随机种子 / 模型参数统计
+训练工具函数:
+- Logger
+- 学习率调度
+- 随机种子
+- 模型参数统计
 """
-import os, sys, math, random, time
+
+import math
+import os
+import random
+import sys
+
 import numpy as np
 import torch
 
-
 # ── 日志 ──
+
 
 class Logger:
     """简单日志类，支持同时输出到 stdout 和文件。"""
-    def __init__(self, path: str = None, mode: str = 'a'):
+
+    def __init__(self, path: str | None = None, mode: str = "a"):
         self.terminal = sys.stdout
         self.file = None
         if path:
-            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-            self.file = open(path, mode, encoding='utf-8')
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            self.file = open(path, mode, encoding="utf-8")
 
     def write(self, message):
         self.terminal.write(message)
@@ -35,8 +45,8 @@ class Logger:
 
 # ── 学习率 ──
 
-def get_lr(global_step: int, total_steps: int, lr: float,
-           warmup_ratio: float = 0.1) -> float:
+
+def get_lr(global_step: int, total_steps: int, lr: float, warmup_ratio: float = 0.1) -> float:
     """
     Cosine 学习率调度 (含 warmup)。
 
@@ -53,6 +63,7 @@ def get_lr(global_step: int, total_steps: int, lr: float,
 
 
 # ── 随机种子 ──
+
 
 def setup_seed(seed: int = 42):
     """固定所有随机种子。"""
