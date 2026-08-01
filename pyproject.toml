@@ -23,6 +23,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "coverage>=7.15.2",
     "ty>=0.0.65",
+    "ruff>=0.14.0",
 ]
 
 [project.scripts]
