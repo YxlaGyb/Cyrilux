@@ -5,9 +5,7 @@ import click
 from .commands import (
     config_cmd,
     data_cmd,
-    eval_cmd,
     list_cmd,
-    prepare_cmd,
     train_cmd,
 )
 
@@ -25,9 +23,7 @@ app.add_command(train_cmd.train)
 app.add_command(train_cmd.from_config)
 app.add_command(train_cmd.resume)
 app.add_command(data_cmd.app)
-app.add_command(eval_cmd.app)
 app.add_command(list_cmd.app)
-app.add_command(prepare_cmd.app)
 app.add_command(config_cmd.app)
 
 
