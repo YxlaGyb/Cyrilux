@@ -17,8 +17,8 @@ app = click.Group(name="eval", help="模型评估命令")
 def all(checkpoint, device):
     """全面评估: Perplexity + 文本生成."""
 
-    from model.core.evaluation import create_eval_runner_loader, run_full_evaluation
     from model.model_cyrene import CyreneConfig, CyreneModel
+    from model.training.evaluation import create_eval_runner_loader, run_full_evaluation
 
     print(f"全面评估 — 检查点: {checkpoint or '默认'}  设备: {device}")
 
@@ -45,8 +45,8 @@ def all(checkpoint, device):
 def language(checkpoint, local, device):
     """语言能力评估: Perplexity + 文本生成."""
 
-    from model.core.evaluation import create_eval_runner_loader, run_full_evaluation
     from model.model_cyrene import CyreneModel
+    from model.training.evaluation import create_eval_runner_loader, run_full_evaluation
 
     ckpt_path = resolve_path(checkpoint)
     print(f"语言评估 — 检查点: {ckpt_path}  设备: {device}")

@@ -16,7 +16,7 @@ understand what the model can and cannot do, not to tune hyperparameters.
 ## Prerequisites
 
 - `model.model_cyrene.CyreneModel` for loading checkpoints
-- `model.core.dataset.DualChannelDataset` for PPL testing
+- `model.training.dataset.DualChannelDataset` for PPL testing
 - `torch.utils.data.DataLoader` with batch_size=1
 
 ## Step 1: Load and report metadata

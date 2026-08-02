@@ -1,7 +1,7 @@
 """统一评估模块 — StreamRunner Perplexity + 文本生成。
 
 用法:
-    from model.core.evaluation import (
+    from model.training.evaluation import (
         compute_perplexity, generate_text,
         run_full_evaluation, create_eval_runner_loader,
     )
@@ -12,8 +12,8 @@ import math
 import torch
 from torch.utils.data import DataLoader
 
-from model.core.dataset import DualChannelDataset
 from model.model_cyrene import CyreneConfig, CyreneModel
+from model.training.dataset import DualChannelDataset
 
 
 def create_eval_runner_loader(
@@ -31,12 +31,7 @@ def _make_eval_runner(h_front: int = 64) -> CyreneModel:
     """创建并初始化一个评估用 CyreneModel."""
     cfg = CyreneConfig(hidden_size=h_front, warmup_steps=50)
     runner = CyreneModel(cfg)
-    runner.add_hidden_layer(
-        n_neurons=min(h_front * 4, 512),
-        from_layer=0,
-        to_layer=7,
-        connection_density=0.2,
-    )
+    runner.add_hidden_layer()
     runner.warmup(20)
     return runner
 

@@ -14,9 +14,9 @@ Ponytail: 嗅探器只做 T=0 纯前向 — 无 PC 推理, 开销约 = 1 步训�
 from __future__ import annotations
 
 import torch
-from torch import nn
 
 from model.continual.memory_bank import MemoryBank
+from model.model_cyrene import CyreneModel
 
 
 class ForgettingSniffer:
@@ -30,7 +30,7 @@ class ForgettingSniffer:
     def __init__(
         self,
         memory_bank: MemoryBank,
-        model: nn.Module,
+        model: CyreneModel,
         check_interval: int = 200,
         threshold: float = 1.2,
         repair_steps: int = 10,
@@ -123,6 +123,44 @@ class ForgettingSniffer:
 
     # ── 核心 ──────────────────────────────────────────────────────────
 
+    def _evaluate(self, device: str) -> dict[str, dict]:
+        """从 MemoryBank 采样 exemplars 跑纯前向 CE loss."""
+        results: dict[str, dict] = {}
+        exemplars = self.memory_bank.sample(min(self.eval_n, self.memory_bank.total), strategy="dopamine")
+        if not exemplars:
+            return results
+        for ex in exemplars:
+            byte_seq = ex.byte_tensor.unsqueeze(0).to(device)
+            logits = self._run_forward(byte_seq)
+            loss = self._ce_loss(logits, int(ex.label_tensor.item()))
+            results.setdefault(ex.task_id, {"loss": 0.0, "ratio": 0.0, "n": 0})
+            r = results[ex.task_id]
+            r["loss"] += loss
+            r["n"] += 1
+        for r in results.values():
+            r["loss"] /= max(r["n"], 1)
+            r["ratio"] = 0.0
+        return results
+
+    def _run_forward(self, byte_seq: torch.Tensor) -> list[float]:
+        self.model.reset_hidden_state()
+        S = byte_seq.shape[-1]
+        logits = None
+        for pos in range(1, S):
+            ctx = byte_seq[:, :, :pos].contiguous()
+            if ctx.shape[-1] < 13:
+                continue
+            self.model.step(ctx)
+            logits = self.model.lm_head.predict_logits(
+                self.model.pool, self.model._top_layer, use_mu=True
+            )
+        return logits if logits is not None else [0.0] * 256
+
+    @staticmethod
+    def _ce_loss(logits: list[float], target: int) -> float:
+        t = torch.tensor(logits, dtype=torch.float32).unsqueeze(0)
+        return float(torch.nn.functional.cross_entropy(t, torch.tensor([target])).item())
+
     def check(self, global_step: int, device: str) -> list[str] | None:
         """嗅探: 检测是否有任务被遗忘. (当前未实现.)"""
         return None
@@ -137,7 +175,7 @@ class ForgettingSniffer:
         """
         if not self.enable_concept_detection or not concept_ids:
             return None
-        results = self.memory_bank.evaluate(self.model, device, N=self.eval_n)
+        results = self._evaluate(device)
         # 按 concept_id 聚合
         concept_results: dict[str, list[float]] = {}
         for tid, r in results.items():

@@ -35,8 +35,6 @@ include = [
     "model","model.*",
     "dataset","dataset.*",
     "pkg.cli","pkg.cli.*",
-    "model.core","model.core.*",
-    "model.continual","model.continual.*",
 ]
 
 [tool.pytest.ini_options]
@@ -92,7 +90,7 @@ per-file-ignores = { "__init__.py" = ["F401"] }
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["alm", "col", "training", "scripts"]
+known-first-party = ["model", "scripts", "pkg"]
 
 [tool.ruff.format]
 # Like Black, use double quotes for strings.

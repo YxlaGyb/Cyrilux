@@ -17,6 +17,7 @@ py_models
 # Python
 /__pycache__
 /.pytest_cache
+/htmlcov
 *.pyc
 .coverage
 

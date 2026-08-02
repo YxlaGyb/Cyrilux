@@ -10,7 +10,7 @@ StreamRunner 适配版: 所有 Hebbian 更新由 StreamRunner.step() 内部完�
   SLEEP (离线巩固): 批量回放 replay buffer 数据
 
 用法:
-    from model.core.autonomous_mind import AutonomousMind
+    from model.autonomous.autonomous_mind import AutonomousMind
     mind = AutonomousMind(runner)
     mind.run_forever()
 """
@@ -76,7 +76,7 @@ class CuriositySampler:
     def __init__(self, runner: CyreneModel, cfg: dict):
         self.runner = runner
         self.cfg = cfg
-        self.device = runner.frontend.byte_proj.weight.device
+        self.device = runner.pool.state.device
         self.temperature = cfg.get("gen_temperature", 0.8)
         self.top_k = cfg.get("gen_top_k", 40)
         self.max_new = cfg.get("gen_max_new", 64)
@@ -383,7 +383,7 @@ class AutonomousMind:
         self.log_callback = log_callback or (lambda msg: Logger(msg))
         self._stop_flag = threading.Event()
         self.runner = runner
-        self.device = runner.frontend.byte_proj.weight.device
+        self.device = runner.pool.state.device
         self.sampler = CuriositySampler(self.runner, self.cfg)
         self.replay_buffer = ExperienceReplayBuffer(self.cfg["max_replay_buffer"])
         self.controller = MetaController(self.cfg)

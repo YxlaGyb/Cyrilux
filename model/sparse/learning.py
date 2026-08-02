@@ -6,6 +6,8 @@ Hebbian 可塑性 + 稳态 + 阈值调节.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from ..constants import (
@@ -19,6 +21,19 @@ from ..constants import (
     F_Z,
     F_Z_PREV,
 )
+
+if TYPE_CHECKING:
+    from .tensor_pool import TensorNeuronPool
+
+
+def compute_precision_scales(
+    pool: TensorNeuronPool,
+    D: float,
+    ACh: float,
+    eta: float = 1.0,
+) -> None:
+    """逐神经元精度权重: pi = 1 + eta*D*|eps| + eta*ACh*|eps| (批量 tensor)."""
+    pool.learning.compute_precision_scales(D, ACh, eta)
 
 
 class LearningEngine:

@@ -11,7 +11,7 @@ from pkg.cli.utils import load_config, resolve_path
 
 
 def _dense_cfg(hidden_size: int, lr: float):
-    from model.pc.dense import DensePCConfig, DensePCNet
+    from model.dense import DensePCConfig, DensePCNet
 
     ratio = hidden_size / 1024.0
     d_cfg = DensePCConfig(
@@ -97,8 +97,8 @@ def _train_sparse(
     dopamine_gamma=0.3,
 ):
     """sparse"""
-    from model.core.dataset import DualChannelDataset
-    from model.core.train import TrainingConfig, TrainingLoop
+    from model.training import TrainingConfig, TrainingLoop
+    from model.training.dataset import DualChannelDataset
 
     config = TrainingConfig(
         checkpoint_path=resolve_path(checkpoint) if checkpoint else None,
@@ -217,8 +217,8 @@ def train(
 @click.option("--verbose", "-v", is_flag=True, default=False, help="详细日志")
 def from_config(config, batch_size, lr, epochs, out_dir, verbose):
     """从 JSON 配置文件加载参数并训练 (纯 Hebbian, 零反向传播)."""
-    from model.core.dataset import DualChannelDataset
-    from model.core.train import TrainingConfig, TrainingLoop
+    from model.training import TrainingConfig, TrainingLoop
+    from model.training.dataset import DualChannelDataset
 
     cfg = load_config(config)
     model_cfg = cfg.get("model", {})
@@ -264,8 +264,8 @@ def from_config(config, batch_size, lr, epochs, out_dir, verbose):
 @click.option("--verbose", "-v", is_flag=True, default=False, help="详细日志")
 def resume(checkpoint, batch_size, max_seq_len, verbose):
     """从检查点文件恢复训练 (纯 Hebbian, 零反向传播)."""
-    from model.core.dataset import DualChannelDataset
-    from model.core.train import TrainingConfig, TrainingLoop
+    from model.training import TrainingConfig, TrainingLoop
+    from model.training.dataset import DualChannelDataset
 
     ckpt_path = resolve_path(checkpoint)
     if not os.path.exists(ckpt_path):

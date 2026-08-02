@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from model.constants import F_EPS, F_Z
 from model.model_cyrene import CyreneModel
 
 
@@ -38,24 +39,15 @@ def compute_layer_importance(
     Returns:
         layer_importance: [max_layer+1] float tensor (fp16)
     """
-    if not runner.pool.layer_groups:
-        return torch.tensor([1.0], dtype=torch.half)
 
-    max_layer = max(runner.pool.layer_groups.keys())
+    alive = runner.pool.alive
+    layers = runner.pool.layer
+    max_layer = int(layers.max().item())
     importance = []
-
     for layer in range(max_layer + 1):
-        nids = runner.pool.layer_groups.get(layer, set())
-        if not nids:
-            importance.append(0.0)
-            continue
-        eps_vals = [
-            abs(runner.pool.neurons[nid].ε)
-            for nid in nids
-            if nid in runner.pool.neurons
-        ]
-        mean_eps = sum(eps_vals) / max(len(eps_vals), 1)
-        importance.append(mean_eps)
+        mask = alive & (layers == layer)
+        eps = runner.pool.state[mask, F_EPS].abs()
+        importance.append(float(eps.mean().item()) if mask.any() else 0.0)
 
     pi = torch.tensor(importance, dtype=torch.half)
     pi_min, pi_max = pi.min(), pi.max()
@@ -131,7 +123,7 @@ class AbstractionBank:
         self._all_nids: list[int] = []
 
     def update_neuron_ids(self, runner: CyreneModel):
-        self._all_nids = sorted(runner.pool.neurons.keys())
+        self._all_nids = torch.where(runner.pool.alive)[0].tolist()
 
     def add_entry(self, entry: AbstractionEntry):
         if entry.task_id not in self.entries:
@@ -145,9 +137,8 @@ class AbstractionBank:
     ) -> AbstractionEntry:
         self.update_neuron_ids(runner)
         z_snapshot = {
-            nid: runner.pool.neurons[nid].z
+            nid: float(runner.pool.state[nid, F_Z].item())
             for nid in self._all_nids
-            if nid in runner.pool.neurons
         }
         entry = AbstractionEntry(z_snapshot, task_id, step)
         self.add_entry(entry)
@@ -178,8 +169,8 @@ class AbstractionBank:
         for i in idx:
             entry = entries[i]
             for nid, z_val in entry.z_states.items():
-                if nid in runner.pool.neurons:
-                    runner.pool.neurons[nid].z = z_val
+                if runner.pool.alive[nid]:
+                    runner.pool.state[nid, F_Z] = z_val
             replayed.append(entry)
         return replayed
 
@@ -230,9 +221,9 @@ class VariationalReplayer:
         for i in idx:
             entry = entries[i]
             for nid, z_val in entry.z_states.items():
-                if nid in runner.pool.neurons:
+                if runner.pool.alive[nid]:
                     noise = torch.randn(1).item() * self.noise_scale
-                    runner.pool.neurons[nid].z = z_val + noise
+                    runner.pool.state[nid, F_Z] = z_val + noise
             replayed.append(entry)
         return replayed
 

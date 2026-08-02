@@ -15,13 +15,13 @@ from ..constants import F_EPS, F_FIRING_RATE, F_MU, F_THRESHOLD, F_Z
 class ForwardEngine:
     def __init__(self, pool):
         self.pool = pool
-        self._mu_buf = None
-        self._mu_td_buf = None
+        self._mu_buf: torch.Tensor | None = None
+        self._mu_td_buf: torch.Tensor | None = None
         self._noise_cache = None
         self._noise_idx = 0
         self._NOISE_TEMPLATES = 8
 
-    def _ensure_buffers(self):
+    def _ensure_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
         N = self.pool.N
         dev = self.pool.device
         if self._mu_buf is None or self._mu_buf.shape[0] < N:
@@ -32,6 +32,7 @@ class ForwardEngine:
             self._noise_cache = torch.stack(
                 [torch.randn(N, dtype=torch.float16, device=dev) * 0.005 for _ in range(self._NOISE_TEMPLATES)], dim=0
             )
+        return self._mu_buf, self._mu_td_buf
 
     def predict_all(self) -> None:
         alive_syn = self.pool.syn_alive
@@ -43,15 +44,16 @@ class ForwardEngine:
         w = self.pool.weight[syn_mask]
         z_pre = self.pool.state[pre.long(), F_Z]
         self._ensure_buffers()
-        self._mu_buf.zero_()
-        self._mu_buf.scatter_add_(0, post.long(), w * z_pre)
+        mu_buf, _ = self._ensure_buffers()
+        mu_buf.zero_()
+        mu_buf.scatter_add_(0, post.long(), w * z_pre)
         alive = self.pool.alive
         if getattr(self.pool, "_fan_in_dirty", True):
             fan_in = (self.pool.in_ptrs[alive] >= 0).sum(dim=-1).to(torch.float16)
             self.pool._fan_in_cache[alive] = fan_in
             self.pool._fan_in_dirty = False
         scale = torch.rsqrt(self.pool._fan_in_cache[alive] + 1e-6)
-        self.pool.state[alive, F_MU] = self._mu_buf[alive] * scale
+        self.pool.state[alive, F_MU] = mu_buf[alive] * scale
         self.pool.state[alive, F_EPS] = self.pool.state[alive, F_Z] - self.pool.state[alive, F_MU]
         non_sensory = alive & (self.pool.layer > 0)
         if non_sensory.any():
@@ -86,11 +88,12 @@ class ForwardEngine:
         td_w = self.pool.td_weight[td_idx]
         z_upper = self.pool.state[td_pre, F_Z]
         self._ensure_buffers()
-        self._mu_td_buf.zero_()
-        self._mu_td_buf.scatter_add_(0, td_post, td_w * z_upper)
+        _, mu_td_buf = self._ensure_buffers()
+        mu_td_buf.zero_()
+        mu_td_buf.scatter_add_(0, td_post, td_w * z_upper)
         sensory = (self.pool.layer == 0) & alive
         if sensory.any():
-            self.pool.state[sensory, F_MU] += self._mu_td_buf[sensory]
+            self.pool.state[sensory, F_MU] += mu_td_buf[sensory]
             self.pool.state[sensory, F_EPS] = self.pool.state[sensory, F_Z] - self.pool.state[sensory, F_MU]
 
     def predict_neurons(self, nids):

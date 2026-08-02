@@ -1,4 +1,4 @@
-"""model.pc.sparse
+"""model.sparse
 
 稀疏/事件驱动后端 (页式槽位 + alive 掩码 + 邻接表).
 
@@ -33,7 +33,7 @@ from ..constants import (
     PAGE_TD,
     TOP_LAYER,
 )
-from .neuromodulation import compute_precision_scales
+from .learning import compute_precision_scales
 from .tensor_pool import TensorNeuronPool
 
 __all__ = [
