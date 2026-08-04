@@ -19,6 +19,47 @@ from pkg.utils.trainer_utils import setup_seed
 from .config import TrainingConfig
 
 
+def warmup(runner: CyreneModel, n_steps: int = 20):
+    """用全零输入预热模型, 建立感官神经元与延迟连接."""
+    with torch.no_grad():
+        dummy = torch.zeros(1, runner.config.hidden_size, dtype=torch.long, device=runner.device)
+        for _ in range(n_steps):
+            runner.step(dummy)
+
+
+def _encode_and_predict_l4_only(runner: CyreneModel, byte_seq: torch.Tensor):
+    """感官创建 + 只对 L4 预测, 跳过全量 predict_pass (训练用, 30x 加速)."""
+    from model.constants import F_EPS, F_MU, F_Z
+
+    runner._step += 1
+    is_warmup = runner._step <= runner.config.warmup_steps
+    byte_events = runner.encode(byte_seq)
+    runner.process_sensory_events(byte_events)
+    if not is_warmup and runner._pending_connects:
+        for from_l, to_l, density, conn_type in runner._pending_connects:
+            if conn_type == 1:
+                runner.pool.projections.topdown_connect_layer(from_l, to_l, density=density)
+            else:
+                runner.pool.synapse.connect_layer(
+                    from_l, to_l, density=density,
+                    bias_strength=runner.config.bias_strength, conn_type=conn_type,
+                    init_scale=7.5 if from_l == 0 else 3.0,
+                )
+        runner._pending_connects = []
+        if runner._top_layer > 0:
+            runner.pool.projections.lm_ensure_top_connected(runner._top_layer)
+    runner.process_network_events(max_events=10)
+    l4_mask = (runner.pool.layer == runner._top_layer) & runner.pool.alive
+    if l4_mask.any():
+        l4_nids = torch.where(l4_mask)[0]
+        mu = runner.pool.forward.predict_neurons(l4_nids)
+        runner.pool.state[l4_nids, F_MU] = mu
+        runner.pool.state[l4_nids, F_EPS] = runner.pool.state[l4_nids, F_Z] - mu
+    sensory_mask = (runner.pool.layer == 0) & runner.pool.alive
+    if sensory_mask.any():
+        runner.pool.state[sensory_mask, 0] = 0.0
+
+
 class TrainingLoop:
     def __init__(self, config: TrainingConfig):
         self.cfg = config
@@ -61,10 +102,7 @@ class TrainingLoop:
 
     def warmup(self):
         assert self.runner is not None
-        with torch.no_grad():
-            dummy = torch.zeros(1, 64, dtype=torch.long, device=self.device)
-            for _ in range(getattr(self.cfg, "warmup_steps", 20)):
-                self.runner.step(dummy)
+        warmup(self.runner, getattr(self.cfg, "warmup_steps", 20))
         self._log("Warmup done")
 
     def _build_mu_table(self, m, top_mask):
@@ -116,7 +154,7 @@ class TrainingLoop:
         m = self.runner
 
         # 前馈序列：感官创建 + 只对 L4 做预测（跳过全量 predict_pass）
-        m.encode_and_predict_l4_only(byte_seq)
+        _encode_and_predict_l4_only(m, byte_seq)
 
         targets_all = labels[0, 1:].long()
         valid = (targets_all >= 0) & (targets_all <= 255)

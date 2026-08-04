@@ -579,27 +579,6 @@ class CyreneModel:
     # 高级 API
     # ═══════════════════════════════════════════════════════════════
 
-    def run(self, byte_seq: torch.Tensor, n_steps: int = 1) -> list[dict]:
-        stats_list = []
-        for _ in range(n_steps):
-            stats_list.append(self.step(byte_seq))
-        return stats_list
-
-    def ingest_stream(
-        self, byte_stream: bytes, positions_per_step: int = 128, batch_size: int = 1
-    ) -> int:
-        processed = 0
-        for t in range(0, max(1, len(byte_stream) - 13), positions_per_step):
-            chunk = byte_stream[t : t + positions_per_step + 12]
-            if len(chunk) < 13:
-                break
-            byte_ids = torch.tensor(
-                list(chunk), dtype=torch.long, device=self.device
-            ).unsqueeze(0)
-            self.step(byte_ids)
-            processed += 1
-        return processed
-
     def connect_topdown(self, upper_layer: int, lower_layer: int, max_per_upper: int = 8):
         """建立 topdown 连接."""
         return self.pool.projections.topdown_connect_active(upper_layer, lower_layer, max_per_upper)
@@ -620,11 +599,6 @@ class CyreneModel:
             "topdown_connections": int(self.pool.td_alive.sum().item()),
         }
 
-    def warmup(self, n_steps: int = 20):
-        dummy = torch.zeros(1, self.config.hidden_size, dtype=torch.long, device=self.device)
-        for _ in range(n_steps):
-            self.step(dummy)
-
     def save(self, path: str):
         state = {
             "config": {f.name: getattr(self.config, f.name) for f in fields(CyreneConfig)},
@@ -635,60 +609,6 @@ class CyreneModel:
         }
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         torch.save(state, path)
-
-    def encode_and_predict(self, byte_seq: torch.Tensor):
-        """只做感官编码和前馈预测，跳过 Hebbian 学习（用于外部 train_step）."""
-        self._step += 1
-        is_warmup = self._step <= self.config.warmup_steps
-        byte_events = self.encode(byte_seq)
-        self.process_sensory_events(byte_events)
-        if not is_warmup and self._pending_connects:
-            for from_l, to_l, density, conn_type in self._pending_connects:
-                if conn_type == 1:
-                    self.pool.projections.topdown_connect_layer(from_l, to_l, density=density)
-                else:
-                    self.pool.synapse.connect_layer(from_l, to_l, density=density,
-                        bias_strength=self.config.bias_strength, conn_type=conn_type,
-                        init_scale=7.5 if from_l == 0 else 3.0)
-            self._pending_connects = []
-            if self._top_layer > 0:
-                self.pool.projections.lm_ensure_top_connected(self._top_layer)
-        self.process_network_events(max_events=10)
-        self.predict_pass()
-        sensory_mask = (self.pool.layer == 0) & self.pool.alive
-        if sensory_mask.any():
-            self.pool.state[sensory_mask, 0] = 0.0
-
-    def encode_and_predict_l4_only(self, byte_seq: torch.Tensor):
-        """只做感官创建 + L4 预测，跳过全量 predict_pass（30x 加速）."""
-        from model.constants import F_EPS, F_MU, F_Z
-
-        self._step += 1
-        is_warmup = self._step <= self.config.warmup_steps
-        byte_events = self.encode(byte_seq)
-        self.process_sensory_events(byte_events)
-        if not is_warmup and self._pending_connects:
-            for from_l, to_l, density, conn_type in self._pending_connects:
-                if conn_type == 1:
-                    self.pool.projections.topdown_connect_layer(from_l, to_l, density=density)
-                else:
-                    self.pool.synapse.connect_layer(from_l, to_l, density=density,
-                        bias_strength=self.config.bias_strength, conn_type=conn_type,
-                        init_scale=7.5 if from_l == 0 else 3.0)
-            self._pending_connects = []
-            if self._top_layer > 0:
-                self.pool.projections.lm_ensure_top_connected(self._top_layer)
-        self.process_network_events(max_events=10)
-        # 只对 L4 做预测
-        l4_mask = (self.pool.layer == self._top_layer) & self.pool.alive
-        if l4_mask.any():
-            l4_nids = torch.where(l4_mask)[0]
-            mu = self.pool.forward.predict_neurons(l4_nids)
-            self.pool.state[l4_nids, F_MU] = mu
-            self.pool.state[l4_nids, F_EPS] = self.pool.state[l4_nids, F_Z] - mu
-        sensory_mask = (self.pool.layer == 0) & self.pool.alive
-        if sensory_mask.any():
-            self.pool.state[sensory_mask, 0] = 0.0
 
     @classmethod
     def load(cls, path: str) -> CyreneModel:
@@ -708,14 +628,6 @@ class CyreneModel:
         # warmup 已在 step() 中自动处理 (is_warmup = _step <= warmup_steps)
         return model
 
-    @property
-    def step_count(self) -> int:
-        return self._step
-
-    @property
-    def h_front(self) -> int:
-        return self.config.hidden_size
-
 
 # ═══════════════════════════════════════════════════════════════════
 # 工厂函数
@@ -729,10 +641,3 @@ def create_cyrene(config: CyreneConfig | None = None) -> CyreneModel:
     if config.num_hidden_layers > 0:
         model.add_hidden_layer()
     return model
-
-
-def load_cyrene_checkpoint(path: str, config: CyreneConfig | None = None) -> CyreneModel:
-    """从检查点加载 Cyrene 模型."""
-    if os.path.exists(path):
-        return CyreneModel.load(path)
-    return create_cyrene(config)

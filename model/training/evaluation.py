@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from model.model_cyrene import CyreneConfig, CyreneModel
 from model.training.dataset import DualChannelDataset
+from model.training.loop import warmup
 
 
 def create_eval_runner_loader(
@@ -32,8 +33,17 @@ def _make_eval_runner(h_front: int = 64) -> CyreneModel:
     cfg = CyreneConfig(hidden_size=h_front, warmup_steps=50)
     runner = CyreneModel(cfg)
     runner.add_hidden_layer()
-    runner.warmup(20)
+    warmup(runner, 20)
     return runner
+
+
+def create_cyrene(config: CyreneConfig | None = None) -> CyreneModel:
+    """创建并初始化一个 Cyrene 模型 (训练辅助工厂)."""
+    config = config or CyreneConfig()
+    model = CyreneModel(config)
+    if config.num_hidden_layers > 0:
+        model.add_hidden_layer()
+    return model
 
 
 # ═══════════════════════════════════════════════════════════════
