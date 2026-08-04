@@ -32,6 +32,9 @@ class DensePCConfig:
     d_l5: int = 256
     d_l6: int = 128
     max_seq_len: int = 256
+    # 时序双通道输入: W_04 输入 = [z0[t], z0[t-1]] 拼接 (词序信息进入表示层).
+    # 单帧重建约束是词序盲区的根因 (dog/cat 互换 z5 恒同); 双通道纯线性路由, 合规
+    input_history: bool = True
 
     # Hebbian 物理有效学习率 (1:1 映射到内部更新公式，无隐藏缩放)
     lr_hebbian: float = 0.003
@@ -56,6 +59,12 @@ class DensePCConfig:
     rpe_gate_max: float = 8.0  # 保留 (未用于误差回路)
     # 微柱阵列: L5 拆成 n 个独立列块, 块间不共享 Hebbian/Oja
     l5_blocks: int = 4
+    # 稀疏绑定层: L5 之上哈希式稀疏绑定 (k-WTA), 离散符元的种子
+    bind_dim: int = 4096
+    bind_k: int = 10
+    # 实验参数: 绑定模式 (none/hard/soft) + 正交化开关
+    bind_mode: str = "hard"
+    bind_orth: bool = False
 
     def dims(self) -> dict[str, int]:
         return {
@@ -99,7 +108,9 @@ class DensePCNet(nn.Module):
         d = self.cfg.dims()
 
         # ── 前馈权重 (自下而上感知) ──
-        self.W_04 = nn.Parameter(torch.empty(d["l4"], self.cfg.d_input, dtype=torch.float16))
+        # W_04 输入维: 单帧 256 或双通道 512 (input_history=True 时拼接 z0[t-1])
+        self._in_dim = self.cfg.d_input * (2 if self.cfg.input_history else 1)
+        self.W_04 = nn.Parameter(torch.empty(d["l4"], self._in_dim, dtype=torch.float16))
         self.W_42 = nn.Parameter(torch.empty(d["l2"], d["l4"], dtype=torch.float16))
         self.W_23 = nn.Parameter(torch.empty(d["l3"], d["l2"], dtype=torch.float16))
         # ── 微柱阵列: L5 拆 4 独立列块, 块间不共享 Hebbian/Oja ──
@@ -111,9 +122,24 @@ class DensePCNet(nn.Module):
         ])
         self.W_56 = nn.Parameter(torch.empty(d["l6"], d["l5"], dtype=torch.float16))
 
-        # ── 世界模型 (增量预测): W_diff 在 a5 空间预测 dz5, b_diff 补零均值生路 ──
-        self.W_diff = nn.Parameter(torch.empty(d["l5"], d["l5"], dtype=torch.float16))
-        self.b_diff = nn.Parameter(torch.zeros(d["l5"], dtype=torch.float16))
+        # ── 世界模型 (下一状态预测): W_diff 在 L4 空间预测 Δz4 = z4[t] - z4[t-1] ──
+        self.W_diff = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
+        self.b_diff = nn.Parameter(torch.zeros(d["l4"], dtype=torch.float16))
+        # ── 状态预测矩阵 (预测编码融合): 独立于 W_diff, 专门给表示层提供预测误差 ──
+        # eps_state = (z4[t] @ W_state_pred) - (z4[t+1] - z4[t]); 表示层最终误差
+        # final_eps = eps_recon + 0.3 * eps_state — 迫使隐状态携带"未来往哪走"
+        self.W_state_pred = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
+
+        # ── LM 头 (自监督赫布): z4 → 256 字节 logits, 独立于重建 W_04 ──
+        # W_04 双向重建被证实解码死锁 (真实 delta 注入仍复读空格);
+        # W_lm 唯一任务: 把状态映射到下一字节, dW_lm = z4^T @ (target - logits) 纯外积
+        self.W_lm = nn.Parameter(torch.empty(d["l4"], self.cfg.d_input, dtype=torch.float16))
+        self.bias_lm = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=torch.float16))
+
+        # ── 稀疏绑定层 (海马体式): z5 → W_bind → 4096 维, top-k WTA 硬稀疏 ──
+        # 连续 L5 激活经高维竞争坍缩为 k 个"离散符元" (纯赫布, 只更新激活行);
+        # 底层 L5 连续系统兜住信息流, 绑定层出问题不影响底层安全
+        self.W_bind = nn.Parameter(torch.empty(d["l5"], self.cfg.bind_dim, dtype=torch.float16))
 
         # ── 多尺度软加权时间窗 (2/4/8 并行因果卷积) ──
         # 软权重按各尺度 EMA 误差自适应; 4 步时间窗环形缓冲保留误差记忆
@@ -122,10 +148,10 @@ class DensePCNet(nn.Module):
         self.register_buffer("_e_ema_4", torch.tensor(0.05, dtype=torch.float16))
         self.register_buffer("_e_ema_8", torch.tensor(0.05, dtype=torch.float16))
         for i in range(4):
-            self.register_buffer(f"_dw_buf_{i}", torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
+            self.register_buffer(f"_dw_buf_{i}", torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
         self._buf_i = 0
         # W_diff 独立 BCM 滑阈 (防指数爆炸)
-        self.register_buffer("_theta_w", torch.full((d["l5"],), 0.01, dtype=torch.float16))
+        self.register_buffer("_theta_w", torch.full((d["l4"],), 0.01, dtype=torch.float16))
 
         # ── 时序权重 (每层, Hebbian 学习, 非超参数) ──
         self.W_t4 = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
@@ -189,11 +215,10 @@ class DensePCNet(nn.Module):
 
     def generate(self, prompt: str, n_tokens: int = 40, temperature: float = 0.7,
                  dev: torch.device | None = None) -> bytes:
-        """行动: 自顶向下重建生成字节序列 (L4 → W_04 解码回 L0 字节空间).
+        """行动: L4 状态 + 预测差分 → W_lm 解码生成字节.
 
-        生成端预测编码反馈注入 (不改训练): L4 每步输出前叠加 L5 差分预测
-        z4_gen = z4 + α*(z5_raw @ W_diff + b_diff)  — 自上而下的预测注入
-        打破 L4 高频数字死循环 (W_diff 学的是"下一时刻 L4 的变化量")
+        生成端: z4_next = z4 + pred_delta (pred_delta = z4 @ W_diff),
+        mu0 = z4_next @ W_lm → 256 字节 logits (W_lm 自监督赫布头, 非重建 W_04).
         """
         if dev is None:
             dev = next(self.parameters()).device
@@ -202,22 +227,12 @@ class DensePCNet(nn.Module):
             bv = torch.tensor([gen[-64:]], dtype=torch.long, device=dev)
             _ = self._predict(bv, store_state=True, is_inference=True)
             a4 = self.active_size["l4"]
-            a5 = self.active_size["l5"]
-            a3 = self.active_size["l3"]
-            a2 = self.active_size["l2"]
-            W_diff_a = self.W_diff[:a5, :a5]
-            # L5 增量预测 (变化量 dz5, a5 空间自洽)
-            dz5_g = self._z5_raw[:, 1:] - self._z5_raw[:, :-1]
-            dz5_g = dz5_g / (dz5_g.norm(dim=-1, keepdim=True) + 1e-3)
-            mu_diff = dz5_g @ W_diff_a.T + self.b_diff[:a5].unsqueeze(0)  # [1,S-1,a5]
-            # 自上而下生成路径: a5→a3→a2→a4 (微柱拼接的逆: 各微柱转置拼回 a5 列)
-            z5_td = torch.cat([self.W_35[b][:self.b5].T for b in range(self.n_blocks)], dim=1)
-            z5_td = z5_td.T  # [a5, a3]
-            inj_a4 = mu_diff @ z5_td  # [1,S-1,a5]@[a5,a3] → [1,S-1,a3]
-            inj_a4 = inj_a4 @ self.W_23[:a3].T  # a3→a2
-            inj_a4 = inj_a4 @ self.W_42[:a2]  # a2→a4 (W_42 是 [a2,a4])
-            z4_gen = self._z4[:, 1:] + 1.0 * inj_a4  # α=1.0 增量预测注入
-            mu0_top = z4_gen @ self.W_04[:a4]  # [1,S,256]
+            W_diff_a = self.W_diff[:a4, :a4]
+            # 下一状态预测: pred_delta = z4 @ W_diff, z4_next = z4 + pred_delta
+            z4_n = self._z4 / (self._z4.norm(dim=-1, keepdim=True) + 1e-3)
+            pred_delta = z4_n @ W_diff_a.T + self.b_diff[:a4].unsqueeze(0).unsqueeze(0)
+            z4_next = self._z4 + pred_delta
+            mu0_top = z4_next @ self.W_lm[:a4] + self.bias_lm  # W_lm 解码
             last = mu0_top[0, -1].float() / temperature
             topv, _ = torch.topk(last, min(15, 256))
             last[last < topv[-1]] = -float("inf")
@@ -264,10 +279,13 @@ class DensePCNet(nn.Module):
         W_42_a = self.W_42[:a2]
         W_23_a = self.W_23[:a3]
         W_56_a = self.W_56[:a6]
-        W_diff_a = self.W_diff[:a5, :a5]
+        W_diff_a = self.W_diff[:a4, :a4]
 
-        # L0 纯 one-hot
+        # L0 纯 one-hot; 时序双通道: [z0[t], z0[t-1]] 拼接 (词序信息进入表示层)
         z0 = F.one_hot(byte_ids, num_classes=256).to(torch.float16)  # [N,S,256]
+        if self.cfg.input_history:
+            z0_prev = torch.cat([torch.zeros(N, 1, 256, dtype=z0.dtype, device=dev), z0[:, :-1]], dim=1)
+            z0 = torch.cat([z0, z0_prev], dim=-1)  # [N,S,512]
 
         mu4 = z0 @ W_04_a.T + self.bias_l4[:a4]
         z4 = self._recurrent(mu4, dev, self.W_t4[:a4, :a4])
@@ -313,15 +331,16 @@ class DensePCNet(nn.Module):
         mu6 = z5 @ W_56_a.T + self.bias_l6[:a6]
         z6 = self._recurrent(mu6, dev, self.W_t6[:a6, :a6])
 
-        # 增量预测 (动力学映射): W_diff 以 z5_prev (上下文) 为输入, 预测 Δz5 = z5[t] - z5[t-1]
-        # 不再是差分→差分的恒等算子, 而是"当前隐状态在相空间中的移动方向"
-        dz5_pred = z5_raw[:, 1:] - z5_raw[:, :-1]
-        dz5_pred = dz5_pred / (dz5_pred.norm(dim=-1, keepdim=True) + 1e-3)  # RMS 归一化
-        z5_prev = z5_raw[:, :-1] / (z5_raw[:, :-1].norm(dim=-1, keepdim=True) + 1e-3)
-        z5_prev_pad = torch.cat([torch.zeros(N, 1, a5, dtype=z5_raw.dtype, device=dev), z5_prev], dim=1)
-        bd = self.b_diff[:a5].unsqueeze(0).unsqueeze(0)
-        mu_diff = z5_prev_pad @ W_diff_a.T + bd
-        diff_err = (dz5_pred - mu_diff[:, :-1]).square().mean()  # 监控用
+        # 下一状态预测 (显式预测目标): W_diff 在 L4 空间预测 Δz4 = z4[t] - z4[t-1]
+        # target_delta = z4_next - z4; pred_delta = z4 @ W_diff;
+        # eps_diff = pred_delta - target_delta (训练误差, 驱动 W_diff 学习动力学)
+        dz4_pred = z4[:, 1:] - z4[:, :-1]
+        dz4_pred = dz4_pred / (dz4_pred.norm(dim=-1, keepdim=True) + 1e-3)  # RMS 归一化
+        z4_prev = z4[:, :-1] / (z4[:, :-1].norm(dim=-1, keepdim=True) + 1e-3)
+        z4_prev_pad = torch.cat([torch.zeros(N, 1, a4, dtype=z4.dtype, device=dev), z4_prev], dim=1)
+        bd = self.b_diff[:a4].unsqueeze(0).unsqueeze(0)
+        mu_diff = z4_prev_pad @ W_diff_a.T + bd
+        diff_err = (dz4_pred - mu_diff[:, :-1]).square().mean()  # eps_diff 训练误差
 
         if store_state:
             self._z0 = z0
@@ -332,11 +351,38 @@ class DensePCNet(nn.Module):
             self._z5_raw = z5_raw
             self._z6 = z6
 
+        # 稀疏绑定 (k-WTA): 连续 z5 经 W_bind 映射到 bind_dim, 只留 top-k 激活
+        # "离散符元" = 高维竞争坍缩出的 k 个神经元 ID, 非外部字典
+        # bind_mode="none" (直连实验) 时跳过整个绑定层
+        if not is_inference and self.cfg.bind_mode != "none":
+            self._bind(z5)
+
         return {
             "mu_diff": mu_diff,
             "diff_err": diff_err,
             "free_energy": diff_err,
         }
+
+    def _bind(self, z5: torch.Tensor) -> None:
+        """稀疏绑定层前向: z5 → W_bind → bind_dim, 硬/软 top-k WTA.
+
+        硬 VQ: top-k 置 1 其余 0 (离散符元 ID); 软 VQ: top-k 保留幅度.
+        bind_orth=True 时 W_bind 列做 Gram-Schmidt 正交化 (容量实验).
+        """
+        a5 = self.active_size["l5"]
+        k = self.cfg.bind_k
+        z5_n = z5 / (z5.norm(dim=-1, keepdim=True) + 1e-4)
+        pre = z5_n @ self.W_bind[:a5]  # [N,S,bind_dim]
+        vals, idx = pre.topk(k, dim=-1)
+        if self.cfg.bind_mode == "hard":
+            sparse = torch.zeros_like(pre)
+            sparse.scatter_(-1, idx, torch.ones_like(vals))
+        else:  # soft VQ: 保留幅度
+            sparse = torch.zeros_like(pre)
+            sparse.scatter_(-1, idx, vals)
+        self._bind_pre = pre
+        self._bind_idx = idx  # [N,S,k] 激活神经元 ID (语义分离度指标)
+        self._bind_sparse = sparse
 
     def _precise(self, eps: torch.Tensor) -> torch.Tensor:
         """精度加权: π_l = 1/(σ_εl + c), 归一化每层误差尺度."""
@@ -366,7 +412,7 @@ class DensePCNet(nn.Module):
         a_sizes = [a4, a2, a3, a5, a6]
 
         W_23_a = self.W_23[:a3]
-        W_diff_a = self.W_diff[:a5, :a5]
+        W_diff_a = self.W_diff[:a4, :a4]
 
         z0 = self._z0
         z4, z2, z3, z5, z6 = self._z4, self._z2, self._z3, self._z5, self._z6
@@ -384,24 +430,23 @@ class DensePCNet(nn.Module):
             alive = (rms > 1e-8).to(x.dtype)
             return x * alive / (rms + 1e-4).sqrt()
 
-        # 增量预测: pred = W_diff @ dz5, e = dz5 - pred, dW = dz5.T @ e
-        dz5 = self._z5_raw[:, 1:] - self._z5_raw[:, :-1]
-        dz5 = dz5 / (dz5.norm(dim=-1, keepdim=True) + 1e-3)  # RMS 归一化
-        # 多尺度软加权时间窗 (2/4/8 并行因果卷积): z5[t-k] 预测 dz5[t],
-        # 各尺度误差 EMA 平滑后软加权; K=8 前 7 步零填充 Mask 掉防伪影
-        z5r = self._z5_raw  # [N,S,a5]
-        S_full = z5r.shape[1]
+        # 下一状态预测 (显式预测目标): pred_delta = z4 @ W_diff, target_delta = z4[t] - z4[t-1]
+        # eps_diff = pred_delta - target_delta (训练误差); 多尺度软窗同构保留
+        dz4 = self._z4[:, 1:] - self._z4[:, :-1]
+        dz4 = dz4 / (dz4.norm(dim=-1, keepdim=True) + 1e-3)  # RMS 归一化
+        z4r = self._z4  # [N,S,a4]
+        S_full = z4r.shape[1]
         masks = {}
         preds_k = {}
         errs_k = {}
         for k, kname in ((2, "2"), (4, "4"), (8, "8")):
-            z_shift = torch.cat([torch.zeros(N, k, a5, dtype=z5r.dtype, device=dev), z5r[:, :-k]], dim=1)
+            z_shift = torch.cat([torch.zeros(N, k, a4, dtype=z4r.dtype, device=dev), z4r[:, :-k]], dim=1)
             z_shift_n = z_shift / (z_shift.norm(dim=-1, keepdim=True) + 1e-3)
-            pred_k = z_shift_n @ W_diff_a.T + self.b_diff[:a5]
-            err_k = (dz5 - pred_k[:, :-1]).square().mean()
+            pred_k = z_shift_n @ W_diff_a.T + self.b_diff[:a4]
+            err_k = (dz4 - pred_k[:, :-1]).square().mean()
             if k == 8:
                 valid = torch.arange(S_full - 1, device=dev) >= 7
-                err_k = ((dz5[:, valid] - pred_k[:, :-1][:, valid]).square()).mean()
+                err_k = ((dz4[:, valid] - pred_k[:, :-1][:, valid]).square()).mean()
             masks[kname] = valid if k == 8 else None
             preds_k[kname] = pred_k
             errs_k[kname] = err_k
@@ -420,21 +465,21 @@ class DensePCNet(nn.Module):
         pred_d = (w2 * preds_k["2"][:, :-1] + w4 * preds_k["4"][:, :-1] + w8 * preds_k["8"][:, :-1])
         # 误差用掩码后的有效区 (K=8 前 7 步剔除)
         if masks["8"] is not None:
-            e_t = (dz5[:, masks["8"]] - pred_d[:, masks["8"]]).detach()
-            e_t_all = dz5 - pred_d
+            e_t = (dz4[:, masks["8"]] - pred_d[:, masks["8"]]).detach()
+            e_t_all = dz4 - pred_d
         else:
-            e_t = dz5 - pred_d
+            e_t = dz4 - pred_d
             e_t_all = e_t
         # W_diff BCM 滑阈: theta_w = EMA(pred²), phi_w 衰减高活跃预测方向
-        th_w = self._theta_w[:a5]
+        th_w = self._theta_w[:a4]
         th_w.mul_(0.975).add_(0.025 * (pred_d * pred_d).mean(dim=(0, 1)))
         phi_w = pred_d * (pred_d - th_w)
-        # 差动赫布外积 (动力学映射): dW = z5_prev^T @ (e - 0.1*phi_w),
-        # 输入是上下文 z5_prev 而非差分 dz5 — 学习"当前隐状态 → 移动方向"
-        z5_prev_n = z5r[:, :-1] / (z5r[:, :-1].norm(dim=-1, keepdim=True) + 1e-3)
+        # 差动赫布外积 (动力学映射): dW = z4_prev^T @ (e - 0.1*phi_w),
+        # 输入是上下文 z4_prev 而非差分 dz4 — 学习"当前 L4 状态 → 移动方向"
+        z4_prev_n = z4r[:, :-1] / (z4r[:, :-1].norm(dim=-1, keepdim=True) + 1e-3)
         e_mod = e_t_all - 0.1 * phi_w
         dW_diff_t = torch.bmm(
-            e_mod.transpose(-2, -1), z5_prev_n
+            e_mod.transpose(-2, -1), z4_prev_n
         ).mean(dim=0) * (1.0 / (S - 1))
         # 4 步时间窗环形缓冲: 更新用最近 4 步平均外积 (保留误差记忆)
         buf = getattr(self, f"_dw_buf_{self._buf_i}")
@@ -458,34 +503,60 @@ class DensePCNet(nn.Module):
         eta_t = eta * self.cfg.temporal_lr_ratio * ach_gain
 
         # Hebbian 外积 (逐层误差 ⊗ pre 活动)
-        eps2_p, eps3_p, eps6_p = (
-            self._precise(eps2), self._precise(eps3),
+        eps2_p, eps6_p = (
+            self._precise(eps2),
             self._precise(eps6),
         )
-        # context_gain 门控 (反 PCA 坍缩): 用 L5 微柱激活的批次方差调制底层误差.
-        # 上层分化 (高方差) → 底层收到丰富误差更新; 上层坍缩 (低方差) → 底层更新被切断.
-        # 打破 Hebbian "永远向全局最优坍缩" 死循环 (cos(mu4) 500步内 0.006→0.52 实测);
-        # 一步张量乘法, 无 if/else, 无 clamp, 符合全部红线.
-        # 标量增益: z5 每特征维跨样本 (N*S) 方差的均值 — 坍缩时每维 std→0, gain→0;
-        # 分化时每维 std 高, gain 大. 全局广播到任意层误差维度
-        context_gain = z5.std(dim=(0, 1)).mean().detach() + 1e-4
-        eps4_g = eps4 * context_gain
+        # ── 预测编码闭环: W_lm 预测误差投影回 z4, 作为表示层 top-down 误差 ──
+        # eps_lm_proj = eps_lm @ W_lm.T: 表示层被迫为"预测下一字节"重组编码,
+        # 而非只重构当前字节. 纯赫布, 零 BP (大脑皮层最核心的闭环)
+        logits_lm = z4 @ self.W_lm[:a4] + self.bias_lm  # [N,S,256]
+        target_lm = F.one_hot(byte_ids[:, 1:], num_classes=256).to(torch.float16)
+        eps_lm = (target_lm - logits_lm[:, :-1]).detach()  # [N,S-1,256]
+        eps_lm_proj = eps_lm @ self.W_lm[:a4].T  # [N,S-1,a4]
+        eps_lm_pad = torch.cat([eps_lm_proj, torch.zeros(N, 1, a4, dtype=eps_lm_proj.dtype, device=dev)], dim=1)
+
+        # ── W_04 主辅误差交换: 预测误差为主, 重建为辅 ──
+        # 重建任务不需要词序 (稳定信号拉权重回单一解); 预测误差才需要词序.
+        # final_error = err_pred_norm + 0.2 * err_recon_norm (RMS 对齐量级)
         inv_s = 1.0 / S
+        err_pred_norm = eps_lm_pad / (eps_lm_pad.norm(dim=-1, keepdim=True) + 1e-4)
+        err_recon_norm = eps4 / (eps4.norm(dim=-1, keepdim=True) + 1e-4)
+        final_error = err_pred_norm + 0.2 * err_recon_norm
+
+        # 样本显著性加权 (打破批平均稀释): bmm 逐样本外积, 高误差样本主导
+        z0_n = _rms(z0)
+        dW_04n = torch.bmm(final_error.transpose(-2, -1), z0_n)  # [N,a4,in]
+        g_04 = final_error.norm(dim=(1, 2)) / (final_error.norm(dim=(1, 2)).max() + 1e-8)
+        g_04 = (0.1 + 0.9 * g_04).unsqueeze(-1).unsqueeze(-1)
+        dW_04 = (dW_04n * g_04).sum(dim=0) * inv_s
+        self.W_04[:a4].data += dW_04 * eta
+        soft_norm_preserve(self.W_04[:a4].data)
 
         dW_list = [
-            (eps4_g.transpose(-2, -1) @ _rms(z0)).mean(dim=0) * inv_s,
             (eps2_p.transpose(-2, -1) @ _rms(z4)).mean(dim=0) * inv_s,
             (eps6_p.transpose(-2, -1) @ _rms(z5)).mean(dim=0) * inv_s,
         ]
-        W_list = [self.W_04[:a4], self.W_42[:a2], self.W_56[:a6]]
+        W_list = [self.W_42[:a2], self.W_56[:a6]]
         for dW, W in zip(dW_list, W_list):
             col_mask = torch.rand(W.shape[0], 1, device=dev) < self.cfg.column_dropout
             W.data += (dW * (~col_mask).to(torch.float16)) * eta
 
+        # 预测编码融合: eps_state = (z4 @ W_state_pred) - Δz4, 注入 W_23 表示层更新.
+        # 底层不再只接收重构误差, 同时携带"未来往哪走"的预测误差 (纯线性叠加)
+        W_sp_a = self.W_state_pred[:a4, :a4]
+        dz4_full = self._z4[:, 1:] - self._z4[:, :-1]
+        eps_state = (self._z4[:, :-1] @ W_sp_a.T) - dz4_full  # [N,S-1,a4]
+        eps_state = _rms(eps_state)
+        # a4 → a3 投影 (经 W_42 逆映射, 尺度匹配)
+        eps_state_a3 = eps_state @ self.W_42[:a2].T[:, :a3]
+        eps3_pc = eps3 + 0.3 * torch.cat([eps_state_a3, torch.zeros(N, 1, a3, dtype=eps_state_a3.dtype, device=dev)], dim=1)
+        eps3_pc = self._precise(eps3_pc)
+
         # L3 种子: W_23 随机增益 + 误差门控 (上游扰动级联到 L5 分散)
         # _gain_l3 是固定 [384, 384] 种子, L3 修剪后行数收缩, 需按当前活性行切片
         gain_l3 = self._gain_l3[:a3, :a3] if a3 < 384 else self._gain_l3[:a3, :]
-        dW23 = (eps3_p.transpose(-2, -1) @ _rms(z2)).mean(dim=0) * inv_s
+        dW23 = (eps3_pc.transpose(-2, -1) @ _rms(z2)).mean(dim=0) * inv_s
         err3_norm = eps3.pow(2).mean(dim=(0, 1)).sqrt() + 1e-8  # [a3] 每神经元
         gate3 = 0.1 + 0.9 * (err3_norm / err3_norm.max())
         dW23 = dW23 * gain_l3 * gate3.unsqueeze(1)
@@ -499,6 +570,11 @@ class DensePCNet(nn.Module):
         # 线性加权 (禁止 exp/非线性), 保留样本差异, 抹平效应消除
         n_sub = 4
         sub = max(1, N // n_sub)
+        # 预测编码向下平移: W_lm 预测误差 → a3 空间
+        # eps_lm_proj 已算 [N,S-1,a4], 补零到 S 对齐完整序列, 经 W_42 逆映射到 a3
+        eps_lm_proj_pad = torch.cat([eps_lm_proj, torch.zeros(N, 1, a4, dtype=eps_lm_proj.dtype, device=dev)], dim=1)
+        eps_lm_a3 = eps_lm_proj_pad @ self.W_42[:a2].T[:, :a3]
+        eps_lm_a3 = _rms(eps_lm_a3)
         # 空间软竞争 (微柱学习率差异化): 各块独立算时序预测误差, 误差大的柱更新慢.
         # 打破 W_35 块间收敛同步 (实测 cos 相似度 0.72→0.83 均质化) — 同误差信号同更新
         # 规则必然同步; 竞争让 3 高频柱 + 1 低频柱分化
@@ -508,6 +584,11 @@ class DensePCNet(nn.Module):
             eps_b = z5_b[:, 1:] - z5_b[:, :-1]  # 块内时序差分误差
             z3_b = z3[:, b::self.n_blocks, :][:, :-1]
             z3_bp = z3_b * (torch.rand_like(z3_b) > 0.3).to(torch.float16)
+            # 预测编码融合: eps_b = 时序差分 + 0.5 × LM 预测误差投影回微柱空间.
+            # 高层 (LM 头) 预测错了 → 告诉 W_35 "你给的微柱特征缺词序信息, 需改"
+            eps_lm_b = eps_lm_a3[:, b::self.n_blocks, :] @ self.W_35[b].T  # [N, S//n, b5]
+            eps_lm_b = eps_lm_b[:, 1:]  # 对齐 eps_b (差分后 S//n - 1)
+            eps_b = eps_b + 0.5 * eps_lm_b
             # 空间竞争权重: 块内原始误差 (归一化前, L1 防平方溢出), 线性加权 — 误差大的柱更新慢
             err_b = eps_b.abs().mean() + 1e-8
             # BCM 滑阈: theta = EMA(eps²), phi = eps(eps-theta); 先 RMS 归一化 eps,
@@ -551,11 +632,11 @@ class DensePCNet(nn.Module):
         self.M_l5[:a5, :a5].data += (dM * eye_mask) * (0.005 * ach_gain) * eta
         soft_norm_preserve(self.M_l5[:a5, :a5].data)
 
-        # W_diff 增量预测更新 (4 步时间窗平均外积) + b_diff 偏置
-        fut_mask = torch.rand(a5, 1, device=dev) < self.cfg.column_dropout
+        # W_diff 下一状态预测更新 (4 步时间窗平均外积) + b_diff 偏置 (L4 空间)
+        fut_mask = torch.rand(a4, 1, device=dev) < self.cfg.column_dropout
         W_diff_a.data += (dW_avg * (~fut_mask).to(torch.float16)) * eta
-        future_e = (dz5 - pred_d).mean(dim=(0, 1))
-        self.b_diff[:a5].data += future_e * eta
+        future_e = (dz4 - pred_d).mean(dim=(0, 1))
+        self.b_diff[:a4].data += future_e * eta
 
         # 时序 Hebbian (W_t 学习, 高确定性时增强 → 记忆巩固)
         for (z_cur, W_t), a_sz in zip(
@@ -568,6 +649,28 @@ class DensePCNet(nn.Module):
             W_t[:a_sz, :a_sz].data += dW_t * eta_t
             # 软范数保持 (0.8-1.2): 权重有界防 fp16 溢出 (5万步 NaN 根因)
             soft_norm_preserve(W_t[:a_sz, :a_sz].data)
+
+        # LM 头自监督赫布 (复用闭环段已算的 logits_lm/target_lm/eps_lm):
+        # 突触前增益控制: error 先 RMS 缩放到单位能量再外积 — 更新幅度完全由
+        # 内部误差能量自适应决定, 不依赖外部 eta 缩放 (替代 W_04 解码死锁)
+        err_norm = eps_lm.norm(dim=-1, keepdim=True) + 1e-4
+        err_scaled = eps_lm / err_norm  # 单位能量, 方向保留
+        dW_lm = (z4[:, :-1].transpose(-2, -1) @ err_scaled).mean(dim=0)  # [a4,256]
+        self.W_lm[:a4].data += dW_lm
+        self.bias_lm.data += err_scaled.mean(dim=(0, 1))
+        soft_norm_preserve(self.W_lm[:a4].data)
+
+        # 状态预测矩阵自更新 (纯赫布): dW_sp = z4^T @ eps_state, 零 BP
+        W_sp_a.data += (self._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0) * eta
+        soft_norm_preserve(W_sp_a.data)
+
+        # 稀疏绑定层赫布更新 (只更新 top-k 激活行): dW_bind = z5^T @ sparse
+        # 激活神经元 = 竞争胜出的"离散符元", 其连接被强化, 其余行不更新
+        if hasattr(self, "_bind_sparse"):
+            z5_n = z5 / (z5.norm(dim=-1, keepdim=True) + 1e-4)
+            dW_bind = (z5_n.transpose(-2, -1) @ self._bind_sparse).mean(dim=0)
+            self.W_bind[:a5].data += dW_bind * eta
+            soft_norm_preserve(self.W_bind[:a5].data)
 
         # 前馈权重软范数保持 (0.8-1.2): W_04/W_42/W_56 无 BCM 约束,
         # 长训累积溢出 fp16 → NaN; 幅度差异保留 (结构化非 clamp)
@@ -584,7 +687,7 @@ class DensePCNet(nn.Module):
         stats = {
             "free_energy": (eps4.square().mean() + eps2.square().mean() + eps3.square().mean()
                             + eps5_td.square().mean() + eps6.square().mean()),
-            "future_err": (dz5 - pred_d).square().mean(),
+            "future_err": (dz4 - pred_d).square().mean(),
             "surprise": surprise,
             "dop_gain": dop_gain,
             "ach_gain": ach_gain,
@@ -699,7 +802,8 @@ class DensePCNet(nn.Module):
             new_death[layer] = None
 
         # -- 列同步 & 显存回收 --
-        up_size = {"l0": self.cfg.d_input}
+        # l0 输入维 = 单帧 256 或双通道 512 (input_history 拼接 z0[t-1])
+        up_size = {"l0": self._in_dim}
         for layer in layers:
             n_alive = n_alive_map.get(layer, self.active_size[layer])
             src = src_layer[layer]
@@ -740,12 +844,27 @@ class DensePCNet(nn.Module):
             self.active_size[layer] = n_alive
             up_size[layer] = n_alive
 
-        # W_diff 是 a5 空间方阵 (行=输出维 a5, 列=输入维 a5), 与 L4 活性无关;
-        # 仅当 L5 被修剪时同步列 (W_diff 行数不随 L4 裁, 否则 matmul 输出维 256 配 bd 252 崩)
-        if self.active_size["l5"] < self.cfg.d_l5:
+        # W_diff 是 L4 空间方阵 (行=输出维 a4, 列=输入维 a4), 随 L4 修剪同步
+        if self.active_size["l4"] < self.cfg.d_l4:
             old_fut = self.W_diff.data
-            self.W_diff = nn.Parameter(old_fut[:self.active_size["l5"], :self.active_size["l5"]].contiguous())
+            self.W_diff = nn.Parameter(old_fut[:self.active_size["l4"], :self.active_size["l4"]].contiguous())
             del old_fut
+            # W_state_pred 同尺寸同步
+            old_sp = self.W_state_pred.data
+            self.W_state_pred = nn.Parameter(old_sp[:self.active_size["l4"], :self.active_size["l4"]].contiguous())
+            del old_sp
+            # W_lm 行同步 (L4 活性维)
+            old_lm = self.W_lm.data
+            self.W_lm = nn.Parameter(old_lm[:self.active_size["l4"], :].contiguous())
+            del old_lm
+            # _dw_buf 环形缓冲同尺寸同步 (否则 copy_ 形状崩: 6000 步 L4 修剪后 1024 vs 973)
+            for i in range(4):
+                old_buf = getattr(self, f"_dw_buf_{i}").data
+                self.register_buffer(
+                    f"_dw_buf_{i}",
+                    old_buf[:self.active_size["l4"], :self.active_size["l4"]].contiguous(),
+                )
+                del old_buf
 
         # W_56/W_t5 列同步: L5 修剪后 W_56 输入维 = W_t5 方阵维 = 活性 L5
         if self.active_size["l5"] < self.cfg.d_l5:
@@ -755,6 +874,10 @@ class DensePCNet(nn.Module):
             old_t5 = self.W_t5.data
             self.W_t5 = nn.Parameter(old_t5[:self.active_size["l5"], :self.active_size["l5"]].contiguous())
             del old_t5
+            # W_bind 行同步 (L5 活性维, 列 = bind_dim 固定)
+            old_bind = self.W_bind.data
+            self.W_bind = nn.Parameter(old_bind[:self.active_size["l5"], :].contiguous())
+            del old_bind
 
     def save(self, path: str):
         """保存模型权重."""
