@@ -217,8 +217,6 @@ class CyreneModel:
             return 0
 
         is_warmup_now = self._step <= self.config.warmup_steps
-
-        is_warmup_now = self._step <= self.config.warmup_steps
         max_ev = 2000 if is_warmup_now else 500
         if len(byte_events) > max_ev:
             byte_events = byte_events[:max_ev]
@@ -308,9 +306,7 @@ class CyreneModel:
         """Stage 7: 神经调质 D/ACh 计算."""
         self._fire("before_modulate", free_energy=free_energy)
         uncertainty = compute_uncertainty(self._free_energy_history)
-        F_prev = (
-            self._free_energy_history[-2] if len(self._free_energy_history) >= 2 else free_energy
-        )
+        F_prev = self._free_energy_history[-2] if len(self._free_energy_history) >= 2 else free_energy
         D = compute_dopamine(free_energy, F_prev)
         ACh = compute_ach(uncertainty, self.config.ach_beta_0)
         modulation = combine_modulation(D, ACh)
@@ -421,7 +417,8 @@ class CyreneModel:
                 if pre_list:
                     is_sensory = src_layer == LAYER_SENSORY
                     self.pool.synapse.create_synapses_batch(
-                        pre_list, post_list,
+                        pre_list,
+                        post_list,
                         init_scale=7.5 if is_sensory else 3.0,
                         conn_type=CONN_FEEDFORWARD,
                     )
@@ -482,7 +479,9 @@ class CyreneModel:
                     self.pool.projections.topdown_connect_layer(from_l, to_l, density=density)
                 else:
                     self.pool.synapse.connect_layer(
-                        from_l, to_l, density=density,
+                        from_l,
+                        to_l,
+                        density=density,
                         bias_strength=self.config.bias_strength,
                         conn_type=conn_type,
                         init_scale=7.5 if is_sensory else 3.0,
@@ -496,23 +495,6 @@ class CyreneModel:
 
         byte_events = self.encode(byte_seq)
         self.process_sensory_events(byte_events)
-
-        # warmup 结束后触发延迟连接 (必须在 sensory 存在之后)
-        if not is_warmup and self._pending_connects:
-            for from_l, to_l, density, conn_type in self._pending_connects:
-                is_sensory = from_l == 0
-                if conn_type == 1:
-                    self.pool.projections.topdown_connect_layer(from_l, to_l, density=density)
-                else:
-                    self.pool.synapse.connect_layer(
-                        from_l, to_l, density=density,
-                        bias_strength=self.config.bias_strength,
-                        conn_type=conn_type,
-                        init_scale=7.5 if is_sensory else 3.0,
-                    )
-            self._pending_connects = []
-            if self._top_layer > 0:
-                self.pool.projections.lm_ensure_top_connected(self._top_layer)
 
         self.process_network_events(max_events=10)
         self.predict_pass()
