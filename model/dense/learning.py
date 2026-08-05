@@ -136,10 +136,12 @@ class LearningEngine:
         if net._step_counter < 50:
             eta = eta * 0.5
         eta_t = eta * net.cfg.temporal_lr_ratio * ach_gain
-        # 表示层冻结 (情况 A): 表示层 lr=0, W_lm lr×boost; BCM 滑阈不冻结 (防漂移)
-        if net.cfg.freeze_backbone:
-            eta = eta * 0.0
-            eta_t = eta_t * 0.0
+        # 动态稳态竞争 (速率自适应): 按 W_lm 熵斜率调节表示层更新幅度 —
+        # 熵加速下降 (W_lm 预测好) → scale→0 表示层放慢; 熵停滞/上升 → scale→2
+        # 表示层放大 (强迫重组供新信息). scale 每 100 步更新, 用上一步值 (滞后一步无影响)
+        if net.cfg.adaptive_traction:
+            eta = eta * net._traction_scale.to(torch.float16)
+            eta_t = eta_t * net._traction_scale.to(torch.float16)
         eta_lm = net.cfg.lm_lr_boost
 
         # Hebbian 外积 (逐层误差 ⊗ pre 活动)
@@ -158,6 +160,22 @@ class LearningEngine:
         # 255 项累积淹没目标位); softmax 后目标位概率 1/256, 误差信号与概率匹配
         probs_lm = torch.softmax(logits_lm.float(), dim=-1).to(torch.float16)  # [N,S,256]
         eps_lm = (target_lm - probs_lm[:, :-1]).detach()  # [N,S-1,256]
+
+        # 动态稳态竞争: 每步记录 batch 级 W_lm 熵 (fp32 调度域, log 精度需 fp32),
+        # 连续负反馈: 20 步窗口最小二乘斜率 (线性拟合滤噪, 零超参),
+        # scale = 2/(1+exp(-slope20/σ)): 熵降 (slope20<0) → scale→0 表示层放慢
+        # 保护成果; 熵停滞/上升 → scale→2 表示层放大强迫重组. 有界无 clamp
+        # slope20 = 20 步熵总变化 (nats), σ = 窗口熵波动 (nats), 比值无量纲
+        if net.cfg.adaptive_traction:
+            ent = -(probs_lm.float() * torch.log(probs_lm.float() + 1e-9)).sum(dim=-1).mean()
+            net._ent_buf[net._ent_i % 20].copy_(ent.detach())
+            net._ent_i += 1
+            if net._ent_i >= 20:
+                idx = (net._ent_i - 19 + torch.arange(20, device=dev)) % 20
+                w = net._ent_buf[idx]  # 按时间正序重排
+                slope20 = (net._t_center * w).sum() / net._t_denom * 20.0  # 20 步总变化
+                sigma = w.std() + 1e-4
+                net._traction_scale.copy_(2.0 / (1.0 + torch.exp(-slope20 / sigma)))
         eps_lm_proj = eps_lm @ net.W_lm[:a4].T  # [N,S-1,a4]
         eps_lm_pad = torch.cat(
             [eps_lm_proj, torch.zeros(N, 1, a4, dtype=eps_lm_proj.dtype, device=dev)], dim=1
@@ -326,10 +344,21 @@ class LearningEngine:
         alive = (err_norm > 1e-8).to(eps_lm.dtype)
         denom = torch.where(alive > 0, err_norm, torch.ones_like(err_norm))
         err_scaled = eps_lm * alive / denom  # 单位能量, 方向保留
-        dW_lm = (z4[:, :-1].transpose(-2, -1) @ err_scaled).mean(dim=0)  # [a4,256]
+
+        # W_lm 专属 BCM 滑阈 (防输出过冲): theta = EMA(logits²) (快 0.99 响应),
+        # phi_wlm = logits_n·(logits_n - theta) — W_lm 开始输出高频极值时 theta 快速
+        # 升高 → logits_n-theta<0 → phi 变负 → dW 修正反向 → 抑制过冲.
+        # 纯机制剪刀, 线性, 零 BP; 0.1 系数镜像 W_diff BCM (同模式)
+        # logits 先 RMS 归一化再进 BCM: 原始 logits ~52, 平方超 fp16 上限 (W_diff 同款)
+        logits_n = _rms(logits_lm.detach())
+        th_wlm = net._theta_wlm
+        th_wlm.mul_(0.01).add_(0.99 * (logits_n * logits_n).mean(dim=(0, 1)))
+        phi_wlm = logits_n * (logits_n - th_wlm)
+        phi_wlm = _rms(phi_wlm)
+        dW_lm = (z4[:, :-1].transpose(-2, -1) @ (err_scaled - 0.1 * phi_wlm[:, :-1])).mean(dim=0)  # [a4,256]
         net.W_lm[:a4].data.mul_(0.999)
         net.W_lm[:a4].data += dW_lm * eta_lm
-        net.bias_lm.data += err_scaled.mean(dim=(0, 1)) * eta_lm
+        net.bias_lm.data += (err_scaled - 0.1 * phi_wlm[:, :-1]).mean(dim=(0, 1)) * eta_lm
         soft_norm_preserve(net.W_lm[:a4].data)
 
         # 状态预测矩阵自更新 (纯赫布): dW_sp = z4^T @ eps_state, 零 BP

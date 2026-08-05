@@ -59,9 +59,9 @@ class DensePCConfig:
     # L4 专属修剪下限 (预测主空间保底): L4 承载"表示+预测"双任务,
     # 维度坍缩 <600 时信息挤压成噪声 → NaN (20000 步实测); 512 是物理屏障
     l4_lower_bound: int = 512
-    # 表示层冻结 + LM 头强化 (情况 A: 探测证明 z4 含字节信息后启用):
-    # 表示层 lr=0, W_lm lr×lm_lr_boost, BCM 滑阈不冻结 (防漂移)
-    freeze_backbone: bool = False
+    # 动态稳态竞争 (速率自适应): 按 W_lm 熵斜率调节表示层更新幅度 —
+    # 熵加速下降 → 表示层放慢 (保护成果); 熵停滞 → 表示层放大 (强迫重组供新信息)
+    adaptive_traction: bool = False
     lm_lr_boost: float = 1.0
     oja_elasticity: float = 0.05
     probation_decay: float = 0.5
@@ -197,10 +197,21 @@ class DensePCNet(nn.Module):
 
         # ── 神经调制与竞争机制 ──
         self.register_buffer("_surprise_buf", torch.tensor(1.0, dtype=torch.float16))  # 惊喜基线
+        # 动态稳态竞争状态: 20 步熵窗口 (环形) + 最小二乘斜率拟合预分配 (t 中心化)
+        # + 速率自适应缩放因子 (fp32 调度域, 非训练张量; scale ∈ (0,2) 数学有界)
+        self.register_buffer("_ent_buf", torch.zeros(20, dtype=torch.float32))
+        self.register_buffer("_t_center", torch.arange(20, dtype=torch.float32) - 9.5)
+        self.register_buffer("_t_denom", (torch.arange(20, dtype=torch.float32) - 9.5).square().sum())
+        self._ent_i = 0
+        self.register_buffer("_traction_scale", torch.tensor(1.0, dtype=torch.float32))
         # BCM 滑阈 (替代 Oja): theta = EMA(eps²), phi = eps(eps-theta)
         for ln, dim in (("l4", d["l4"]), ("l2", d["l2"]), ("l3", d["l3"]), ("l5", d["l5"]), ("l6", d["l6"])):
             self.register_buffer(f"_theta_{ln}", torch.full((dim,), 0.01, dtype=torch.float16))
         self.register_buffer("_theta_diff", torch.full((d["l4"],), 0.01, dtype=torch.float16))
+        # W_lm 专属 BCM 滑阈 (防输出过冲): theta = EMA(pred²), phi = pred(pred-theta),
+        # W_lm 开始输出高频极值 (振荡源头) 时 theta 升高 → pred-theta<0 → 抑制过冲.
+        # 纯机制剪刀, 线性, 无 BP; 与 W_diff 的 _theta_w 同模式
+        self.register_buffer("_theta_wlm", torch.full((self.cfg.d_input,), 0.01, dtype=torch.float16))
         # Foldiak 反赫布侧抑制 (L5 去相关): M 协方差, 零对角线
         self.M_l5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
         # 固定掩码 (只切 dW 更新路径): 10% 突触剪切 + [0.5,1.5] 随机增益播种
