@@ -69,7 +69,8 @@ class ForwardEngine:
             z4_n = net._z4 / (net._z4.norm(dim=-1, keepdim=True) + 1e-3)
             pred_delta = z4_n @ W_diff_a.T + net.b_diff[:a4].unsqueeze(0).unsqueeze(0)
             z4_next = net._z4 + pred_delta
-            mu0_top = z4_next @ net.W_lm[:a4] + net.bias_lm  # W_lm 解码
+            zh_next = torch.cat([z4_next, net._h], dim=-1)  # 工作记忆拼接
+            mu0_top = zh_next @ net.W_lm[:2 * a4] + net.bias_lm  # W_lm 解码
             last = mu0_top[0, -1].float() / temperature
             topv, _ = torch.topk(last, min(15, 256))
             last[last < topv[-1]] = -float("inf")
@@ -188,6 +189,13 @@ class ForwardEngine:
             net._z5 = z5
             net._z5_raw = z5_raw
             net._z6 = z6
+            # 工作记忆 (海马体式指数积分): h_t = 0.99·h_{t-1} + 0.01·z4_t,
+            # batch 内按时间步递推, 跨序列累积低分辨率环境信息 (不改变物理输入层)
+            h_t = net._h_mem.unsqueeze(0).unsqueeze(0).expand(N, 1, -1).clone()  # [N,1,a4] 第 0 步 = 上序列末态
+            for t in range(1, S):
+                h_t = torch.cat([h_t, net._h_alpha * h_t[:, -1:] + 0.01 * z4[:, t:t + 1]], dim=1)
+            net._h_mem.copy_((net._h_alpha * h_t[:, -1] + 0.01 * z4[:, -1]).mean(dim=0))
+            net._h = h_t  # [N, S, a4] 每步的积分记忆
 
         # 稀疏绑定 (k-WTA): 连续 z5 经 W_bind 映射到 bind_dim, 只留 top-k 激活
         # "离散符元" = 高维竞争坍缩出的 k 个神经元 ID, 非外部字典

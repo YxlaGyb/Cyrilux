@@ -140,10 +140,16 @@ class DensePCNet(nn.Module):
         # final_eps = eps_recon + 0.3 * eps_state — 迫使隐状态携带"未来往哪走"
         self.W_state_pred = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
 
-        # ── LM 头 (自监督赫布): z4 → 256 字节 logits, 独立于重建 W_04 ──
+        # ── LM 头 (自监督赫布): [z4, h] → 256 字节 logits, 独立于重建 W_04 ──
         # W_04 双向重建被证实解码死锁 (真实 delta 注入仍复读空格);
-        # W_lm 唯一任务: 把状态映射到下一字节, dW_lm = z4^T @ (target - logits) 纯外积
-        self.W_lm = nn.Parameter(torch.empty(d["l4"], self.cfg.d_input, dtype=torch.float16))
+        # W_lm 唯一任务: 把状态映射到下一字节, dW_lm = [z4,h]^T @ (target - logits) 纯外积
+        # h = 工作记忆 (指数积分 0.99·h + 0.01·z4), 承载跨序列的低分辨率环境信息,
+        # 拼接进 W_lm 输入 (输入维 = d_l4 × 2), 生物海马体式存储器
+        self._h_alpha = 0.99
+        self.register_buffer("_h_mem", torch.zeros(d["l4"], dtype=torch.float16))
+        # W_lm 行 = 输入神经元 (前 a4 = z4, 后 a4 = h, 神经元对齐), 列 = 256 字节;
+        # h 是 z4 的指数积分 → 修剪 perm 重排需同步前后两半 (见 pruning._sync_l4_aux)
+        self.W_lm = nn.Parameter(torch.empty(d["l4"] * 2, self.cfg.d_input, dtype=torch.float16))
         self.bias_lm = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=torch.float16))
 
         # ── 稀疏绑定层 (海马体式): z5 → W_bind → 4096 维, top-k WTA 硬稀疏 ──
@@ -306,4 +312,9 @@ class DensePCNet(nn.Module):
             "l5": net.W_56.shape[1],
             "l6": net.W_56.shape[0],
         }
+        # _h_mem (工作记忆) 对齐活性 L4 (旧检查点无此缓冲 → init 全量, 需裁)
+        if net._h_mem.shape[0] != net.active_size["l4"]:
+            old_h = net._h_mem.data
+            net.register_buffer("_h_mem", old_h[: net.active_size["l4"]].contiguous())
+            del old_h
         return net

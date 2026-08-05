@@ -123,7 +123,8 @@ class PruningEngine:
         """L4 神经元行重排 → 同步重排所有 L4 行映射的权重,
         否则预测误差投影与 W_04 行错位 → 6000-7000 步 NaN (修剪后首爆)."""
         net = self.net
-        net.W_lm.data = net.W_lm.data[perm].contiguous()
+        # W_lm 行 = [z4 神经元 | h 神经元] (h 是 z4 指数积分, 神经元对齐) → 前后两半同 perm
+        net.W_lm.data = net.W_lm.data[torch.cat([perm, perm])].contiguous()
         net.W_diff.data = net.W_diff.data[perm][:, perm].contiguous()
         net.W_state_pred.data = net.W_state_pred.data[perm][:, perm].contiguous()
         # _dw_buf 环形缓冲同 perm 重排 (否则 4 步缓冲与 W_diff 行错位 → 更新错乱)
@@ -135,6 +136,10 @@ class PruningEngine:
         old_thw = net._theta_w.data
         net.register_buffer("_theta_w", old_thw[perm].contiguous())
         del old_thw
+        # _h_mem (工作记忆) 同 perm 重排 (h 与 z4 神经元对齐, 错位 → W_lm 输入乱)
+        old_h = net._h_mem.data
+        net.register_buffer("_h_mem", old_h[perm].contiguous())
+        del old_h
 
     def _shrink_columns(
         self, layer: str, n_alive: int, src: str, src_n: int, perm_map: dict[str, torch.Tensor]
@@ -258,9 +263,9 @@ class PruningEngine:
                 old_sp[: net.active_size["l4"], : net.active_size["l4"]].contiguous()
             )
             del old_sp
-            # W_lm 行同步 (L4 活性维)
+            # W_lm 行同步 (L4 活性维 ×2: z4 半 + h 半)
             old_lm = net.W_lm.data
-            net.W_lm = nn.Parameter(old_lm[: net.active_size["l4"], :].contiguous())
+            net.W_lm = nn.Parameter(old_lm[: 2 * net.active_size["l4"], :].contiguous())
             del old_lm
             # _dw_buf 环形缓冲同尺寸同步 (否则 copy_ 形状崩: 6000 步 L4 修剪后 1024 vs 973)
             for i in range(4):
@@ -275,6 +280,10 @@ class PruningEngine:
             old_thw = net._theta_w.data
             net.register_buffer("_theta_w", old_thw[: net.active_size["l4"]].contiguous())
             del old_thw
+            # _h_mem (工作记忆) 裁到活性维 (与 W_lm 的 h 半输入行对齐)
+            old_h = net._h_mem.data
+            net.register_buffer("_h_mem", old_h[: net.active_size["l4"]].contiguous())
+            del old_h
 
         # W_56/W_t5 列同步: L5 修剪后 W_56 输入维 = W_t5 方阵维 = 活性 L5
         if net.active_size["l5"] < net.cfg.d_l5:

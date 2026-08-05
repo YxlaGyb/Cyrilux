@@ -153,7 +153,10 @@ class LearningEngine:
         # ── 预测编码闭环: W_lm 预测误差投影回 z4, 作为表示层 top-down 误差 ──
         # eps_lm_proj = eps_lm @ W_lm.T: 表示层被迫为"预测下一字节"重组编码,
         # 而非只重构当前字节. 纯赫布, 零 BP (大脑皮层最核心的闭环)
-        logits_lm = z4 @ net.W_lm[:a4] + net.bias_lm  # [N,S,256]
+        # 工作记忆拼接: [z4, h] 双通道进 W_lm (h = 0.99h + 0.01z4 指数积分,
+        # 承载跨序列环境信息; 物理输入层不变)
+        zh = torch.cat([z4, net._h], dim=-1)  # [N,S,2a4]
+        logits_lm = zh @ net.W_lm[:2 * a4] + net.bias_lm  # [N,S,256]
         target_lm = F.one_hot(byte_ids[:, 1:], num_classes=256).to(torch.float16)
         # 赫布版 softmax 误差: eps = target - softmax(logits) (概率尺度 0-1).
         # 原始 target - logits 的负信号被 logits 幅度主导 (熵 5.5 时 logit~0 但非目标位
@@ -355,11 +358,11 @@ class LearningEngine:
         th_wlm.mul_(0.01).add_(0.99 * (logits_n * logits_n).mean(dim=(0, 1)))
         phi_wlm = logits_n * (logits_n - th_wlm)
         phi_wlm = _rms(phi_wlm)
-        dW_lm = (z4[:, :-1].transpose(-2, -1) @ (err_scaled - 0.1 * phi_wlm[:, :-1])).mean(dim=0)  # [a4,256]
-        net.W_lm[:a4].data.mul_(0.999)
-        net.W_lm[:a4].data += dW_lm * eta_lm
+        dW_lm = (zh[:, :-1].transpose(-2, -1) @ (err_scaled - 0.1 * phi_wlm[:, :-1])).mean(dim=0)  # [2a4,256]
+        net.W_lm[:2 * a4].data.mul_(0.999)
+        net.W_lm[:2 * a4].data += dW_lm * eta_lm
         net.bias_lm.data += (err_scaled - 0.1 * phi_wlm[:, :-1]).mean(dim=(0, 1)) * eta_lm
-        soft_norm_preserve(net.W_lm[:a4].data)
+        soft_norm_preserve(net.W_lm[:2 * a4].data)
 
         # 状态预测矩阵自更新 (纯赫布): dW_sp = z4^T @ eps_state, 零 BP
         W_sp_a.data += (net._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0) * eta
