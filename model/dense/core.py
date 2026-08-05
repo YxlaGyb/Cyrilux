@@ -51,6 +51,9 @@ class DensePCConfig:
     death_probation: int = 200
     death_threshold: float = 1e-4
     active_size_lower_bound: int = 128
+    # L4 专属修剪下限 (预测主空间保底): L4 承载"表示+预测"双任务,
+    # 维度坍缩 <600 时信息挤压成噪声 → NaN (20000 步实测); 512 是物理屏障
+    l4_lower_bound: int = 512
     oja_elasticity: float = 0.05
     probation_decay: float = 0.5
 
@@ -253,12 +256,17 @@ class DensePCNet(nn.Module):
         for _ in range(sweeps):
             shift = torch.cat([torch.zeros(N, 1, d, dtype=z.dtype, device=dev), z[:, :-1]], dim=1)
             s_rms = shift.square().mean(dim=-1, keepdim=True)
-            shift_n = shift * torch.rsqrt(s_rms + 1e-6)
+            # 零向量保护: 掩码后 where 选分母 (fp16 下 1e-8 舍入为 0, 不能用)
+            s_alive = (s_rms > 1e-8).to(z.dtype)
+            s_denom = torch.where(s_alive > 0, (s_rms * 1.01).sqrt(), torch.ones_like(s_rms))
+            shift_n = shift * s_alive / s_denom
             rec = (shift_n @ W_t.T) * inv_d
             # 递归项单独归一化再乘 inv_d 小扰动: 保 mu 语义方向 (cos 0.69→0.98 抹平),
             # 同时幅度有界防逐层累积 (旧整体 RMS 压幅度但抹方向; 无约束则 58 步 NaN)
             r_rec = rec.square().mean(dim=-1, keepdim=True)
-            rec = rec * torch.rsqrt(r_rec + 1e-4) * inv_d
+            r_alive = (r_rec > 1e-8).to(z.dtype)
+            r_denom = torch.where(r_alive > 0, (r_rec * 1.01).sqrt(), torch.ones_like(r_rec))
+            rec = rec * r_alive / r_denom * inv_d
             z = z + rec
         return z
 
@@ -289,19 +297,28 @@ class DensePCNet(nn.Module):
 
         mu4 = z0 @ W_04_a.T + self.bias_l4[:a4]
         z4 = self._recurrent(mu4, dev, self.W_t4[:a4, :a4])
-        z4_n = z4 / (z4.norm(dim=-1, keepdim=True) + 1e-4)
+        z4_nrm = z4.norm(dim=-1, keepdim=True)
+        z4_alive = (z4_nrm > 1e-8).to(z4.dtype)
+        z4_denom = torch.where(z4_alive > 0, z4_nrm * 1.01, torch.ones_like(z4_nrm))
+        z4_n = z4 * z4_alive / z4_denom
         mu2 = z4_n @ W_42_a.T + self.bias_l2[:a2]
         z2 = self._recurrent(mu2, dev, self.W_t2[:a2, :a2])
         # 预投影 RMSNorm (CLAUDE.md 铁律: 投影前加 RMSNorm 防 fp16 溢出):
         # 只归一化输入, 保方向压尖峰; 不归一化输出 mu, 不抹平差异
-        z2_n = z2 / (z2.norm(dim=-1, keepdim=True) + 1e-4)
+        z2_nrm = z2.norm(dim=-1, keepdim=True)
+        z2_alive = (z2_nrm > 1e-8).to(z2.dtype)
+        z2_denom = torch.where(z2_alive > 0, z2_nrm * 1.01, torch.ones_like(z2_nrm))
+        z2_n = z2 * z2_alive / z2_denom
         mu3 = z2_n @ W_23_a.T + self.bias_l3[:a3]
         if not is_inference:
             mu3 = mu3 + torch.sign(2.0 * (torch.rand_like(mu3) - 0.5)) * 0.03  # ACh 噪声
         z3 = self._recurrent(mu3, dev, self.W_t3[:a3, :a3])
         # 微柱路由: 微柱 b 处理时间步 {b, b+4, ...}, 输出到 z5 的 [b*b5:(b+1)*b5] 切片
         z5 = torch.zeros(N, S, a5, dtype=torch.float16, device=dev)
-        z3_n = z3 / (z3.norm(dim=-1, keepdim=True) + 1e-4)
+        z3_nrm = z3.norm(dim=-1, keepdim=True)
+        z3_alive = (z3_nrm > 1e-8).to(z3.dtype)
+        z3_denom = torch.where(z3_alive > 0, z3_nrm * 1.01, torch.ones_like(z3_nrm))
+        z3_n = z3 * z3_alive / z3_denom
         for b in range(self.n_blocks):
             z3_route = z3_n[:, b::self.n_blocks, :]  # [N, S//n, a3] 该微柱的时间步子集
             zb = z3_route @ self.W_35[b].T + self.bias_l5[b * self.b5:(b + 1) * self.b5]
@@ -321,7 +338,7 @@ class DensePCNet(nn.Module):
                 zb = z5[..., b_s][:, b::self.n_blocks]
                 epsb = zb[:, 1:] - zb[:, :-1]
                 # L1 平均误差防平方溢出 (fp16), 误差大的柱权重小
-                err_b = epsb.abs().mean() + 1e-4
+                err_b = epsb.abs().mean() * 1.01
                 w_sp[b] = 1.0 / (1.0 + err_b * 4.0)
             # 只抑制不放大 (w_sp ≤ 1): 坏柱缩小, 好柱保持, 幅度只减不增防溢出
             for b in range(self.n_blocks):
@@ -371,7 +388,10 @@ class DensePCNet(nn.Module):
         """
         a5 = self.active_size["l5"]
         k = self.cfg.bind_k
-        z5_n = z5 / (z5.norm(dim=-1, keepdim=True) + 1e-4)
+        z5_nrm = z5.norm(dim=-1, keepdim=True)
+        z5_alive = (z5_nrm > 1e-8).to(z5.dtype)
+        z5_denom = torch.where(z5_alive > 0, z5_nrm * 1.01, torch.ones_like(z5_nrm))
+        z5_n = z5 * z5_alive / z5_denom
         pre = z5_n @ self.W_bind[:a5]  # [N,S,bind_dim]
         vals, idx = pre.topk(k, dim=-1)
         if self.cfg.bind_mode == "hard":
@@ -428,7 +448,8 @@ class DensePCNet(nn.Module):
         def _rms(x):
             rms = x.square().mean(dim=-1, keepdim=True)
             alive = (rms > 1e-8).to(x.dtype)
-            return x * alive / (rms + 1e-4).sqrt()
+            denom = torch.where(alive > 0, (rms * 1.01).sqrt(), torch.ones_like(rms))
+            return x * alive / denom
 
         # 下一状态预测 (显式预测目标): pred_delta = z4 @ W_diff, target_delta = z4[t] - z4[t-1]
         # eps_diff = pred_delta - target_delta (训练误差); 多尺度软窗同构保留
@@ -518,18 +539,30 @@ class DensePCNet(nn.Module):
 
         # ── W_04 主辅误差交换: 预测误差为主, 重建为辅 ──
         # 重建任务不需要词序 (稳定信号拉权重回单一解); 预测误差才需要词序.
-        # final_error = err_pred_norm + 0.2 * err_recon_norm (RMS 对齐量级)
+        # final_error = err_pred_norm + 0.2 * err_recon_norm (量级对齐)
+        # 突触后增益控制: 归一化基于当前误差自身的 std (统计去耦), 不依赖维度 —
+        # 修剪缩小 L4 时误差方差自然变小, 分母自动适应, 无 1/A4 静态系数
         inv_s = 1.0 / S
-        err_pred_norm = eps_lm_pad / (eps_lm_pad.norm(dim=-1, keepdim=True) + 1e-4)
-        err_recon_norm = eps4 / (eps4.norm(dim=-1, keepdim=True) + 1e-4)
+        # 突触后增益控制 (std 归一化) + 相对地板: 地板 = 全局 std 的 0.1%,
+        # 随信号缩放 (修剪缩维 → 全局 std 自动降), 防 fp16 精度极限下除零放大
+        eps_pred_scale = eps_lm_pad.std(dim=-1, keepdim=True)
+        eps_pred_scale = eps_pred_scale * 1.01 + eps_lm_pad.std() * 1e-3
+        err_pred_norm = eps_lm_pad / eps_pred_scale
+        eps_recon_scale = eps4.std(dim=-1, keepdim=True)
+        eps_recon_scale = eps_recon_scale * 1.01 + eps4.std() * 1e-3
+        err_recon_norm = eps4 / eps_recon_scale
         final_error = err_pred_norm + 0.2 * err_recon_norm
 
-        # 样本显著性加权 (打破批平均稀释): bmm 逐样本外积, 高误差样本主导
+        # 幅度-方向解耦 (单步更新上界锁死): dW_n 归一化为单位向量,
+        # 显著性只选方向不放大幅度 — 原 g_n×dW_n 等效 e² 平方级放大,
+        # 极端样本单步爆幅度 → NaN; 归一化后最大单步幅度 = lr, 纯机制保证
         z0_n = _rms(z0)
         dW_04n = torch.bmm(final_error.transpose(-2, -1), z0_n)  # [N,a4,in]
-        g_04 = final_error.norm(dim=(1, 2)) / (final_error.norm(dim=(1, 2)).max() + 1e-8)
-        g_04 = (0.1 + 0.9 * g_04).unsqueeze(-1).unsqueeze(-1)
-        dW_04 = (dW_04n * g_04).sum(dim=0) * inv_s
+        nrm_04 = dW_04n.norm(dim=(-2, -1), keepdim=True)
+        dW_04n = dW_04n / (nrm_04 + 1e-6)  # 单位向量 (只保留方向)
+        e_norm = final_error.norm(dim=(1, 2))
+        g_04 = (e_norm / (e_norm.max() + e_norm.std() + 1e-6)).unsqueeze(-1).unsqueeze(-1)
+        dW_04 = (dW_04n * g_04).sum(dim=0) / (g_04.sum() + 1e-6)
         self.W_04[:a4].data += dW_04 * eta
         soft_norm_preserve(self.W_04[:a4].data)
 
@@ -586,8 +619,10 @@ class DensePCNet(nn.Module):
             z3_bp = z3_b * (torch.rand_like(z3_b) > 0.3).to(torch.float16)
             # 预测编码融合: eps_b = 时序差分 + 0.5 × LM 预测误差投影回微柱空间.
             # 高层 (LM 头) 预测错了 → 告诉 W_35 "你给的微柱特征缺词序信息, 需改"
+            # eps_lm_b 先 RMS 归一化防投影幅度溢出 (特定 batch 长文本 → 超大误差)
             eps_lm_b = eps_lm_a3[:, b::self.n_blocks, :] @ self.W_35[b].T  # [N, S//n, b5]
             eps_lm_b = eps_lm_b[:, 1:]  # 对齐 eps_b (差分后 S//n - 1)
+            eps_lm_b = _rms(eps_lm_b)
             eps_b = eps_b + 0.5 * eps_lm_b
             # 空间竞争权重: 块内原始误差 (归一化前, L1 防平方溢出), 线性加权 — 误差大的柱更新慢
             err_b = eps_b.abs().mean() + 1e-8
@@ -653,7 +688,7 @@ class DensePCNet(nn.Module):
         # LM 头自监督赫布 (复用闭环段已算的 logits_lm/target_lm/eps_lm):
         # 突触前增益控制: error 先 RMS 缩放到单位能量再外积 — 更新幅度完全由
         # 内部误差能量自适应决定, 不依赖外部 eta 缩放 (替代 W_04 解码死锁)
-        err_norm = eps_lm.norm(dim=-1, keepdim=True) + 1e-4
+        err_norm = eps_lm.norm(dim=-1, keepdim=True) * 1.01
         err_scaled = eps_lm / err_norm  # 单位能量, 方向保留
         dW_lm = (z4[:, :-1].transpose(-2, -1) @ err_scaled).mean(dim=0)  # [a4,256]
         self.W_lm[:a4].data += dW_lm
@@ -667,7 +702,9 @@ class DensePCNet(nn.Module):
         # 稀疏绑定层赫布更新 (只更新 top-k 激活行): dW_bind = z5^T @ sparse
         # 激活神经元 = 竞争胜出的"离散符元", 其连接被强化, 其余行不更新
         if hasattr(self, "_bind_sparse"):
-            z5_n = z5 / (z5.norm(dim=-1, keepdim=True) + 1e-4)
+            z5_nrm = z5.norm(dim=-1, keepdim=True)
+            z5_alive = (z5_nrm > 1e-8).to(z5.dtype)
+            z5_n = z5 * z5_alive / (z5_nrm * 1.01 + 1e-8 * (1 - z5_alive))
             dW_bind = (z5_n.transpose(-2, -1) @ self._bind_sparse).mean(dim=0)
             self.W_bind[:a5].data += dW_bind * eta
             soft_norm_preserve(self.W_bind[:a5].data)
@@ -712,6 +749,8 @@ class DensePCNet(nn.Module):
         src_layer = {"l4": "l0", "l2": "l4", "l3": "l2", "l6": "l5"}
 
         bound = self.cfg.active_size_lower_bound
+        # L4 专属屏障: 预测主空间保底 512 (L2/L3/L6 保持 128 自然竞争)
+        l4_bound = self.cfg.l4_lower_bound
         frac = self.cfg.prune_fraction
         dprob = self.cfg.death_probation
 
@@ -737,10 +776,13 @@ class DensePCNet(nn.Module):
 
         new_death: dict[str, torch.Tensor | None] = {}
         n_alive_map: dict[str, int] = {}
+        perm_map: dict[str, torch.Tensor] = {}
 
         for layer in layers:
             active = self.active_size[layer]
-            if active <= bound:
+            # L4 专属下限: 达到屏障后停止修剪 (保留 512 神经元承载双任务)
+            layer_bound = l4_bound if layer == "l4" else bound
+            if active <= layer_bound:
                 n_alive_map[layer] = active
                 new_death[layer] = None
                 continue
@@ -761,7 +803,7 @@ class DensePCNet(nn.Module):
             if expired is not None:
                 alive_mask = alive_mask & ~expired
 
-            n_alive = max(bound, (int(alive_mask.sum().detach().item()) // 8) * 8)
+            n_alive = max(layer_bound, (int(alive_mask.sum().detach().item()) // 8) * 8)
             n_alive = max(n_alive, active - n_candidate)
             n_alive = min(n_alive, active)
 
@@ -794,6 +836,23 @@ class DensePCNet(nn.Module):
             W_t.data = W_t.data[perm][:, perm].contiguous()
             b = getattr(self, b_attr[layer])
             b.data = b.data[perm].contiguous()
+            # 保存 perm 供列同步段使用 (W_35 列需按 L3 perm 重排)
+            perm_map[layer] = perm
+            # L4 神经元行重排 → 同步重排所有 L4 行映射的权重 (W_lm/W_diff/W_state_pred),
+            # 否则预测误差投影与 W_04 行错位 → 6000-7000 步 NaN (修剪后首爆)
+            if layer == "l4":
+                self.W_lm.data = self.W_lm.data[perm].contiguous()
+                self.W_diff.data = self.W_diff.data[perm][:, perm].contiguous()
+                self.W_state_pred.data = self.W_state_pred.data[perm][:, perm].contiguous()
+                # _dw_buf 环形缓冲同 perm 重排 (否则 4 步缓冲与 W_diff 行错位 → 更新错乱)
+                for i in range(4):
+                    old_buf = getattr(self, f"_dw_buf_{i}").data
+                    self.register_buffer(f"_dw_buf_{i}", old_buf[perm][:, perm].contiguous())
+                    del old_buf
+                # _theta_w (W_diff BCM 滑阈) 同 perm 重排 (错位阈值 → phi_w 异常 → 漂移 NaN)
+                old_thw = self._theta_w.data
+                self.register_buffer("_theta_w", old_thw[perm].contiguous())
+                del old_thw
 
             self._death_row[layer] = new_dr[perm]
             self._probation_counter[layer] = new_pc[perm]
@@ -816,16 +875,42 @@ class DensePCNet(nn.Module):
 
             W = getattr(self, W_attr[layer])
             old = W.data
+            # 跨层列映射同步 (系统性补全): 源层神经元重排 → 下游权重的列必须同 perm.
+            # 顺序关键: 先 perm 后裁 (perm 长度 = 修剪前 active, 裁后列数 < active 会越界)
+            src_perm = perm_map.get(src)
+            if src_perm is not None:
+                old = old[:, src_perm]
             setattr(self, W_attr[layer], nn.Parameter(old[:n_alive, :src_n].contiguous()))
             del old
+            # _gain_l3 列 = L2 神经元, 用 L2 自己的 perm (非 src perm — src 是 L4)
+            l2_perm = perm_map.get("l2")
+            if l2_perm is not None:
+                old_g = self._gain_l3.data
+                self.register_buffer("_gain_l3", old_g[:, l2_perm].contiguous())
+                del old_g
 
-            # W_35 微柱输入维 = L3 活性维: L3 修剪后同步 W_35 列数, 否则路由 matmul 形状崩
-            # (6000 步冒烟实测 z3_route[.., 365] @ W_35[b].T[384, 64] 形状不匹配)
+            # W_35 微柱输入维 = L3 活性维: L3 修剪后同步 W_35 列数 + 按 perm 重排列,
+            # 否则 z3 (重排后的 L3) 喂给旧序列 → 系统性错位 → eps5_td 突变 → surprise NaN
+            # (6000 步修剪后 6100 步 eta=nan 全链路爆的根因)
             if layer == "l3":
+                l3_perm = perm_map.get("l3")
                 for b in range(self.n_blocks):
                     old_b = self.W_35[b].data
+                    if l3_perm is not None:
+                        old_b = old_b[:, l3_perm]
                     self.W_35[b] = nn.Parameter(old_b[:, :src_n].contiguous())
                     del old_b
+                    # _syn_mask/_gain_mask 列与 W_35 列同源 (L3 神经元), 同 perm 重排
+                    if l3_perm is not None:
+                        for mname in (f"_syn_mask_{b}", f"_gain_mask_{b}"):
+                            old_m = getattr(self, mname).data
+                            self.register_buffer(mname, old_m[:, l3_perm][:, :src_n].contiguous())
+                            del old_m
+                # _gain_l3 行与 W_23 行同源 (L3 神经元), 同 perm 重排
+                if l3_perm is not None:
+                    old_g = self._gain_l3.data
+                    self.register_buffer("_gain_l3", old_g[l3_perm][:, :src_n].contiguous())
+                    del old_g
 
             W_t = getattr(self, t_attr[layer])
             old_t = W_t.data
@@ -865,6 +950,11 @@ class DensePCNet(nn.Module):
                     old_buf[:self.active_size["l4"], :self.active_size["l4"]].contiguous(),
                 )
                 del old_buf
+            # _theta_w (W_diff BCM 滑阈) 对齐 W_diff 行数: perm 重排只改变顺序不缩短,
+            # 列同步段必须裁到活性维, 否则与 W_diff 行错位累积 → 长期漂移 NaN
+            old_thw = self._theta_w.data
+            self.register_buffer("_theta_w", old_thw[:self.active_size["l4"]].contiguous())
+            del old_thw
 
         # W_56/W_t5 列同步: L5 修剪后 W_56 输入维 = W_t5 方阵维 = 活性 L5
         if self.active_size["l5"] < self.cfg.d_l5:
