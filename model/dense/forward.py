@@ -69,9 +69,9 @@ class ForwardEngine:
             z4_n = net._z4 / (net._z4.norm(dim=-1, keepdim=True) + 1e-3)
             pred_delta = z4_n @ W_diff_a.T + net.b_diff[:a4].unsqueeze(0).unsqueeze(0)
             z4_next = net._z4 + pred_delta
-            zh_next = torch.cat([z4_next, net._m2, net._m8, net._m32], dim=-1)  # 记忆池拼接
-            inv_h = 1.0 / math.sqrt(4 * a4)
-            mu0_top = (zh_next @ net.W_lm[:4 * a4] + net.bias_lm) * inv_h  # W_lm 解码 (输出缩放)
+            zh_next = torch.cat([z4_next, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)  # 记忆池+绑定拼接
+            inv_h = 1.0 / math.sqrt(4 * a4 + 3 * net.bind_slot_dim)
+            mu0_top = (zh_next @ net.W_lm + net.bias_lm) * inv_h  # W_lm 解码 (输出缩放)
             last = mu0_top[0, -1].float() / temperature
             topv, _ = torch.topk(last, min(15, 256))
             last[last < topv[-1]] = -float("inf")
@@ -185,11 +185,11 @@ class ForwardEngine:
             net._m_pool = torch.cat([m2[:, -1], m8[:, -1], m32[:, -1]], dim=-1).mean(dim=0)  # [3a4]
             net._m2, net._m8, net._m32 = m2, m8, m32  # [N,S,a4] 每级记忆池
 
-        # 稀疏绑定 (k-WTA): 连续 z5 经 W_bind 映射到 bind_dim, 只留 top-k 激活
-        # "离散符元" = 高维竞争坍缩出的 k 个神经元 ID, 非外部字典
-        # bind_mode="none" (直连实验) 时跳过整个绑定层
-        if not is_inference and net.cfg.bind_mode != "none":
-            self._bind(z5)
+        # 稀疏绑定 (角色分离三槽): 连续 z4 → W_bind 三块 → 槽内 top-k WTA 硬稀疏
+        # bind_vec = [实体(256) | 角色(256) | 谓语(256)] 拼进 W_lm 输入 (第 5 段);
+        # 推理也计算 (生成/评估与训练同构)
+        if net.cfg.bind_mode != "none":
+            self._bind(z4)
 
         return {
             "mu_diff": mu_diff,
@@ -197,27 +197,27 @@ class ForwardEngine:
             "free_energy": diff_err,
         }
 
-    def _bind(self, z5: torch.Tensor) -> None:
-        """稀疏绑定层前向: z5 → W_bind → bind_dim, 硬/软 top-k WTA.
+    def _bind(self, z4: torch.Tensor) -> None:
+        """角色分离绑定前向: z4 → W_bind 三块 (实体/角色/谓语) → 槽内 top-k WTA.
 
-        硬 VQ: top-k 置 1 其余 0 (离散符元 ID); 软 VQ: top-k 保留幅度.
-        bind_orth=True 时 W_bind 列做 Gram-Schmidt 正交化 (容量实验).
+        每槽 256 维独立投影 (块对角 W_bind), 槽内 top-k 置 1 其余 0 (硬离散符元).
+        bind_vec = [槽1|槽2|槽3] 拼接 (3*256), 与 W_lm 输入第 5 段对齐;
+        全部 3*256 槽位始终参与计算 (不同于 bind_k 的 top-k 选择数, 那是槽内阈值).
         """
         net = self.net
-        a5 = net.active_size["l5"]
+        a4 = net.active_size["l4"]
+        z4_n = _l2_norm(z4)
+        pre = z4_n @ net.W_bind[:a4]  # [N,S,768]
         k = net.cfg.bind_k
-        z5_n = _l2_norm(z5)
-        pre = z5_n @ net.W_bind[:a5]  # [N,S,bind_dim]
-        vals, idx = pre.topk(k, dim=-1)
-        if net.cfg.bind_mode == "hard":
-            sparse = torch.zeros_like(pre)
-            sparse.scatter_(-1, idx, torch.ones_like(vals))
-        else:  # soft VQ: 保留幅度
-            sparse = torch.zeros_like(pre)
-            sparse.scatter_(-1, idx, vals)
+        bd = net.bind_slot_dim
+        sparse = torch.zeros_like(pre)
+        for i in range(3):
+            sl = slice(i * bd, (i + 1) * bd)
+            vals, idx = pre[:, :, sl].topk(k, dim=-1)
+            sparse[:, :, sl].scatter_(-1, idx, torch.ones_like(vals))
         net._bind_pre = pre
-        net._bind_idx = idx  # [N,S,k] 激活神经元 ID (语义分离度指标)
-        net._bind_sparse = sparse
+        net._bind_idx = idx  # 末槽 top-k ID (诊断)
+        net._bind_vec = sparse
 
     def _precise(self, eps: torch.Tensor) -> torch.Tensor:
         """精度加权: π_l = 1/(σ_εl + c), 归一化每层误差尺度."""

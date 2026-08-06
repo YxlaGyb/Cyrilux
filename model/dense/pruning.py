@@ -129,11 +129,15 @@ class PruningEngine:
         """L4 神经元行重排 → 同步重排所有 L4 行映射的权重,
         否则预测误差投影与 W_04 行错位 → 6000-7000 步 NaN (修剪后首爆)."""
         net = self.net
-        # W_lm 行 = [z4 | m2 | m8 | m32] (池与 z4 神经元对齐) → 4 段同 perm
-        net.W_lm.data = net.W_lm.data[torch.cat([perm, perm, perm, perm])].contiguous()
-        net.W_lm_2.data = net.W_lm_2.data[torch.cat([perm, perm, perm, perm])].contiguous()
+        n_bind = 3 * net.bind_slot_dim
+        # W_lm 行 = [z4 | m2 | m8 | m32 | bind] (池与 z4 神经元对齐) → 前 4 段同 perm,
+        # bind 段为独立符元 (无神经元映射, 顺序与 z4 无关) → 恒等保持
+        net.W_lm.data = net.W_lm.data[torch.cat([perm, perm, perm, perm, torch.arange(n_bind, device=perm.device)])].contiguous()
+        net.W_lm_2.data = net.W_lm_2.data[torch.cat([perm, perm, perm, perm, torch.arange(n_bind, device=perm.device)])].contiguous()
         net.W_diff.data = net.W_diff.data[perm][:, perm].contiguous()
         net.W_state_pred.data = net.W_state_pred.data[perm][:, perm].contiguous()
+        # W_bind 行 = z4 神经元 (槽共享), 同 perm
+        net.W_bind.data = net.W_bind.data[perm].contiguous()
         # _dw_buf 环形缓冲同 perm 重排 (否则 4 步缓冲与 W_diff 行错位 → 更新错乱)
         for i in range(4):
             old_buf = getattr(net, f"_dw_buf_{i}").data
@@ -276,12 +280,17 @@ class PruningEngine:
                 old_sp[: net.active_size["l4"], : net.active_size["l4"]].contiguous()
             )
             del old_sp
-            # W_lm 行同步 (L4 活性维 ×4: z4 + 3 记忆池)
+            # W_lm 行同步 (L4 活性维 ×4: z4 + 3 记忆池; bind 段 768 固定保持)
+            n_bind = 3 * net.bind_slot_dim
             old_lm = net.W_lm.data
-            net.W_lm = nn.Parameter(old_lm[: 4 * net.active_size["l4"], :].contiguous())
+            net.W_lm = nn.Parameter(old_lm[: 4 * net.active_size["l4"] + n_bind, :].contiguous())
             old_lm2 = net.W_lm_2.data
-            net.W_lm_2 = nn.Parameter(old_lm2[: 4 * net.active_size["l4"], :].contiguous())
+            net.W_lm_2 = nn.Parameter(old_lm2[: 4 * net.active_size["l4"] + n_bind, :].contiguous())
             del old_lm
+            # W_bind 行同步 (L4 活性维, 列 = 768 槽位固定)
+            old_bind = net.W_bind.data
+            net.W_bind = nn.Parameter(old_bind[: net.active_size["l4"], :].contiguous())
+            del old_bind
             # _dw_buf 环形缓冲同尺寸同步 (否则 copy_ 形状崩: 6000 步 L4 修剪后 1024 vs 973)
             for i in range(4):
                 old_buf = getattr(net, f"_dw_buf_{i}").data
@@ -308,7 +317,3 @@ class PruningEngine:
             old_t5 = net.W_t5.data
             net.W_t5 = nn.Parameter(old_t5[: net.active_size["l5"], : net.active_size["l5"]].contiguous())
             del old_t5
-            # W_bind 行同步 (L5 活性维, 列 = bind_dim 固定)
-            old_bind = net.W_bind.data
-            net.W_bind = nn.Parameter(old_bind[: net.active_size["l5"], :].contiguous())
-            del old_bind

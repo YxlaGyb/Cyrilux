@@ -134,24 +134,29 @@ class DensePCNet(nn.Module):
         # final_eps = eps_recon + 0.3 * eps_state — 迫使隐状态携带"未来往哪走"
         self.W_state_pred = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
 
-        # ── LM 头 (自监督赫布): [z4, m2, m8, m32] → 256 字节 logits, 独立于重建 W_04 ──
+        # ── 稀疏绑定层 (角色分离, 任务 2): z4 → W_bind → 3 槽 [实体|角色|谓语] ──
+        # 块对角 [a4, 3*256]: 槽间硬切块 = 独立角色 (非共享投影), 槽内 top-k WTA 硬稀疏.
+        # W_lm 输入拼接 4 段连续 z4/记忆池 + 1 段绑定向量, 绑定离散符元显式承载
+        # "主语-动词-宾语"结构 → 组合 (The slow red fox jumps) 由槽重组而非高频串复读
+        self.bind_slot_dim = 256
+        self._lm_in = d["l4"] * 4 + 3 * self.bind_slot_dim
+        self.W_bind = nn.Parameter(torch.empty(d["l4"], 3 * self.bind_slot_dim, dtype=torch.float16))
+        self.register_buffer("_bind_mask", torch.zeros(3 * self.bind_slot_dim, dtype=torch.float16))
+        self._bind_mask[: self.bind_slot_dim] = 1.0
+
+        # ── LM 头 (自监督赫布): [z4, m2, m8, m32, bind] → 256 字节 logits, 独立于重建 W_04 ──
         # W_04 双向重建被证实解码死锁 (真实 delta 注入仍复读空格);
         # W_lm 唯一任务: 把状态映射到下一字节, 纯外积.
-        # 多级记忆池拼接进 W_lm 输入 (输入维 = 4×d_l4): 3 级因果卷积核 (2/8/32 步)
-        # 承载跨序列低分辨率信息; 池间竞争由各通路 BCM 滑阈自动调节 (注意力雏形)
+        # 多级记忆池拼接进 W_lm 输入 (输入维 = 4×d_l4 + bind): 3 级因果卷积核
+        # (2/8/32 步) 承载跨序列低分辨率信息; 池间竞争由各通路 BCM 滑阈自动调节 (注意力雏形)
         self.register_buffer("_m_pool", torch.zeros(3 * d["l4"], dtype=torch.float16))
-        # W_lm 行 = 输入神经元 (z4 + 3 记忆池, 神经元对齐), 列 = 256 字节;
-        # 修剪 perm 重排需同步 4 个区段 (见 pruning._sync_l4_aux)
-        self.W_lm = nn.Parameter(torch.empty(d["l4"] * 4, self.cfg.d_input, dtype=torch.float16))
-        # W_lm_2 独立子预测器 (Q3 解耦): 专责 t+2 预测, 共享 z4/记忆池输入,
+        # W_lm 行 = 输入神经元 (z4 + 3 记忆池 + bind, 神经元对齐), 列 = 256 字节;
+        # 修剪 perm 重排需同步 5 个区段 (见 pruning._sync_l4_aux)
+        self.W_lm = nn.Parameter(torch.empty(self._lm_in, self.cfg.d_input, dtype=torch.float16))
+        # W_lm_2 独立子预测器 (Q3 解耦): 专责 t+2 预测, 共享 z4/记忆池/bind 输入,
         # 更新与 W_lm 完全独立 (dW 互不干扰) — 避免同一突触拟合双目标的信号冲突
-        self.W_lm_2 = nn.Parameter(torch.empty(d["l4"] * 4, self.cfg.d_input, dtype=torch.float16))
+        self.W_lm_2 = nn.Parameter(torch.empty(self._lm_in, self.cfg.d_input, dtype=torch.float16))
         self.bias_lm = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=torch.float16))
-
-        # ── 稀疏绑定层 (海马体式): z5 → W_bind → 4096 维, top-k WTA 硬稀疏 ──
-        # 连续 L5 激活经高维竞争坍缩为 k 个"离散符元" (纯赫布, 只更新激活行);
-        # 底层 L5 连续系统兜住信息流, 绑定层出问题不影响底层安全
-        self.W_bind = nn.Parameter(torch.empty(d["l5"], self.cfg.bind_dim, dtype=torch.float16))
 
         # ── 多尺度软加权时间窗 (2/4/8 并行因果卷积) ──
         # 软权重按各尺度 EMA 误差自适应; 4 步时间窗环形缓冲保留误差记忆
@@ -264,7 +269,8 @@ class DensePCNet(nn.Module):
                 continue  # 去相关矩阵零起步 (M=0 → 前向恒等)
             if name in ("W_lm", "W_lm_2"):
                 nn.init.normal_(p[: self.cfg.d_l4], mean=0.0, std=1.0 / math.sqrt(p.shape[-1]))
-                nn.init.normal_(p[self.cfg.d_l4:], mean=0.0, std=1e-4)
+                nn.init.normal_(p[self.cfg.d_l4 : 4 * self.cfg.d_l4], mean=0.0, std=1e-4)
+                nn.init.normal_(p[4 * self.cfg.d_l4 :], mean=0.0, std=1e-4)
             else:
                 nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(p.shape[-1]))
 

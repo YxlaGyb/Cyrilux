@@ -176,13 +176,15 @@ class LearningEngine:
         # ── 预测编码闭环: W_lm 预测误差投影回 z4, 作为表示层 top-down 误差 ──
         # eps_lm_proj = eps_lm @ W_lm.T: 表示层被迫为"预测下一字节"重组编码,
         # 而非只重构当前字节. 纯赫布, 零 BP (大脑皮层最核心的闭环)
-        # 多级记忆池拼接: [z4, m2, m8, m32] 四通道进 W_lm (物理输入层不变)
-        # 输出缩放 1/√H (CLAUDE.md: 投影输出溢出 → 乘 1/√H): logits 幅度 ∝ √(4a4)≈64
+        # 多级记忆池 + 角色绑定拼接: [z4, m2, m8, m32, bind] 五通道进 W_lm.
+        # 绑定向量 (任务 2) 由 z4 经 W_bind 三槽 top-k 生成, 离散符元承载
+        # "主语-动词-宾语" 角色结构; 记忆池承载跨序列环境 (物理输入层不变)
+        # 输出缩放 1/√H (CLAUDE.md: 投影输出溢出 → 乘 1/√H): logits 幅度 ∝ √(4a4+bind)
         # (表示层 PR 破局后有效维度大, 点积求和放大; 旧架构 PR~2 共线时隐式小).
         # 无缩放则 logits ±67 → softmax 饱和 → 熵锁 0.18 (4000 步实测)
-        zh = torch.cat([z4, net._m2, net._m8, net._m32], dim=-1)  # [N,S,4a4]
-        inv_h = 1.0 / math.sqrt(4 * a4)
-        logits_lm = (zh @ net.W_lm[:4 * a4] + net.bias_lm) * inv_h  # [N,S,256]
+        zh = torch.cat([z4, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)  # [N,S,4a4+768]
+        inv_h = 1.0 / math.sqrt(4 * a4 + 3 * net.bind_slot_dim)
+        logits_lm = (zh @ net.W_lm + net.bias_lm) * inv_h  # [N,S,256]
         # 池间侧抑制竞争 (Q4 注意力雏形): 每池 (z4/m2/m8/m32) 对 logits 的贡献能量
         # e_pool[i] = ‖zh_seg @ W_lm_seg‖ (未归一化原始能量 — 归一化会抹平池间差异,
         # 导致 BCM 阈值无区分度, 门控退化恒 0.99). BCM: theta = EMA(e_pool),
@@ -197,18 +199,20 @@ class LearningEngine:
         rel_th = th_pool / (th_pool.mean() + 1e-3)  # [4] 相对阈值
         pool_gate = 1.0 / (1.0 + rel_th)  # [4] 池级抑制系数
         pool_gate[0] = 1.0  # z4 当前状态不参与竞争 (基线通路)
-        gate_full = torch.ones(4 * a4, dtype=torch.float16, device=dev)
+        gate_full = torch.ones(4 * a4 + 3 * net.bind_slot_dim, dtype=torch.float16, device=dev)
         for i in range(1, 4):
             gate_full[seg[i]] = gate_full[seg[i]] * pool_gate[i].to(torch.float16)
         zh = zh * gate_full.unsqueeze(0).unsqueeze(0)
-        logits_lm = (zh @ net.W_lm[:4 * a4] + net.bias_lm) * inv_h  # 重算: 门控后 (输出缩放)
+        logits_lm = (zh @ net.W_lm + net.bias_lm) * inv_h  # 重算: 门控后 (输出缩放)
 
         # 多步预测 (Q3 解耦): W_lm 专责 t+1, W_lm_2 独立子预测器专责 t+2.
-        # 共享 z4/记忆池输入, 各自更新独立 (同一突触不拟合双目标 → 无信号冲突).
+        # 共享 z4/记忆池/bind 输入, 各自更新独立 (同一突触不拟合双目标 → 无信号冲突).
         # 生物学: 多巴胺 RPE 奖励"未来时间窗预测准确度"; 数学: 只有预测 2 步,
         # z4 才被迫携带跨词边界的高维结构 (单步预测锁死 N-gram 局域极小值)
-        zh2 = torch.cat([z4[:, :-2], net._m2[:, :-2], net._m8[:, :-2], net._m32[:, :-2]], dim=-1)
-        logits_t2 = (zh2 @ net.W_lm_2[:4 * a4] + net.bias_lm) * inv_h  # [N,S-2,256] (输出缩放)
+        zh2 = torch.cat(
+            [z4[:, :-2], net._m2[:, :-2], net._m8[:, :-2], net._m32[:, :-2], net._bind_vec[:, :-2]], dim=-1
+        )
+        logits_t2 = (zh2 @ net.W_lm_2 + net.bias_lm) * inv_h  # [N,S-2,256] (输出缩放)
         target_lm = F.one_hot(byte_ids[:, 1:], num_classes=256).to(torch.float16)
         target_lm2 = F.one_hot(byte_ids[:, 2:], num_classes=256).to(torch.float16)
         # 赫布版 softmax 误差: eps = target - softmax(logits) (概率尺度 0-1).
@@ -218,7 +222,20 @@ class LearningEngine:
         probs_t2 = torch.softmax(logits_t2.float(), dim=-1).to(torch.float16)
         eps_lm = (target_lm - probs_lm[:, :-1]).detach()  # [N,S-1,256]
         eps_t2 = (target_lm2 - probs_t2).detach()  # [N,S-2,256] 专供 W_lm_2 更新
-        eps_total = eps_lm  # W_lm 只吃 t+1 误差 (解耦后无 t2 混入)
+        # 任务 1: 多步差分目标 — 差分误差 = (target_{t+2}-target_{t+1}) - (probs_{t+2}-probs_{t+1}),
+        # 两步内字节变化的方向/幅度必须匹配 (structure 上"下一步变什么").
+        # W_lm 吃 diff2 (S-1 对齐) + t+1 误差; W_lm_2 吃 diff2 + t+2 误差 (同权重,
+        # 不引入 BP — 差分目标只是额外的赫布外积误差通道)
+        probs_l1 = probs_lm[:, :-1]  # [N,S-1,256] = t+1 概率
+        probs_l2 = probs_t2  # [N,S-2,256] = t+2 概率
+        target_l1 = target_lm  # [N,S-1,256] = t+1 目标
+        target_l2 = target_lm2  # [N,S-2,256] = t+2 目标
+        diff2 = (target_l2 - target_l1[:, :-1]) - (probs_l2 - probs_l1[:, :-1])  # [N,S-2,256]
+        diff2 = torch.cat([diff2, torch.zeros(N, 1, 256, dtype=diff2.dtype, device=dev)], dim=1)  # S-1 对齐
+        # 0.2 权重: diff2 能量占比 ~22% (0.5 时 41%, W_lm 更新方向被差分信号主宰,
+        # 单步目标被稀释 → 熵慢降、命中率冻结). 差分目标保留为辅助结构信号
+        eps_total = (eps_lm + 0.2 * diff2).detach()  # W_lm: t+1 误差 + 差分误差 (S-1 对齐)
+        eps_t2_total = (eps_t2 + 0.2 * diff2[:, :-1]).detach()  # W_lm_2: t+2 误差 + 差分误差 (S-2)
 
         # 动态稳态竞争: 每步记录 batch 级 W_lm 熵 (fp32 调度域, log 精度需 fp32),
         # 连续负反馈: 20 步窗口最小二乘斜率 (线性拟合滤噪, 零超参),
@@ -235,18 +252,23 @@ class LearningEngine:
                 slope20 = (net._t_center * w).sum() / net._t_denom * 20.0  # 20 步总变化
                 sigma = w.std() + 1e-4
                 net._traction_scale.copy_(2.0 / (1.0 + torch.exp(-slope20 / sigma)))
-        # Q1 显著性反馈: 回传误差 × 时间突变范数 |z4[t]-z4[t-1]| — 神经元只在状态
-        # 剧变 (感知突发事件) 时接收高强度 top-down 反馈, 而非均匀背景噪声.
-        # 突变范数 RMS 归一化防幅度失控. (实验开关: 关时退化为均匀回传)
-        # 投影用全量 W_lm (4 段) 再取 z4 维: 预测误差经所有输入段权重汇聚到 z4
-        # 神经元 — 不受池门控排挤影响 (若只投影 z4 段, 池权重增长会压制 z4 段
+        # Q1 显著性反馈 + 任务 3 误差剧烈度缩放: 回传误差 × 时间突变范数
+        # |z4[t]-z4[t-1]| × 预测误差能量 — 状态剧变且预测失误的时刻, 自上而下
+        # 大幅改写表示层; 平稳且预测准的时刻回传弱 (保护已学结构).
+        # 投影用全量 W_lm (5 段含绑定) 再取 z4 维: 预测误差经所有输入段权重汇聚到
+        # z4 神经元 — 不受池门控排挤影响 (若只投影 z4 段, 池权重增长会压制 z4 段
         # → 表示层收不到预测误差 → 漂移 NaN, 9000 步崩盘根因)
         if getattr(net, "_q1_enabled", True):
             dz4_sig = (z4[:, 1:] - z4[:, :-1]).norm(dim=-1, keepdim=True)  # [N,S-1,1]
             dz4_sig = dz4_sig / (dz4_sig.max() + 1e-3)
-            eps_lm_proj = (eps_total @ net.W_lm[:4 * a4].T)[:, :, :a4] * dz4_sig  # [N,S-1,a4]
+            # soft 饱和增益: gain = x/(0.5·mean+0.5·x) ∈ (0,2), 有界无 clamp;
+            # 误差 x=均值 → 1, x≫均值 → 2 (大幅改写), x≪均值 → 0 (保护)
+            err_mag = eps_total.norm(dim=-1, keepdim=True)  # [N,S-1,1]
+            err_ref = err_mag.mean() + 1e-3
+            gain = err_mag / (0.5 * err_ref + 0.5 * err_mag)
+            eps_lm_proj = (eps_total @ net.W_lm.T)[:, :, :a4] * dz4_sig * gain  # [N,S-1,a4]
         else:
-            eps_lm_proj = (eps_total @ net.W_lm[:4 * a4].T)[:, :, :a4]  # 均匀回传
+            eps_lm_proj = (eps_total @ net.W_lm.T)[:, :, :a4]  # 均匀回传
         eps_lm_pad = torch.cat(
             [eps_lm_proj, torch.zeros(N, 1, a4, dtype=eps_lm_proj.dtype, device=dev)], dim=1
         )
@@ -426,8 +448,6 @@ class LearningEngine:
         # 指数遗忘 (0.999/步, 纯乘法): 单位能量外积在目标附近振荡 (无阻尼 LMS),
         # 遗忘项提供阻尼让权重收敛而非翻转
         err_norm = eps_total.norm(dim=-1, keepdim=True) * 1.01
-        # 零向量保护: 某位置预测完美 (softmax 概率 fp16 舍入到 1.0) 时误差
-        # 全零 → 0/0 = NaN, 冻结长跑 ~2000 步偶发爆 W_lm. 掩码: 零范数行分母=1
         alive = (err_norm > 1e-8).to(eps_total.dtype)
         denom = torch.where(alive > 0, err_norm, torch.ones_like(err_norm))
         err_scaled = eps_total * alive / denom  # 单位能量, 方向保留
@@ -445,54 +465,69 @@ class LearningEngine:
         # 更新外积用 _rms(zh): 高维输入稀释 dW 能量 (4096 维 vs 旧架构共线 ~2 维),
         # 0.999 指数遗忘吃掉稀释后的更新 → W_lm 行范数冻结 (实测 1.195 纹丝不动);
         # 输入归一化让更新能量与维度解耦, 每步更新恒定
-        dW_lm = (_rms(zh[:, :-1]).transpose(-2, -1) @ (err_scaled - 0.1 * phi_wlm[:, :-1])).mean(dim=0) * math.sqrt(4 * a4)  # [4a4,256] (补偿输出缩放)
+        dW_lm = (_rms(zh[:, :-1]).transpose(-2, -1) @ (err_scaled - 0.1 * phi_wlm[:, :-1])).mean(dim=0) * math.sqrt(4 * a4 + 3 * net.bind_slot_dim)  # [4a4+768,256] (补偿输出缩放)
         # 单步更新幅度上界 (W_04 同款幅度-方向解耦): 高维输入下 dW 能量大,
         # 极端 batch (长文本/padding 边界) 单步爆 → W_lm_2 NaN (800 步实测);
         # 归一化到单位方向再乘 eta_lm, 最大单步幅度 = eta_lm
         dW_lm_n = dW_lm.norm() + 1e-8
         dW_lm = dW_lm / dW_lm_n
         # 记忆池段学习率激励 (生物倾角): 池段从 1e-4 低起点起爬, lr_mem = lr_z4 × 1.5,
-        # 让其能以更快速度爬到与 z4 公平竞争的高峰. 固定机制, 非调参
-        lr_seg = torch.full((4 * a4, 1), eta_lm, dtype=torch.float16, device=dev)
-        lr_seg[a4:] = eta_lm * 1.5
-        net.W_lm[:4 * a4].data.mul_(0.999)
-        net.W_lm[:4 * a4].data += dW_lm * lr_seg
-        net.bias_lm.data += (err_scaled - 0.1 * phi_wlm[:, :-1]).mean(dim=(0, 1)) * eta_lm
-        soft_norm_preserve(net.W_lm[:4 * a4].data)
+        # 绑定段 (任务 2 新符元) 同激励, 让其能以更快速度爬到与 z4 公平竞争的高峰.
+        # 固定机制, 非调参
+        n_bind = 3 * net.bind_slot_dim
+        lr_seg = torch.full((4 * a4 + n_bind, 1), eta_lm, dtype=torch.float16, device=dev)
+        lr_seg[a4 : 4 * a4] = eta_lm * 1.5
+        lr_seg[4 * a4 :] = eta_lm * 1.5
+        net.W_lm.data.mul_(0.999)
+        net.W_lm.data += dW_lm * lr_seg
+        # bias 只学"哪些字节整体更常见"的相对偏置 (全体去均值, softmax 对平移不变):
+        # 误差只用纯 t+1 目标 (eps_lm 的 err_scaled), 不含 diff2 — diff2 的逐字节
+        # 目标位模式 (+1/-1 在 t2/t1 间交替) 会把中文高频 UTF-8 字节位系统性推高,
+        # bias 单向累积 (实测 2000 步 std 471) → logits 被 bias 主导 → 熵锁死 1.6.
+        # diff2 继续进 W_lm 权重更新 (dW_lm), 那里才是差分目标的用途
+        bias_err = eps_lm / (eps_lm.norm(dim=-1, keepdim=True) * 1.01 + 1e-8)
+        bias_d = bias_err.mean(dim=(0, 1))
+        net.bias_lm.data += (bias_d - bias_d.mean()) * eta_lm
+        soft_norm_preserve(net.W_lm.data)
 
-        # W_lm_2 独立更新 (Q3 解耦): 只吃 t+2 误差, 与 W_lm 完全独立
+        # W_lm_2 独立更新 (Q3 解耦): 吃 t+2 误差 + 差分误差 (eps_t2_total), 与 W_lm 完全独立
         # 同款机制: 零向量保护 + 单位能量 + BCM 防抖 + 指数遗忘
-        err_norm2 = eps_t2.norm(dim=-1, keepdim=True) * 1.01
-        alive2 = (err_norm2 > 1e-8).to(eps_t2.dtype)
+        err_norm2 = eps_t2_total.norm(dim=-1, keepdim=True) * 1.01
+        alive2 = (err_norm2 > 1e-8).to(eps_t2_total.dtype)
         denom2 = torch.where(alive2 > 0, err_norm2, torch.ones_like(err_norm2))
-        err_scaled2 = eps_t2 * alive2 / denom2
+        err_scaled2 = eps_t2_total * alive2 / denom2
         logits_n2 = _rms(logits_t2.detach())
         th_wlm2 = net._theta_wlm2
         th_wlm2.mul_(0.01).add_(0.99 * (logits_n2 * logits_n2).mean(dim=(0, 1)))
         phi_wlm2 = logits_n2 * (logits_n2 - th_wlm2)
         phi_wlm2 = _rms(phi_wlm2)
-        dW_lm2 = (_rms(zh2).transpose(-2, -1) @ (err_scaled2 - 0.1 * phi_wlm2)).mean(dim=0) * math.sqrt(4 * a4)
+        dW_lm2 = (_rms(zh2).transpose(-2, -1) @ (err_scaled2 - 0.1 * phi_wlm2)).mean(dim=0) * math.sqrt(4 * a4 + 3 * net.bind_slot_dim)
         dW_lm2_n = dW_lm2.norm() + 1e-8
         dW_lm2 = dW_lm2 / dW_lm2_n  # 单步更新幅度上界 (防突爆)
-        lr_seg2 = torch.full((4 * a4, 1), eta_lm, dtype=torch.float16, device=dev)
-        lr_seg2[a4:] = eta_lm * 1.5
-        net.W_lm_2[:4 * a4].data.mul_(0.999)
-        net.W_lm_2[:4 * a4].data += dW_lm2 * lr_seg2
-        soft_norm_preserve(net.W_lm_2[:4 * a4].data)
+        lr_seg2 = torch.full((4 * a4 + n_bind, 1), eta_lm, dtype=torch.float16, device=dev)
+        lr_seg2[a4 : 4 * a4] = eta_lm * 1.5
+        lr_seg2[4 * a4 :] = eta_lm * 1.5
+        net.W_lm_2.data.mul_(0.999)
+        net.W_lm_2.data += dW_lm2 * lr_seg2
+        soft_norm_preserve(net.W_lm_2.data)
 
         # 状态预测矩阵自更新 (纯赫布): dW_sp = z4^T @ eps_state, 零 BP
         W_sp_a.data += (net._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0) * eta
         soft_norm_preserve(W_sp_a.data)
 
-        # 稀疏绑定层赫布更新 (只更新 top-k 激活行): dW_bind = z5^T @ sparse
-        # 激活神经元 = 竞争胜出的"离散符元", 其连接被强化, 其余行不更新
-        if hasattr(net, "_bind_sparse"):
-            z5_nrm = z5.norm(dim=-1, keepdim=True)
-            z5_alive = (z5_nrm > 1e-8).to(z5.dtype)
-            z5_n = z5 * z5_alive / (z5_nrm * 1.01 + 1e-8 * (1 - z5_alive))
-            dW_bind = (z5_n.transpose(-2, -1) @ net._bind_sparse).mean(dim=0)
-            net.W_bind[:a5].data += dW_bind * eta
-            soft_norm_preserve(net.W_bind[:a5].data)
+        # ── 稀疏绑定层赫布更新 (任务 2, 纯外积, 零 BP): ──
+        # dW_bind = z4_pre^T @ (sparse_pre @ _bind_mask 展平) — W_bind 行 = z4 神经元
+        # (3 段), 列 = 768 槽位. 槽位掩码 _bind_mask: 非角色槽 (槽 2/3) 强制掩零,
+        # 只学"实体"槽的 z4→槽映射, 角色/谓语槽作为生成输出承载结构 (防 768 槽
+        # 全部竞争同一角色 → 槽间退化). 激活槽位 (top-k=1) 的映射被强化, 其余不变
+        if hasattr(net, "_bind_vec"):
+            z4n = _rms(z4)
+            bind_target = (net._bind_vec * net._bind_mask.unsqueeze(0).unsqueeze(0))  # [N,S,768]
+            dW_bind = (z4n[:, :-1].transpose(-2, -1) @ bind_target[:, :-1]).mean(dim=0) * (1.0 / (S - 1))
+            dW_bind = dW_bind * net._bind_mask.unsqueeze(0)
+            net.W_bind[:a4].data.mul_(0.9995)
+            net.W_bind[:a4].data += dW_bind * (eta * 2.0)
+            soft_norm_preserve(net.W_bind[:a4].data)
 
         # 前馈权重软范数保持 (0.8-1.2): W_04/W_42/W_56 无 BCM 约束,
         # 长训累积溢出 fp16 → NaN; 幅度差异保留 (结构化非 clamp)
