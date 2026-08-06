@@ -34,7 +34,7 @@ class DensePCConfig:
     d_l4: int = 1024
     d_l2: int = 384
     d_l3: int = 384
-    d_l5: int = 256
+    d_l5: int = 1024  # 统一 L5 (撤销硬切块): 原 256 拆 4×64 微柱, 现单矩阵 [1024,384]
     d_l6: int = 128
     max_seq_len: int = 256
     # 时序双通道输入: W_04 输入 = [z0[t], z0[t-1]] 拼接 (词序信息进入表示层).
@@ -43,7 +43,7 @@ class DensePCConfig:
 
     # Hebbian 物理有效学习率 (1:1 映射到内部更新公式，无隐藏缩放)
     lr_hebbian: float = 0.003
-    temporal_lr_ratio: float = 5.0
+    temporal_lr_ratio: float = 5.0  # 频率锚点方案: 恢复默认, 不靠降速治谱
     oja_alpha: float = 0.05
     column_dropout: float = 0.25
     # 时间惯性 alpha (per-layer, per-neuron)
@@ -68,8 +68,6 @@ class DensePCConfig:
 
     # 时序预测连接 (时空差分共振) 配置
     gen_precision: float = 1.0  # 差分共振强度
-    # 微柱阵列: L5 拆成 n 个独立列块, 块间不共享 Hebbian/Oja
-    l5_blocks: int = 4
     # 稀疏绑定层: L5 之上哈希式稀疏绑定 (k-WTA), 离散符元的种子
     bind_dim: int = 4096
     bind_k: int = 10
@@ -124,12 +122,8 @@ class DensePCNet(nn.Module):
         self.W_04 = nn.Parameter(torch.empty(d["l4"], self._in_dim, dtype=torch.float16))
         self.W_42 = nn.Parameter(torch.empty(d["l2"], d["l4"], dtype=torch.float16))
         self.W_23 = nn.Parameter(torch.empty(d["l3"], d["l2"], dtype=torch.float16))
-        # ── 微柱阵列: L5 拆 4 独立列块, 块间不共享 Hebbian/Oja ──
-        self.n_blocks = self.cfg.l5_blocks
-        self.b5 = d["l5"] // self.n_blocks  # 每块维度
-        self.W_35 = nn.ParameterList(
-            [nn.Parameter(torch.empty(self.b5, d["l3"], dtype=torch.float16)) for _ in range(self.n_blocks)]
-        )
+        # ── L5 统一矩阵 (撤销微柱硬切块): 单 W_35 [1024,384], 无块路由 ──
+        self.W_35 = nn.Parameter(torch.empty(d["l5"], d["l3"], dtype=torch.float16))
         self.W_56 = nn.Parameter(torch.empty(d["l6"], d["l5"], dtype=torch.float16))
 
         # ── 世界模型 (下一状态预测): W_diff 在 L4 空间预测 Δz4 = z4[t] - z4[t-1] ──
@@ -140,16 +134,18 @@ class DensePCNet(nn.Module):
         # final_eps = eps_recon + 0.3 * eps_state — 迫使隐状态携带"未来往哪走"
         self.W_state_pred = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
 
-        # ── LM 头 (自监督赫布): [z4, h] → 256 字节 logits, 独立于重建 W_04 ──
+        # ── LM 头 (自监督赫布): [z4, m2, m8, m32] → 256 字节 logits, 独立于重建 W_04 ──
         # W_04 双向重建被证实解码死锁 (真实 delta 注入仍复读空格);
-        # W_lm 唯一任务: 把状态映射到下一字节, dW_lm = [z4,h]^T @ (target - logits) 纯外积
-        # h = 工作记忆 (指数积分 0.99·h + 0.01·z4), 承载跨序列的低分辨率环境信息,
-        # 拼接进 W_lm 输入 (输入维 = d_l4 × 2), 生物海马体式存储器
-        self._h_alpha = 0.99
-        self.register_buffer("_h_mem", torch.zeros(d["l4"], dtype=torch.float16))
-        # W_lm 行 = 输入神经元 (前 a4 = z4, 后 a4 = h, 神经元对齐), 列 = 256 字节;
-        # h 是 z4 的指数积分 → 修剪 perm 重排需同步前后两半 (见 pruning._sync_l4_aux)
-        self.W_lm = nn.Parameter(torch.empty(d["l4"] * 2, self.cfg.d_input, dtype=torch.float16))
+        # W_lm 唯一任务: 把状态映射到下一字节, 纯外积.
+        # 多级记忆池拼接进 W_lm 输入 (输入维 = 4×d_l4): 3 级因果卷积核 (2/8/32 步)
+        # 承载跨序列低分辨率信息; 池间竞争由各通路 BCM 滑阈自动调节 (注意力雏形)
+        self.register_buffer("_m_pool", torch.zeros(3 * d["l4"], dtype=torch.float16))
+        # W_lm 行 = 输入神经元 (z4 + 3 记忆池, 神经元对齐), 列 = 256 字节;
+        # 修剪 perm 重排需同步 4 个区段 (见 pruning._sync_l4_aux)
+        self.W_lm = nn.Parameter(torch.empty(d["l4"] * 4, self.cfg.d_input, dtype=torch.float16))
+        # W_lm_2 独立子预测器 (Q3 解耦): 专责 t+2 预测, 共享 z4/记忆池输入,
+        # 更新与 W_lm 完全独立 (dW 互不干扰) — 避免同一突触拟合双目标的信号冲突
+        self.W_lm_2 = nn.Parameter(torch.empty(d["l4"] * 4, self.cfg.d_input, dtype=torch.float16))
         self.bias_lm = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=torch.float16))
 
         # ── 稀疏绑定层 (海马体式): z5 → W_bind → 4096 维, top-k WTA 硬稀疏 ──
@@ -218,13 +214,28 @@ class DensePCNet(nn.Module):
         # W_lm 开始输出高频极值 (振荡源头) 时 theta 升高 → pred-theta<0 → 抑制过冲.
         # 纯机制剪刀, 线性, 无 BP; 与 W_diff 的 _theta_w 同模式
         self.register_buffer("_theta_wlm", torch.full((self.cfg.d_input,), 0.01, dtype=torch.float16))
-        # Foldiak 反赫布侧抑制 (L5 去相关): M 协方差, 零对角线
+        # W_lm_2 专属 BCM 滑阈 (同 W_lm 防过冲模式)
+        self.register_buffer("_theta_wlm2", torch.full((self.cfg.d_input,), 0.01, dtype=torch.float16))
+        # 池间侧抑制竞争滑阈 (Q4): 4 池各一个能量级 BCM theta (标量, 池级竞争)
+        self.register_buffer("_theta_pool", torch.full((4,), 0.01, dtype=torch.float16))
+        # Foldiak 反赫布权重去同质化矩阵 (每层一个): E 学权重行间**绝对相关**
+        # (|cos| — 有符号 cos 被 ± 符号随机掩盖, 检测不到 Hebbian 行收敛到 ±w 对),
+        # 作用于 dW/W: W -= 0.2·E_n@W, 打破行收敛 → 投影秩 1 (PR_eff 焊死根因).
+        # E 零起步 = 无抑制; 零对角; 指数遗忘 ×0.99, 稳态 E_ij ≈ |corr_ij|
+        self.E_l5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
+        self.E_42 = nn.Parameter(torch.zeros(d["l2"], d["l2"], dtype=torch.float16))
+        self.E_23 = nn.Parameter(torch.zeros(d["l3"], d["l3"], dtype=torch.float16))
+        # 时间核去同质化矩阵: W_t 既有秩 1 结构 (top1 sv 11.4 固化, 旧检查点
+        # 激活秩 1 的来源 — 锚点只防新增长, 不清除旧结构). 超量 E (β=1.2)
+        # 直接清除 W_t 主方向
+        self.E_t2 = nn.Parameter(torch.zeros(d["l2"], d["l2"], dtype=torch.float16))
+        self.E_t3 = nn.Parameter(torch.zeros(d["l3"], d["l3"], dtype=torch.float16))
+        self.E_t5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
+        # Foldiak 反赫布侧抑制矩阵 (L5 激活去相关, 方案 D): M 零起步 = 前向恒等
+        # (z5 - α·M@z5); 学 z_out 协方差 (白化本质), 零对角, 指数遗忘防爆炸
         self.M_l5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
-        # 固定掩码 (只切 dW 更新路径): 10% 突触剪切 + [0.5,1.5] 随机增益播种
-        for b in range(self.n_blocks):
-            self.register_buffer(f"_syn_mask_{b}", (torch.rand(self.b5, d["l3"]) > 0.1).to(torch.float16))
-        for b in range(self.n_blocks):
-            self.register_buffer(f"_gain_mask_{b}", (0.5 + torch.rand(self.b5, d["l3"])).to(torch.float16))
+        # 固定掩码 (只切 dW 更新路径): [0.5,1.5] 随机增益播种 (L5 无块, 无 10% 剪切)
+        self.register_buffer("_gain_mask", (0.5 + torch.rand(d["l5"], d["l3"])).to(torch.float16))
         # L3 种子: W_23 固定随机增益掩码 (上游扰动级联到 L5)
         self.register_buffer("_gain_l3", (0.5 + torch.rand(d["l3"], d["l2"])).to(torch.float16))
 
@@ -240,11 +251,22 @@ class DensePCNet(nn.Module):
         self.pruner = PruningEngine(self)
 
     def _init_weights(self):
-        """Kaiming 初始化所有权重 (行范数 ≈ 1.0, 配合 Oja 稳态)."""
+        """Kaiming 初始化所有权重 (行范数 ≈ 1.0, 配合 Oja 稳态).
+
+        例外: W_lm/W_lm_2 的记忆池段 (m2/m8/m32, 后 3/4) 初始化接近 0 (1e-4) —
+        新池从"无贡献"开始学 (生物发育: 突触从杂乱到有效), 由池门控自然放大
+        有用的池; z4 段保持 Kaiming (加载旧权重时被覆盖).
+        """
         for name, p in self.named_parameters():
             if "bias" in name:
                 continue
-            nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(p.shape[-1]))
+            if name in ("E_l5", "E_42", "E_23", "M_l5", "E_t2", "E_t3", "E_t5"):
+                continue  # 去相关矩阵零起步 (M=0 → 前向恒等)
+            if name in ("W_lm", "W_lm_2"):
+                nn.init.normal_(p[: self.cfg.d_l4], mean=0.0, std=1.0 / math.sqrt(p.shape[-1]))
+                nn.init.normal_(p[self.cfg.d_l4:], mean=0.0, std=1e-4)
+            else:
+                nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(p.shape[-1]))
 
     # ── 门面: 一行委托 (逻辑在引擎模块) ──
 
@@ -312,9 +334,9 @@ class DensePCNet(nn.Module):
             "l5": net.W_56.shape[1],
             "l6": net.W_56.shape[0],
         }
-        # _h_mem (工作记忆) 对齐活性 L4 (旧检查点无此缓冲 → init 全量, 需裁)
-        if net._h_mem.shape[0] != net.active_size["l4"]:
-            old_h = net._h_mem.data
-            net.register_buffer("_h_mem", old_h[: net.active_size["l4"]].contiguous())
-            del old_h
+        # _m_pool (多级记忆池) 对齐活性 L4 (旧检查点无此缓冲 → init 全量, 需裁 3 段)
+        if net._m_pool.shape[0] != 3 * net.active_size["l4"]:
+            old_m = net._m_pool.data
+            net.register_buffer("_m_pool", old_m[: 3 * net.active_size["l4"]].contiguous())
+            del old_m
         return net

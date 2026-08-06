@@ -69,8 +69,9 @@ class ForwardEngine:
             z4_n = net._z4 / (net._z4.norm(dim=-1, keepdim=True) + 1e-3)
             pred_delta = z4_n @ W_diff_a.T + net.b_diff[:a4].unsqueeze(0).unsqueeze(0)
             z4_next = net._z4 + pred_delta
-            zh_next = torch.cat([z4_next, net._h], dim=-1)  # 工作记忆拼接
-            mu0_top = zh_next @ net.W_lm[:2 * a4] + net.bias_lm  # W_lm 解码
+            zh_next = torch.cat([z4_next, net._m2, net._m8, net._m32], dim=-1)  # 记忆池拼接
+            inv_h = 1.0 / math.sqrt(4 * a4)
+            mu0_top = (zh_next @ net.W_lm[:4 * a4] + net.bias_lm) * inv_h  # W_lm 解码 (输出缩放)
             last = mu0_top[0, -1].float() / temperature
             topv, _ = torch.topk(last, min(15, 256))
             last[last < topv[-1]] = -float("inf")
@@ -138,34 +139,14 @@ class ForwardEngine:
         if not is_inference:
             mu3 = mu3 + torch.sign(2.0 * (torch.rand_like(mu3) - 0.5)) * 0.03  # ACh 噪声
         z3 = self._recurrent(mu3, dev, net.W_t3[:a3, :a3])
-        # 微柱路由: 微柱 b 处理时间步 {b, b+4, ...}, 输出到 z5 的 [b*b5:(b+1)*b5] 切片
-        z5 = torch.zeros(N, S, a5, dtype=torch.float16, device=dev)
         z3_n = _l2_norm(z3)
-        for b in range(net.n_blocks):
-            z3_route = z3_n[:, b :: net.n_blocks, :]  # [N, S//n, a3] 该微柱的时间步子集
-            zb = z3_route @ net.W_35[b].T + net.bias_l5[b * net.b5 : (b + 1) * net.b5]
-            z5[:, b :: net.n_blocks, b * net.b5 : (b + 1) * net.b5] = zb
-        # Foldiak 去相关 + 路由分离: z5_raw 原始幅度喂 W_diff, z5 去中心化喂下游
+        # L5 统一矩阵 (撤销微柱硬切块): 全量 z3 → 单 W_35 [a5, a3]
+        z5 = z3_n @ net.W_35[:a5].T + net.bias_l5[:a5]
+        # 路由分离: z5_raw 原始幅度喂 W_diff, z5 去中心化喂下游.
+        # Foldiak 反赫布侧抑制 (方案 D): z5 -= 0.2·M@z5, M 零起步 = 恒等;
+        # M 学 z_out 协方差 → 白化去相关 → 打破行收敛 ±w 的共线激活
         z5_fd = z5 - 0.2 * (net.M_l5[:a5, :a5] @ z5.transpose(-2, -1)).transpose(-2, -1)
         z5_raw = z5_fd
-        # 空间软竞争 (微柱级): 各微柱独立算时序差分误差 (与 learn 同口径),
-        # 误差软化倒数加权 — 误差小的柱权重放大, 误差大的柱被抑制但不清零.
-        # w = 1/(1 + err·scale): 动态范围有限, 坏柱权重下限 >0, 防正反馈崩溃 NaN.
-        # 打破 4 柱同权均质化; 与多尺度时间窗软加权同构.
-        w_sp = torch.ones(net.n_blocks, dtype=torch.float16, device=dev)
-        if not is_inference:
-            for b in range(net.n_blocks):
-                b_s = slice(b * net.b5, (b + 1) * net.b5)
-                # 用缩放前的原始 z5 (Foldiak 后), 避免原地缩放污染后续块误差口径
-                zb = z5[..., b_s][:, b :: net.n_blocks]
-                epsb = zb[:, 1:] - zb[:, :-1]
-                # L1 平均误差防平方溢出 (fp16), 误差大的柱权重小
-                err_b = epsb.abs().mean() * 1.01
-                w_sp[b] = 1.0 / (1.0 + err_b * 4.0)
-            # 只抑制不放大 (w_sp ≤ 1): 坏柱缩小, 好柱保持, 幅度只减不增防溢出
-            for b in range(net.n_blocks):
-                b_s = slice(b * net.b5, (b + 1) * net.b5)
-                z5_raw[..., b_s] = z5_raw[..., b_s] * w_sp[b]
         z5 = z5_raw - z5_raw.mean(dim=-1, keepdim=True)
         mu6 = z5 @ W_56_a.T + net.bias_l6[:a6]
         z6 = self._recurrent(mu6, dev, net.W_t6[:a6, :a6])
@@ -189,13 +170,20 @@ class ForwardEngine:
             net._z5 = z5
             net._z5_raw = z5_raw
             net._z6 = z6
-            # 工作记忆 (海马体式指数积分): h_t = 0.99·h_{t-1} + 0.01·z4_t,
-            # batch 内按时间步递推, 跨序列累积低分辨率环境信息 (不改变物理输入层)
-            h_t = net._h_mem.unsqueeze(0).unsqueeze(0).expand(N, 1, -1).clone()  # [N,1,a4] 第 0 步 = 上序列末态
+            # 多级记忆池 (3 级因果卷积核, 替代单变量 h): 即时 2 步 / 短时 8 步 /
+            # 长时 32 步 — 每级 = 核窗口内 z4 的因果滑动平均 (纯机制, 无超参权重),
+            # 位置信息由各级窗口保留, 跨序列经 _m_pool 延续 (零填充 = 接续上序列末态)
+            m_prev = net._m_pool.unsqueeze(0).unsqueeze(0).expand(N, 1, -1).clone()  # [N,1,3a4]
+            m2 = m_prev[:, :, :a4]
+            m8 = m_prev[:, :, a4:2 * a4]
+            m32 = m_prev[:, :, 2 * a4:]
             for t in range(1, S):
-                h_t = torch.cat([h_t, net._h_alpha * h_t[:, -1:] + 0.01 * z4[:, t:t + 1]], dim=1)
-            net._h_mem.copy_((net._h_alpha * h_t[:, -1] + 0.01 * z4[:, -1]).mean(dim=0))
-            net._h = h_t  # [N, S, a4] 每步的积分记忆
+                zt = z4[:, t:t + 1]  # [N,1,a4]
+                m2 = torch.cat([m2, 0.5 * m2[:, -1:] + 0.5 * zt], dim=1)
+                m8 = torch.cat([m8, 0.125 * m8[:, -1:] + 0.875 * zt], dim=1)
+                m32 = torch.cat([m32, 0.03125 * m32[:, -1:] + 0.96875 * zt], dim=1)
+            net._m_pool = torch.cat([m2[:, -1], m8[:, -1], m32[:, -1]], dim=-1).mean(dim=0)  # [3a4]
+            net._m2, net._m8, net._m32 = m2, m8, m32  # [N,S,a4] 每级记忆池
 
         # 稀疏绑定 (k-WTA): 连续 z5 经 W_bind 映射到 bind_dim, 只留 top-k 激活
         # "离散符元" = 高维竞争坍缩出的 k 个神经元 ID, 非外部字典

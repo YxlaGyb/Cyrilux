@@ -57,8 +57,12 @@ class PruningEngine:
         n_candidate: int,
         expired: torch.Tensor | None,
         perm_map: dict[str, torch.Tensor],
+        score_fn=None,
     ) -> tuple[torch.Tensor | None, int]:
         """相对排名淘汰: 行范数 top-k 候选 + 过期强制, 生成 perm 并重排行向权重.
+
+        感知修剪 (方案 B): L4 传 score_fn, 候选分数 = 表示层行范数 × W_lm 行范数 —
+        只剪"对预测无贡献"的神经元 (表示层低活跃 且 W_lm 依赖弱); 其余层用纯行范数.
 
         Returns:
             (perm, n_alive): perm=None 表示无修剪 (n_alive=active).
@@ -66,6 +70,8 @@ class PruningEngine:
         net = self.net
         W = getattr(net, self._W_attr[layer])
         rn = W[:active].data.norm(dim=1)
+        if score_fn is not None:
+            rn = score_fn(rn, active)
 
         _, dead_ix = rn.topk(n_candidate, dim=-1, largest=False)
         candidate_mask = torch.zeros(active, dtype=torch.bool, device=rn.device)
@@ -123,8 +129,9 @@ class PruningEngine:
         """L4 神经元行重排 → 同步重排所有 L4 行映射的权重,
         否则预测误差投影与 W_04 行错位 → 6000-7000 步 NaN (修剪后首爆)."""
         net = self.net
-        # W_lm 行 = [z4 神经元 | h 神经元] (h 是 z4 指数积分, 神经元对齐) → 前后两半同 perm
-        net.W_lm.data = net.W_lm.data[torch.cat([perm, perm])].contiguous()
+        # W_lm 行 = [z4 | m2 | m8 | m32] (池与 z4 神经元对齐) → 4 段同 perm
+        net.W_lm.data = net.W_lm.data[torch.cat([perm, perm, perm, perm])].contiguous()
+        net.W_lm_2.data = net.W_lm_2.data[torch.cat([perm, perm, perm, perm])].contiguous()
         net.W_diff.data = net.W_diff.data[perm][:, perm].contiguous()
         net.W_state_pred.data = net.W_state_pred.data[perm][:, perm].contiguous()
         # _dw_buf 环形缓冲同 perm 重排 (否则 4 步缓冲与 W_diff 行错位 → 更新错乱)
@@ -136,10 +143,11 @@ class PruningEngine:
         old_thw = net._theta_w.data
         net.register_buffer("_theta_w", old_thw[perm].contiguous())
         del old_thw
-        # _h_mem (工作记忆) 同 perm 重排 (h 与 z4 神经元对齐, 错位 → W_lm 输入乱)
-        old_h = net._h_mem.data
-        net.register_buffer("_h_mem", old_h[perm].contiguous())
-        del old_h
+        # _m_pool (多级记忆池, 3 段 × a4) 同 perm 重排 (池与 z4 神经元对齐,
+        # 错位 → W_lm 输入乱)
+        old_m = net._m_pool.data
+        net.register_buffer("_m_pool", old_m[torch.cat([perm, perm, perm])].contiguous())
+        del old_m
 
     def _shrink_columns(
         self, layer: str, n_alive: int, src: str, src_n: int, perm_map: dict[str, torch.Tensor]
@@ -161,23 +169,21 @@ class PruningEngine:
             net.register_buffer("_gain_l3", old_g[:, l2_perm].contiguous())
             del old_g
 
-        # W_35 微柱输入维 = L3 活性维: L3 修剪后同步 W_35 列数 + 按 perm 重排列,
+        # W_35 输入维 = L3 活性维: L3 修剪后同步 W_35 列数 + 按 perm 重排列,
         # 否则 z3 (重排后的 L3) 喂给旧序列 → 系统性错位 → eps5_td 突变 → surprise NaN
         # (6000 步修剪后 6100 步 eta=nan 全链路爆的根因)
         if layer == "l3":
             l3_perm = perm_map.get("l3")
-            for b in range(net.n_blocks):
-                old_b = net.W_35[b].data
-                if l3_perm is not None:
-                    old_b = old_b[:, l3_perm]
-                net.W_35[b] = nn.Parameter(old_b[:, :src_n].contiguous())
-                del old_b
-                # _syn_mask/_gain_mask 列与 W_35 列同源 (L3 神经元), 同 perm 重排
-                if l3_perm is not None:
-                    for mname in (f"_syn_mask_{b}", f"_gain_mask_{b}"):
-                        old_m = getattr(net, mname).data
-                        net.register_buffer(mname, old_m[:, l3_perm][:, :src_n].contiguous())
-                        del old_m
+            old_35 = net.W_35.data
+            if l3_perm is not None:
+                old_35 = old_35[:, l3_perm]
+            net.W_35 = nn.Parameter(old_35[:, :src_n].contiguous())
+            del old_35
+            # _gain_mask 列与 W_35 列同源 (L3 神经元), 同 perm 重排
+            if l3_perm is not None:
+                old_gm = net._gain_mask.data
+                net.register_buffer("_gain_mask", old_gm[:, l3_perm][:, :src_n].contiguous())
+                del old_gm
             # _gain_l3 行与 W_23 行同源 (L3 神经元), 同 perm 重排
             if l3_perm is not None:
                 old_g = net._gain_l3.data
@@ -232,7 +238,14 @@ class PruningEngine:
                 continue
             n_candidate = max(1, int(active * frac))
             expired = expired_flags.get(layer)
-            perm, n_alive = self._permute_weights(layer, active, n_candidate, expired, perm_map)
+            # 感知修剪 (方案 B): L4 候选分数 = 表示层行范数 × W_lm z4段行范数 —
+            # 只剪对预测无贡献的神经元 (低活跃 且 W_lm 依赖弱);
+            # 防止修剪破坏 W_lm 学到的映射 (6000 步断崖根因)
+            score_fn = None
+            if layer == "l4":
+                rn_lm = net.W_lm[:active].data.norm(dim=1)
+                score_fn = lambda rn, a: rn * rn_lm[:a]
+            perm, n_alive = self._permute_weights(layer, active, n_candidate, expired, perm_map, score_fn)
             n_alive_map[layer] = n_alive
             if perm is None:
                 continue
@@ -263,9 +276,11 @@ class PruningEngine:
                 old_sp[: net.active_size["l4"], : net.active_size["l4"]].contiguous()
             )
             del old_sp
-            # W_lm 行同步 (L4 活性维 ×2: z4 半 + h 半)
+            # W_lm 行同步 (L4 活性维 ×4: z4 + 3 记忆池)
             old_lm = net.W_lm.data
-            net.W_lm = nn.Parameter(old_lm[: 2 * net.active_size["l4"], :].contiguous())
+            net.W_lm = nn.Parameter(old_lm[: 4 * net.active_size["l4"], :].contiguous())
+            old_lm2 = net.W_lm_2.data
+            net.W_lm_2 = nn.Parameter(old_lm2[: 4 * net.active_size["l4"], :].contiguous())
             del old_lm
             # _dw_buf 环形缓冲同尺寸同步 (否则 copy_ 形状崩: 6000 步 L4 修剪后 1024 vs 973)
             for i in range(4):
@@ -280,10 +295,10 @@ class PruningEngine:
             old_thw = net._theta_w.data
             net.register_buffer("_theta_w", old_thw[: net.active_size["l4"]].contiguous())
             del old_thw
-            # _h_mem (工作记忆) 裁到活性维 (与 W_lm 的 h 半输入行对齐)
-            old_h = net._h_mem.data
-            net.register_buffer("_h_mem", old_h[: net.active_size["l4"]].contiguous())
-            del old_h
+            # _m_pool (多级记忆池) 裁到活性维 (与 W_lm 输入行对齐, 3 段 × a4)
+            old_m = net._m_pool.data
+            net.register_buffer("_m_pool", old_m[: 3 * net.active_size["l4"]].contiguous())
+            del old_m
 
         # W_56/W_t5 列同步: L5 修剪后 W_56 输入维 = W_t5 方阵维 = 活性 L5
         if net.active_size["l5"] < net.cfg.d_l5:
