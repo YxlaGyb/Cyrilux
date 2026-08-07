@@ -33,17 +33,55 @@ class LearningEngine:
     def __init__(self, net: DensePCNet):
         self.net = net
 
-    def learn(self, byte_ids: torch.Tensor) -> dict:
+    def _closed_loop_input(self, byte_ids: torch.Tensor) -> torch.Tensor:
+        """自回归闭环输入: 前 56 位真实 + 后 8 位模型自生成 (批量 rollout).
+
+        每样本独立 rollout: 用 [真实前缀] 生成 8 字节, 拼成 [N, S] 输入.
+        纯前向, 零梯度 (赫布更新用 _predict 后的状态, 不依赖输入梯度).
+        """
+        net = self.net
+        N, S = byte_ids.shape
+        dev = byte_ids.device
+        KEEP = S - 8
+        out = byte_ids.clone()
+        for n in range(N):
+            seq = list(byte_ids[n, :KEEP].tolist())
+            for _ in range(8):
+                ids = torch.tensor([seq[-64:]], dtype=torch.long, device=dev)
+                _ = net.forward_engine._predict(ids, store_state=True, is_inference=True)
+                a4 = net.active_size["l4"]
+                mean_abs = net._z4.abs().mean() + 1e-4
+                z4_nl = net._z4 * (1.0 / mean_abs)
+                z4_nl = z4_nl / (z4_nl.square().mean(dim=-1, keepdim=True).sqrt() * 1.01 + 1e-8)
+                z4_nl = z4_nl * (1.0 - 0.5 * z4_nl.pow(2))
+                zh = torch.cat([z4_nl, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)
+                inv_h = 1.0 / math.sqrt(4 * a4 + net.bind_slot_dim)
+                last = (zh @ net.W_lm + net.bias_lm)[0, -1].float() * inv_h / 0.9
+                topv, _ = torch.topk(last, min(15, 256))
+                last[last < topv[-1]] = -float("inf")
+                probs = torch.softmax(last, dim=-1)
+                seq.append(int(torch.multinomial(probs, 1).item()))
+            out[n, KEEP:] = torch.tensor(seq[KEEP:], dtype=torch.long, device=dev)
+        return out
+
+    def learn(self, byte_ids: torch.Tensor, closed_loop: bool = False) -> dict:
         """Hebbian 学习 (零反传, 零误差回路). 不接收 targets.
 
         Args:
             byte_ids: [N, S] long 输入.
+            closed_loop: 自回归闭环训练 (exposure bias 对治) — 输入 = 前 56 位
+            真实 + 后 8 位模型自生成 (批量 rollout), targets 始终是真实 byte_ids.
+            模型在自身输出上学习纠正/延续, 打破 teacher forcing 静态范式.
 
         Returns:
             stats dict (future_err, 各层误差范数).
         """
         net = self.net
-        _ = net.forward_engine._predict(byte_ids, store_state=True)
+        if closed_loop:
+            inp = self._closed_loop_input(byte_ids)
+        else:
+            inp = byte_ids
+        _ = net.forward_engine._predict(inp, store_state=True)
         N, S = byte_ids.shape
         dev = byte_ids.device
         a4, a2, a3, a5, a6 = (net.active_size[k] for k in ("l4", "l2", "l3", "l5", "l6"))
@@ -408,6 +446,51 @@ class LearningEngine:
             soft_norm_preserve(Wb)
         _decorr_W(Wb, net.E_l5[:a5, :a5])
 
+        # ── 自组织预测引擎 (第 50 轮): 层间局部误差 + 多巴胺 RPE 门控 ──
+        # local_err_L5 = z5 - pred_L5 (pred_L5 = z4 @ W_pred_54.T): L4 对 L5 的
+        # 预测误差, 直接注入 W_35 更新 (惊喜度驱动中间层重组).
+        # local_err_L4 = z4 - pred_L4 (pred_L4 = z3 @ W_pred_43.T): L3 对 L4 的
+        # 预测误差, 经 W_42 投影回 a2 注入 W_42 更新.
+        # RPE 门控: 全局误差幅度大 (熵高) → (1+global_RPE) 放大重组力度;
+        # 预测稳定 → 可塑性收窄. 无 BP, 纯外积
+        # 输入能量调制 (第 2 轮修复): z4 std 0.06 未调制 → pred 比 z5 小 3500 倍,
+        # local_err = z5 拷贝, W_pred 学到平凡零预测. 调制到 std≈1 (与 W_lm
+        # 输入同款, 逐位置 std 归一化), pred 与 z5 同量级 → 真实误差可学习
+        z4_pred_in = z4 / (z4.std(dim=-1, keepdim=True) + 1e-4)
+        z3_pred_in = z3 / (z3.std(dim=-1, keepdim=True) + 1e-4)
+        global_rpe = (eps_total.square().mean().sqrt() * 10.0).clamp(max=1.0)  # 全局误差幅度
+        Wp54_a = net.W_pred_54[:a5, :a4]
+        Wp43_a = net.W_pred_43[:a4, :a3]
+        pred_l5 = z4_pred_in @ Wp54_a.T  # [N,S,a5]
+        pred_l4 = z3_pred_in @ Wp43_a.T  # [N,S,a4]
+        local_err_l5 = z5 - pred_l5
+        local_err_l4 = z4 - pred_l4
+        rpe = (1.0 + global_rpe).to(torch.float16)
+        # W_35 注入: dW = local_err_L5.T @ z3 (对齐 S-1, 与 W_35 输入同源).
+        # 注入强度 1.5×eta×RPE (修复一: 原 0.5 太弱, 主误差轰鸣噪音淹没内部
+        # 预测误差 → 中间层永远学不会预测未来; 1.5 让局部误差与主误差同量级)
+        dW_pred35 = (local_err_l5[:, :-1].transpose(-2, -1) @ _rms(z3[:, :-1])).mean(dim=0) * (1.0 / (S - 1))
+        Wb.data += dW_pred35 * eta * rpe * 1.5
+        soft_norm_preserve(Wb.data)
+        # W_42 注入: local_err_L4 经 W_42 逆映射到 a2 (与 eps_lm_a3 同模式)
+        local_err_l4_a2 = local_err_l4 @ net.W_42[:a2].T
+        local_err_l4_a2 = _rms(local_err_l4_a2)
+        dW_pred42 = (local_err_l4_a2[:, :-1].transpose(-2, -1) @ _rms(z4[:, :-1])).mean(dim=0) * (1.0 / (S - 1))
+        net.W_42[:a2].data += dW_pred42 * eta * rpe * 1.5
+        soft_norm_preserve(net.W_42[:a2].data)
+        # W_pred 矩阵自更新 (纯外积, 输入用调制后 z4/z3 保持一致): dW_pred54 = local_err_L5.T @ z4_pred_in
+        Wp54_a.data += (local_err_l5[:, :-1].transpose(-2, -1) @ z4_pred_in[:, :-1]).mean(dim=0) * eta
+        Wp43_a.data += (local_err_l4[:, :-1].transpose(-2, -1) @ z3_pred_in[:, :-1]).mean(dim=0) * eta
+        soft_norm_preserve(Wp54_a.data)
+        soft_norm_preserve(Wp43_a.data)
+        # 诊断: local_err 相对能量 (红线指标), z5 加性保护分母 (修复二:
+        # z5 去中心化后近 0 样本 → 直接除 z5 能量 → inf; scale = std +
+        # 0.01·mean_std + 1e-4 加性保护, 非 clamp, 保留信号方向)
+        z5_scale = z5.square().mean() + 0.01 * z5.square().mean() + 1e-4
+        z4_scale = z4.square().mean() + 0.01 * z4.square().mean() + 1e-4
+        net._local_err_l5 = (local_err_l5.square().mean() / z5_scale).detach()
+        net._local_err_l4 = (local_err_l4.square().mean() / z4_scale).detach()
+
         # Foldiak 反赫布侧抑制更新 (方案 D): dM = z_out 协方差 (白化本质),
         # 零对角, 指数遗忘 ×0.99 防爆炸. 不做 Frobenius 归一化 — 归一化把 dM
         # 缩到 ~1e-4 (1024² 矩阵范数 ~1000), ×0.01 → ~1e-6 被 fp16 舍入,
@@ -440,10 +523,11 @@ class LearningEngine:
             post = z_cur[:, 1:]
             dz = post - pre  # Δz = z_t - z_{t-1}
             dz_n = dz.norm(dim=-1)  # [N, S-1]
-            # 绝对阈值 = z 平均范数的 5%: 分位阈值在 z 塌缩后失效 (塌缩后"动态帧"
-            # 也在主方向, 贡献仍秩 1); 绝对阈值让塌缩 → 差分变小 → 静止占比暴增 →
-            # W_t 学习信号枯竭 → 自然平衡点 (频率锚点)
-            th = (post.norm(dim=-1).mean() * 0.05).unsqueeze(0)
+            # 绝对阈值 = z 平均范数的 2% (闭环训练起放宽: 5%→2% 给长程记忆喘息,
+            # 时序动力学稍作释放; 监视 W_t top1 秩防坍缩): 分位阈值在 z 塌缩后
+            # 失效 (塌缩后"动态帧"也在主方向, 贡献仍秩 1); 绝对阈值让塌缩 →
+            # 差分变小 → 静止占比暴增 → W_t 学习信号枯竭 → 自然平衡点 (频率锚点)
+            th = (post.norm(dim=-1).mean() * 0.02).unsqueeze(0)
             s = (dz_n < th).to(dz_n.dtype)  # 静止帧 → 0, 动态帧 → 1
             dW_t = (_rms(pre).transpose(-2, -1) @ (_rms(post) * s.unsqueeze(-1))).mean(dim=0) * (1.0 / (S - 1))
             W_t[:a_sz, :a_sz].data += dW_t * eta_t
@@ -491,19 +575,13 @@ class LearningEngine:
         lr_seg[4 * a4 :] = eta_lm * 1.5
         net.W_lm.data.mul_(0.999)
         net.W_lm.data += dW_lm * lr_seg
-        # bias 只学"哪些字节整体更常见"的相对偏置 (全体去均值, softmax 对平移不变):
-        # 误差只用纯 t+1 目标 (eps_lm 的 err_scaled), 不含 diff2 — diff2 的逐字节
-        # 目标位模式 (+1/-1 在 t2/t1 间交替) 会把中文高频 UTF-8 字节位系统性推高,
-        # bias 单向累积 (实测 2000 步 std 471) → logits 被 bias 主导 → 熵锁死 1.6.
-        # diff2 继续进 W_lm 权重更新 (dW_lm), 那里才是差分目标的用途
+        # bias 硬复位: 范数锁定 (target=100, 除法缩放非 clamp) — 切断自由生长,
+        # 死守 bias_std≈6.26, 保住命中率 28.5% 基线. 去均值只学相对偏置
         bias_err = eps_lm / (eps_lm.norm(dim=-1, keepdim=True) * 1.01 + 1e-8)
         bias_d = bias_err.mean(dim=(0, 1))
         net.bias_lm.data += (bias_d - bias_d.mean()) * eta_lm
-        # 范数约束 (结构保护, 除法缩放非 clamp): 高频字节的统计误差持续自我强化,
-        # 去均值只减缓不阻止 (实测仍线性涨到 60+). 范数超 target 时整体等比缩回 —
-        # 相对差异保留 (softmax 对缩放不变), 绝对电平受限, bias_std 稳定在 10 以内
         bn = net.bias_lm.norm()
-        target_norm = 100.0  # 256 维均匀时 std ≈ 100/16 ≈ 6.3
+        target_norm = 100.0
         if bn > target_norm:
             net.bias_lm.data.mul_(target_norm / bn)
         soft_norm_preserve(net.W_lm.data)

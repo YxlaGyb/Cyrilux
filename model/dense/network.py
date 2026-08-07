@@ -134,6 +134,14 @@ class DensePCNet(nn.Module):
         # final_eps = eps_recon + 0.3 * eps_state — 迫使隐状态携带"未来往哪走"
         self.W_state_pred = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
 
+        # ── 自组织预测引擎 (第 50 轮): 层间局部预测矩阵 ──
+        # W_pred_54: L4 → 预测 L5 (pred_L5 = z4 @ W_pred_54.T, [N,S,a5])
+        # W_pred_43: L3 → 预测 L4 (pred_L4 = z3 @ W_pred_43.T, [N,S,a4])
+        # 每层拥有自己的预测目标: local_err = z_cur - pred(上层), 惊喜度直接
+        # 驱动中间层重组. 纯外积更新, 零 BP
+        self.W_pred_54 = nn.Parameter(torch.empty(d["l5"], d["l4"], dtype=torch.float16))
+        self.W_pred_43 = nn.Parameter(torch.empty(d["l4"], d["l3"], dtype=torch.float16))
+
         # ── 竞争性概念绑定层 (纯赫布非线性, 任务 4): z4 → W_bind → K=16 概念槽 ──
         # sim = z4 @ W_bind [N,S,16]; 软竞争 z_bind = sim / ‖sim‖ (L2 归一化产生
         # 竞争性非线性: 匹配槽被相对放大, 其余被抑制). 所有槽位向量参与 W_lm
@@ -203,6 +211,9 @@ class DensePCNet(nn.Module):
 
         # ── 神经调制与竞争机制 ──
         self.register_buffer("_surprise_buf", torch.tensor(1.0, dtype=torch.float16))  # 惊喜基线
+        # 批级预测熵 EMA 基线 (动态自适应锚点): 当前熵高于基线 = 迷茫 (放 bias),
+        # 低于基线 = 稳定 (衰减缩回). 初始 5.5 ≈ 均匀分布熵 (256 字节)
+        self.register_buffer("_ent_ema", torch.tensor(5.5, dtype=torch.float16))
         # 动态稳态竞争状态: 20 步熵窗口 (环形) + 最小二乘斜率拟合预分配 (t 中心化)
         # + 速率自适应缩放因子 (fp32 调度域, 非训练张量; scale ∈ (0,2) 数学有界)
         self.register_buffer("_ent_buf", torch.zeros(20, dtype=torch.float32))
@@ -289,9 +300,12 @@ class DensePCNet(nn.Module):
         """核心前馈: 感知 (L0→L6) + 微柱路由 + Foldiak 去相关 + 去中心化 + 增量预测."""
         return self.forward_engine._predict(byte_ids, store_state=store_state, is_inference=is_inference)
 
-    def learn(self, byte_ids: torch.Tensor) -> dict:
-        """Hebbian 学习 (零反传, 零误差回路). 不接收 targets."""
-        return self.learning_engine.learn(byte_ids)
+    def learn(self, byte_ids: torch.Tensor, closed_loop: bool = False) -> dict:
+        """Hebbian 学习 (零反传, 零误差回路). 不接收 targets.
+
+        closed_loop=True: 自回归闭环训练 (输入 = 真实前缀 + 自生成后缀).
+        """
+        return self.learning_engine.learn(byte_ids, closed_loop=closed_loop)
 
     def _prune(self):
         """拓扑重塑: 发育期内不剪 → 死缓二级判决 → 相对排名淘汰."""

@@ -136,6 +136,11 @@ class PruningEngine:
         net.W_lm_2.data = net.W_lm_2.data[torch.cat([perm, perm, perm, perm, torch.arange(n_bind, device=perm.device)])].contiguous()
         net.W_diff.data = net.W_diff.data[perm][:, perm].contiguous()
         net.W_state_pred.data = net.W_state_pred.data[perm][:, perm].contiguous()
+        # W_pred_54 行 = L5 神经元 (随 L4 修剪? 否 — 行=L5, 列=L4): 列同 L4 perm
+        # W_pred_54 [a5, a4]: 列 (L4) 同 perm
+        net.W_pred_54.data = net.W_pred_54.data[:, perm].contiguous()
+        # W_pred_43 [a4, a3]: 行 (L4) 同 perm
+        net.W_pred_43.data = net.W_pred_43.data[perm].contiguous()
         # W_bind 行 = z4 神经元 (槽共享), 同 perm
         net.W_bind.data = net.W_bind.data[perm].contiguous()
         # _dw_buf 环形缓冲同 perm 重排 (否则 4 步缓冲与 W_diff 行错位 → 更新错乱)
@@ -308,6 +313,13 @@ class PruningEngine:
             old_m = net._m_pool.data
             net.register_buffer("_m_pool", old_m[: 3 * net.active_size["l4"]].contiguous())
             del old_m
+            # W_pred_54 [a5, a4]: 列 (L4) 裁到活性维; W_pred_43 [a4, a3]: 行 (L4) 裁
+            old_p54 = net.W_pred_54.data
+            net.W_pred_54 = nn.Parameter(old_p54[:, : net.active_size["l4"]].contiguous())
+            del old_p54
+            old_p43 = net.W_pred_43.data
+            net.W_pred_43 = nn.Parameter(old_p43[: net.active_size["l4"], :].contiguous())
+            del old_p43
 
         # W_56/W_t5 列同步: L5 修剪后 W_56 输入维 = W_t5 方阵维 = 活性 L5
         if net.active_size["l5"] < net.cfg.d_l5:

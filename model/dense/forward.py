@@ -149,6 +149,9 @@ class ForwardEngine:
         # 路由分离: z5_raw 原始幅度喂 W_diff, z5 去中心化喂下游.
         # Foldiak 反赫布侧抑制 (方案 D): z5 -= 0.2·M@z5, M 零起步 = 恒等;
         # M 学 z_out 协方差 → 白化去相关 → 打破行收敛 ±w 的共线激活
+        # 注: z5 不做三阶 — z5 有稀疏尖峰结构 (Foldiak 侧抑制孤立放大),
+        # 任何范数归一化保留相对形状, 尖峰经三阶翻转放大 → W_35 差分 NaN (实测
+        # step 111, 全局 std 与逐行 RMS 均压不住). z5 保留线性, 非线性由 z3 承载
         z5_fd = z5 - 0.2 * (net.M_l5[:a5, :a5] @ z5.transpose(-2, -1)).transpose(-2, -1)
         z5_raw = z5_fd
         z5 = z5_raw - z5_raw.mean(dim=-1, keepdim=True)
