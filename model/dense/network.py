@@ -134,15 +134,14 @@ class DensePCNet(nn.Module):
         # final_eps = eps_recon + 0.3 * eps_state — 迫使隐状态携带"未来往哪走"
         self.W_state_pred = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
 
-        # ── 稀疏绑定层 (角色分离, 任务 2): z4 → W_bind → 3 槽 [实体|角色|谓语] ──
-        # 块对角 [a4, 3*256]: 槽间硬切块 = 独立角色 (非共享投影), 槽内 top-k WTA 硬稀疏.
-        # W_lm 输入拼接 4 段连续 z4/记忆池 + 1 段绑定向量, 绑定离散符元显式承载
-        # "主语-动词-宾语"结构 → 组合 (The slow red fox jumps) 由槽重组而非高频串复读
-        self.bind_slot_dim = 256
-        self._lm_in = d["l4"] * 4 + 3 * self.bind_slot_dim
-        self.W_bind = nn.Parameter(torch.empty(d["l4"], 3 * self.bind_slot_dim, dtype=torch.float16))
-        self.register_buffer("_bind_mask", torch.zeros(3 * self.bind_slot_dim, dtype=torch.float16))
-        self._bind_mask[: self.bind_slot_dim] = 1.0
+        # ── 竞争性概念绑定层 (纯赫布非线性, 任务 4): z4 → W_bind → K=16 概念槽 ──
+        # sim = z4 @ W_bind [N,S,16]; 软竞争 z_bind = sim / ‖sim‖ (L2 归一化产生
+        # 竞争性非线性: 匹配槽被相对放大, 其余被抑制). 所有槽位向量参与 W_lm
+        # 预测, 由 W_lm 端学习哪些槽组合预测哪字节. 槽位更新纯赫布外积 + 去均值
+        # (Oja 式, 零 BP), 归一化防坍缩
+        self.bind_slot_dim = 16
+        self._lm_in = d["l4"] * 4 + self.bind_slot_dim
+        self.W_bind = nn.Parameter(torch.empty(d["l4"], self.bind_slot_dim, dtype=torch.float16))
 
         # ── LM 头 (自监督赫布): [z4, m2, m8, m32, bind] → 256 字节 logits, 独立于重建 W_04 ──
         # W_04 双向重建被证实解码死锁 (真实 delta 注入仍复读空格);

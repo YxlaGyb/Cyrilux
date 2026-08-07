@@ -179,11 +179,22 @@ class LearningEngine:
         # 多级记忆池 + 角色绑定拼接: [z4, m2, m8, m32, bind] 五通道进 W_lm.
         # 绑定向量 (任务 2) 由 z4 经 W_bind 三槽 top-k 生成, 离散符元承载
         # "主语-动词-宾语" 角色结构; 记忆池承载跨序列环境 (物理输入层不变)
+        # W_lm 输入前的能量调制 + 竞争性非线性 (老师方向 C):
+        # 1) 能量调制: z4 被 W_04 行范均分压到 std≈0.06 (微缩信号, 上下文信息
+        #    被 bias 频率先验淹没 → 命中率 23% 铁板). 全局几何缩放 mean_abs→1.0,
+        #    纯机制, 无 BP/clamp/float
+        # 2) RMS 前置 (CLAUDE.md 铁律): 调制后厚尾平方可超 fp16 上限 (实测 65504),
+        #    投影前 RMSNorm 结构化防溢出
+        # 3) 三阶非线性: f(x)=x·(1-0.5x²) 类 tanh, 在 std≈1 时真正进入非线性区
+        mean_abs = z4.abs().mean() + 1e-4
+        z4_lm = z4 * (1.0 / mean_abs)
+        z4_lm = _rms(z4_lm)
+        z4_lm = z4_lm * (1.0 - 0.5 * z4_lm.pow(2))
         # 输出缩放 1/√H (CLAUDE.md: 投影输出溢出 → 乘 1/√H): logits 幅度 ∝ √(4a4+bind)
         # (表示层 PR 破局后有效维度大, 点积求和放大; 旧架构 PR~2 共线时隐式小).
         # 无缩放则 logits ±67 → softmax 饱和 → 熵锁 0.18 (4000 步实测)
-        zh = torch.cat([z4, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)  # [N,S,4a4+768]
-        inv_h = 1.0 / math.sqrt(4 * a4 + 3 * net.bind_slot_dim)
+        zh = torch.cat([z4_lm, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)  # [N,S,4a4+16]
+        inv_h = 1.0 / math.sqrt(4 * a4 + net.bind_slot_dim)
         logits_lm = (zh @ net.W_lm + net.bias_lm) * inv_h  # [N,S,256]
         # 池间侧抑制竞争 (Q4 注意力雏形): 每池 (z4/m2/m8/m32) 对 logits 的贡献能量
         # e_pool[i] = ‖zh_seg @ W_lm_seg‖ (未归一化原始能量 — 归一化会抹平池间差异,
@@ -199,7 +210,7 @@ class LearningEngine:
         rel_th = th_pool / (th_pool.mean() + 1e-3)  # [4] 相对阈值
         pool_gate = 1.0 / (1.0 + rel_th)  # [4] 池级抑制系数
         pool_gate[0] = 1.0  # z4 当前状态不参与竞争 (基线通路)
-        gate_full = torch.ones(4 * a4 + 3 * net.bind_slot_dim, dtype=torch.float16, device=dev)
+        gate_full = torch.ones(4 * a4 + net.bind_slot_dim, dtype=torch.float16, device=dev)
         for i in range(1, 4):
             gate_full[seg[i]] = gate_full[seg[i]] * pool_gate[i].to(torch.float16)
         zh = zh * gate_full.unsqueeze(0).unsqueeze(0)
@@ -210,7 +221,7 @@ class LearningEngine:
         # 生物学: 多巴胺 RPE 奖励"未来时间窗预测准确度"; 数学: 只有预测 2 步,
         # z4 才被迫携带跨词边界的高维结构 (单步预测锁死 N-gram 局域极小值)
         zh2 = torch.cat(
-            [z4[:, :-2], net._m2[:, :-2], net._m8[:, :-2], net._m32[:, :-2], net._bind_vec[:, :-2]], dim=-1
+            [z4_lm[:, :-2], net._m2[:, :-2], net._m8[:, :-2], net._m32[:, :-2], net._bind_vec[:, :-2]], dim=-1
         )
         logits_t2 = (zh2 @ net.W_lm_2 + net.bias_lm) * inv_h  # [N,S-2,256] (输出缩放)
         target_lm = F.one_hot(byte_ids[:, 1:], num_classes=256).to(torch.float16)
@@ -465,7 +476,7 @@ class LearningEngine:
         # 更新外积用 _rms(zh): 高维输入稀释 dW 能量 (4096 维 vs 旧架构共线 ~2 维),
         # 0.999 指数遗忘吃掉稀释后的更新 → W_lm 行范数冻结 (实测 1.195 纹丝不动);
         # 输入归一化让更新能量与维度解耦, 每步更新恒定
-        dW_lm = (_rms(zh[:, :-1]).transpose(-2, -1) @ (err_scaled - 0.1 * phi_wlm[:, :-1])).mean(dim=0) * math.sqrt(4 * a4 + 3 * net.bind_slot_dim)  # [4a4+768,256] (补偿输出缩放)
+        dW_lm = (_rms(zh[:, :-1]).transpose(-2, -1) @ (err_scaled - 0.1 * phi_wlm[:, :-1])).mean(dim=0) * math.sqrt(4 * a4 + net.bind_slot_dim)  # [4a4+768,256] (补偿输出缩放)
         # 单步更新幅度上界 (W_04 同款幅度-方向解耦): 高维输入下 dW 能量大,
         # 极端 batch (长文本/padding 边界) 单步爆 → W_lm_2 NaN (800 步实测);
         # 归一化到单位方向再乘 eta_lm, 最大单步幅度 = eta_lm
@@ -474,7 +485,7 @@ class LearningEngine:
         # 记忆池段学习率激励 (生物倾角): 池段从 1e-4 低起点起爬, lr_mem = lr_z4 × 1.5,
         # 绑定段 (任务 2 新符元) 同激励, 让其能以更快速度爬到与 z4 公平竞争的高峰.
         # 固定机制, 非调参
-        n_bind = 3 * net.bind_slot_dim
+        n_bind = net.bind_slot_dim
         lr_seg = torch.full((4 * a4 + n_bind, 1), eta_lm, dtype=torch.float16, device=dev)
         lr_seg[a4 : 4 * a4] = eta_lm * 1.5
         lr_seg[4 * a4 :] = eta_lm * 1.5
@@ -488,6 +499,13 @@ class LearningEngine:
         bias_err = eps_lm / (eps_lm.norm(dim=-1, keepdim=True) * 1.01 + 1e-8)
         bias_d = bias_err.mean(dim=(0, 1))
         net.bias_lm.data += (bias_d - bias_d.mean()) * eta_lm
+        # 范数约束 (结构保护, 除法缩放非 clamp): 高频字节的统计误差持续自我强化,
+        # 去均值只减缓不阻止 (实测仍线性涨到 60+). 范数超 target 时整体等比缩回 —
+        # 相对差异保留 (softmax 对缩放不变), 绝对电平受限, bias_std 稳定在 10 以内
+        bn = net.bias_lm.norm()
+        target_norm = 100.0  # 256 维均匀时 std ≈ 100/16 ≈ 6.3
+        if bn > target_norm:
+            net.bias_lm.data.mul_(target_norm / bn)
         soft_norm_preserve(net.W_lm.data)
 
         # W_lm_2 独立更新 (Q3 解耦): 吃 t+2 误差 + 差分误差 (eps_t2_total), 与 W_lm 完全独立
@@ -501,7 +519,7 @@ class LearningEngine:
         th_wlm2.mul_(0.01).add_(0.99 * (logits_n2 * logits_n2).mean(dim=(0, 1)))
         phi_wlm2 = logits_n2 * (logits_n2 - th_wlm2)
         phi_wlm2 = _rms(phi_wlm2)
-        dW_lm2 = (_rms(zh2).transpose(-2, -1) @ (err_scaled2 - 0.1 * phi_wlm2)).mean(dim=0) * math.sqrt(4 * a4 + 3 * net.bind_slot_dim)
+        dW_lm2 = (_rms(zh2).transpose(-2, -1) @ (err_scaled2 - 0.1 * phi_wlm2)).mean(dim=0) * math.sqrt(4 * a4 + net.bind_slot_dim)
         dW_lm2_n = dW_lm2.norm() + 1e-8
         dW_lm2 = dW_lm2 / dW_lm2_n  # 单步更新幅度上界 (防突爆)
         lr_seg2 = torch.full((4 * a4 + n_bind, 1), eta_lm, dtype=torch.float16, device=dev)
@@ -515,16 +533,14 @@ class LearningEngine:
         W_sp_a.data += (net._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0) * eta
         soft_norm_preserve(W_sp_a.data)
 
-        # ── 稀疏绑定层赫布更新 (任务 2, 纯外积, 零 BP): ──
-        # dW_bind = z4_pre^T @ (sparse_pre @ _bind_mask 展平) — W_bind 行 = z4 神经元
-        # (3 段), 列 = 768 槽位. 槽位掩码 _bind_mask: 非角色槽 (槽 2/3) 强制掩零,
-        # 只学"实体"槽的 z4→槽映射, 角色/谓语槽作为生成输出承载结构 (防 768 槽
-        # 全部竞争同一角色 → 槽间退化). 激活槽位 (top-k=1) 的映射被强化, 其余不变
+        # ── 竞争性概念绑定层赫布更新 (任务 4, 纯外积, 零 BP): ──
+        # dW_bind = z4_pre^T @ (z_bind - mean(z_bind)) — 槽位激活去均值 (Oja 式):
+        # 高激活槽位强化 z4→槽映射, 低激活槽位削弱, 竞争分化; 零均值防单槽垄断.
+        # W_bind 行范数保持 (0.8-1.2) 防坍缩, 软竞争 (L2 归一化) 无死亡
         if hasattr(net, "_bind_vec"):
             z4n = _rms(z4)
-            bind_target = (net._bind_vec * net._bind_mask.unsqueeze(0).unsqueeze(0))  # [N,S,768]
-            dW_bind = (z4n[:, :-1].transpose(-2, -1) @ bind_target[:, :-1]).mean(dim=0) * (1.0 / (S - 1))
-            dW_bind = dW_bind * net._bind_mask.unsqueeze(0)
+            bind_t = net._bind_vec - net._bind_vec.mean(dim=-1, keepdim=True)  # [N,S,K] 去均值
+            dW_bind = (z4n[:, :-1].transpose(-2, -1) @ bind_t[:, :-1]).mean(dim=0) * (1.0 / (S - 1))
             net.W_bind[:a4].data.mul_(0.9995)
             net.W_bind[:a4].data += dW_bind * (eta * 2.0)
             soft_norm_preserve(net.W_bind[:a4].data)

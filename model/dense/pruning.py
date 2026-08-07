@@ -129,7 +129,7 @@ class PruningEngine:
         """L4 神经元行重排 → 同步重排所有 L4 行映射的权重,
         否则预测误差投影与 W_04 行错位 → 6000-7000 步 NaN (修剪后首爆)."""
         net = self.net
-        n_bind = 3 * net.bind_slot_dim
+        n_bind = net.bind_slot_dim
         # W_lm 行 = [z4 | m2 | m8 | m32 | bind] (池与 z4 神经元对齐) → 前 4 段同 perm,
         # bind 段为独立符元 (无神经元映射, 顺序与 z4 无关) → 恒等保持
         net.W_lm.data = net.W_lm.data[torch.cat([perm, perm, perm, perm, torch.arange(n_bind, device=perm.device)])].contiguous()
@@ -281,7 +281,7 @@ class PruningEngine:
             )
             del old_sp
             # W_lm 行同步 (L4 活性维 ×4: z4 + 3 记忆池; bind 段 768 固定保持)
-            n_bind = 3 * net.bind_slot_dim
+            n_bind = net.bind_slot_dim
             old_lm = net.W_lm.data
             net.W_lm = nn.Parameter(old_lm[: 4 * net.active_size["l4"] + n_bind, :].contiguous())
             old_lm2 = net.W_lm_2.data

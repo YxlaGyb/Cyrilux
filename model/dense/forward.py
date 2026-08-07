@@ -5,7 +5,7 @@
 感知: L0(纯 one-hot, 时序双通道) → L4 → L2 → L3 → L5(微柱阵列) → L6
 时序: 每层时间核 W_t 递归 z[t] 依赖 z[t-1]
 生成: L4 状态 + W_diff 预测差分 → W_lm 解码字节
-绑定: z5 → W_bind → bind_dim, top-k WTA 稀疏化
+绑定: z4 → W_bind → K=16 概念槽, 软竞争归一化
 
 全 fp16, 零 .float(), 零反向传播.
 """
@@ -69,8 +69,12 @@ class ForwardEngine:
             z4_n = net._z4 / (net._z4.norm(dim=-1, keepdim=True) + 1e-3)
             pred_delta = z4_n @ W_diff_a.T + net.b_diff[:a4].unsqueeze(0).unsqueeze(0)
             z4_next = net._z4 + pred_delta
-            zh_next = torch.cat([z4_next, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)  # 记忆池+绑定拼接
-            inv_h = 1.0 / math.sqrt(4 * a4 + 3 * net.bind_slot_dim)
+            mean_abs = z4_next.abs().mean() + 1e-4
+            z4_nl = z4_next * (1.0 / mean_abs)  # 能量调制 (与训练同款)
+            z4_nl = _rms(z4_nl)
+            z4_nl = z4_nl * (1.0 - 0.5 * z4_nl.pow(2))  # 三阶非线性 (与训练同款)
+            zh_next = torch.cat([z4_nl, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)  # 记忆池+绑定拼接
+            inv_h = 1.0 / math.sqrt(4 * a4 + net.bind_slot_dim)
             mu0_top = (zh_next @ net.W_lm + net.bias_lm) * inv_h  # W_lm 解码 (输出缩放)
             last = mu0_top[0, -1].float() / temperature
             topv, _ = torch.topk(last, min(15, 256))
@@ -198,26 +202,21 @@ class ForwardEngine:
         }
 
     def _bind(self, z4: torch.Tensor) -> None:
-        """角色分离绑定前向: z4 → W_bind 三块 (实体/角色/谓语) → 槽内 top-k WTA.
+        """竞争性概念绑定: z4 → W_bind → K=16 槽位 → 软竞争归一化.
 
-        每槽 256 维独立投影 (块对角 W_bind), 槽内 top-k 置 1 其余 0 (硬离散符元).
-        bind_vec = [槽1|槽2|槽3] 拼接 (3*256), 与 W_lm 输入第 5 段对齐;
-        全部 3*256 槽位始终参与计算 (不同于 bind_k 的 top-k 选择数, 那是槽内阈值).
+        sim = z4 @ W_bind [N,S,K]; z_bind = sim / ‖sim‖ (L2 归一化产生竞争性
+        非线性 — 匹配槽被相对放大, 其余被抑制). 连续软竞争 (非硬 WTA, 不死亡).
+        bind_vec = z_bind (K 维), 与 W_lm 输入第 5 段对齐.
         """
         net = self.net
         a4 = net.active_size["l4"]
         z4_n = _l2_norm(z4)
-        pre = z4_n @ net.W_bind[:a4]  # [N,S,768]
-        k = net.cfg.bind_k
-        bd = net.bind_slot_dim
-        sparse = torch.zeros_like(pre)
-        for i in range(3):
-            sl = slice(i * bd, (i + 1) * bd)
-            vals, idx = pre[:, :, sl].topk(k, dim=-1)
-            sparse[:, :, sl].scatter_(-1, idx, torch.ones_like(vals))
+        pre = z4_n @ net.W_bind[:a4]  # [N,S,K]
+        nrm = pre.norm(dim=-1, keepdim=True)
+        alive = (nrm > 1e-8).to(pre.dtype)
+        z_bind = pre * alive / (nrm * 1.01 + 1e-8 * (1 - alive))
         net._bind_pre = pre
-        net._bind_idx = idx  # 末槽 top-k ID (诊断)
-        net._bind_vec = sparse
+        net._bind_vec = z_bind  # [N,S,K]
 
     def _precise(self, eps: torch.Tensor) -> torch.Tensor:
         """精度加权: π_l = 1/(σ_εl + c), 归一化每层误差尺度."""
