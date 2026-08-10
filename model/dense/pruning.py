@@ -117,6 +117,11 @@ class PruningEngine:
         W.data = W.data[perm].contiguous()
         W_t = getattr(net, self._t_attr[layer])
         W_t.data = W_t.data[perm][:, perm].contiguous()
+        # W_t4 decorr 状态同 perm (E_t4 行列 = L4 神经元, 错位 → decorr 拆错方向)
+        et_attr = {"l4": "E_t4"}
+        if layer in et_attr:
+            Et = getattr(net, et_attr[layer])
+            Et.data = Et.data[perm][:, perm].contiguous()
         b = getattr(net, self._b_attr[layer])
         b.data = b.data[perm].contiguous()
 
@@ -129,11 +134,10 @@ class PruningEngine:
         """L4 神经元行重排 → 同步重排所有 L4 行映射的权重,
         否则预测误差投影与 W_04 行错位 → 6000-7000 步 NaN (修剪后首爆)."""
         net = self.net
+        # W_lm/W_lm_2 行 = d_h 混合空间 (无神经元映射) → 不随 L4 perm 重排
+        # W1 行 = [z4 | m2 | m8 | m32 | bind] → 前 4 段同 perm, bind 段恒等
         n_bind = net.bind_slot_dim
-        # W_lm 行 = [z4 | m2 | m8 | m32 | bind] (池与 z4 神经元对齐) → 前 4 段同 perm,
-        # bind 段为独立符元 (无神经元映射, 顺序与 z4 无关) → 恒等保持
-        net.W_lm.data = net.W_lm.data[torch.cat([perm, perm, perm, perm, torch.arange(n_bind, device=perm.device)])].contiguous()
-        net.W_lm_2.data = net.W_lm_2.data[torch.cat([perm, perm, perm, perm, torch.arange(n_bind, device=perm.device)])].contiguous()
+        net.W1.data = net.W1.data[torch.cat([perm, perm, perm, perm, torch.arange(n_bind, device=perm.device)])].contiguous()
         net.W_diff.data = net.W_diff.data[perm][:, perm].contiguous()
         net.W_state_pred.data = net.W_state_pred.data[perm][:, perm].contiguous()
         # W_pred_54 行 = L5 神经元 (随 L4 修剪? 否 — 行=L5, 列=L4): 列同 L4 perm
@@ -157,6 +161,14 @@ class PruningEngine:
         old_m = net._m_pool.data
         net.register_buffer("_m_pool", old_m[torch.cat([perm, perm, perm])].contiguous())
         del old_m
+        # E_bind 行列同 perm 重排 (行 = L4 神经元, 对称矩阵双边同步)
+        old_eb = net.E_bind.data
+        net.E_bind = nn.Parameter(old_eb[perm][:, perm].contiguous())
+        del old_eb
+        # E_04 行列同 perm 重排 (W_04 行 = L4 神经元)
+        old_e04 = net.E_04.data
+        net.E_04 = nn.Parameter(old_e04[perm][:, perm].contiguous())
+        del old_e04
 
     def _shrink_columns(
         self, layer: str, n_alive: int, src: str, src_n: int, perm_map: dict[str, torch.Tensor]
@@ -285,13 +297,12 @@ class PruningEngine:
                 old_sp[: net.active_size["l4"], : net.active_size["l4"]].contiguous()
             )
             del old_sp
-            # W_lm 行同步 (L4 活性维 ×4: z4 + 3 记忆池; bind 段 768 固定保持)
+            # W1 行同步 (L4 活性维 ×4: z4 + 3 记忆池; bind 段 16 固定保持)
+            # W_lm/W_lm_2 行 = d_h 混合空间 (无神经元映射) → 不裁剪
             n_bind = net.bind_slot_dim
-            old_lm = net.W_lm.data
-            net.W_lm = nn.Parameter(old_lm[: 4 * net.active_size["l4"] + n_bind, :].contiguous())
-            old_lm2 = net.W_lm_2.data
-            net.W_lm_2 = nn.Parameter(old_lm2[: 4 * net.active_size["l4"] + n_bind, :].contiguous())
-            del old_lm
+            old_w1 = net.W1.data
+            net.W1 = nn.Parameter(old_w1[: 4 * net.active_size["l4"] + n_bind, :].contiguous())
+            del old_w1
             # W_bind 行同步 (L4 活性维, 列 = 768 槽位固定)
             old_bind = net.W_bind.data
             net.W_bind = nn.Parameter(old_bind[: net.active_size["l4"], :].contiguous())
@@ -320,6 +331,14 @@ class PruningEngine:
             old_p43 = net.W_pred_43.data
             net.W_pred_43 = nn.Parameter(old_p43[: net.active_size["l4"], :].contiguous())
             del old_p43
+            # E_t4 裁到活性维 (W_t4 方阵随 L4 收缩, decorr 状态必须同尺寸)
+            old_et4 = net.E_t4.data
+            net.E_t4 = nn.Parameter(old_et4[: net.active_size["l4"], : net.active_size["l4"]].contiguous())
+            del old_et4
+            # _theta_wt4 裁到活性维 (W_t4 homeostatic 滑阈)
+            old_tht4 = net._theta_wt4.data
+            net.register_buffer("_theta_wt4", old_tht4[: net.active_size["l4"]].contiguous())
+            del old_tht4
 
         # W_56/W_t5 列同步: L5 修剪后 W_56 输入维 = W_t5 方阵维 = 活性 L5
         if net.active_size["l5"] < net.cfg.d_l5:

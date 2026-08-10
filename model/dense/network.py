@@ -63,6 +63,9 @@ class DensePCConfig:
     # 熵加速下降 → 表示层放慢 (保护成果); 熵停滞 → 表示层放大 (强迫重组供新信息)
     adaptive_traction: bool = False
     lm_lr_boost: float = 1.0
+    # 自适应塑性归一化 (第 75 轮): s_h = clip(0.03/ρ_hebb^raw, 0.005, 1.0) 缩放 W_35
+    # Hebbian 外积. 单变量实验开关, 默认关保持旧行为
+    adaptive_rho: bool = False
     oja_elasticity: float = 0.05
     probation_decay: float = 0.5
 
@@ -150,6 +153,15 @@ class DensePCNet(nn.Module):
         self.bind_slot_dim = 16
         self._lm_in = d["l4"] * 4 + self.bind_slot_dim
         self.W_bind = nn.Parameter(torch.empty(d["l4"], self.bind_slot_dim, dtype=torch.float16))
+        # 概念槽 homeostatic 滑阈 (第 75 轮): θ_j 跟踪 z_bind_j² 槽能量,
+        # z_bind_j /= (1+θ_j) — 高激活槽增益低 → 对称性自发破缺 → 软 WTA 涌现
+        self.register_buffer("_theta_bind", torch.zeros(self.bind_slot_dim, dtype=torch.float16))
+        # W_bind 列方向去同质化 (第 75 轮: 逐样本加权破对称后的防垄断安全网,
+        # 槽维 16×16, 与行 decorr 正交)
+        self.E_bind_col = nn.Parameter(torch.zeros(self.bind_slot_dim, self.bind_slot_dim, dtype=torch.float16))
+        # 独立逐样本 surprise EMA (第 75 轮最终): 每样本独立历史, 初始 1.0
+        # 让第一批 rel_n ≈ surprise_n (无共享统计, 纯局部)
+        self.register_buffer("_s_ema_n", torch.ones(8, dtype=torch.float16))
 
         # ── LM 头 (自监督赫布): [z4, m2, m8, m32, bind] → 256 字节 logits, 独立于重建 W_04 ──
         # W_04 双向重建被证实解码死锁 (真实 delta 注入仍复读空格);
@@ -157,12 +169,21 @@ class DensePCNet(nn.Module):
         # 多级记忆池拼接进 W_lm 输入 (输入维 = 4×d_l4 + bind): 3 级因果卷积核
         # (2/8/32 步) 承载跨序列低分辨率信息; 池间竞争由各通路 BCM 滑阈自动调节 (注意力雏形)
         self.register_buffer("_m_pool", torch.zeros(3 * d["l4"], dtype=torch.float16))
-        # W_lm 行 = 输入神经元 (z4 + 3 记忆池 + bind, 神经元对齐), 列 = 256 字节;
-        # 修剪 perm 重排需同步 5 个区段 (见 pruning._sync_l4_aux)
-        self.W_lm = nn.Parameter(torch.empty(self._lm_in, self.cfg.d_input, dtype=torch.float16))
-        # W_lm_2 独立子预测器 (Q3 解耦): 专责 t+2 预测, 共享 z4/记忆池/bind 输入,
+        # 内部 EMA 频率 (第 54 轮读出端去偏): 纯模型内部累计 target 分布,
+        # 绝不依赖外部统计. fp32 调度域 (log 精度 + 1e-3 级增量, 同 _ent_buf 先例)
+        self.register_buffer("_freq", torch.full((self.cfg.d_input,), 1.0 / 256.0, dtype=torch.float32))
+        # ── 非线性混合层 (第 57 轮): W1 [lm_in, d_h] + 三阶激活 + 转置误差传播 ──
+        # h = zh @ W1; h = h·(1-0.5h²); logits = h @ W_lm.
+        # W_lm 输入从 zh 变为混合特征 h (d_h 维), 横向交叉组合打散高频 e 列.
+        # 纯赫布: dW_lm = h^T e; e_h = e @ W_lm.T · (1-1.5h²); dW1 = zh^T e_h. 零 BP
+        self.d_h = 256
+        self.W1 = nn.Parameter(torch.empty(self._lm_in, self.d_h, dtype=torch.float16))
+        # W_lm 行 = 混合特征 h 维度 (d_h), 列 = 256 字节; 修剪 perm 重排只影响
+        # z4/池段 (前 4 段), h 为折叠空间 (无神经元映射) → 恒等保持
+        self.W_lm = nn.Parameter(torch.empty(self.d_h, self.cfg.d_input, dtype=torch.float16))
+        # W_lm_2 独立子预测器 (Q3 解耦): 专责 t+2 预测, 共享混合特征 h 输入,
         # 更新与 W_lm 完全独立 (dW 互不干扰) — 避免同一突触拟合双目标的信号冲突
-        self.W_lm_2 = nn.Parameter(torch.empty(self._lm_in, self.cfg.d_input, dtype=torch.float16))
+        self.W_lm_2 = nn.Parameter(torch.empty(self.d_h, self.cfg.d_input, dtype=torch.float16))
         self.bias_lm = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=torch.float16))
 
         # ── 多尺度软加权时间窗 (2/4/8 并行因果卷积) ──
@@ -176,6 +197,12 @@ class DensePCNet(nn.Module):
         self._buf_i = 0
         # W_diff 独立 BCM 滑阈 (防指数爆炸)
         self.register_buffer("_theta_w", torch.full((d["l4"],), 0.01, dtype=torch.float16))
+        # W_04 输出端 homeostatic 滑阈 (第 75 轮): θ_j 慢速跟踪 mu4_j² 平均能量,
+        # g_j = 1/(1+θ_j) 抑制高激活列权重更新 → 打破 σ₁ 奇异值垄断
+        self.register_buffer("_theta_w04", torch.full((d["l4"],), 0.01, dtype=torch.float16))
+        # W_t4 输出端 homeostatic 滑阈 (第 75 轮): 打破 W_t4 σ₁/σ₂≈4000:1 垄断,
+        # rec4 从压制源转丰富源. θ_j 跟踪 rec4_j² = 时序差分每维能量
+        self.register_buffer("_theta_wt4", torch.zeros(d["l4"], dtype=torch.float16))
 
         # ── 时序权重 (每层, Hebbian 学习, 非超参数) ──
         self.W_t4 = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
@@ -221,6 +248,13 @@ class DensePCNet(nn.Module):
         self.register_buffer("_t_denom", (torch.arange(20, dtype=torch.float32) - 9.5).square().sum())
         self._ent_i = 0
         self.register_buffer("_traction_scale", torch.tensor(1.0, dtype=torch.float32))
+        # 快慢时序散度 (第 69 轮): Z_slow = β·Z_slow + (1-β)·Z_fast (慢通道滑动
+        # 记忆, fp16 纯量乘法); 新奇度 N = ‖Z_fast - Z_slow‖² — 死循环时状态
+        # 不再转移, Z_fast 坍缩向 Z_slow, N → 0, 触发负向多巴胺 (主动遗忘 LTD)
+        self.register_buffer("_z_slow", torch.zeros(d["l4"], dtype=torch.float16))
+        # tau 初始 = z4 原始幅度 (std~0.06) 平方量级: 若初始 0.01 > nov 量级,
+        # nov-tau 恒负 → D 恒负 → 全局 LTD 擦除权重 (第 69 轮实测熵 1.18→5.5)
+        self.register_buffer("_theta_novelty", torch.full((1,), 0.001, dtype=torch.float16))
         # BCM 滑阈 (替代 Oja): theta = EMA(eps²), phi = eps(eps-theta)
         for ln, dim in (("l4", d["l4"]), ("l2", d["l2"]), ("l3", d["l3"]), ("l5", d["l5"]), ("l6", d["l6"])):
             self.register_buffer(f"_theta_{ln}", torch.full((dim,), 0.01, dtype=torch.float16))
@@ -245,7 +279,11 @@ class DensePCNet(nn.Module):
         # 直接清除 W_t 主方向
         self.E_t2 = nn.Parameter(torch.zeros(d["l2"], d["l2"], dtype=torch.float16))
         self.E_t3 = nn.Parameter(torch.zeros(d["l3"], d["l3"], dtype=torch.float16))
+        self.E_t4 = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))  # W_t4 漏挂修复
         self.E_t5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
+        # W_bind 行去同质化矩阵 (与 E_l5/E_42/E_23 同款, 防秩 1 自锁)
+        self.E_bind = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
+        self.E_04 = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
         # Foldiak 反赫布侧抑制矩阵 (L5 激活去相关, 方案 D): M 零起步 = 前向恒等
         # (z5 - α·M@z5); 学 z_out 协方差 (白化本质), 零对角, 指数遗忘防爆炸
         self.M_l5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
@@ -275,12 +313,12 @@ class DensePCNet(nn.Module):
         for name, p in self.named_parameters():
             if "bias" in name:
                 continue
-            if name in ("E_l5", "E_42", "E_23", "M_l5", "E_t2", "E_t3", "E_t5"):
+            if name in ("E_l5", "E_42", "E_23", "M_l5", "E_t2", "E_t3", "E_t4", "E_t5", "E_bind", "E_bind_col", "E_04"):
                 continue  # 去相关矩阵零起步 (M=0 → 前向恒等)
             if name in ("W_lm", "W_lm_2"):
-                nn.init.normal_(p[: self.cfg.d_l4], mean=0.0, std=1.0 / math.sqrt(p.shape[-1]))
-                nn.init.normal_(p[self.cfg.d_l4 : 4 * self.cfg.d_l4], mean=0.0, std=1e-4)
-                nn.init.normal_(p[4 * self.cfg.d_l4 :], mean=0.0, std=1e-4)
+                nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(self.d_h))
+            elif name == "W1":
+                nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(p.shape[0]))
             else:
                 nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(p.shape[-1]))
 
