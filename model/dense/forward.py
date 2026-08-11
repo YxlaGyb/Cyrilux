@@ -85,35 +85,65 @@ class ForwardEngine:
         if not hasattr(net, "_block_stats"):
             net._block_stats = {"rep": 0, "utf8": 0, "gen": 0}
         stats = net._block_stats
+        freq_safe = net._freq + 1e-2  # 频率去偏基线 (两读出分支共用)
         for _ in range(n_gen):
-            bv = cur[:, -64:]
+            bv = cur[:, -64:]  # 上下文窗口 64 (任务语义)
             _ = self._predict(bv, store_state=True, is_inference=True)
-            a4 = net.active_size["l4"]
-            W_diff_a = net.W_diff[:a4, :a4]
-            z4_n = net._z4 / (net._z4.norm(dim=-1, keepdim=True) + 1e-3)
-            pred_delta = z4_n @ W_diff_a.T + net.b_diff[:a4].unsqueeze(0).unsqueeze(0)
-            z4_next = net._z4 + pred_delta
-            # 与训练头同款: 分流抑制 → RMS → 三阶 → 记忆池+绑定拼接 → W1 混合层
-            z4_nl = z4_next / (1.0 + z4_next.abs())
-            z4_nl = _rms(z4_nl)
-            z4_nl = z4_nl * (1.0 - 0.5 * z4_nl.pow(2))
-            zh_next = torch.cat([z4_nl, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)
-            h_next = zh_next @ net.W1
-            h_next = h_next / (1.0 + h_next.abs())  # 分流抑制 (与训练同款)
-            h_next = h_next / (h_next.square().mean(dim=-1, keepdim=True).sqrt() * 1.01 + 1e-8)
-            h_next = h_next * (1.0 - 0.5 * h_next.pow(2))
-            inv_h = 1.0 / math.sqrt(net.d_h)
-            mu0_top = (h_next @ net.W_lm + net.bias_lm) * inv_h
-            logits_c = (mu0_top - mu0_top.mean(dim=-1, keepdim=True)) / (
-                mu0_top.std(dim=-1, keepdim=True) + 1e-4
-            )
-            mu0_top = logits_c / logits_c.abs().max(dim=-1, keepdim=True).values * 60.0
-            freq_safe = net._freq + 1e-2
-            mu0_top = mu0_top - (6.0 * torch.log(freq_safe)).to(torch.float16).unsqueeze(0).unsqueeze(0)
-            mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
-            mask_print[32:] = 1.0
-            mu0_top = mu0_top + (1.0 - mask_print) * -1e4
-            last = mu0_top[:, -1].float()
+            if getattr(net, "use_w_act", False):
+                # 动作回路 (第 76 轮): 概念槽 z_bind → W_act 脉冲字节, 离散事件驱动
+                z_bind = net._bind_vec[:, -1]  # [N,16] 概念槽 (软竞争, 语义连续)
+                # 内部思考循环 (第 76 轮战略裁决): 输出前先运行 K 步纯内部演化 —
+                # z_bind 经 W_bind_self 自转移 (无外部输入), 受 intrinsic_drive
+                # 相位调制 (不同相位 → 不同转移偏好). 思考不输出字节、不更新
+                # W_act — 输出是内部演化溢出, 非对上一字节的机械响应.
+                # 打破刺激-反应锁链: 相同前缀经不同思考路径可达不同终态.
+                # 思考期间相位持续推进 (内部节律在思考中运行, 每步不同相位)
+                K_THINK = getattr(net, "_think_k", 3)
+                if K_THINK > 0:
+                    th_b = net._theta_bind
+                    for _ in range(K_THINK):
+                        cnt = net._intr_cnt
+                        cnt.add_(1.0)
+                        cnt.remainder_(20.0)
+                        A = net._intr_sin.index_select(0, cnt.long().squeeze(0))  # [1] fp16
+                        z_bind = torch.relu(z_bind @ net.W_bind_self * (0.5 + A) - th_b)
+                        z_bind = z_bind / (1.0 + z_bind.abs())  # 分流抑制 (同前向)
+                net._think_z = z_bind  # 诊断: 思考后终态
+                pot = z_bind @ net.W_act  # [N,256] 动作电位
+                # 可打印掩码对齐训练读出空间 (第 76 轮): 0x00-0x1F 物理屏蔽
+                mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
+                mask_print[32:] = 1.0
+                pot = pot + (1.0 - mask_print) * -1e4
+                # 频率去偏对齐 W_lm 生成路径 (第 76 轮): 无去偏时 argmax 恒选
+                # 最高频字节 (0xEF/续字节/空格) → 屏蔽一个选次高 → � 周期复读
+                pot = pot - (6.0 * torch.log(freq_safe)).to(torch.float16).unsqueeze(0)
+                last = pot / (pot.abs().max(dim=-1, keepdim=True).values + 1e-4) * 60.0  # fp16
+            else:
+                a4 = net.active_size["l4"]
+                W_diff_a = net.W_diff[:a4, :a4]
+                z4_n = net._z4 / (net._z4.norm(dim=-1, keepdim=True) + 1e-3)
+                pred_delta = z4_n @ W_diff_a.T + net.b_diff[:a4].unsqueeze(0).unsqueeze(0)
+                z4_next = net._z4 + pred_delta
+                # 与训练头同款: 分流抑制 → RMS → 三阶 → 记忆池+绑定拼接 → W1 混合层
+                z4_nl = z4_next / (1.0 + z4_next.abs())
+                z4_nl = _rms(z4_nl)
+                z4_nl = z4_nl * (1.0 - 0.5 * z4_nl.pow(2))
+                zh_next = torch.cat([z4_nl, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)
+                h_next = zh_next @ net.W1
+                h_next = h_next / (1.0 + h_next.abs())  # 分流抑制 (与训练同款)
+                h_next = h_next / (h_next.square().mean(dim=-1, keepdim=True).sqrt() * 1.01 + 1e-8)
+                h_next = h_next * (1.0 - 0.5 * h_next.pow(2))
+                inv_h = 1.0 / math.sqrt(net.d_h)
+                mu0_top = (h_next @ net.W_lm + net.bias_lm) * inv_h
+                logits_c = (mu0_top - mu0_top.mean(dim=-1, keepdim=True)) / (
+                    mu0_top.std(dim=-1, keepdim=True) + 1e-4
+                )
+                mu0_top = logits_c / logits_c.abs().max(dim=-1, keepdim=True).values * 60.0
+                mu0_top = mu0_top - (6.0 * torch.log(freq_safe)).to(torch.float16).unsqueeze(0).unsqueeze(0)
+                mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
+                mask_print[32:] = 1.0
+                mu0_top = mu0_top + (1.0 - mask_print) * -1e4
+                last = mu0_top[:, -1]  # [N,256] fp16
             if temperature > 0:
                 last = last / temperature
             is_utf8_cont = (last_byte >= 0x80) & (last_byte <= 0xBF)
@@ -253,6 +283,9 @@ class ForwardEngine:
             # 多级记忆池 (3 级因果卷积核, 替代单变量 h): 即时 2 步 / 短时 8 步 /
             # 长时 32 步 — 每级 = 核窗口内 z4 的因果滑动平均 (纯机制, 无超参权重),
             # 位置信息由各级窗口保留, 跨序列经 _m_pool 延续 (零填充 = 接续上序列末态)
+            # 注: 保留循环版 — 张量化 (幂次权重矩阵) 在 fp16 下与循环乘法链
+            # 舍入不同 (0.5^64 下溢为 0 vs 逐步乘保留), 数学不等价 (第 76 轮实测
+            # 最大差 17.9), 不可用于训练
             m_prev = net._m_pool.unsqueeze(0).unsqueeze(0).expand(N, 1, -1).clone()  # [N,1,3a4]
             m2 = m_prev[:, :, :a4]
             m8 = m_prev[:, :, a4 : 2 * a4]
@@ -264,14 +297,11 @@ class ForwardEngine:
                 m32 = torch.cat([m32, 0.03125 * m32[:, -1:] + 0.96875 * zt], dim=1)
             net._m_pool = torch.cat([m2[:, -1], m8[:, -1], m32[:, -1]], dim=-1).mean(dim=0)  # [3a4]
             net._m2, net._m8, net._m32 = m2, m8, m32  # [N,S,a4] 每级记忆池
-            # 快慢时序散度 (第 69 轮): 快通道 = 即时帧 z4[t], 慢通道 = 显式
-            # 慢 EMA (β_slow = 0.99/帧, 半衰期 ~69 帧). N[t] = ‖z4[t] - Z_slow[t]‖²
-            # 原始空间平方欧氏距离 (老师规格: 免除法, 纯平方和).
-            # 归一化会杀死散度: 逐帧 RMS 后每帧 norm=1, 慢通道仅在幅度上
-            # 滞后 → 方向一致 → 散度恒 0 (第 69 轮实测). 原始空间幅度差
             # 才是"状态是否推进"的信号. tau 按原始量级自动校准 (EMA).
             # 死循环: 帧不再转移 → 慢通道收敛向快通道 → N → 0 (LTD 主动遗忘);
             # 正常推进: z4 持续领先 → N 健康正值 (LTP)
+            # 注: 保留循环版 — 张量化 (0.99^t 幂次矩阵) fp16 下溢 (0.99^63≈0.53
+            # 但 0.01·0.99^63 累加链舍入不同), 与循环乘法链不等价
             zslow = torch.zeros_like(z4)
             zslow[:, 0] = z4[:, 0]
             for t in range(1, S):
@@ -291,26 +321,41 @@ class ForwardEngine:
         }
 
     def _bind(self, z4: torch.Tensor) -> None:
-        """竞争性概念绑定: z4 → W_bind → K=16 槽位 → 软 WTA 竞争.
+        """竞争性概念绑定: z4 → W_bind → K=16 槽位 → 连续值稀疏激活向量.
 
-        软 WTA (第 75 轮): softmax(raw·T_inv) — L2 归一化线性平均化 1e-7 级
-        槽差异 → 对称死锁温床; softmax 指数放大微小优势 → 正反馈分化.
-        T_inv=4.0 竞争强度 (softmax 用 fp32 防 exp 溢出, 与 probs_lm 同款).
-        槽级分流抑制 (第 75 轮): z_bind_j /= (1+θ_j), θ_j 跟踪槽能量 —
-        稳态约束防单槽垄断. bind_vec = z_bind (K 维), 与 W_lm 输入第 5 段对齐.
+        第 76 轮终局升级 (裁决: z_bind 表示层从概率分布 → 超完备连续编码):
+        - 旧: softmax(T_inv=4) + sum=1 归一化 → 15 维单纯形, 区分度天花板
+          ~0.003 量级 → 三任信号源 (外部目标/W_lm 陌生度/W_bind_self 转移
+          误差) 全部无梯度失效 (实测).
+        - 新: relu(raw - θ) 阈值竞争 + 分流抑制 x/(1+|x|), 无 sum=1 约束.
+          输出 = 连续值稀疏向量: 大多数槽零, 少数激活槽携带幅度信息.
+          范数成为自由度 → 不同上下文的 z_bind 差异不再被压缩.
+        - θ 复用已有分流抑制滑阈 (_theta_bind 跟踪槽能量, 高激活槽被压).
+        - 软 WTA 竞争内核保留 (relu 阈值 = 竞争), 无温度参数.
+        - W_act/W_bind_self/decorr/自适应全部保持不变 (输入仍是 [N,S,16]).
         """
         net = self.net
         a4 = net.active_size["l4"]
         z4_n = _l2_norm(z4)
-        raw = z4_n @ net.W_bind[:a4]  # [N,S,K]
-        z_bind = torch.softmax((raw.float() * 4.0), dim=-1).to(torch.float16)  # 软 WTA
-        z_bind = z_bind / (z_bind.sum(dim=-1, keepdim=True) + 1e-8)  # sum=1 (fp16 舍入修正)
-        # 槽级分流抑制: θ_j 跟踪分流前槽能量 (softmax 概率), 高激活槽被压
+        raw = z4_n @ net.W_bind[:a4]  # [N,S,K] 自下而上投影
+        if getattr(net, "_bind_loop", True):
+            z_bind = torch.relu(raw[:, :1] - net._theta_bind)  # t=0 无历史
+            z_binds = [z_bind]
+            for t in range(1, raw.shape[1]):
+                raw_t = raw[:, t : t + 1] + 0.5 * (z_bind @ net.W_bind_self)
+                z_bind = torch.relu(raw_t - net._theta_bind)
+                z_binds.append(z_bind)
+            z_bind = torch.cat(z_binds, dim=1)
+        else:
+            z_bind = torch.relu(raw - net._theta_bind)
+        # 分流抑制: 上界 1.0, 幅度保留 (无 sum=1 归一化, 范数 = 自由度)
         th_b = net._theta_bind
         th_b.mul_(0.98).add_(0.02 * (z_bind * z_bind).mean(dim=(0, 1)))
-        z_bind = z_bind / (1.0 + th_b).unsqueeze(0).unsqueeze(0)
+        z_bind = z_bind / (1.0 + z_bind.abs())
         net._bind_pre = raw
-        net._bind_vec = z_bind  # [N,S,K]
+        net._bind_vec = z_bind  # [N,S,K] 连续值稀疏向量
+        # 动作电位 (第 76 轮): 概念槽 → W_act → 256 字节脉冲潜能, 供学习器三因子更新
+        net._act_pot = z_bind @ net.W_act  # [N,S,256] (soft_norm 列归一有界)
 
     def _precise(self, eps: torch.Tensor) -> torch.Tensor:
         """精度加权: π_l = 1/(σ_εl + c), 归一化每层误差尺度."""

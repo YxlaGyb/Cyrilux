@@ -159,6 +159,42 @@ class DensePCNet(nn.Module):
         # W_bind 列方向去同质化 (第 75 轮: 逐样本加权破对称后的防垄断安全网,
         # 槽维 16×16, 与行 decorr 正交)
         self.E_bind_col = nn.Parameter(torch.zeros(self.bind_slot_dim, self.bind_slot_dim, dtype=torch.float16))
+        # ── 槽自循环 W_bind_self (第 76 轮, 海马 CA3 循环侧支) ──
+        # z_bind[t] = f(z4[t]@W_bind + z_bind[t-1]@W_bind_self): 槽激活携带自身
+        # 历史 → 动态检测器, 时序积分使槽可编码多字节模式 (无记忆状态机无法
+        # 产生结构化输出). 初始 std=1/√16 小随机, z4 主导; 序列首步 prev=零.
+        # 学习: 槽共现 Hebbian (i@t-1 激活 & j@t 激活 → 强化 i→j 转移),
+        # soft_norm 行范数约束与主 W_bind 同步
+        self.W_bind_self = nn.Parameter(torch.empty(self.bind_slot_dim, self.bind_slot_dim, dtype=torch.float16))
+        # W_bind_self 列去同质化 (第 76 轮, 裁决: 防均匀转移坍缩): 16 列各对应
+        # 一个源槽的转移权重向量 — 均匀转移时所有列收敛同向量 (列相似度 0.906
+        # 实测), decorr 施斥力迫使不同源槽分化目标槽偏好. 与 W_bind 主矩阵列
+        # decorr 同构, 零起步 (E=0 → 无抑制)
+        self.E_bind_self = nn.Parameter(torch.zeros(self.bind_slot_dim, self.bind_slot_dim, dtype=torch.float16))
+        # ── 自发活动发生器 (第 76 轮战略转向: 双重驱动) ──
+        # 内部全局调控信号 intrinsic_drive: 独立于外部预测误差的内部驱动源.
+        # 自发振荡 A = 0.5+0.5·sin(2π·cnt/20) — 纯 fp16: cnt 为 0-19 整数计数器
+        # (fp16 精确表示), 正弦查表 _intr_sin 预计算 20 项 fp16 (周期 ~20 步,
+        # 自发节律, 不依赖任何输入); 状态耦合 Ω = 槽激活功率 EMA (概念槽切换
+        # 频率, 内部状态). intr = 0.5·A + 0.5·Ω ∈ [0,1], 广播至 W_bind_self
+        # 与 W_act 更新 — 与多巴胺/乙酰胆碱并列的第三驱动 (内部, 非外部误差)
+        self.register_buffer("_intr_cnt", torch.zeros(1, dtype=torch.float16))  # 相位计数器 0-19
+        self.register_buffer(
+            "_intr_sin",
+            torch.tensor(
+                [0.5 + 0.5 * math.sin(2.0 * math.pi * i / 20.0) for i in range(20)],
+                dtype=torch.float16,
+            ),
+        )  # 正弦查表 [20] fp16
+        self.register_buffer("_intr_omega", torch.tensor(0.3, dtype=torch.float16))  # 槽切换功率 EMA
+        # ── 动作读出矩阵 W_act (无 Token 生成, 第 76 轮): [K=16 槽, 256 字节] ──
+        # 概念槽 z_bind → 离散字节脉冲: potential = z_bind @ W_act; 推理 argmax 脉冲
+        # 输出, 学习三因子赫布 (目标列强化 + softmax 稳态抑制 + dop_gain 门控).
+        # 行 = 槽 (随 W_bind 同 perm 修剪), 列 = 256 字节 (soft_norm 列归一有界)
+        self.W_act = nn.Parameter(torch.empty(self.bind_slot_dim, self.cfg.d_input, dtype=torch.float16))
+        # W_act 输出端 BCM 滑阈 (防字节垄断): theta = EMA(potential²), 高电位字节
+        # 抑制 → 稳态 (与 _theta_wlm 同款剪刀)
+        self.register_buffer("_theta_act", torch.full((self.cfg.d_input,), 0.01, dtype=torch.float16))
         # 独立逐样本 surprise EMA (第 75 轮最终): 每样本独立历史, 初始 1.0
         # 让第一批 rel_n ≈ surprise_n (无共享统计, 纯局部)
         self.register_buffer("_s_ema_n", torch.ones(8, dtype=torch.float16))
@@ -170,8 +206,9 @@ class DensePCNet(nn.Module):
         # (2/8/32 步) 承载跨序列低分辨率信息; 池间竞争由各通路 BCM 滑阈自动调节 (注意力雏形)
         self.register_buffer("_m_pool", torch.zeros(3 * d["l4"], dtype=torch.float16))
         # 内部 EMA 频率 (第 54 轮读出端去偏): 纯模型内部累计 target 分布,
-        # 绝不依赖外部统计. fp32 调度域 (log 精度 + 1e-3 级增量, 同 _ent_buf 先例)
-        self.register_buffer("_freq", torch.full((self.cfg.d_input,), 1.0 / 256.0, dtype=torch.float32))
+        # 绝不依赖外部统计. 全 fp16 (0.01 级增量 fp16 可精确表示, 1/256 初值
+        # 与增量同量级, 无精度损失)
+        self.register_buffer("_freq", torch.full((self.cfg.d_input,), 1.0 / 256.0, dtype=torch.float16))
         # ── 非线性混合层 (第 57 轮): W1 [lm_in, d_h] + 三阶激活 + 转置误差传播 ──
         # h = zh @ W1; h = h·(1-0.5h²); logits = h @ W_lm.
         # W_lm 输入从 zh 变为混合特征 h (d_h 维), 横向交叉组合打散高频 e 列.
@@ -242,12 +279,12 @@ class DensePCNet(nn.Module):
         # 低于基线 = 稳定 (衰减缩回). 初始 5.5 ≈ 均匀分布熵 (256 字节)
         self.register_buffer("_ent_ema", torch.tensor(5.5, dtype=torch.float16))
         # 动态稳态竞争状态: 20 步熵窗口 (环形) + 最小二乘斜率拟合预分配 (t 中心化)
-        # + 速率自适应缩放因子 (fp32 调度域, 非训练张量; scale ∈ (0,2) 数学有界)
-        self.register_buffer("_ent_buf", torch.zeros(20, dtype=torch.float32))
-        self.register_buffer("_t_center", torch.arange(20, dtype=torch.float32) - 9.5)
-        self.register_buffer("_t_denom", (torch.arange(20, dtype=torch.float32) - 9.5).square().sum())
+        # + 速率自适应缩放因子 (全 fp16; scale ∈ (0,2) 数学有界)
+        self.register_buffer("_ent_buf", torch.zeros(20, dtype=torch.float16))
+        self.register_buffer("_t_center", torch.arange(20, dtype=torch.float16) - 9.5)
+        self.register_buffer("_t_denom", (torch.arange(20, dtype=torch.float16) - 9.5).square().sum())
         self._ent_i = 0
-        self.register_buffer("_traction_scale", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("_traction_scale", torch.tensor(1.0, dtype=torch.float16))
         # 快慢时序散度 (第 69 轮): Z_slow = β·Z_slow + (1-β)·Z_fast (慢通道滑动
         # 记忆, fp16 纯量乘法); 新奇度 N = ‖Z_fast - Z_slow‖² — 死循环时状态
         # 不再转移, Z_fast 坍缩向 Z_slow, N → 0, 触发负向多巴胺 (主动遗忘 LTD)
@@ -313,8 +350,12 @@ class DensePCNet(nn.Module):
         for name, p in self.named_parameters():
             if "bias" in name:
                 continue
-            if name in ("E_l5", "E_42", "E_23", "M_l5", "E_t2", "E_t3", "E_t4", "E_t5", "E_bind", "E_bind_col", "E_04"):
+            if name in ("E_l5", "E_42", "E_23", "M_l5", "E_t2", "E_t3", "E_t4", "E_t5", "E_bind", "E_bind_col", "E_04", "E_bind_self"):
                 continue  # 去相关矩阵零起步 (M=0 → 前向恒等)
+            if name == "W_act":
+                nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(self.bind_slot_dim))
+            if name == "W_bind_self":
+                nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(self.bind_slot_dim))
             if name in ("W_lm", "W_lm_2"):
                 nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(self.d_h))
             elif name == "W1":

@@ -264,8 +264,13 @@ class PruningEngine:
             # 防止修剪破坏 W_lm 学到的映射 (6000 步断崖根因)
             score_fn = None
             if layer == "l4":
-                rn_lm = net.W_lm[:active].data.norm(dim=1)
-                score_fn = lambda rn, a: rn * rn_lm[:a]
+                # 感知修剪 (方案 B): 候选分数 = 表示层行范数 × W1 z4 段行范数 —
+                # W1 行 = [z4|m2|m8|m32|bind], 前 a4 行映射 L4 神经元 (混合层下
+                # W_lm 行 = d_h 折叠空间, 无神经元映射, 旧引用越界且语义失效)
+                rn_w1 = net.W1[:active].data.norm(dim=1)
+
+                def score_fn(rn, a):
+                    return rn * rn_w1[:a]
             perm, n_alive = self._permute_weights(layer, active, n_candidate, expired, perm_map, score_fn)
             n_alive_map[layer] = n_alive
             if perm is None:
