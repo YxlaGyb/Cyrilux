@@ -91,24 +91,41 @@ class ForwardEngine:
             _ = self._predict(bv, store_state=True, is_inference=True)
             if getattr(net, "use_w_act", False):
                 # 动作回路 (第 76 轮): 概念槽 z_bind → W_act 脉冲字节, 离散事件驱动
-                z_bind = net._bind_vec[:, -1]  # [N,16] 概念槽 (软竞争, 语义连续)
-                # 内部思考循环 (第 76 轮战略裁决): 输出前先运行 K 步纯内部演化 —
-                # z_bind 经 W_bind_self 自转移 (无外部输入), 受 intrinsic_drive
-                # 相位调制 (不同相位 → 不同转移偏好). 思考不输出字节、不更新
-                # W_act — 输出是内部演化溢出, 非对上一字节的机械响应.
-                # 打破刺激-反应锁链: 相同前缀经不同思考路径可达不同终态.
-                # 思考期间相位持续推进 (内部节律在思考中运行, 每步不同相位)
-                K_THINK = getattr(net, "_think_k", 3)
-                if K_THINK > 0:
-                    th_b = net._theta_bind
-                    for _ in range(K_THINK):
-                        cnt = net._intr_cnt
-                        cnt.add_(1.0)
-                        cnt.remainder_(20.0)
-                        A = net._intr_sin.index_select(0, cnt.long().squeeze(0))  # [1] fp16
-                        z_bind = torch.relu(z_bind @ net.W_bind_self * (0.5 + A) - th_b)
-                        z_bind = z_bind / (1.0 + z_bind.abs())  # 分流抑制 (同前向)
-                net._think_z = z_bind  # 诊断: 思考后终态
+                # 裁决 10: 思考循环已剥离 (NaN 工厂); 裁决 12: 内部状态错误配对
+                z_bind = net._bind_vec[:, -1]  # [N,16] 概念槽 (连续值稀疏)
+                # ── 内部状态错误配对 (裁决 12/13): 持续低强度运作 ──
+                # 复读检测: 最近 10 步唯一字节 <3 → 复读深度累计 (探索清零).
+                # 错配始终在线: 强度 = 0.01 + 0.15·min(rep_depth/10, 1) —
+                # 复读深度 0 也有 0.01 背景探索 (蓝斑强直性活动, 防完全固化);
+                # 深度 ≥1 强度线性增长至 0.16 (满幅探索).
+                # 扰动: 从 z_bind@W_bind_self 转移偏好 top-3 目标槽随机选一,
+                # z_bind += strength·(tgt_emb - z_bind). 定向 (非随机噪声),
+                # 由内部转移模型结构决定方向 (海马尖波涟漪组合性探索).
+                # 注意: 生成端独立维护 rep_depth (学习端 _rep_run 不同步到此)
+                if getattr(net, "_mismatch", False) and cur.shape[1] >= 10:
+                    gb_recent = cur[:, -10:]  # [N,10]
+                    oh_r = F.one_hot(gb_recent, num_classes=256).to(torch.float16)
+                    n_uniq = (oh_r.sum(dim=1) > 0).sum(dim=-1)  # [N] 每样本唯一字节数
+                    in_rep = (n_uniq < 3).to(torch.float16)  # [N]
+                    # _rep_depth 按当前 batch 对齐 (跨 batch 残留会广播错位,
+                    # 第 76 轮实测: 训练 batch=8 残留 → 评估 N=1 时 z_bind 扩到 [8,16])
+                    rep_depth = getattr(net, "_rep_depth", None)
+                    if rep_depth is None or rep_depth.shape[0] != N:
+                        rep_depth = torch.zeros(N, device=dev, dtype=torch.float16)
+                    rep_depth = torch.where(in_rep > 0, rep_depth + 1.0, torch.zeros_like(rep_depth))
+                    net._rep_depth = rep_depth
+                    # 错配强度: 0.01 背景 + 0.15·min(深度/10, 1) (裁决 13 数值)
+                    strength = 0.01 + 0.15 * (rep_depth / 10.0).clamp(0.0, 1.0)  # [N]
+                    # 转移偏好 top-3 目标槽, 随机选一
+                    trans = z_bind @ net.W_bind_self  # [N,16]
+                    _, top_idx = trans.topk(3, dim=-1)  # [N,3]
+                    pick = torch.randint(0, 3, (N,), device=dev)  # [N] 0-2
+                    tgt = top_idx.gather(1, pick.unsqueeze(1)).squeeze(1)  # [N]
+                    tgt_emb = net.W_bind_self[:, tgt].T  # [N,16] 目标槽转移向量
+                    shift = strength.unsqueeze(1) * (tgt_emb - z_bind)
+                    z_bind = z_bind + shift  # 持续在线, 全样本施加
+                    z_bind = z_bind / (1.0 + z_bind.abs())  # 分流抑制
+                    net._mismatch_active = in_rep.mean()  # 诊断: 复读占比
                 pot = z_bind @ net.W_act  # [N,256] 动作电位
                 # 可打印掩码对齐训练读出空间 (第 76 轮): 0x00-0x1F 物理屏蔽
                 mask_print = torch.zeros(256, dtype=torch.float16, device=dev)

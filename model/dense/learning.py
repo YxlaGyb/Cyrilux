@@ -837,7 +837,7 @@ class LearningEngine:
             scale = (1e-4 * rel_rep.clamp(min=1e-4)).to(torch.float16)  # [16,1]
             noise = torch.randn_like(W_col) * scale
             net._noise_scale = scale.mean()  # 诊断: 平均噪声幅度
-            net._col_cos = (cov_col * (1.0 - torch.eye(16, device=dev, dtype=torch.float16))).abs().mean()
+            net._col_cos = (cov_col * (1.0 - torch.eye(net.bind_slot_dim, device=dev, dtype=torch.float16))).abs().mean()
             W_col.add_(noise)
             net.W_bind[:a4].data = W_col.T.contiguous()
             soft_norm_preserve(net.W_bind[:a4].data)
@@ -879,7 +879,12 @@ class LearningEngine:
                 ).mean(dim=0)
                 dW_self = dW_self / (dW_self.norm() + 1e-8)
                 net.W_bind_self.data.mul_(0.9995)
-                net.W_bind_self.data += dW_self * (eta * 2.0)
+                # 裁决 10: intrinsic 调制 W_bind_self 学习率 — η_self = η_base·(1+0.5·sinφ)
+                # 高潮期 (A→1) 学习率 1.5× → 自洽误差上升 → 系统探索新表达;
+                # 低谷期 (A→0) 学习率 1.0× → 自洽误差回落 → 固化探索成果.
+                # 内部节律驱动探索-固化循环, 无新计算路径, 零 NaN 风险
+                eta_self = (eta * 2.0) * (1.0 + 0.5 * A)
+                net.W_bind_self.data += dW_self * eta_self
                 # 列方向 decorr (第 76 轮裁决): 转置后行 decorr 同型 — 16 列各为
                 # 源槽转移向量, 均匀统计下收敛同向量 (实测列相似 0.906), 斥力
                 # 迫使分化. 更新后、soft_norm 前挂载 (与 W_bind 主矩阵同序).
@@ -910,21 +915,13 @@ class LearningEngine:
                 gb = net._gen_bytes  # [N,S_gen] 自生成字节 (表达)
                 N_gen = gb.shape[1]
                 zb_g = zbind[:, -N_gen:]  # [N,N_gen,16] 生成段槽状态
-                # 自洽性惊喜 (裁决 7: 信号源切换): 内部自洽 = 系统对自身状态
-                # 转移的预测能力, 不是外部世界对字节的熟悉度.
-                # 主信号 (0.9): W_bind_self 对 z_bind[t] 的预测误差 —
-                # pred = softmax(z_bind[t-1] @ W_bind_self ·4), 与实际 z_bind[t]
-                # 的差异 = 内部转移自洽误差. 复读模式转移高度可预测 → 低误差
-                # → 保留为稳定基态; 变异若仍可预测 → 纳入表达库; 混乱转移 →
-                # 高误差 → 抑制.
-                # 平滑项 (0.1): W_lm 对 gen_byte 的预测误差 (文化环境最低约束,
-                # 婴儿发音不完全脱离外部反馈)
-                zb_prev = torch.cat(
-                    [zb_g[:, :1], zb_g[:, :-1]], dim=1
-                )  # [N,N_gen,16] z_bind[t-1] (t=0 用自身, 边界近似)
-                pred_self = torch.softmax(
-                    (zb_prev @ net.W_bind_self) * 4.0, dim=-1
-                )  # [N,N_gen,16] 内部转移预测 (softmax 竞争, 同前向)
+                # 自洽性惊喜 (裁决 10: 回退单信号): 锚定自洽被物理否决 (比值
+                # 恒 1.00 — 思考转移与锚定转移误差统计无差异, 信号退化).
+                # 回归裁决 7 配置: W_bind_self 转移预测误差 0.9 + W_lm 弱约束 0.1.
+                # 复读转移高度可预测 → 低误差 → 保留; 变异若可预测 → 纳入;
+                # 混乱转移 → 高误差 → 抑制
+                zb_prev = torch.cat([zb_g[:, :1], zb_g[:, :-1]], dim=1)  # [N,N_gen,16]
+                pred_self = torch.softmax((zb_prev @ net.W_bind_self) * 4.0, dim=-1)
                 self_err = (zb_g - pred_self).square().mean(dim=-1, keepdim=True)  # [N,N_gen,1]
                 probs_g = probs_lm[:, S - N_gen - 1 : S - 1]  # [N,N_gen,256]
                 oh_g = F.one_hot(gb, num_classes=256).to(torch.float16)  # [N,N_gen,256]
@@ -946,6 +943,17 @@ class LearningEngine:
                 # 零 GPU→CPU 同步 — _intr_drive 已是 fp16 张量, 直接张量乘法)
                 intr_d = getattr(net, "_intr_drive", torch.tensor(0.5, device=dev, dtype=torch.float16))
                 net.W_act.data += dW_act * (net.cfg.lm_lr_boost * 0.2) * (0.5 + intr_d)
+                # ── 复读检测跟踪 (裁决 12): 随机扰动已升级为内部状态错误配对
+                # (forward.py 生成路径, W_bind_self 定向扰动替代各向同性噪声).
+                # 此处保留复读状态跟踪供诊断/监控
+                gb_recent = gb[:, -10:]  # [N,10] 最近 10 字节
+                oh_r = F.one_hot(gb_recent, num_classes=256).to(torch.float16)  # [N,10,256]
+                n_uniq = (oh_r.sum(dim=1) > 0).sum(dim=-1).to(torch.float16)  # [N]
+                rep_run = getattr(net, "_rep_run", torch.zeros(N, device=dev, dtype=torch.float16))
+                in_rep = (n_uniq < 3).to(torch.float16)  # [N]
+                rep_run = torch.where(in_rep > 0, rep_run + 1.0, torch.zeros_like(rep_run))
+                net._rep_run = rep_run
+                net._rep_frac = in_rep.mean().to(torch.float16)  # 诊断 (fp16 张量, 零同步)
                 # 列范数保持 (0.8-1.2): 槽列有界防溢出; 转置视图 in-place 直接
                 # 写回原参数 (第 76 轮修复: 旧 .contiguous() 副本装饰性失效)
                 soft_norm_preserve(net.W_act.data.T)

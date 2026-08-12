@@ -150,7 +150,7 @@ class DensePCNet(nn.Module):
         # 竞争性非线性: 匹配槽被相对放大, 其余被抑制). 所有槽位向量参与 W_lm
         # 预测, 由 W_lm 端学习哪些槽组合预测哪字节. 槽位更新纯赫布外积 + 去均值
         # (Oja 式, 零 BP), 归一化防坍缩
-        self.bind_slot_dim = 16
+        self.bind_slot_dim = 32  # 裁决 14: 16→32 槽扩容 (容量上限 16→32, 20+ 可达)
         self._lm_in = d["l4"] * 4 + self.bind_slot_dim
         self.W_bind = nn.Parameter(torch.empty(d["l4"], self.bind_slot_dim, dtype=torch.float16))
         # 概念槽 homeostatic 滑阈 (第 75 轮): θ_j 跟踪 z_bind_j² 槽能量,
