@@ -102,26 +102,6 @@ class LearningEngine:
         # 不充分, v 含噪声, 超量抑制放大噪声 → E_l5 NaN, 334 步实测复现)
         learn_boost = 2.0 - net._traction_scale.to(torch.float16)
 
-        def _rho_spectral(W: torch.Tensor, iters: int = 6) -> torch.Tensor:
-            """幂迭代谱半径估计 (纯局部, 只依赖 W 自身): 随机向量迭代
-            v ← WᵀWv / ‖·‖, ρ ≈ ‖Wv‖. 用于谱半径稳态器 (第 77 轮)."""
-            v = torch.randn(W.shape[1], 1, device=W.device, dtype=W.dtype) * 0.01
-            for _ in range(iters):
-                v = W.T @ (W @ v)
-                v = v / (v.norm() + 1e-8)
-            rho = (W @ v).norm() / (v.norm() + 1e-8)
-            return rho
-
-        def _rho_stabilize(W: torch.Tensor) -> None:
-            """谱半径稳态器: W ← W·(ρ_target/ρ)^ρ_step (积分式, 无硬截断).
-            递归强度拉向临界阻尼 (ρ_target=0.9), 破低频锁定."""
-            rho = _rho_spectral(W)
-            if not torch.isfinite(rho) or rho < 1e-6:
-                return
-            scale = (net.cfg.rho_target / rho) ** net.cfg.rho_step
-            W.mul_(scale)
-            net._rho_last = (W.shape, float(rho))  # 诊断
-
         def _decorr_W(
             W: torch.Tensor,
             E: torch.Tensor,
@@ -239,15 +219,13 @@ class LearningEngine:
         if net.cfg.adaptive_traction:
             eta = eta * net._traction_scale.to(torch.float16)
             eta_t = eta_t * net._traction_scale.to(torch.float16)
-        # 自我维持控制器 (第 77 轮, 仅自由运行): η_global = η_base·eta_g,
-        # eta_g 由神经调质调节核心输出 (_eta_global, 第 77 轮裁决: 三维 PI
-        # 控制器, 与快节律幅度/噪声强度同源自主演化, 废除手动数值与冻结)
+        # 自由运行 (第 77 轮): 无全局学习率调节 — 局部方差稳态器接管
+        # (每单元增益 g=1/(1+θ) 由自身活动方差驱动, 见 forward.py). eta 恒为
+        # 基准值, 无上帝之手
+        # 层偏置稳态更新 (第 77 轮新增): bias 跟踪各层预测误差均值 —
+        # 原代码 bias 从不更新 (恒零); 自由运行下偏置是内部稳态机制,
+        # eps→surprise→dop_gain 反馈自限 (bias 增长 → 误差均值降 → 减缓)
         if free_run:
-            eta = eta * getattr(net, "_eta_global", 1.0)
-            eta_t = eta_t * getattr(net, "_eta_global", 1.0)
-            # 层偏置稳态更新 (第 77 轮新增): bias 跟踪各层预测误差均值 —
-            # 原代码 bias 从不更新 (恒零); 自由运行下偏置是内部稳态机制,
-            # eps→surprise→dop_gain 反馈自限 (bias 增长 → 误差均值降 → 减缓)
             net.bias_l4[:a4].data += eta * eps4.mean(dim=(0, 1))
             net.bias_l2[:a2].data += eta * eps2.mean(dim=(0, 1))
             net.bias_l3[:a3].data += eta * eps3.mean(dim=(0, 1))
@@ -262,7 +240,7 @@ class LearningEngine:
             fe._precise(eps6),
         )
         if not free_run:
-                # ── 预测编码闭环: W_lm 预测误差投影回 z4, 作为表示层 top-down 误差 ──
+            # ── 预测编码闭环: W_lm 预测误差投影回 z4, 作为表示层 top-down 误差 ──
             # eps_lm_proj = eps_lm @ W_lm.T: 表示层被迫为"预测下一字节"重组编码,
             # 而非只重构当前字节. 纯赫布, 零 BP (大脑皮层最核心的闭环)
             # 多级记忆池 + 角色绑定拼接: [z4, m2, m8, m32, bind] 五通道进 W_lm.
@@ -736,8 +714,6 @@ class LearningEngine:
             # 超量 E 清除 W_t 既有秩 1 结构 (top1 sv 11.4 固化 → 递归拉 z 秩 1)
             if E_t is not None:
                 _decorr_W(W_t[:a_sz, :a_sz].data, E_t[:a_sz, :a_sz])
-            # 谱半径稳态器 (第 77 轮): 递归强度拉向 ρ_target=0.9, 破低频锁定
-            _rho_stabilize(W_t[:a_sz, :a_sz].data)
 
         if not free_run:
             # LM 头自监督赫布 (复用闭环段已算的 logits_lm/eps_total):
@@ -961,8 +937,6 @@ class LearningEngine:
                 # 原参数 (第 76 轮实测: 0.906→0.935 不降反升, 装饰性失效)
                 _decorr_W(net.W_bind_self.data.T, net.E_bind_self)
                 soft_norm_preserve(net.W_bind_self.data)
-                # 谱半径稳态器 (第 77 轮): 槽自循环递归强度拉向 ρ_target=0.9
-                _rho_stabilize(net.W_bind_self.data)
 
             # ── 闭环自洽生成 (第 76 轮最终裁决: 表达者范式) ──
             # W_act 从"预测器"转"行为生成器": 切断一切外部目标字节驱动.
