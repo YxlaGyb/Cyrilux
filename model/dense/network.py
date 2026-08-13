@@ -66,6 +66,30 @@ class DensePCConfig:
     # 自适应塑性归一化 (第 75 轮): s_h = clip(0.03/ρ_hebb^raw, 0.005, 1.0) 缩放 W_35
     # Hebbian 外积. 单变量实验开关, 默认关保持旧行为
     adaptive_rho: bool = False
+    # ── 自由运行 (第 77 轮, 生命第一因): 三尺度加性振荡器 + 自我维持控制器 ──
+    free_run_window: int = 64  # 自由运行每窗位置数 (与快节律周期对齐)
+    osc_amp_f: float = 0.15  # 快节律 (64 步) 注入幅度 → z_bind / L5 (第 77 轮裁决: 0.10→0.15)
+    osc_amp_m: float = 0.03  # 中节律 (256 步) 注入幅度 → L4 / L2
+    osc_amp_s: float = 0.01  # 慢节律 (1024 步) 注入幅度 → L3 / L6
+    crit_kappa: float = 0.5  # 控制器增益: η = η_base·(1+κ·tanh((s_target−s_ema)/τ))
+    crit_tau: float = 1.0
+    crit_s_target: float = -1.0  # 临界态目标: 功率谱斜率 ≈ -1 (1/f)
+    # ── 神经调质调节核心 (第 77 轮裁决: 废除手动数值调节, 系统自组织) ──
+    # 三维 PI 控制器: 输入生命第一因偏差 e = s_ema − s_target, 输出三个调节
+    # 信号 (快节律注入幅度 / 高斯噪声强度 / 全局学习率). 边界由 tanh 渐近
+    # 保证 (无硬截断); 初始输出 = 前几轮手动调谐值, 之后完全自主演化
+    mod_a_fast_range: tuple[float, float] = (0.01, 0.5)  # 快节律注入幅度边界
+    mod_sigma_range: tuple[float, float] = (0.0, 0.1)  # 高斯噪声强度边界
+    mod_eta_range: tuple[float, float] = (0.5, 2.0)  # 全局学习率边界
+    mod_kp: float = 0.3  # 比例增益 (即时响应)
+    mod_ki: float = 0.05  # 积分增益 (长期寻优)
+    # ── 谱半径稳态器 (第 77 轮裁决第二阶段: 递归结构低频锁定诊断确认) ──
+    # 每个递归矩阵更新后, 用幂迭代估计自身谱半径 ρ(W), 然后积分式缩放:
+    #   W ← W · (ρ_target / ρ(W))^small_step
+    # 纯局部 (只依赖 W 自身), 无硬截断, 逐步把递归强度拉向临界阻尼附近.
+    # ρ_target=0.9 是生命第一因的推论 (既不僵化也不发散), 非决策者拍脑袋参数
+    rho_target: float = 0.9
+    rho_step: float = 0.01  # 积分器小步长 (每步更新后施加)
     oja_elasticity: float = 0.05
     probation_decay: float = 0.5
 
@@ -187,6 +211,31 @@ class DensePCNet(nn.Module):
             ),
         )  # 正弦查表 [20] fp16
         self.register_buffer("_intr_omega", torch.tensor(0.3, dtype=torch.float16))  # 槽切换功率 EMA
+        # ── 三尺度内源节律振荡器 (第 77 轮, 自由运行活动源) ──
+        # 相位计数器每步递增 (快 64 / 中 256 / 慢 1024), 查表值 = 1-2·i/N (阶梯方波,
+        # fp16 精确可表示, 零运行时三角运算); 注入到各层预激活 (加性电流, 神经元
+        # 自发放电的生理机制 — 乘性无法在零输入时启动网络). 幅度 ≤0.1 保 fp16 安全,
+        # 分流抑制限上界 (无 clamp 红线)
+        for osc_name, osc_n in (("f", 64), ("m", 256), ("s", 1024)):
+            self.register_buffer(f"_osc_{osc_name}_cnt", torch.zeros(1, dtype=torch.float16))
+            self.register_buffer(
+                f"_osc_{osc_name}_tab",
+                (1.0 - 2.0 * torch.arange(osc_n, dtype=torch.float16) / osc_n),
+            )
+        # ── 自我维持控制器状态 (第 77 轮): 功率谱斜率 → 全局学习率 ──
+        # _crit_s_slope = 最近观测的谱斜率 EMA (目标 -1); _crit_eta = 控制器输出
+        # η_global/η_base = 1+κ·tanh((s_target−s_ema)/τ) ∈ [0.5,1.5], 恒正无 clamp
+        self.register_buffer("_crit_s_slope", torch.tensor(-1.0, dtype=torch.float16))
+        self.register_buffer("_crit_eta", torch.tensor(1.0, dtype=torch.float16))
+        # ── 神经调质调节核心状态 (第 77 轮裁决: 三维自组织, 废除手动调节) ──
+        # 积分器 u ∈ [−1,1]³ (三个通道各一, tanh 压缩), 输出 = mid + range·tanh(u):
+        #   a_fast   = 0.5·(lo+hi) + 0.5·(hi−lo)·tanh(u0)  ∈ (lo, hi)
+        #   sigma    = 0.5·(lo+hi) + 0.5·(hi−lo)·tanh(u1)
+        #   eta_g    = 0.5·(lo+hi) + 0.5·(hi−lo)·tanh(u2)
+        # 更新 (观测器每 1024 步调一次): u ← 0.9·u + ki·e + kp·sign(e)·(1−|u|)
+        # (比例项随饱和收窄 — 远离边界时 |u|≪1 → 全速响应, 近边界 → 平滑停靠)
+        self.register_buffer("_mod_u", torch.zeros(3, dtype=torch.float16))
+        self._fr_state: dict[str, torch.Tensor] = {}  # 自由运行跨窗延续 (末帧缓存)
         # ── 动作读出矩阵 W_act (无 Token 生成, 第 76 轮): [K=16 槽, 256 字节] ──
         # 概念槽 z_bind → 离散字节脉冲: potential = z_bind @ W_act; 推理 argmax 脉冲
         # 输出, 学习三因子赫布 (目标列强化 + softmax 稳态抑制 + dop_gain 门控).
@@ -369,6 +418,50 @@ class DensePCNet(nn.Module):
 
     # ── 门面: 一行委托 (逻辑在引擎模块) ──
 
+    def modulate(self, s_ema: float) -> None:
+        """神经调质调节核心 (第 77 轮): 生命第一因偏差 e = s_ema − s_target
+        → 更新三维积分器 → 写出 a_fast/σ/η_global. 由观测器 (train_life.py)
+        每 1024 步调用一次. 输出经 tanh 渐近边界, 无硬截断.
+
+        通道方向 (物理语义):
+        - 谱过陡 (s_ema ≪ s_target, e < 0, 低频主导) → 需增强高频源
+          (a_fast/σ 升: u0/u1 随 −e 移动) + 降低固化 (η 降: u2 随 +e 移动)
+        - 谱过平 (s_ema ≈ 0, e > 0, 白噪无序) → 需减弱高频源 + 增强固化"""
+        e = s_ema - self.cfg.crit_s_target
+        u = self._mod_u.to(torch.float32)
+        # 积分 (长期寻优) + 比例 (即时响应, 随饱和收窄)
+        u[0] = u[0] * 0.9 - self.cfg.mod_ki * e - self.cfg.mod_kp * math.tanh(e) * (1.0 - u[0].abs())
+        u[1] = u[1] * 0.9 - self.cfg.mod_ki * e - self.cfg.mod_kp * math.tanh(e) * (1.0 - u[1].abs())
+        u[2] = u[2] * 0.9 + self.cfg.mod_ki * e + self.cfg.mod_kp * math.tanh(e) * (1.0 - u[2].abs())
+        self._mod_u.copy_(u.clamp(-1.0, 1.0).to(torch.float16))
+        self._mod_outputs()  # 写出三维输出
+
+    def _mod_outputs(self) -> None:
+        """从积分器状态映射三维输出 (mid + range·tanh(u), 渐近边界)."""
+        u = self._mod_u.to(torch.float32)
+        lo, hi = self.cfg.mod_a_fast_range
+        self._a_fast = float(0.5 * (lo + hi) + 0.5 * (hi - lo) * math.tanh(u[0].item()))
+        lo, hi = self.cfg.mod_sigma_range
+        self._sigma_noise = float(0.5 * (lo + hi) + 0.5 * (hi - lo) * math.tanh(u[1].item()))
+        lo, hi = self.cfg.mod_eta_range
+        self._eta_global = float(0.5 * (lo + hi) + 0.5 * (hi - lo) * math.tanh(u[2].item()))
+
+    def _mod_init(self, a_fast: float, sigma: float, eta_g: float) -> None:
+        """初始状态: 前几轮手动调谐值作为调节核心起点, 之后完全自主演化.
+        u ← atanh(2·(out−mid)/range − 1) 反解, 使输出恰好等于给定值."""
+        import torch as _t
+
+        def _solve(out: float, lo: float, hi: float) -> float:
+            t = (out - 0.5 * (lo + hi)) / (0.5 * (hi - lo))
+            t = max(-0.999, min(0.999, t))
+            return math.atanh(t)
+
+        u0 = _solve(a_fast, *self.cfg.mod_a_fast_range)
+        u1 = _solve(sigma, *self.cfg.mod_sigma_range)
+        u2 = _solve(eta_g, *self.cfg.mod_eta_range)
+        self._mod_u.copy_(_t.tensor([u0, u1, u2], dtype=_t.float16))
+        self._mod_outputs()
+
     def forward(self, byte_ids: torch.Tensor) -> dict:
         """推理前馈: 返回未来预测偏差.  ACh 关闭, 确定性."""
         return self.forward_engine.forward(byte_ids)
@@ -383,12 +476,13 @@ class DensePCNet(nn.Module):
         """核心前馈: 感知 (L0→L6) + 微柱路由 + Foldiak 去相关 + 去中心化 + 增量预测."""
         return self.forward_engine._predict(byte_ids, store_state=store_state, is_inference=is_inference)
 
-    def learn(self, byte_ids: torch.Tensor, closed_loop: bool = False) -> dict:
+    def learn(self, byte_ids: torch.Tensor | None = None, closed_loop: bool = False, free_run: bool = False) -> dict:
         """Hebbian 学习 (零反传, 零误差回路). 不接收 targets.
 
         closed_loop=True: 自回归闭环训练 (输入 = 真实前缀 + 自生成后缀).
+        free_run=True: 自由运行 (第 77 轮) — 外部输入恒零, 内部振荡器驱动.
         """
-        return self.learning_engine.learn(byte_ids, closed_loop=closed_loop)
+        return self.learning_engine.learn(byte_ids, closed_loop=closed_loop, free_run=free_run)
 
     def _prune(self):
         """拓扑重塑: 发育期内不剪 → 死缓二级判决 → 相对排名淘汰."""

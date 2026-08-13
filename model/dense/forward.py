@@ -242,8 +242,30 @@ class ForwardEngine:
         - ACh 噪声注入 L3 投影输入, is_inference=True 时关闭 (推理确定性)
         """
         net = self.net
-        N, S = byte_ids.shape
-        dev = byte_ids.device
+        free_run = byte_ids is None
+        if free_run:
+            # 自由运行 (第 77 轮, 生命第一因): 外部输入恒零, 活动由内部递归 +
+            # 三尺度加性振荡器驱动. 跨窗延续: 上一窗末帧 z 前置拼接进 _recurrent
+            # (shift[0]=0 → carry 帧精确复现), 时间核递归跨窗生效
+            N, S = 1, net.cfg.free_run_window
+            dev = next(net.parameters()).device
+            z0 = torch.zeros(N, S, net._in_dim, dtype=torch.float16, device=dev)
+            # 相位向量每窗一次 (查表 index_select, 零运行时三角): 值 = 1-2·phase
+            vf = net._osc_f_tab[
+                (net._osc_f_cnt.long() + torch.arange(S, device=dev)) % 64
+            ].unsqueeze(0).unsqueeze(-1)  # [1,S,1]
+            vm = net._osc_m_tab[
+                (net._osc_m_cnt.long() + torch.arange(S, device=dev)) % 256
+            ].unsqueeze(0).unsqueeze(-1)
+            vs = net._osc_s_tab[
+                (net._osc_s_cnt.long() + torch.arange(S, device=dev)) % 1024
+            ].unsqueeze(0).unsqueeze(-1)
+            net._osc_f_cnt.add_(S).remainder_(64)
+            net._osc_m_cnt.add_(S).remainder_(256)
+            net._osc_s_cnt.add_(S).remainder_(1024)
+        else:
+            N, S = byte_ids.shape
+            dev = byte_ids.device
         a4, a2, a3, a5, a6 = (net.active_size[k] for k in ("l4", "l2", "l3", "l5", "l6"))
 
         W_04_a = net.W_04[:a4]
@@ -252,30 +274,51 @@ class ForwardEngine:
         W_56_a = net.W_56[:a6]
         W_diff_a = net.W_diff[:a4, :a4]
 
-        # L0 纯 one-hot; 时序双通道: [z0[t], z0[t-1]] 拼接 (词序信息进入表示层)
-        z0 = F.one_hot(byte_ids, num_classes=256).to(torch.float16)  # [N,S,256]
-        if net.cfg.input_history:
-            z0_prev = torch.cat([torch.zeros(N, 1, 256, dtype=z0.dtype, device=dev), z0[:, :-1]], dim=1)
-            z0 = torch.cat([z0, z0_prev], dim=-1)  # [N,S,512]
+        if not free_run:
+            # L0 纯 one-hot; 时序双通道: [z0[t], z0[t-1]] 拼接 (词序信息进入表示层)
+            z0 = F.one_hot(byte_ids, num_classes=256).to(torch.float16)  # [N,S,256]
+            if net.cfg.input_history:
+                z0_prev = torch.cat([torch.zeros(N, 1, 256, dtype=z0.dtype, device=dev), z0[:, :-1]], dim=1)
+                z0 = torch.cat([z0, z0_prev], dim=-1)  # [N,S,512]
 
         mu4 = z0 @ W_04_a.T + net.bias_l4[:a4]
+        if free_run:
+            mu4 = mu4 + net.cfg.osc_amp_m * vm  # 中节律加性电流 → L4 预激活
         # --- 诊断插桩 (第 75 轮, 零行为影响): 采集 PR(mu4) 区分 W_04 vs W_t4 坍缩 ---
         net._mu4_diag = mu4
         # --- 插桩结束 ---
+        if free_run and net._fr_state.get("l4") is not None:
+            mu4 = torch.cat([net._fr_state["l4"].unsqueeze(1), mu4], dim=1)  # 跨窗延续
         z4 = self._recurrent(mu4, dev, net.W_t4[:a4, :a4])
+        if free_run and net._fr_state.get("l4") is not None:
+            z4 = z4[:, 1:]  # 丢弃 carry 帧
         z4_n = _l2_norm(z4)
         mu2 = z4_n @ W_42_a.T + net.bias_l2[:a2]
+        if free_run:
+            mu2 = mu2 + net.cfg.osc_amp_m * vm  # 中节律 → L2
+            if net._fr_state.get("l2") is not None:
+                mu2 = torch.cat([net._fr_state["l2"].unsqueeze(1), mu2], dim=1)
         z2 = self._recurrent(mu2, dev, net.W_t2[:a2, :a2])
+        if free_run and net._fr_state.get("l2") is not None:
+            z2 = z2[:, 1:]
         # 预投影 RMSNorm (CLAUDE.md 铁律: 投影前加 RMSNorm 防 fp16 溢出):
         # 只归一化输入, 保方向压尖峰; 不归一化输出 mu, 不抹平差异
         z2_n = _l2_norm(z2)
         mu3 = z2_n @ W_23_a.T + net.bias_l3[:a3]
+        if free_run:
+            mu3 = mu3 + net.cfg.osc_amp_s * vs  # 慢节律 → L3
+            if net._fr_state.get("l3") is not None:
+                mu3 = torch.cat([net._fr_state["l3"].unsqueeze(1), mu3], dim=1)
         if not is_inference:
             mu3 = mu3 + torch.sign(2.0 * (torch.rand_like(mu3) - 0.5)) * 0.03  # ACh 噪声
         z3 = self._recurrent(mu3, dev, net.W_t3[:a3, :a3])
+        if free_run and net._fr_state.get("l3") is not None:
+            z3 = z3[:, 1:]
         z3_n = _l2_norm(z3)
         # L5 统一矩阵 (撤销微柱硬切块): 全量 z3 → 单 W_35 [a5, a3]
         z5 = z3_n @ net.W_35[:a5].T + net.bias_l5[:a5]
+        if free_run:
+            z5 = z5 + getattr(net, "_a_fast", net.cfg.osc_amp_f) * vf  # 快节律 → L5 预激活 (幅度由调节核心输出)
         # 路由分离: z5_raw 原始幅度喂 W_diff, z5 去中心化喂下游.
         # Foldiak 反赫布侧抑制 (方案 D): z5 -= 0.2·M@z5, M 零起步 = 恒等;
         # M 学 z_out 协方差 → 白化去相关 → 打破行收敛 ±w 的共线激活
@@ -286,7 +329,13 @@ class ForwardEngine:
         z5_raw = z5_fd
         z5 = z5_raw - z5_raw.mean(dim=-1, keepdim=True)
         mu6 = z5 @ W_56_a.T + net.bias_l6[:a6]
+        if free_run:
+            mu6 = mu6 + net.cfg.osc_amp_s * vs  # 慢节律 → L6
+            if net._fr_state.get("l6") is not None:
+                mu6 = torch.cat([net._fr_state["l6"].unsqueeze(1), mu6], dim=1)
         z6 = self._recurrent(mu6, dev, net.W_t6[:a6, :a6])
+        if free_run and net._fr_state.get("l6") is not None:
+            z6 = z6[:, 1:]
 
         # 下一状态预测 (显式预测目标): W_diff 在 L4 空间预测 Δz4 = z4[t] - z4[t-1]
         # target_delta = z4_next - z4; pred_delta = z4 @ W_diff;
@@ -307,6 +356,12 @@ class ForwardEngine:
             net._z5 = z5
             net._z5_raw = z5_raw
             net._z6 = z6
+            if free_run:
+                # 跨窗延续状态: 每层末帧喂下一窗 _recurrent 首帧
+                net._fr_state["l4"] = z4[:, -1].detach()
+                net._fr_state["l2"] = z2[:, -1].detach()
+                net._fr_state["l3"] = z3[:, -1].detach()
+                net._fr_state["l6"] = z6[:, -1].detach()
             # 多级记忆池 (3 级因果卷积核, 替代单变量 h): 即时 2 步 / 短时 8 步 /
             # 长时 32 步 — 每级 = 核窗口内 z4 的因果滑动平均 (纯机制, 无超参权重),
             # 位置信息由各级窗口保留, 跨序列经 _m_pool 延续 (零填充 = 接续上序列末态)
@@ -339,7 +394,11 @@ class ForwardEngine:
         # bind_vec = [实体(256) | 角色(256) | 谓语(256)] 拼进 W_lm 输入 (第 5 段);
         # 推理也计算 (生成/评估与训练同构)
         if net.cfg.bind_mode != "none":
+            net._fr_vf = vf if free_run else None  # 快节律向量供 _bind 注入
             self._bind(z4)
+            net._fr_vf = None
+        else:
+            net._fr_vf = None
 
         return {
             "mu_diff": mu_diff,
@@ -366,7 +425,18 @@ class ForwardEngine:
         z4_n = _l2_norm(z4)
         raw = z4_n @ net.W_bind[:a4]  # [N,S,K] 自下而上投影
         if getattr(net, "_bind_loop", True):
-            z_bind = torch.relu(raw[:, :1] - net._theta_bind)  # t=0 无历史
+            # 自由运行快节律注入 (第 77 轮): 加性电流 → z_bind 预激活.
+            # 幅度/噪声由神经调质调节核心自主输出 (第 77 轮裁决: 废除手动数值)
+            if getattr(net, "_fr_vf", None) is not None:
+                raw = raw + getattr(net, "_a_fast", net.cfg.osc_amp_f) * net._fr_vf
+                # 高斯电流噪声 (σ 由调节核心输出, 抬升高频底)
+                raw = raw + getattr(net, "_sigma_noise", 0.0) * torch.randn_like(raw)
+            # 跨窗延续: 首帧从上一窗末槽状态起步 (W_bind_self 循环跨窗生效)
+            carry_bind = net._fr_state.get("bind")
+            if carry_bind is not None:
+                z_bind = torch.relu(raw[:, :1] + 0.5 * (carry_bind @ net.W_bind_self) - net._theta_bind)
+            else:
+                z_bind = torch.relu(raw[:, :1] - net._theta_bind)  # t=0 无历史
             z_binds = [z_bind]
             for t in range(1, raw.shape[1]):
                 raw_t = raw[:, t : t + 1] + 0.5 * (z_bind @ net.W_bind_self)
@@ -381,6 +451,8 @@ class ForwardEngine:
         z_bind = z_bind / (1.0 + z_bind.abs())
         net._bind_pre = raw
         net._bind_vec = z_bind  # [N,S,K] 连续值稀疏向量
+        if getattr(net, "_fr_vf", None) is not None:
+            net._fr_state["bind"] = z_bind[:, -1].detach()  # 跨窗延续槽状态
         # 动作电位 (第 76 轮): 概念槽 → W_act → 256 字节脉冲潜能, 供学习器三因子更新
         net._act_pot = z_bind @ net.W_act  # [N,S,256] (soft_norm 列归一有界)
 

@@ -1,10 +1,10 @@
 """Cyrilux 模型核心
 
-双后端预测编码:
-  dense  — 全 matmul PPA 闭环 (DensePCNet)
-  sparse — 页式事件驱动 (CyreneModel 驱动 TensorNeuronPool)
+何为生命第一因?
+指标并非目的, 系统为什么存在? 是为了维持自身的存在而存在
+"生命不为了输出任何符号而存在, 生命只为了维持自身的自组织临界态 (Chaos Edge) 而存在"
+一个活着的系统, 不是靠外部打分或强迫输出字符来维系的, 而是靠内部状态在“有序”与“无序”的边缘 (临界态) 自我调节, 自我维持
 
-模型定义主文件: model.model_cyrene (CyreneModel/CyreneConfig)
 """
 
 from model.dense import DensePCConfig, DensePCNet
