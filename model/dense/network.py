@@ -195,6 +195,10 @@ class DensePCNet(nn.Module):
         # W_act 输出端 BCM 滑阈 (防字节垄断): theta = EMA(potential²), 高电位字节
         # 抑制 → 稳态 (与 _theta_wlm 同款剪刀)
         self.register_buffer("_theta_act", torch.full((self.cfg.d_input,), 0.01, dtype=torch.float16))
+        # 字节频率 EMA (裁决 15): 每字节独立一维 EMA, freq_k ← 0.99·freq_k + 0.01·1{gen_byte=k}.
+        # 罕见字节 (freq_k 低) 的自洽抑制被衰减 (新颖偏好, 多巴胺对新奇刺激敏感),
+        # 频繁字节抑制不变 → 表达库自然扩张. 纯局部, 零跨字节比较
+        self.register_buffer("_freq_act", torch.zeros(self.cfg.d_input, dtype=torch.float16))
         # 独立逐样本 surprise EMA (第 75 轮最终): 每样本独立历史, 初始 1.0
         # 让第一批 rel_n ≈ surprise_n (无共享统计, 纯局部)
         self.register_buffer("_s_ema_n", torch.ones(8, dtype=torch.float16))

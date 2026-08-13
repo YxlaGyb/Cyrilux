@@ -192,7 +192,17 @@ class ForwardEngine:
             topv, _ = torch.topk(last, min(15, 256), dim=-1)
             last[last < topv[:, -1:]] = -float("inf")
             probs = torch.softmax(last, dim=-1)
-            if temperature <= 0.0 or rep_backstop:
+            if getattr(net, "use_w_act", False) and getattr(net, "_entropy_sample", False):
+                # 生成端熵激励 (裁决 17): W_act 分支软采样 + 频率偏置 —
+                # pot_bias = pot + β·(1-freq_act), 罕见字节获得生成机会
+                # (argmax 确定性采样导致未见过字节永不出现在生成里, 表达库
+                # 上限 11-14 的根源). 软采样替代硬 argmax, 温度 1.0.
+                # 频率偏置仅作用于生成采样, 不进任何学习更新 (自组织筛选)
+                beta = getattr(net, "_entropy_beta", 0.3)
+                freq_bias = (beta * (1.0 - net._freq_act)).unsqueeze(0)  # [1,256]
+                pot_b = last + freq_bias
+                b = torch.multinomial(torch.softmax(pot_b, dim=-1), 1).squeeze(-1)
+            elif temperature <= 0.0 or rep_backstop:
                 b = probs.argmax(dim=-1)
             else:
                 b = torch.multinomial(probs, 1).squeeze(-1)

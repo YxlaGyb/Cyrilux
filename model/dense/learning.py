@@ -915,20 +915,39 @@ class LearningEngine:
                 gb = net._gen_bytes  # [N,S_gen] 自生成字节 (表达)
                 N_gen = gb.shape[1]
                 zb_g = zbind[:, -N_gen:]  # [N,N_gen,16] 生成段槽状态
-                # 自洽性惊喜 (裁决 10: 回退单信号): 锚定自洽被物理否决 (比值
-                # 恒 1.00 — 思考转移与锚定转移误差统计无差异, 信号退化).
-                # 回归裁决 7 配置: W_bind_self 转移预测误差 0.9 + W_lm 弱约束 0.1.
-                # 复读转移高度可预测 → 低误差 → 保留; 变异若可预测 → 纳入;
-                # 混乱转移 → 高误差 → 抑制
+                # ── 学习进步信号 (裁决 16): 从"最小化预测误差"到"最大化学习进步" ──
+                # 复读是"最小化当前预测误差"的全局最优解 — 必须放弃该目标.
+                # LP_t = ε_{t-1} - ε_t (预测误差的负时间差分):
+                #   LP>0: 误差下降, 系统"学会了" → 正强化 (保留该行为)
+                #   LP<0: 误差上升, 系统"变笨了" → 负强化 (抑制该行为)
+                # 复读: ε_{t-1}≈ε_t → LP≈0 → 行为不被强化 → 逐渐遗忘 (打破复读)
+                # 探索新字节若提升可预测性 (LP>0) → 强化 → 表达库向复杂演化.
+                # 多巴胺真实角色: 奖励预测误差 (比预期更好 = 学习进步), 非奖赏本身
+                # 实现: φ = 0.5·(1 - tanh(α·LP)) ∈ [0,1] — LP 大 → φ→0 (弱抑制=
+                # 保留), LP 小 → φ→1 (强抑制). 符号保持, 幅度受限, 纯局部.
+                # (裁决公式 ΔW=-η·tanh(LP)·... 与"LP>0 正强化"矛盾, 按物理
+                # 意图实现: LP>0 保留, LP<0 抑制)
                 zb_prev = torch.cat([zb_g[:, :1], zb_g[:, :-1]], dim=1)  # [N,N_gen,16]
                 pred_self = torch.softmax((zb_prev @ net.W_bind_self) * 4.0, dim=-1)
-                self_err = (zb_g - pred_self).square().mean(dim=-1, keepdim=True)  # [N,N_gen,1]
+                eps_t = (zb_g - pred_self).square().mean(dim=-1, keepdim=True)  # [N,N_gen,1] ε_t
+                eps_prev = torch.cat([eps_t[:, :1], eps_t[:, :-1]], dim=1)  # ε_{t-1}
+                LP = (eps_prev - eps_t).detach()  # 学习进步 [N,N_gen,1]
+                alpha = 50.0  # tanh 缩放 (ε 量级 ~0.003, ×50 → LP 归一)
+                phi = 0.5 * (1.0 - torch.tanh(alpha * LP))  # 增益 [0,1]
                 probs_g = probs_lm[:, S - N_gen - 1 : S - 1]  # [N,N_gen,256]
                 oh_g = F.one_hot(gb, num_classes=256).to(torch.float16)  # [N,N_gen,256]
                 p_gen = (probs_g * oh_g).sum(dim=-1, keepdim=True)  # [N,N_gen,1]
                 wlm_err = (1.0 - p_gen).detach()  # [N,N_gen,1] 外部弱约束
-                surprise = (0.9 * self_err + 0.1 * wlm_err).detach()  # 内部自洽惊喜
-                # 三因子赫布 (表达者版, 裁决公式): dW_act = -η·(z_bind^T ⊗ one_hot(gen_byte))·surprise
+                surprise = (0.9 * phi + 0.1 * wlm_err).detach()  # 学习进步增益 + W_lm 弱约束
+                # ── 字节频率门控 (裁决 15): 罕见字节抑制衰减 (辅助调制) ──
+                fa = net._freq_act
+                oh_gen = F.one_hot(gb, num_classes=256).to(torch.float16)  # [N,N_gen,256]
+                fa.mul_(0.99).add_(0.01 * oh_gen.mean(dim=(0, 1)))
+                beta = 0.5  # 新颖偏好强度
+                freq_gate = (1.0 - beta * (1.0 - fa)).unsqueeze(0).unsqueeze(0)  # [1,1,256]
+                surprise = surprise * freq_gate  # 逐字节频率调制
+                net._LP = LP  # 诊断: 学习进步分布
+                # 三因子赫布 (表达者版): dW_act = -η·(z_bind^T ⊗ one_hot(gen_byte))·surprise
                 # 负号是裁决核心: 高惊喜 (内部模型意外) → 负向更新抑制该行为;
                 # 低惊喜 (内部自洽) → 弱负向, 通路保留. 复读是低惊喜稳定基态
                 # → 自然强化为起点. (第 76 轮修正: 旧实现正号把高惊喜表达
