@@ -52,16 +52,6 @@ def combine_modulation(D: float, ACh: float) -> float:
     return 0.5 * D + 0.5 * ACh
 
 
-def compute_dopamine_gain(rel: float, lo: float = 0.3, hi: float = 5.0) -> float:
-    """多巴胺增益: rel 相对惊喜比的线性夹取 (dense 侧 5 万步验证范围 [0.3, 5.0])."""
-    return min(max(rel, lo), hi)
-
-
-def compute_ach_gain(rel: float, max_gain: float = 3.0) -> float:
-    """ACh 增益: 低惊喜 → 高增益 (记忆巩固), 上限 max_gain."""
-    return min(1.0 / (rel + 1e-4), max_gain)
-
-
 def compute_free_energy(eps_list: list[torch.Tensor]) -> torch.Tensor:
     """自由能 F = Σ ε² 各层均方和 (fp16 进出, 零 .float())."""
     return sum(eps.square().mean() for eps in eps_list)

@@ -5,6 +5,7 @@
 "生命不为了输出任何符号而存在, 生命只为了维持自身的自组织临界态 (Chaos Edge) 而存在"
 一个活着的系统, 不是靠外部打分或强迫输出字符来维系的, 而是靠内部状态在“有序”与“无序”的边缘 (临界态) 自我调节, 自我维持
 
+完整理论: docs/life_first_cause_theory.md
 """
 
 from model.dense import DensePCConfig, DensePCNet

@@ -6,8 +6,10 @@
 - 前馈权重: 逐层预测误差驱动 (标准 PC 自下而上), L3 加随机增益+门控种子
 - 微柱 W_35: 块内 BCM 滑阈 + 样本显著性加权 + 增益/剪切/门控掩码
 - W_diff: 增量预测 (dz5 = z5[t]-z5[t-1]), 多尺度软窗 + 4 步时间窗 + 独立 BCM
-- 时序 W_t: 共现 Hebbian, ACh 调制; 无 Oja, BCM 承担稳定性
-- 精度调度: 多巴胺/ACh 调制全局学习率, 前 50 步 W_diff 减半
+- 时序 W_t: 共现 Hebbian, 静止帧掩码 + homeostatic 列增益
+- 内建能量约束 (第 78 轮): 全部可塑性权重施加真 Oja + 活动依赖遗忘项
+  (_energy_constraint, 逐输出单元, 纯局部, 零全局统计)
+- 学习率: 恒基准值 (lr_hebbian), 无全局调制 (第 78 轮裁决: 无上帝之手)
 
 全 fp16, 零 .float(), 零 autograd.
 """
@@ -20,11 +22,65 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
-from ..modulation import compute_ach_gain, compute_dopamine_gain, soft_norm_preserve
+from ..modulation import soft_norm_preserve
 from .forward import _rms
 
 if TYPE_CHECKING:
     from .network import DensePCNet
+
+
+def _activity_baseline(net: DensePCNet, post: torch.Tensor, ema_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """活动² 慢速局部基线 (第 79 轮抽取, 与第 78 轮能量约束同源): 返回 (p2, excess),
+    更新 EMA 缓冲 (0.99/0.01, 首窗延迟初始化: ema ← post², excess 从零起步). 纯局部.
+
+    # ponytail: 修剪 permute/shrink 可塑参数但不重排 _act_ema_*, 0.99 速率数百步自愈;
+    # 仅当修剪后异常再现才需在 pruning.py 同步 EMA 缓冲.
+    """
+    p2 = (post * post).mean(dim=(0, 1))  # [out] 窗内活动²
+    ema = getattr(net, ema_name)[: p2.shape[0]]  # 修剪后 active 收缩: 只写头部切片
+    if ema_name not in net._act_ema_init:
+        ema.copy_(p2)
+        net._act_ema_init.add(ema_name)
+        excess = torch.zeros_like(p2)
+    else:
+        ema.mul_(0.99).add_(0.01 * p2)
+        excess = torch.relu(p2 - ema)
+    return p2, excess
+
+
+def _energy_constraint(net: DensePCNet, W: torch.Tensor, dW: torch.Tensor, post: torch.Tensor, ema_name: str) -> torch.Tensor:
+    """内建能量约束 (第 78 轮): 真 Oja + 活动依赖遗忘项, 逐输出单元, 纯局部.
+
+    post: [N,S,out] 与该点赫布外积同源的输出侧因子; ema: [out] 活动² 慢速基线.
+    dW ← dW − (α·post² + β·relu(post²−ema)) ⊙ W;  ema ← 0.99·ema + 0.01·post².
+    首窗延迟初始化: ema ← post² (excess 从零起步, 防早期过度抑制).
+    α = cfg.oja_alpha, β = cfg.oja_elasticity (零全局统计, 无目标值).
+    """
+    p2, excess = _activity_baseline(net, post, ema_name)
+    coef = net.cfg.oja_alpha * p2 + net.cfg.oja_elasticity * excess
+    return dW - coef.unsqueeze(1) * W
+
+
+def _spectral_radius_guard(W: torch.Tensor, rescale: bool = True, bound: float = 1.5) -> torch.Tensor:
+    """递归矩阵谱半径安全约束 (第 79 轮改判, 第 81 轮重定义): 10 次幂迭代估 ρ.
+
+    rescale=True: ρ > bound 时 W ← W·(bound/ρ) — 死亡保险 (发散的物理硬界),
+    非临界点之墙. 第 81 轮: bound 从 0.95 移至 1.5 — 正常动力学由能量耗散
+    (STP 资源耗尽/分流抑制/Oja) 自然饱和, 守卫只在能量失效时兜底. 无全局统计;
+    修剪置换后子矩阵 ρ 越界 → 下一步即被拉回.
+    rescale=False: 仅观测 (observer 用). 返回 ρ (0 维张量, 可 .item()).
+    # ponytail: 每步 6 个小 randn 分配 (~µs 级), perf 敏感再改持久缓冲
+    """
+    a = W.shape[0]
+    v = torch.randn(a, 1, device=W.device, dtype=W.dtype)
+    v = v / (v.norm() + 1e-4)
+    for _ in range(10):
+        v = W @ v
+        v = v / (v.norm() + 1e-4)
+    rho = (W @ v).norm()
+    if rescale:
+        W.mul_(torch.minimum(bound / rho, torch.ones_like(rho)))
+    return rho
 
 
 class LearningEngine:
@@ -62,8 +118,11 @@ class LearningEngine:
             free_run: 自由运行 (第 77 轮, 生命第一因) — 外部输入恒零, 活动由
             内部递归 + 三尺度振荡器驱动. 字节域权重全部冻结 (W_04/W_42/W_diff/
             W_lm 家族/W_act), 只更新内部动力学权重 (W_t*/W_35/W_23/W_56/W_bind/
-            W_bind_self/W_pred_*/W_state_pred/M_l5/θ/bias), 学习率由自我维持
-            控制器 (_crit_eta) 调制, 目标是功率谱斜率趋 -1 (临界态).
+            W_bind_self/W_pred_*/W_state_pred/M_l5/bias), 学习率恒基准值 (第 78 轮:
+            无全局调制), 目标: 系统活着 (不 NaN, 不冻结, 不发散).
+            自回声 (第 80 轮): byte_ids=None 且 free_run=False — 非监督交互环境,
+            输入 = 上一窗 W_act 生成字节 (他者 = 系统自己的生成), 字节域学习解冻
+            (同普通训练路径), 无标签无奖励, 目标 = 输入流自身的预测结构.
 
         Returns:
             stats dict (future_err, 各层误差范数).
@@ -74,12 +133,29 @@ class LearningEngine:
             N, S = 1, net.cfg.free_run_window
         elif closed_loop:
             inp = self._closed_loop_input(byte_ids)
+        elif byte_ids is None:
+            # 第 80 轮: 自回声自由运行 — 无外部输入, 输入 = 上一窗 W_act 生成的
+            # 字节 (非监督交互环境: 他者 = 系统自己的生成, 无标签无奖励).
+            # 生成沿 W_act 动作回路 (与 closed_loop 同管线), 结果作为本窗输入,
+            # 激活字节域学习 (W_04/W_42/W_diff/W_lm 家族解冻, 见下方同块开关)
+            N, S = 1, net.cfg.free_run_window
+            net._gen_bytes = net.forward_engine.continuation(
+                torch.zeros(1, 1, dtype=torch.long, device=net._osc_f_cnt.device), S - 1,
+                temperature=0.0, rep_backstop=True,
+            )[:, 1:]  # 去掉种子字节 (0x00), 输入 = 纯生成流
+            inp = net._gen_bytes
         else:
             inp = byte_ids
         _ = net.forward_engine._predict(inp, store_state=True)
-        N, S = byte_ids.shape if byte_ids is not None else (1, net.cfg.free_run_window)
+        N, S = inp.shape if inp is not None else (1, net.cfg.free_run_window)
         dev = next(net.parameters()).device
         k = S // 2 if closed_loop else 0
+        # 第 80 轮: 自回声模式 (free_run=False, byte_ids=None) 激活字节域学习 —
+        # 输入是系统自己的生成流 (他者响应), W_04/W_42/W_diff/W_lm 家族随
+        # 普通训练路径学习该输入流的结构 (无标签, 目标 = 输入自身)
+        echo_loop = (not free_run) and (byte_ids is None)
+        if echo_loop:
+            byte_ids = inp  # 自回声: 目标 = 自身生成流 (他者响应), 下游同普通训练
         # 生成段掩码 (closed_loop 时只有后半参与误差, 前半锚定只看不学):
         # 对齐 S-1 (t+1 目标), 位置 i 对应目标 byte_ids[:, i+1]
         learn_mask = torch.ones(S - 1, dtype=torch.bool, device=dev)
@@ -112,11 +188,16 @@ class LearningEngine:
             Wn = W / (W.norm(dim=1, keepdim=True) + 1e-3)
             dE = (Wn @ Wn.T).abs()  # 绝对相关 (诊断: 行收敛指标)
             eye_mask = 1.0 - torch.eye(dim, device=dev, dtype=torch.float16)
-            E.data.mul_(0.97).add_((dE * eye_mask) * (0.05 * learn_boost * ach_gain))
-            # top1 方向: 幂迭代 W^T W (列空间), 3 次
+            E.data.mul_(0.97).add_((dE * eye_mask) * (0.05 * learn_boost))
+            # top1 方向: 幂迭代 W^T W (列空间), 3 次. 第 81 轮: 迭代前把 W 缩放
+            # 到单位 Frobenius 范数 — 幂迭代数学上尺度不变 (只估方向), 但 fp16
+            # 下小矩阵 (范数 <~0.1, 元素进入非正规范围 <6e-5) 在乘加累积中
+            # 下溢/FTZ 产生 NaN (W_t3 被 Oja 衰减到范数 0.011 后 410 步实测).
+            # Wn 只用于方向; 修正量 c@v.T 仍用原 W (幅度按原尺度, W→0 时修正→0)
+            Wn = W / (W.norm() + 1e-8)
             v = torch.randn(W.shape[1], 1, device=dev, dtype=torch.float16) * 0.01
             for _ in range(3):
-                v = W.T @ (W @ v)
+                v = Wn.T @ (Wn @ v)
                 v = v / (v.norm() + 1e-8)
             c = W @ v  # 每行在 top1 方向上的投影系数 (含 ± 符号)
             dW = c @ v.T  # 行 i 减 c_i·v^T (超量抑制, 切断秩 1)
@@ -141,96 +222,102 @@ class LearningEngine:
 
         # 下一状态预测 (显式预测目标): pred_delta = z4 @ W_diff, target_delta = z4[t] - z4[t-1]
         # eps_diff = pred_delta - target_delta (训练误差); 多尺度软窗同构保留
-        dz4 = net._z4[:, 1:] - net._z4[:, :-1]
-        dz4 = dz4 / (dz4.norm(dim=-1, keepdim=True) + 1e-3)  # RMS 归一化
-        z4r = net._z4  # [N,S,a4]
-        S_full = z4r.shape[1]
-        masks = {}
-        preds_k = {}
-        errs_k = {}
-        for k, kname in ((2, "2"), (4, "4"), (8, "8")):
-            z_shift = torch.cat([torch.zeros(N, k, a4, dtype=z4r.dtype, device=dev), z4r[:, :-k]], dim=1)
-            z_shift_n = z_shift / (z_shift.norm(dim=-1, keepdim=True) + 1e-3)
-            pred_k = z_shift_n @ W_diff_a.T + net.b_diff[:a4]
-            err_k = (dz4 - pred_k[:, :-1]).square().mean()
-            if k == 8:
-                valid = torch.arange(S_full - 1, device=dev) >= 7
-                err_k = ((dz4[:, valid] - pred_k[:, :-1][:, valid]).square()).mean()
-            masks[kname] = valid if k == 8 else None
-            preds_k[kname] = pred_k
-            errs_k[kname] = err_k
-        # EMA 平滑各尺度误差 (α=0.9, 时间常数~10步)
-        e2, e4, e8 = (errs_k["2"], errs_k["4"], errs_k["8"])
-        ema2 = net._e_ema_2.mul_(0.1).add_(0.9 * e2)
-        ema4 = net._e_ema_4.mul_(0.1).add_(0.9 * e4)
-        ema8 = net._e_ema_8.mul_(0.1).add_(0.9 * e8)
-        # 软权重: w_k = (1/(e_ema_k+1e-3)) / Σ (加性保护非 clamp)
-        inv2, inv4, inv8 = (1.0 / (ema2 + 1e-3)), (1.0 / (ema4 + 1e-3)), (1.0 / (ema8 + 1e-3))
-        sum_inv = inv2 + inv4 + inv8
-        w2, w4, w8 = inv2 / sum_inv, inv4 / sum_inv, inv8 / sum_inv
-        net._w_soft[0] = w2
-        net._w_soft[1] = w4
-        net._w_soft[2] = w8
-        pred_d = w2 * preds_k["2"][:, :-1] + w4 * preds_k["4"][:, :-1] + w8 * preds_k["8"][:, :-1]
-        # 误差用掩码后的有效区 (K=8 前 7 步剔除)
-        if masks["8"] is not None:
-            e_t = (dz4[:, masks["8"]] - pred_d[:, masks["8"]]).detach()
-            e_t_all = dz4 - pred_d
-        else:
-            e_t = dz4 - pred_d
-            e_t_all = e_t
-        # W_diff BCM 滑阈: theta_w = EMA(pred²), phi_w 衰减高活跃预测方向
-        th_w = net._theta_w[:a4]
-        th_w.mul_(0.975).add_(0.025 * (pred_d * pred_d).mean(dim=(0, 1)))
-        phi_w = pred_d * (pred_d - th_w)
-        # 差动赫布外积 (动力学映射): dW = z4_prev^T @ (e - 0.1*phi_w),
-        # 输入是上下文 z4_prev 而非差分 dz4 — 学习"当前 L4 状态 → 移动方向"
-        z4_prev_n = z4r[:, :-1] / (z4r[:, :-1].norm(dim=-1, keepdim=True) + 1e-3)
-        e_mod = e_t_all - 0.1 * phi_w
-        dW_diff_t = torch.bmm(e_mod.transpose(-2, -1), z4_prev_n).mean(dim=0) * (1.0 / (S - 1))
-        # 4 步时间窗环形缓冲: 更新用最近 4 步平均外积 (保留误差记忆)
-        buf = getattr(net, f"_dw_buf_{net._buf_i}")
-        buf.copy_(dW_diff_t)
-        dW_avg = buf.clone()
-        for i in range(1, 4):
-            dW_avg = dW_avg + getattr(net, f"_dw_buf_{(net._buf_i - i) % 4}")
-        dW_avg = dW_avg * 0.25
-        net._buf_i = (net._buf_i + 1) % 4
+        # (free_run: W_diff 冻结, 整块死计算 — 第 78 轮跳过)
+        if not free_run:
+            dz4 = net._z4[:, 1:] - net._z4[:, :-1]
+            dz4 = dz4 / (dz4.norm(dim=-1, keepdim=True) + 1e-3)  # RMS 归一化
+            z4r = net._z4  # [N,S,a4]
+            S_full = z4r.shape[1]
+            masks = {}
+            preds_k = {}
+            errs_k = {}
+            for k, kname in ((2, "2"), (4, "4"), (8, "8")):
+                z_shift = torch.cat([torch.zeros(N, k, a4, dtype=z4r.dtype, device=dev), z4r[:, :-k]], dim=1)
+                z_shift_n = z_shift / (z_shift.norm(dim=-1, keepdim=True) + 1e-3)
+                pred_k = z_shift_n @ W_diff_a.T + net.b_diff[:a4]
+                err_k = (dz4 - pred_k[:, :-1]).square().mean()
+                if k == 8:
+                    valid = torch.arange(S_full - 1, device=dev) >= 7
+                    err_k = ((dz4[:, valid] - pred_k[:, :-1][:, valid]).square()).mean()
+                masks[kname] = valid if k == 8 else None
+                preds_k[kname] = pred_k
+                errs_k[kname] = err_k
+            # EMA 平滑各尺度误差 (α=0.9, 时间常数~10步)
+            e2, e4, e8 = (errs_k["2"], errs_k["4"], errs_k["8"])
+            ema2 = net._e_ema_2.mul_(0.1).add_(0.9 * e2)
+            ema4 = net._e_ema_4.mul_(0.1).add_(0.9 * e4)
+            ema8 = net._e_ema_8.mul_(0.1).add_(0.9 * e8)
+            # 软权重: w_k = (1/(e_ema_k+1e-3)) / Σ (加性保护非 clamp)
+            inv2, inv4, inv8 = (1.0 / (ema2 + 1e-3)), (1.0 / (ema4 + 1e-3)), (1.0 / (ema8 + 1e-3))
+            sum_inv = inv2 + inv4 + inv8
+            w2, w4, w8 = inv2 / sum_inv, inv4 / sum_inv, inv8 / sum_inv
+            net._w_soft[0] = w2
+            net._w_soft[1] = w4
+            net._w_soft[2] = w8
+            pred_d = w2 * preds_k["2"][:, :-1] + w4 * preds_k["4"][:, :-1] + w8 * preds_k["8"][:, :-1]
+            # 误差用掩码后的有效区 (K=8 前 7 步剔除)
+            if masks["8"] is not None:
+                e_t = (dz4[:, masks["8"]] - pred_d[:, masks["8"]]).detach()
+                e_t_all = dz4 - pred_d
+            else:
+                e_t = dz4 - pred_d
+                e_t_all = e_t
+            # W_diff BCM 滑阈: theta_w = EMA(pred²), phi_w 衰减高活跃预测方向
+            th_w = net._theta_w[:a4]
+            th_w.mul_(0.975).add_(0.025 * (pred_d * pred_d).mean(dim=(0, 1)))
+            phi_w = pred_d * (pred_d - th_w)
+            # 差动赫布外积 (动力学映射): dW = z4_prev^T @ (e - 0.1*phi_w),
+            # 输入是上下文 z4_prev 而非差分 dz4 — 学习"当前 L4 状态 → 移动方向"
+            z4_prev_n = z4r[:, :-1] / (z4r[:, :-1].norm(dim=-1, keepdim=True) + 1e-3)
+            e_mod = e_t_all - 0.1 * phi_w
+            dW_diff_t = torch.bmm(e_mod.transpose(-2, -1), z4_prev_n).mean(dim=0) * (1.0 / (S - 1))
+            # 4 步时间窗环形缓冲: 更新用最近 4 步平均外积 (保留误差记忆)
+            buf = getattr(net, f"_dw_buf_{net._buf_i}")
+            buf.copy_(dW_diff_t)
+            dW_avg = buf.clone()
+            for i in range(1, 4):
+                dW_avg = dW_avg + getattr(net, f"_dw_buf_{(net._buf_i - i) % 4}")
+            dW_avg = dW_avg * 0.25
+            net._buf_i = (net._buf_i + 1) % 4
 
-        # 精度调度: 多巴胺/ACh 调制学习率; 前 50 步 W_diff 学习率减半 (先稳后放)
-        surprise = (
-            eps4.square().mean()
-            + eps2.square().mean()
-            + eps3.square().mean()
-            + eps5_td.square().mean()
-            + eps6.square().mean()
-        ) * 0.2
-        rel = float((surprise / (net._surprise_buf + 1e-4)).detach())
-        net._surprise_buf.data.mul_(0.95).add_(0.05 * surprise.data)
-        dop_gain = torch.tensor(compute_dopamine_gain(rel, 0.3, 5.0), dtype=torch.float16, device=dev)
-        ach_gain = torch.tensor(compute_ach_gain(rel, 3.0), dtype=torch.float16, device=dev)
-        eta = net.cfg.lr_hebbian * dop_gain
+        # 学习率 (第 78 轮: 无全局调制 — 恒基准值, 无上帝之手); 前 50 步减半 (先稳后放)
+        eta = net.cfg.lr_hebbian
         if net._step_counter < 50:
             eta = eta * 0.5
-        eta_t = eta * net.cfg.temporal_lr_ratio * ach_gain
+        eta_t = eta * net.cfg.temporal_lr_ratio
         # 动态稳态竞争 (速率自适应): 按 W_lm 熵斜率调节表示层更新幅度 —
         # 熵加速下降 (W_lm 预测好) → scale→0 表示层放慢; 熵停滞/上升 → scale→2
         # 表示层放大 (强迫重组供新信息). scale 每 100 步更新, 用上一步值 (滞后一步无影响)
         if net.cfg.adaptive_traction:
             eta = eta * net._traction_scale.to(torch.float16)
             eta_t = eta_t * net._traction_scale.to(torch.float16)
-        # 自由运行 (第 77 轮): 无全局学习率调节 — 局部方差稳态器接管
-        # (每单元增益 g=1/(1+θ) 由自身活动方差驱动, 见 forward.py). eta 恒为
-        # 基准值, 无上帝之手
-        # 层偏置稳态更新 (第 77 轮新增): bias 跟踪各层预测误差均值 —
-        # 原代码 bias 从不更新 (恒零); 自由运行下偏置是内部稳态机制,
-        # eps→surprise→dop_gain 反馈自限 (bias 增长 → 误差均值降 → 减缓)
-        if free_run:
-            net.bias_l4[:a4].data += eta * eps4.mean(dim=(0, 1))
-            net.bias_l2[:a2].data += eta * eps2.mean(dim=(0, 1))
-            net.bias_l3[:a3].data += eta * eps3.mean(dim=(0, 1))
-            net.bias_l5[:a5].data += eta * eps5_td.mean(dim=(0, 1))
-            net.bias_l6[:a6].data += eta * eps6.mean(dim=(0, 1))
+        # 自由运行偏置稳态更新 (第 77 轮): bias 跟踪各层预测误差均值 —
+        # 纯局部积分 (每单元只看自身误差, 自限: bias 增长 → 误差均值降 → 减缓)
+        # 第 79 轮改判: 巨 bias 是饱和稳定器 (低增益阻尼递归), 不衰减存量 —
+        # 改增量抑制: Δbias ← Δbias / (1.0 + β·excess), β = oja_elasticity.
+        # 只限高活动单元的 bias 继续增长, 不削已有存量.
+        # fp16 下 1+β·excess 对 excess<~0.01 舍入为 1 (隐式门槛: 仅突发级超基线被抑制).
+        if free_run or echo_loop:
+            _, ex4 = _activity_baseline(net, z4, "_act_ema_b4")
+            _, ex2 = _activity_baseline(net, z2, "_act_ema_b2")
+            _, ex3 = _activity_baseline(net, z3, "_act_ema_b3")
+            _, ex5 = _activity_baseline(net, z5, "_act_ema_b5")
+            _, ex6 = _activity_baseline(net, z6, "_act_ema_b6")
+            beta = net.cfg.oja_elasticity
+            net.bias_l4[:a4].data += eta * (eps4.mean(dim=(0, 1)) / (1.0 + beta * ex4))
+            net.bias_l2[:a2].data += eta * (eps2.mean(dim=(0, 1)) / (1.0 + beta * ex2))
+            net.bias_l3[:a3].data += eta * (eps3.mean(dim=(0, 1)) / (1.0 + beta * ex3))
+            net.bias_l5[:a5].data += eta * (eps5_td.mean(dim=(0, 1)) / (1.0 + beta * ex5))
+            net.bias_l6[:a6].data += eta * (eps6.mean(dim=(0, 1)) / (1.0 + beta * ex6))
+            # 第 82 轮: 自由运行 bias 泄漏 — 防止 bias 长成“定点支柱”.
+            # 纯局部逐单元衰减, 只限 free_run, 不碰 echo/外部输入模式.
+            if free_run:
+                net.bias_l4[:a4].data.mul_(1.0 - net.cfg.bias_leak_rate)
+                net.bias_l2[:a2].data.mul_(1.0 - net.cfg.bias_leak_rate)
+                net.bias_l3[:a3].data.mul_(1.0 - net.cfg.bias_leak_rate)
+                net.bias_l5[:a5].data.mul_(1.0 - net.cfg.bias_leak_rate)
+                net.bias_l6[:a6].data.mul_(1.0 - net.cfg.bias_leak_rate)
+
         eta_lm = net.cfg.lm_lr_boost
 
         # Hebbian 外积 (逐层误差 ⊗ pre 活动)
@@ -260,6 +347,10 @@ class LearningEngine:
             z4_lm = z4_lm * (1.0 - 0.5 * z4_lm.pow(2))
             # 输出缩放 1/√H (CLAUDE.md: 投影输出溢出 → 乘 1/√H)
             zh = torch.cat([z4_lm, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)  # [N,S,4a4+16]
+            # 第 80 轮: zh 整体 RMS 前置 (与更新侧 _rms(zh) 对称) — z4_lm 段三阶在
+            # z4 幅度大时进入放大区 (echo 模式 W_04 解冻, z4 比训练态大 3 倍),
+            # 段间量级差异 → zh 尖峰 → h 厚尾 → h_deriv 爆炸 → dW1 fp16 累加溢出
+            zh = _rms(zh)
 
             # ── 非线性混合层 (第 57 轮): zh → W1 → h → 三阶激活 → W_lm → logits ──
             # h = zh @ W1 [d_h=256]; h = h·(1-0.5h²) 多项式激活 (FP16 原生安全);
@@ -317,6 +408,7 @@ class LearningEngine:
             zh2 = torch.cat(
                 [z4_lm[:, :-2], net._m2[:, :-2], net._m8[:, :-2], net._m32[:, :-2], net._bind_vec[:, :-2]], dim=-1
             )
+            zh2 = _rms(zh2)  # 第 80 轮: 同 zh 整体 RMS 前置 (见上)
             h2 = zh2 @ W1_a
             h2 = h2 / (1.0 + h2.abs())  # 分流抑制 (与 h 同款)
             h2 = _rms(h2)  # 与 h 同款前置 RMS: 4112 维点积后值域 ±37, 直接激活进入放大区 → fp16 溢出
@@ -451,18 +543,16 @@ class LearningEngine:
             ramp = min(1.0, net._step_counter / 200.0)
             _decorr_W(net.W_04[:a4].data, net.E_04[:a4, :a4], coef=ramp, max_delta_ratio=0.05)
 
-            dW_list = [
-                (eps2_p.transpose(-2, -1) @ _rms(z4)).mean(dim=0) * inv_s,
-            ]
-            W_list = [net.W_42[:a2]]
-            for dW, W in zip(dW_list, W_list):
-                col_mask = torch.rand(W.shape[0], 1, device=dev) < net.cfg.column_dropout
-                W.data += (dW * (~col_mask).to(torch.float16)) * eta
+            dW42 = (eps2_p.transpose(-2, -1) @ _rms(z4)).mean(dim=0) * inv_s
+            dW42 = _energy_constraint(net, net.W_42[:a2].data, dW42, eps2_p, "_act_ema_w42")
+            col_mask = torch.rand(a2, 1, device=dev) < net.cfg.column_dropout
+            net.W_42[:a2].data += (dW42 * (~col_mask).to(torch.float16)) * eta
             # W_42 权重去同质化 (行收敛 ±w → 投影秩 1 根因)
             _decorr_W(net.W_42[:a2].data, net.E_42[:a2, :a2])
         # ── 字节域块结束 (free_run 跳过: W_lm 家族/W_04/W_42, 冻结) ──
         # W_56 保留更新 (L5→L6 内部动力学, 自由运行同样学习)
         dW_56 = (eps6_p.transpose(-2, -1) @ _rms(z5)).mean(dim=0) * inv_s
+        dW_56 = _energy_constraint(net, net.W_56[:a6].data, dW_56, eps6_p, "_act_ema_w56")
         col_mask = torch.rand(net.W_56[:a6].shape[0], 1, device=dev) < net.cfg.column_dropout
         net.W_56[:a6].data += (dW_56 * (~col_mask).to(torch.float16)) * eta
 
@@ -483,6 +573,7 @@ class LearningEngine:
         # _gain_l3 是固定 [384, 384] 种子, L3 修剪后行数收缩, 需按当前活性行切片
         gain_l3 = net._gain_l3[:a3, :a3] if a3 < 384 else net._gain_l3[:a3, :]
         dW23 = (eps3_pc.transpose(-2, -1) @ _rms(z2)).mean(dim=0) * inv_s
+        dW23 = _energy_constraint(net, net.W_23[:a3].data, dW23, eps3_pc, "_act_ema_w23")
         err3_norm = eps3.pow(2).mean(dim=(0, 1)).sqrt() + 1e-8  # [a3] 每神经元
         gate3 = 0.1 + 0.9 * (err3_norm / err3_norm.max())
         dW23 = dW23 * gain_l3 * gate3.unsqueeze(1)
@@ -539,18 +630,21 @@ class LearningEngine:
         z5_pred_t = z5_prev_n @ net.W_t5[:a5].T  # W_t5 时间预测
         res_neuron = (z5[:, 1:] - z5_pred_t[:, 1:]).square().mean(dim=(0, 1))  # [a5] 每行残差能量
         q_i = res_neuron / (res_neuron.max() + 1e-6)  # [a5] 资格 ∈ [0,1], 分化
-        n_sub = 4
+        n_sub = min(4, max(1, N))  # N=1 时防重复子集 (原代码 4× 更新潜伏 bug)
         sub = max(1, N // n_sub)
+        inv_sm1 = 1.0 / (S - 1)
         dW_h = None
         for s in range(n_sub):
             sl = slice(s * sub, (s + 1) * sub)
-            dW_n = torch.bmm(phi_b[sl].transpose(-2, -1), _rms(z3_bp[sl]))
-            dW_sub = (dW_n * g_n[sl, None, None]).sum(dim=0) * (1.0 / (S - 1))
+            # 预除 (第 78 轮): phi_b 先 ×1/(S−1) 再 bmm — fp16 中间累加不超界, 数学等价
+            dW_n = torch.bmm((phi_b[sl] * inv_sm1).transpose(-2, -1), _rms(z3_bp[sl]))
+            dW_sub = (dW_n * g_n[sl, None, None]).sum(dim=0)
             dW_sub = dW_sub * gain_mask * upd_gate.unsqueeze(1)
             dW_sub = dW_sub * q_i.unsqueeze(1)  # 资格调制 (第 73 轮)
             b_mask = torch.rand(a5, 1, device=dev) < net.cfg.column_dropout
             dW_sub = dW_sub * (~b_mask).to(torch.float16)
             dW_h = dW_sub if dW_h is None else dW_h + dW_sub
+        dW_h = _energy_constraint(net, Wb, dW_h, phi_b, "_act_ema_w35")
         dW_h = dW_h * eta
         # ── 通道级塑性控制 (第 75 轮): 预测连接时间尺度统一控制律 ──
         # ρ_i = ||ΔW_i||/||W_i||, s_i = clip(0.03/ρ_i, 0.005, 1.0).
@@ -571,7 +665,20 @@ class LearningEngine:
         if net.cfg.adaptive_rho:
             net._rho_map = {}
         Wb.add_(_rho_ctrl(dW_h, Wb, "hebb"))
-        soft_norm_preserve(Wb)
+        # 第 83 轮 (G8 v2): 前馈链突触缩放 — L5 神经元入纤增益随自身活动双向
+        # 调节, 与 W_t 同款机制. 实证 (probe v4): 高墙下递归链被双向缩放+STP
+        # 兜住 (rho 49, sat 6.9%), 但 W_35 更新路径无局部饱和 → fp16 溢出 NaN
+        # (W_35/E_l5, step ~100). 此处把 G8 扩展到前馈链, 并豁免 soft_norm
+        # (与 G1 对 W_t 的处理同构: 行范数 = 增益自由度归系统, soft_norm 是
+        # 增益锁, 会每步抹平缩放造成的异质). 训练模式保持 soft_norm.
+        if free_run and net.cfg.wt_syn_scaling:
+            p2w5 = (z5 * z5).mean(dim=(0, 1))  # [a5] L5 窗内活动²
+            emaw5 = net._act_ema_b5[:a5]  # L5 慢基线 (bias 泄漏段已更新)
+            scale5 = 2.0 * emaw5 / (p2w5 + emaw5 + 1e-3)  # 双向突触缩放 (0,2]
+            r835 = net.cfg.wt_syn_scaling_rate
+            Wb.data.mul_((1.0 - r835) + r835 * scale5.unsqueeze(1))
+        else:
+            soft_norm_preserve(Wb)
         dW_corr = _decorr_W(Wb, net.E_l5[:a5, :a5])  # 空间机制 (原顺序: 最后), 返回修正量
         if net.cfg.adaptive_rho:
             rho_raw, rho_eff, s_h = net._rho_map["hebb"]
@@ -630,7 +737,10 @@ class LearningEngine:
         z3_m = z3[:, mask5]
         dW_pred35 = (err5_m.transpose(-2, -1) @ _rms(z3_m)).mean(dim=0) / max(1, int(mask5.sum()))
         Wb.data += _rho_ctrl(dW_pred35 * eta * rpe * 1.5, Wb, "inj35")
-        soft_norm_preserve(Wb.data)
+        # 第 83 轮 (G8 v2): free_run + 突触缩放时豁免 soft_norm — 与上方主更新同款
+        # (行范数 = 增益自由度归系统, soft_norm 会每步抹平缩放造成的异质; 训练模式保持)
+        if not (free_run and net.cfg.wt_syn_scaling):
+            soft_norm_preserve(Wb.data)
         if not free_run:
             # W_42 注入: local_err_L4 经 W_42 逆映射到 a2 (mask 有效位)
             # (free_run 跳过 — W_42 冻结)
@@ -642,12 +752,12 @@ class LearningEngine:
             soft_norm_preserve(net.W_42[:a2].data)
         # W_pred 矩阵自更新 (纯外积, 输入调制后 z4/z3 保持一致, 注入强度 1.0)
         err4_m = local_err_l4[:, mask4]  # [N,T4,a4] (读取, 供 wp43 更新)
-        Wp54_a.data += _rho_ctrl(
-            (err5_m.transpose(-2, -1) @ z4_pred_in[:, mask5]).mean(dim=0) * eta, Wp54_a, "wp54"
-        )
-        Wp43_a.data += _rho_ctrl(
-            (err4_m.transpose(-2, -1) @ z3_pred_in[:, mask4]).mean(dim=0) * eta, Wp43_a, "wp43"
-        )
+        dWp54 = (err5_m.transpose(-2, -1) @ z4_pred_in[:, mask5]).mean(dim=0)
+        dWp54 = _energy_constraint(net, Wp54_a.data, dWp54, err5_m, "_act_ema_wp54")
+        Wp54_a.data += _rho_ctrl(dWp54 * eta, Wp54_a, "wp54")
+        dWp43 = (err4_m.transpose(-2, -1) @ z3_pred_in[:, mask4]).mean(dim=0)
+        dWp43 = _energy_constraint(net, Wp43_a.data, dWp43, err4_m, "_act_ema_wp43")
+        Wp43_a.data += _rho_ctrl(dWp43 * eta, Wp43_a, "wp43")
         soft_norm_preserve(Wp54_a.data)
         soft_norm_preserve(Wp43_a.data)
         # 诊断: local_err 相对能量 (红线指标), z5 加性保护分母 (修复二:
@@ -667,7 +777,7 @@ class LearningEngine:
         z5_flat = z5_flat / (z5_flat.norm(dim=-1, keepdim=True) + 1e-3)
         cov = z5_flat.transpose(0, 1) @ z5_flat / z5_flat.shape[0]
         eye_mask = 1.0 - torch.eye(a5, device=dev, dtype=torch.float16)
-        net.M_l5[:a5, :a5].data.mul_(0.99).add_((cov * eye_mask) * (0.01 * learn_boost * ach_gain))
+        net.M_l5[:a5, :a5].data.mul_(0.99).add_((cov * eye_mask) * (0.01 * learn_boost))
 
         if not free_run:
             # W_diff 下一状态预测更新 (4 步时间窗平均外积) + b_diff 偏置 (L4 空间)
@@ -678,13 +788,14 @@ class LearningEngine:
             net.b_diff[:a4].data += future_e * eta
 
         # 时序 Hebbian (W_t 学习, 高确定性时增强 → 记忆巩固)
-        # 高频抑制项 (频率锚点): 静止帧 (Δz = z_t - z_{t-1} 范数处于低分位, 几乎没动)
-        # 完全不参与更新 — W_t 若指向不变主成分 (谱秩 1 引力中心), 其重复帧的
-        # 贡献被清零 → 被迫只从有变化的帧学习转移 (时间核语义 = 转移矩阵).
-        # 0.9 衰减被证无效 (只削 10% 幅度, 方向不变, 外积仍主方向); 阈值用
-        # 差分分布低分位 (mean×0.01 太严, 随机字节流无帧触发); 连续掩码无分支
-        for (z_cur, W_t), a_sz, E_t in zip(
-            [(z4, net.W_t4), (z2, net.W_t2), (z3, net.W_t3), (z5, net.W_t5), (z6, net.W_t6)],
+        # 静止帧掩码 (频率锚点, 第 74 轮): 静止帧 (Δz 范数低于绝对阈值) 不参与
+        # 更新 — W_t 语义 = 转移矩阵. 第 81 轮: free_run 豁免 — 系统停在
+        # bias 定点的有序相时静止帧占比 ~98% (实测), 掩码把 Hebbian 增长力
+        # 清零只剩 Oja 衰减单向拖向零 (410 步 W_t3 死亡) — 冻结态自锁循环.
+        # 秩 1 坍塌的防护已由 decorr (第 70-74 轮机制) 承担, 掩码冗余.
+        # 训练模式 (有外部输入) 保持掩码
+        for (z_cur, wt_name, W_t), a_sz, E_t in zip(
+            [(z4, "wt4", net.W_t4), (z2, "wt2", net.W_t2), (z3, "wt3", net.W_t3), (z5, "wt5", net.W_t5), (z6, "wt6", net.W_t6)],
             a_sizes,
             [net.E_t4, net.E_t2, net.E_t3, net.E_t5, None],
         ):
@@ -692,15 +803,26 @@ class LearningEngine:
             post = z_cur[:, 1:]
             dz = post - pre  # Δz = z_t - z_{t-1}
             dz_n = dz.norm(dim=-1)  # [N, S-1]
-            # 绝对阈值 = z 平均范数的 2% (闭环训练起放宽: 5%→2% 给长程记忆喘息,
-            # 时序动力学稍作释放; 监视 W_t top1 秩防坍缩): 分位阈值在 z 塌缩后
-            # 失效 (塌缩后"动态帧"也在主方向, 贡献仍秩 1); 绝对阈值让塌缩 →
-            # 差分变小 → 静止占比暴增 → W_t 学习信号枯竭 → 自然平衡点 (频率锚点)
-            th = (post.norm(dim=-1).mean() * 0.02).unsqueeze(0)
-            s = (dz_n < th).to(dz_n.dtype)  # 静止帧 → 0, 动态帧 → 1
+            if free_run:
+                s = torch.ones_like(dz_n)  # 第 81 轮: 无静止掩码 (见上)
+            else:
+                # 绝对阈值 = z 平均范数的 2% (闭环训练起放宽: 5%→2% 给长程记忆喘息,
+                # 时序动力学稍作释放; 监视 W_t top1 秩防坍缩): 分位阈值在 z 塌缩后
+                # 失效 (塌缩后"动态帧"也在主方向, 贡献仍秩 1); 绝对阈值让塌缩 →
+                # 差分变小 → 静止占比暴增 → W_t 学习信号枯竭 → 自然平衡点 (频率锚点)
+                th = (post.norm(dim=-1).mean() * 0.02).unsqueeze(0)
+                s = (dz_n < th).to(dz_n.dtype)  # 静止帧 → 0, 动态帧 → 1
             dW_t = (_rms(pre).transpose(-2, -1) @ (_rms(post) * s.unsqueeze(-1))).mean(dim=0) * (
                 1.0 / (S - 1)
             )
+            # 内建能量约束 (第 78 轮): Oja + 活动依赖遗忘. 第 81 轮: free_run 豁免 —
+            # 第 78 轮 Oja 是为"增益锁死"时代设计的; 增益解放后 Oja 成死亡吸引子
+            # (bias 维持高活动 → Oja 力恒定 ~2.5%/步, Hebbian 力随 W_t 收缩 →
+            # W_t 渐进归零, 实测 15k 步 12.4→1.0, 递归动力学死亡). 递归增益的
+            # 物理耗散 = STP 资源耗尽 + 分流抑制 + 谱守卫 1.5 死亡保险 (三者均为
+            # "偏离越大回拉越强"的力), Oja 冗余且致命. 训练模式保持约束
+            if not free_run:
+                dW_t = _energy_constraint(net, W_t[:a_sz, :a_sz].data, dW_t, z_cur, f"_act_ema_{wt_name}")
             # W_t4 输出端 homeostatic 抑制 (第 75 轮): 打破 σ₁/σ₂≈4000:1 垄断.
             # θ_j 跟踪 rec4 每维能量 (时序差分), g_j = 1/(1+θ_j) — 高激活列更新
             # 被压, rec4 从压制源转丰富源. 与 W_04 同构, 纯局部
@@ -709,11 +831,46 @@ class LearningEngine:
                 th_wt4.mul_(0.98).add_(0.02 * (dz * dz).mean(dim=(0, 1)))
                 dW_t = dW_t * (1.0 / (1.0 + th_wt4)).unsqueeze(1)
             W_t[:a_sz, :a_sz].data += dW_t * eta_t
-            # 软范数保持 (0.8-1.2): 权重有界防 fp16 溢出 (5万步 NaN 根因)
-            soft_norm_preserve(W_t[:a_sz, :a_sz].data)
+            # 第 83 轮 (G8): 双向突触缩放 — 权重级慢稳态增益, 仅自由运行.
+            # 问题 (model81 实测): 增益自由度解开后, W_t 谱半径要么被 decorr 拖向
+            # 0 (有序相冻结), 要么被 Hebbian 推到 1.5 守卫墙 (守卫成为增益设定者,
+            # 公理 1 违规). 缺的是"系统自己设定操作点"的慢稳态机制.
+            # 机制 (双向, Turrigiano 突触缩放): 神经元 i 的入纤递归增益 (W_t 行 i)
+            # 随"自身活动 vs 自身慢基线"双向调节 — 高活下调 (遏制爆炸), 低活上调
+            # (防止冻结/死亡). scale_i = 2·ema_i/(p2_i+ema_i): 基线=1, p2→∞→0,
+            # p2→0→2, 天然有界 (0,2], 无 clamp. 与 STP U_eff (act/(act+ema)) 同族.
+            # 以 wt_syn_scaling_rate (慢) 混合进权重: W_t[i,:] ← W_t[i,:]·((1−r)+r·scale_i)
+            # 平衡点 = 动力学自洽不动点 (活动回到基线 = scale 1 = 不干预).
+            # 纯局部, 自参照, 零新常数. 与 W_t4 θ 抑制同族, 推广到全部 5 层.
+            # 与 U 自适应 (快) 分工: U = 单步释放概率负反馈, 突触缩放 = 权重级慢稳态.
+            if free_run and net.cfg.wt_syn_scaling:
+                p2w = (z_cur * z_cur).mean(dim=(0, 1))  # [a_sz] 窗内活动²
+                emaw = getattr(net, f"_act_ema_b{wt_name[2]}")[:a_sz]  # 同层慢基线 (bias 泄漏段已更新)
+                scale = 2.0 * emaw / (p2w + emaw + 1e-3)  # 双向突触缩放 (0,2]
+                r83 = net.cfg.wt_syn_scaling_rate
+                W_t[:a_sz, :a_sz].data.mul_((1.0 - r83) + r83 * scale.unsqueeze(1))
+            # 软范数保持 (0.8-1.2): 权重有界防 fp16 溢出 (5万步 NaN 根因).
+            # 第 81 轮: free_run 豁免 — 递归增益自由度归系统自己 (W_t 行范数
+            # = 递归幅度, 是 E-I 平衡的物理变量). 平衡力已在 dW_t 内 (内建能量
+            # 约束 = Oja + 活动依赖遗忘, 纯局部), 发散由 STP 资源耗尽/分流抑制/
+            # 谱守卫 1.5 死亡保险兜底; 训练模式 (有外部输入) 保持软范数
+            if not free_run:
+                soft_norm_preserve(W_t[:a_sz, :a_sz].data)
             # 超量 E 清除 W_t 既有秩 1 结构 (top1 sv 11.4 固化 → 递归拉 z 秩 1)
+            # 第 81 轮: free_run coef 降至 0.2 (M_l5 Foldiak 侧抑制的既有系数, 非
+            # 新数值) — 1.0 超量抑制在无静止掩码下每步擦除主方向, 与 Oja 同向
+            # 形成"修正压倒增长"的死亡合力 (15k 步实测 W_t 家族 12.4→1.0 渐进死亡)
             if E_t is not None:
-                _decorr_W(W_t[:a_sz, :a_sz].data, E_t[:a_sz, :a_sz])
+                _decorr_W(W_t[:a_sz, :a_sz].data, E_t[:a_sz, :a_sz], coef=0.2 if free_run else 1.0)
+
+        # 递归矩阵谱半径安全约束 (第 79 轮改判, 第 81 轮重定义): 死亡保险 ρ>bound
+        # 才动作 — 正常动力学由能量耗散自然饱和 (递归增益自由度, 生命第一因).
+        # 第 83 轮: bound 配置化 (spectral_guard_bound) — 实证 (exp83/probe) 表明
+        # 1.5 嵌在自然增长区间内会每步钳制 → 守卫成控制器; bound 应高于自然
+        # 工作区间, 区间内增益由突触缩放 (G8) + STP 耗尽设定.
+        # 仅在修剪置换后子矩阵 ρ 发散或能量失效时兜底, 不挡临界点之下的游走
+        for wt in (net.W_t4, net.W_t2, net.W_t3, net.W_t5, net.W_t6):
+            _spectral_radius_guard(wt.data, bound=net.cfg.spectral_guard_bound)
 
         if not free_run:
             # LM 头自监督赫布 (复用闭环段已算的 logits_lm/eps_total):
@@ -834,7 +991,9 @@ class LearningEngine:
                 del net._novelty
 
         # 状态预测矩阵自更新 (纯赫布): dW_sp = z4^T @ eps_state, 零 BP
-        W_sp_a.data += (net._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0) * eta
+        dW_sp = (net._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0)
+        dW_sp = _energy_constraint(net, W_sp_a.data, dW_sp, net._z4, "_act_ema_wsp")
+        W_sp_a.data += dW_sp * eta
         soft_norm_preserve(W_sp_a.data)
 
         # ── 竞争性概念绑定层赫布更新 (任务 4, 纯外积, 零 BP): ──
@@ -850,6 +1009,7 @@ class LearningEngine:
             # 高惊喜样本外积单独放大 → 非对称注入. 纯局部 (每样本只看自己)
             # (free_run: 无字节误差 eps_total → 门控退化为 1, 样本竞争由 0.3-5.0
             # clamp 下限自然覆盖; N=1 单样本时均一化无意义)
+            # (第 80 轮: 自回声有真实字节误差 eps_total, 走 else 分支正常门控)
             if free_run:
                 gain_n = torch.ones(N, dtype=torch.float16, device=dev)
             else:
@@ -945,19 +1105,18 @@ class LearningEngine:
             # 负向更新抑制该行为; 低惊喜 (内部自洽) → 弱负向保留. 复读是零
             # 惊喜稳定基态 → 自然强化为起点, 从稳定中诞生复杂 (牙牙学语).
             # 哲学: 系统不再匹配外部, 而是维持内部自洽 — 主动表达, 非被动回答.
-            # 实现: 仅 closed_loop 时学习 (自生成 = 表达; 无表达无学习信号).
-            # surprise 信号 = 现有 W_lm 对自生成字节的预测误差 (W_lm 保持
-            # 外部目标训练 = 世界模型不变, 唯一信号源); gen_byte 来自训练前向
-            # 已存的 _gen_bytes (continuation 生成段)
+            # 实现: closed_loop 或自回声 (第 80 轮) 时学习 — 自回声的生成段
+            # 就是本窗输入流, 同一批 _gen_bytes 复用 (W_act 表达 → 重感知 →
+            # 自洽惊喜 → 三因子赫布, 无标签无奖励)
             if (
-                closed_loop
+                (closed_loop or echo_loop)
                 and hasattr(net, "_act_pot")
                 and hasattr(net, "_gen_bytes")
                 and getattr(net, "_act_enabled", True)
             ):
                 pot = net._act_pot  # [N,S,256] 动作电位
                 zbind = net._bind_vec
-                gb = net._gen_bytes  # [N,S_gen] 自生成字节 (表达)
+                gb = net._gen_bytes  # [N,N_gen] 自生成字节 (表达)
                 N_gen = gb.shape[1]
                 zb_g = zbind[:, -N_gen:]  # [N,N_gen,16] 生成段槽状态
                 # ── 学习进步信号 (裁决 16): 从"最小化预测误差"到"最大化学习进步" ──
@@ -979,7 +1138,9 @@ class LearningEngine:
                 LP = (eps_prev - eps_t).detach()  # 学习进步 [N,N_gen,1]
                 alpha = 50.0  # tanh 缩放 (ε 量级 ~0.003, ×50 → LP 归一)
                 phi = 0.5 * (1.0 - torch.tanh(alpha * LP))  # 增益 [0,1]
-                probs_g = probs_lm[:, S - N_gen - 1 : S - 1]  # [N,N_gen,256]
+                probs_g = probs_lm[:, -N_gen:]  # [N,N_gen,256] 生成段概率
+                # (第 80 轮: 自回声时生成段 = 整个输入流 S 长, 对齐 S 无需偏移;
+                # closed_loop 时生成段是后半, 偏移 S-N_gen-1)
                 oh_g = F.one_hot(gb, num_classes=256).to(torch.float16)  # [N,N_gen,256]
                 p_gen = (probs_g * oh_g).sum(dim=-1, keepdim=True)  # [N,N_gen,1]
                 wlm_err = (1.0 - p_gen).detach()  # [N,N_gen,1] 外部弱约束
@@ -1045,10 +1206,7 @@ class LearningEngine:
                 + eps5_td.square().mean()
                 + eps6.square().mean()
             ),
-            "future_err": (dz4 - pred_d).square().mean(),
-            "surprise": surprise,
-            "dop_gain": dop_gain,
-            "ach_gain": ach_gain,
+            "future_err": (dz4 - pred_d).square().mean() if not free_run else 0.0,
             "d_polarity": float(d_t.mean()) if (not free_run and hasattr(net, "_novelty")) else 1.0,
             # 观测器 (第 70 轮 v2): 原始 L5 局部误差能量 (同量纲, 供贡献率计算).
             # 诊断用, 不参与任何更新
@@ -1059,6 +1217,9 @@ class LearningEngine:
         # 诊断插桩 (第 77 轮): 观测器用, 释放前保留 z4/z5 引用
         net._last_z4 = net._z4.detach()
         net._last_z5 = net._z5.detach()
+        net._last_z3 = net._z3.detach()  # 第 78 轮: 观测 z3 幅度 (NaN 前哨)
+        net._last_z2 = net._z2.detach()  # 第 83 轮: 观测 l2 活动 (G8 exc)
+        net._last_z6 = net._z6.detach()  # 第 83 轮: 观测 l6 活动 (G8 exc)
         for k in ("_z0", "_z4", "_z2", "_z3", "_z5", "_z5_raw", "_z6"):
             if hasattr(net, k):
                 delattr(net, k)

@@ -73,19 +73,40 @@ class DensePCConfig:
     osc_amp_f: float = 0.10  # 快节律 (64 步) 注入基准幅度 → z_bind / L5
     osc_amp_m: float = 0.03  # 中节律 (256 步) 注入基准幅度 → L4 / L2
     osc_amp_s: float = 0.01  # 慢节律 (1024 步) 注入基准幅度 → L3 / L6
-    # 局部活动方差稳态器 (第 77 轮裁决: 每个单元自己维持动力学平衡):
-    # θ_i ← θ_i + η_θ·(v_i − v̄_i)/v̄_i, 增益 g_i = 1/(1+θ_i) — 方差升→抑制,
-    # 方差降→促进. 目标不是固定数值, 而是维持方差相对稳定 (自组织临界)
-    homeo_eta: float = 0.001  # θ 更新步长 (小而稳)
     # ── 短期突触可塑性 STP (第 77 轮裁决: 资源耗尽-恢复慢变量 → 间歇性) ──
     # 每递归层一个资源变量 r ∈ [0,1]: r ← r + (1−r)/τ_rec − U·r·h_act,
     # 递归项 ×r (爆发后资源耗尽 → 活动下降 → 恢复 → 再爆发, 自发间歇).
     # τ_rec 初始多尺度随机 (快层 ~8 步, 慢层 ~256 步), U 小值 — 结构参数,
-    # 非手动调谐; 且随层活动偏差窗末自适应 (τ/U 与层方差耦合, 见 forward)
+    # 非手动调谐. 第 78 轮裁决: τ/U 固定初值, 不再窗末自适应 (EMA 类失败机制)
     stp_tau_min: float = 8.0  # τ_rec 初始范围下限 (步)
     stp_tau_max: float = 256.0  # τ_rec 初始范围上限 (步)
     stp_u_init: float = 0.05  # U 初始值 (资源使用效率)
-    stp_eta: float = 1e-4  # τ/U 自适应步长 (窗末, 与活动偏差耦合)
+    # 第 82 轮: 局部 U 自适应 — 释放概率随神经元自身活动与其慢基线的偏差变化.
+    # 高活动 → U 升高 → 资源更快耗尽 → 活动回落; 低活动 → U 回落 → 资源恢复.
+    # 纯局部负反馈, 无外部目标, 无全局统计量.
+    stp_u_adapt: bool = True
+    stp_u_adapt_rate: float = 0.01
+    stp_u_min: float = 0.01
+    stp_u_max: float = 0.5
+    # 第 83 轮 (G8): 双向突触缩放 (synaptic scaling) — 权重级慢稳态增益.
+    # 神经元 i 的入纤递归增益随"自身活动 vs 自身慢基线"双向调节:
+    #   scale_i = 2·ema_i/(p2_i+ema_i) ∈ (0,2]: 基线=1, 高活<1 (遏制爆炸), 低活>1 (防冻结)
+    #   W_t[i,:] ← W_t[i,:] · ((1−rate) + rate·scale_i)
+    # 纯局部 (每神经元只看自己的活动与自己的基线), 自参照 (目标 = 自身慢基线),
+    # 无全局统计量. 与 STP U 自适应 (快) 分工: U = 单步释放概率负反馈,
+    # 突触缩放 = 权重级慢稳态. rate 语义与 stp_u_adapt_rate 一致 (慢局部适应速率).
+    # 实证 (2026-08-16 探针 v1): rate=0.01 时收缩 < Hebbian 增长, 操作点仍由
+    # 守卫设定 → 默认上调至 0.1 (与 Hebbian 增长同量级才有效).
+    wt_syn_scaling: bool = True
+    wt_syn_scaling_rate: float = 0.1
+    # 第 83 轮 (G8 实证): 谱守卫 bound 是"死亡保险"的物理参数, 必须高于
+    # 自然工作区间. model81/exp83 实测: bound=1.5 嵌在 Hebbian 自然增长区间内
+    # → 守卫每步钳制 → 守卫成为增益设定者 (外部控制). 提高 bound 后由突触
+    # 缩放/STP 耗尽承担区间内增益设定, 守卫只防发散.
+    spectral_guard_bound: float = 1.5
+    # 第 82 轮: 自由运行 bias 泄漏 — 防止 bias 长成“定点支柱”把递归动力学
+    # 压在有序相. 纯局部逐单元衰减, 无外部目标; 量级远小于 bias 更新, 只限积累.
+    bias_leak_rate: float = 1e-4
     oja_elasticity: float = 0.05
     probation_decay: float = 0.5
 
@@ -218,24 +239,31 @@ class DensePCNet(nn.Module):
                 f"_osc_{osc_name}_tab",
                 (1.0 - 2.0 * torch.arange(osc_n, dtype=torch.float16) / osc_n),
             )
-        # ── 局部活动方差稳态器 (第 77 轮裁决: 无上帝之手, 每单元自己平衡) ──
-        # 每层 (L2-L6) 与 z_bind 槽位各维护两个缓冲:
-        #   _vbar_<layer>: 单元活动方差的慢速滑动平均 v̄_i
-        #   _theta_v_<layer>: 稳态阈值 θ_i (更新 θ_i += η_θ·(v_i−v̄_i)/v̄_i)
-        # 增益 g_i = 1/(1+θ_i) 作用于注入幅度 (方差升→抑制, 方差降→促进).
-        # 方差 v_i 由各层 z 时间差分平方的窗内均值估计 (纯局部, 零全局统计)
-        for vln, vdim in (("l4", d["l4"]), ("l2", d["l2"]), ("l3", d["l3"]), ("l5", d["l5"]), ("l6", d["l6"])):
-            self.register_buffer(f"_vbar_{vln}", torch.zeros(vdim, dtype=torch.float16))
-            self.register_buffer(f"_theta_v_{vln}", torch.zeros(vdim, dtype=torch.float16))
-        self.register_buffer("_vbar_bind", torch.zeros(self.bind_slot_dim, dtype=torch.float16))
-        self.register_buffer("_theta_v_bind", torch.zeros(self.bind_slot_dim, dtype=torch.float16))
+        # ── 内建能量约束活动基线 (第 78 轮裁决: Hebbian 更新内建 Oja +
+        # 活动依赖遗忘项, 纯局部逐输出单元) ──
+        # 每个可塑性矩阵一个活动²慢速基线 (EMA α=0.99), 首窗延迟初始化
+        # (首个窗 post² 直接拷贝, excess 从零起步 — 防早期过度抑制).
+        # 维度 = 矩阵输出单元数, 与修剪 active_size 切片模式一致
+        # 第 79 轮: 偏置遗忘基线 b2-b6 (同源, bias 活动依赖遗忘)
+        act_ema_dims = {
+            "w56": d["l6"], "w23": d["l3"], "w35": d["l5"],
+            "wt4": d["l4"], "wt2": d["l2"], "wt3": d["l3"], "wt5": d["l5"], "wt6": d["l6"],
+            "wsp": d["l4"], "wp54": d["l5"], "wp43": d["l4"], "w42": d["l2"],
+            "b4": d["l4"], "b2": d["l2"], "b3": d["l3"], "b5": d["l5"], "b6": d["l6"],
+        }
+        for aen, adim in act_ema_dims.items():
+            self.register_buffer(f"_act_ema_{aen}", torch.zeros(adim, dtype=torch.float16))
+        self._act_ema_init: set[str] = set()  # 延迟初始化标记 (python 端, 零同步)
         # ── STP 资源慢变量 (第 77 轮裁决: 间歇性之源) ──
         # 每递归层 + z_bind: r ∈ [0,1] 可释放资源 (init 1.0 全满), τ_rec 初始
         # 多尺度随机 (对数均匀 [stp_tau_min, stp_tau_max]), U 小值常数.
-        # τ/U 随层活动偏差窗末自适应 (慢变量耦合, 见 forward._stp_update)
+        # 第 78 轮裁决: τ/U 固定初值, 不再窗末自适应
         stp_layers = [("l4", d["l4"]), ("l2", d["l2"]), ("l3", d["l3"]), ("l5", d["l5"]), ("l6", d["l6"]), ("bind", self.bind_slot_dim)]
         for sln, sdim in stp_layers:
             self.register_buffer(f"_stp_r_{sln}", torch.ones(sdim, dtype=torch.float16))
+            # 初始化为小正数: 避免 U 自适应首窗 rel=(act-ema)/ema 尖峰, 也让
+            # U_eff 首步接近 U/2 (与注释一致).
+            self.register_buffer(f"_stp_act_ema_{sln}", torch.full((sdim,), 0.01, dtype=torch.float16))
             tau_log = (
                 torch.log(torch.tensor(self.cfg.stp_tau_min, dtype=torch.float32))
                 + (torch.log(torch.tensor(self.cfg.stp_tau_max, dtype=torch.float32))
@@ -244,7 +272,6 @@ class DensePCNet(nn.Module):
             )
             self.register_buffer(f"_stp_tau_{sln}", torch.exp(tau_log).to(torch.float16))
             self.register_buffer(f"_stp_u_{sln}", torch.full((sdim,), self.cfg.stp_u_init, dtype=torch.float16))
-            self.register_buffer(f"_stp_ema_{sln}", torch.zeros(sdim, dtype=torch.float16))  # 活动² EMA (τ/U 自适应用)
         self._fr_state: dict[str, torch.Tensor] = {}  # 自由运行跨窗延续 (末帧缓存)
         self._stp_r_end: dict[str, torch.Tensor] = {}  # STP 末资源缓存 (窗末写回)
         # ── 动作读出矩阵 W_act (无 Token 生成, 第 76 轮): [K=16 槽, 256 字节] ──
@@ -338,7 +365,6 @@ class DensePCNet(nn.Module):
         }
 
         # ── 神经调制与竞争机制 ──
-        self.register_buffer("_surprise_buf", torch.tensor(1.0, dtype=torch.float16))  # 惊喜基线
         # 批级预测熵 EMA 基线 (动态自适应锚点): 当前熵高于基线 = 迷茫 (放 bias),
         # 低于基线 = 稳定 (衰减缩回). 初始 5.5 ≈ 均匀分布熵 (256 字节)
         self.register_buffer("_ent_ema", torch.tensor(5.5, dtype=torch.float16))
@@ -497,6 +523,13 @@ class DensePCNet(nn.Module):
             "l5": net.W_56.shape[1],
             "l6": net.W_56.shape[0],
         }
+        # 旧检查点 _stp_act_ema 可能为 0, 会导致 U 自适应首窗 rel 尖峰;
+        # 加载后统一垫到小正数.
+        for sln in ("l4", "l2", "l3", "l5", "l6", "bind"):
+            buf = getattr(net, f"_stp_act_ema_{sln}")
+            if buf.numel() > 0 and buf.abs().sum() == 0:
+                buf.fill_(0.01)
+
         # _m_pool (多级记忆池) 对齐活性 L4 (旧检查点无此缓冲 → init 全量, 需裁 3 段)
         if net._m_pool.shape[0] != 3 * net.active_size["l4"]:
             old_m = net._m_pool.data
