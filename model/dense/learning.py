@@ -232,12 +232,17 @@ class LearningEngine:
             preds_k = {}
             errs_k = {}
             for k, kname in ((2, "2"), (4, "4"), (8, "8")):
-                z_shift = torch.cat([torch.zeros(N, k, a4, dtype=z4r.dtype, device=dev), z4r[:, :-k]], dim=1)
+                # 第 87 轮: 交互短输入 — 序列短于尺度时收缩历史深度, 否则
+                # z4r[:, :-k] 为空 → pred 形状错位 (聊天 "你好"=6 字节, k=8 崩).
+                # k_eff = min(k, S-1) 保证 z_shift 恒为 [N,S]; k=8 的 valid 掩码
+                # 同步收缩 (仍非空, 防 .mean() 空选区 NaN).
+                k_eff = min(k, S_full - 1)
+                z_shift = torch.cat([torch.zeros(N, k_eff, a4, dtype=z4r.dtype, device=dev), z4r[:, :-k_eff]], dim=1)
                 z_shift_n = z_shift / (z_shift.norm(dim=-1, keepdim=True) + 1e-3)
                 pred_k = z_shift_n @ W_diff_a.T + net.b_diff[:a4]
                 err_k = (dz4 - pred_k[:, :-1]).square().mean()
                 if k == 8:
-                    valid = torch.arange(S_full - 1, device=dev) >= 7
+                    valid = torch.arange(S_full - 1, device=dev) >= (k_eff - 1)
                     err_k = ((dz4[:, valid] - pred_k[:, :-1][:, valid]).square()).mean()
                 masks[kname] = valid if k == 8 else None
                 preds_k[kname] = pred_k
@@ -304,19 +309,43 @@ class LearningEngine:
             _, ex5 = _activity_baseline(net, z5, "_act_ema_b5")
             _, ex6 = _activity_baseline(net, z6, "_act_ema_b6")
             beta = net.cfg.oja_elasticity
-            net.bias_l4[:a4].data += eta * (eps4.mean(dim=(0, 1)) / (1.0 + beta * ex4))
-            net.bias_l2[:a2].data += eta * (eps2.mean(dim=(0, 1)) / (1.0 + beta * ex2))
-            net.bias_l3[:a3].data += eta * (eps3.mean(dim=(0, 1)) / (1.0 + beta * ex3))
-            net.bias_l5[:a5].data += eta * (eps5_td.mean(dim=(0, 1)) / (1.0 + beta * ex5))
-            net.bias_l6[:a6].data += eta * (eps6.mean(dim=(0, 1)) / (1.0 + beta * ex6))
+            # 第 86 轮 (G9): bias 增长门控 — exp85 实证 bias 成为支柱 (8→54) 把 z4
+            # 焊进分流饱和区 (sat 54%, env_cv 0.011 间歇性死亡). 根因: bias 积分
+            # eps.mean 持续为正 (bias→mu→z4→eps 正反馈). 门控: 当 bias 已主导局部
+            # 信号 (share 高) 时抑制其增长 — 逐单元局部, rel_n 家族, 零新常数.
+            # g_i = act²_i/(bias²_i+act²_i+1e-6) ∈ (0,1]: bias 主导 → g→0 停增长
+            # (bias 只承担均值, 不承担驱动); 活动主导 → g→1 正常积分.
+            # 第 87 轮: 门控覆盖 echo_loop (自回声输入) — 交互训练双相位走这里.
+            b_gate = {}
+            for b_par, zz, a_sz in (
+                (net.bias_l4, z4, a4), (net.bias_l2, z2, a2),
+                (net.bias_l3, z3, a3), (net.bias_l5, z5, a5),
+                (net.bias_l6, z6, a6),
+            ):
+                b2 = b_par[:a_sz].data.square()
+                act2 = (zz * zz).mean(dim=(0, 1))  # 窗内活动能量
+                b_gate[id(b_par)] = act2 / (b2 + act2 + 1e-6)
+            net.bias_l4[:a4].data += eta * (eps4.mean(dim=(0, 1)) / (1.0 + beta * ex4)) * b_gate[id(net.bias_l4)]
+            net.bias_l2[:a2].data += eta * (eps2.mean(dim=(0, 1)) / (1.0 + beta * ex2)) * b_gate[id(net.bias_l2)]
+            net.bias_l3[:a3].data += eta * (eps3.mean(dim=(0, 1)) / (1.0 + beta * ex3)) * b_gate[id(net.bias_l3)]
+            net.bias_l5[:a5].data += eta * (eps5_td.mean(dim=(0, 1)) / (1.0 + beta * ex5)) * b_gate[id(net.bias_l5)]
+            net.bias_l6[:a6].data += eta * (eps6.mean(dim=(0, 1)) / (1.0 + beta * ex6)) * b_gate[id(net.bias_l6)]
             # 第 82 轮: 自由运行 bias 泄漏 — 防止 bias 长成“定点支柱”.
             # 纯局部逐单元衰减, 只限 free_run, 不碰 echo/外部输入模式.
+            # 第 86 轮 (G9b): 泄漏随"bias 在局部信号中的占比"增强 — 固定泄漏
+            # 1e-4 被 bias 积分压过 (bias_l4 8→54). rel_n 家族 (零新常数):
+            # share_i = bias²_i/(bias²_i + act²_i + 1e-6), 泄漏率 = rate·(1+share)
+            # ∈ [rate, 2·rate] — bias 主导 → 泄漏翻倍 (拆存量), 活动主导 → 基线.
             if free_run:
-                net.bias_l4[:a4].data.mul_(1.0 - net.cfg.bias_leak_rate)
-                net.bias_l2[:a2].data.mul_(1.0 - net.cfg.bias_leak_rate)
-                net.bias_l3[:a3].data.mul_(1.0 - net.cfg.bias_leak_rate)
-                net.bias_l5[:a5].data.mul_(1.0 - net.cfg.bias_leak_rate)
-                net.bias_l6[:a6].data.mul_(1.0 - net.cfg.bias_leak_rate)
+                for b_par, zz, a_sz in (
+                    (net.bias_l4, z4, a4), (net.bias_l2, z2, a2),
+                    (net.bias_l3, z3, a3), (net.bias_l5, z5, a5),
+                    (net.bias_l6, z6, a6),
+                ):
+                    b2 = b_par[:a_sz].data.square()
+                    act2 = (zz * zz).mean(dim=(0, 1))  # 窗内活动能量
+                    share = b2 / (b2 + act2 + 1e-6)  # bias 占比 ∈ [0,1]
+                    b_par[:a_sz].data.mul_(1.0 - net.cfg.bias_leak_rate * (1.0 + share))
 
         eta_lm = net.cfg.lm_lr_boost
 
@@ -519,7 +548,10 @@ class LearningEngine:
             e_norm = final_error.norm(dim=(1, 2))
             # 零向量保护: e_norm 全零 (perfect batch) → max+std=0 → 0/0=NaN.
             # torch.where 掩码 (与 _rms 同款): 全零行分母=1, 分子×0 → 零更新
-            e_denom = e_norm.max() + e_norm.std()
+            # 第 87 轮: N=1 (交互单样本) 时 e_norm.std() 自由度≤0 → UserWarning.
+            # 恒等映射保护: N=1 时 std 无意义, 用 0 等价 (e_denom = max 不变).
+            e_std = e_norm.std() if e_norm.shape[0] > 1 else torch.zeros_like(e_norm.max())
+            e_denom = e_norm.max() + e_std
             e_alive = (e_denom > 1e-8).to(e_norm.dtype)
             g_04 = e_norm / torch.where(e_alive > 0, e_denom, torch.ones_like(e_denom))
             g_04 = (g_04 * e_alive).unsqueeze(-1).unsqueeze(-1)
@@ -613,14 +645,29 @@ class LearningEngine:
         e2 = (eps_b * eps_b).mean(dim=(0, 1))
         th.mul_(0.975).add_(0.025 * e2)
         phi_b = eps_b * (eps_b - th)
+        # 第 84 轮: phi_b 按 max|phi_b| 标量归一化 — eps_b 稀疏尖峰 (墙移除后
+        # z4 进非线性区) 使 phi_b 达 ~310, 其平方在 _energy_constraint 的 p2、
+        # g_n 与 _rms 内部均溢出 fp16 (312²≈97500>65504) → inf → NaN
+        # (b60 step 457 实证, phi_b_max=312.8). 标量 s=max|phi_b| 无平方绝不
+        # 溢出; phi_b/s ≤1 后一切平方安全; s 是批内标量缩放 (同 _precise 的
+        # std 归一化一族), 相对结构与 BCM 符号保留, rho_ctrl 已钳最终幅度.
+        s_phi = phi_b.abs().max() + 1e-6  # 标量 (max 无平方, fp16 安全)
+        phi_b = phi_b / s_phi
         # 样本显著性: g_n = surprise_n / Σ surprise_n (线性加权)
         g_n = (phi_b * phi_b).mean(dim=(1, 2)) + 1e-8
-        g_n = g_n / g_n.sum()
+        # 第 84 轮: 零向量保护 — z5 坍缩到常数时 phi_b≡0 → g_n=0+1e-8 在 fp16 舍入为
+        # 0 → 0/0 = NaN (b60 step 391 实证 g_n_max=nan). 与 _rms/g_04 同款 alive 掩码.
+        g_sum = g_n.sum()
+        g_alive = (g_sum > 1e-8).to(g_n.dtype)
+        g_n = g_n / torch.where(g_alive > 0, g_sum, torch.ones_like(g_sum))
         Wb = net.W_35[:a5].data
         gain_mask = net._gain_mask[:a5, :a3]
         # 误差门控: 高误差神经元主导更新, 低误差保 10% 下限
         err_norm = eps_b.pow(2).mean(dim=(0, 1)).sqrt() + 1e-8
-        upd_gate = 0.1 + 0.9 * (err_norm / err_norm.max())
+        # 第 84 轮: 零向量保护 — eps_b≡0 时 err_norm≡0 → 0/0 = NaN (同 g_n 实证).
+        e_max = err_norm.max()
+        e_alive = (e_max > 1e-8).to(err_norm.dtype)
+        upd_gate = 0.1 + 0.9 * (err_norm / torch.where(e_alive > 0, e_max, torch.ones_like(e_max)))
         # ── W35 资格调制 (第 73 轮): 单变量, 移除 Cos 惩罚 ──
         # q_i = 每行 (微柱) 的时间残差能量 — 时间差分无法解释的行获得更高
         # 学习资格: ΔW_i = q_i·η·ε·z3^T. 让"谁学习"由内部误差决定, 而非
@@ -628,7 +675,15 @@ class LearningEngine:
         z5_prev = torch.cat([torch.zeros(N, 1, a5, dtype=z5.dtype, device=dev), z5[:, :-1]], dim=1)
         z5_prev_n = _rms(z5_prev)
         z5_pred_t = z5_prev_n @ net.W_t5[:a5].T  # W_t5 时间预测
-        res_neuron = (z5[:, 1:] - z5_pred_t[:, 1:]).square().mean(dim=(0, 1))  # [a5] 每行残差能量
+        # 第 84 轮: 残差平方前按 max|残差| 标量归一化 — 墙移除后 W_t5 增益自由游走
+        # (实测 rho 23.5, 残差幅度 ~230), 直接 (z5 - z5_pred_t)² 在 fp16 下平方溢出
+        # → inf → q_i = inf/inf = NaN → W_35/E_l5 NaN (b60_fix step 57 实证).
+        # 标量 s = max|残差| 不涉及平方 (绝不溢出), 归一化后平方 ≤1; q_i 末尾
+        # 本就除以 res_neuron.max(), 标量 s² 在分子分母中精确消去 → q_i 与原式
+        # 数学全等, 零语义改变, 只阻断 inf→NaN 路径 (CLAUDE.md: pre-norm 非 clamp).
+        res_t = z5[:, 1:] - z5_pred_t[:, 1:]  # [N,S-1,a5] 残差
+        s = res_t.abs().max() + 1e-6  # 标量 (max 无平方, fp16 安全)
+        res_neuron = ((res_t / s) ** 2).mean(dim=(0, 1))  # [a5] 每行相对残差能量
         q_i = res_neuron / (res_neuron.max() + 1e-6)  # [a5] 资格 ∈ [0,1], 分化
         n_sub = min(4, max(1, N))  # N=1 时防重复子集 (原代码 4× 更新潜伏 bug)
         sub = max(1, N // n_sub)
@@ -674,7 +729,11 @@ class LearningEngine:
         if free_run and net.cfg.wt_syn_scaling:
             p2w5 = (z5 * z5).mean(dim=(0, 1))  # [a5] L5 窗内活动²
             emaw5 = net._act_ema_b5[:a5]  # L5 慢基线 (bias 泄漏段已更新)
-            scale5 = 2.0 * emaw5 / (p2w5 + emaw5 + 1e-3)  # 双向突触缩放 (0,2]
+            # 第 84 轮: 分母保护 1e-3 → 1e-6 — 低活动分支被 1e-3 地板淹没: z5 坍缩后
+            # ema 衰减到 ~1e-4 时 scale=2·1e-4/(0+1e-4+1e-3)≈0.18 → 永久收缩 → W_35
+            # 死亡螺旋 (b60 step 391 实证: Wb_max=0.0055, z5_max=0.0038). 1e-6 与
+            # rel_n 家族 (STP U_eff) 同款保护, 让低活分支真正给出 scale→2 (防冻结).
+            scale5 = 2.0 * emaw5 / (p2w5 + emaw5 + 1e-6)  # 双向突触缩放 (0,2]
             r835 = net.cfg.wt_syn_scaling_rate
             Wb.data.mul_((1.0 - r835) + r835 * scale5.unsqueeze(1))
         else:
@@ -731,9 +790,15 @@ class LearningEngine:
         local_err_l5 = z5_fut - pred_l5  # 只在 mask5 有效位有意义
         local_err_l4 = z4_fut - pred_l4
         rpe = (1.0 + global_rpe).to(torch.float16)
-        # W_35 注入: dW = local_err_L5.T @ z3 (mask 有效位, 与 W_35 输入同源).
-        # 注入强度 1.5×eta×RPE (老师指示维持: 局部误差与主误差同量级)
-        err5_m = local_err_l5[:, mask5]  # [N,T5,a5]
+        # 第 84 轮: 前馈链注入路径误差预归一化 — 主 Hebbian 路径 (eps_b = _rms(eps_b))
+        # 已归一化, 但注入路径 err5_m/err4_m 裸用 → 递归增益升高时 (墙移除后 rho 达
+        # ~49, probe v4 实测) z5 爆发 → local_err_l5 量级暴涨 → bmm 外积 Frobenius
+        # 范数超 fp16 上限 (65504) → inf → _rho_ctrl 计算 inf·0 = NaN (W_35/E_l5
+        # step~278 实证, probe v2 b3.0_g8). 预归一化 (pre-norm, 非 clamp, CLAUDE.md
+        # 合规): 与主路径同款 _rms, 只保方向压量级; rho_ctrl 已把最终更新幅度钳在
+        # 3%‖W‖, 归一化零语义改变 (稳定区), 只阻断 inf→NaN 路径.
+        err5_m = _rms(local_err_l5[:, mask5])  # [N,T5,a5] 逐位 RMS 归一化
+        err4_m = _rms(local_err_l4[:, mask4])  # [N,T4,a4] (供 wp43 更新)
         z3_m = z3[:, mask5]
         dW_pred35 = (err5_m.transpose(-2, -1) @ _rms(z3_m)).mean(dim=0) / max(1, int(mask5.sum()))
         Wb.data += _rho_ctrl(dW_pred35 * eta * rpe * 1.5, Wb, "inj35")
@@ -744,14 +809,12 @@ class LearningEngine:
         if not free_run:
             # W_42 注入: local_err_L4 经 W_42 逆映射到 a2 (mask 有效位)
             # (free_run 跳过 — W_42 冻结)
-            err4_m = local_err_l4[:, mask4]  # [N,T4,a4]
             z4_m = z4[:, mask4]
             local_err_l4_a2 = _rms(err4_m @ net.W_42[:a2].T)
             dW_pred42 = (local_err_l4_a2.transpose(-2, -1) @ _rms(z4_m)).mean(dim=0) / max(1, int(mask4.sum()))
             net.W_42[:a2].data += _rho_ctrl(dW_pred42 * eta * rpe * 1.5, net.W_42[:a2], "inj42")
             soft_norm_preserve(net.W_42[:a2].data)
         # W_pred 矩阵自更新 (纯外积, 输入调制后 z4/z3 保持一致, 注入强度 1.0)
-        err4_m = local_err_l4[:, mask4]  # [N,T4,a4] (读取, 供 wp43 更新)
         dWp54 = (err5_m.transpose(-2, -1) @ z4_pred_in[:, mask5]).mean(dim=0)
         dWp54 = _energy_constraint(net, Wp54_a.data, dWp54, err5_m, "_act_ema_wp54")
         Wp54_a.data += _rho_ctrl(dWp54 * eta, Wp54_a, "wp54")
@@ -846,7 +909,9 @@ class LearningEngine:
             if free_run and net.cfg.wt_syn_scaling:
                 p2w = (z_cur * z_cur).mean(dim=(0, 1))  # [a_sz] 窗内活动²
                 emaw = getattr(net, f"_act_ema_b{wt_name[2]}")[:a_sz]  # 同层慢基线 (bias 泄漏段已更新)
-                scale = 2.0 * emaw / (p2w + emaw + 1e-3)  # 双向突触缩放 (0,2]
+                # 第 84 轮: 分母保护 1e-3 → 1e-6 (同 W_35 侧, 见该处注释) — 低活分支
+                # 不被地板淹没, scale→2 防冻结.
+                scale = 2.0 * emaw / (p2w + emaw + 1e-6)  # 双向突触缩放 (0,2]
                 r83 = net.cfg.wt_syn_scaling_rate
                 W_t[:a_sz, :a_sz].data.mul_((1.0 - r83) + r83 * scale.unsqueeze(1))
             # 软范数保持 (0.8-1.2): 权重有界防 fp16 溢出 (5万步 NaN 根因).
