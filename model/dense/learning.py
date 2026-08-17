@@ -374,6 +374,13 @@ class LearningEngine:
             z4_lm = z4 / (1.0 + z4.abs())
             z4_lm = _rms(z4_lm)
             z4_lm = z4_lm * (1.0 - 0.5 * z4_lm.pow(2))
+            # 第 101 轮: 三阶输出分流止血 (与 h 路径第 57 轮同构) — 三阶激活在
+            # |x|>1.4 进入放大区 (f(x) 反超 x), 从零初始化 z4 的 4.5σ 尾部穿透
+            # RMS 后仍存在, 实测 z4_lm_max 20-30 → zh 尖峰 35.8 → h_raw fp16
+            # 溢出 → W1 NaN (chat101 step 44). 分流 x/(1+|x|) 把尾部压回 ≤1,
+            # 正常区 (|x|<1) 近似恒等 — 预训练检查点行为不变. 结构化 pre-norm,
+            # 非 clamp (CLAUDE.md 合规)
+            z4_lm = z4_lm / (1.0 + z4_lm.abs())
             # 输出缩放 1/√H (CLAUDE.md: 投影输出溢出 → 乘 1/√H)
             zh = torch.cat([z4_lm, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)  # [N,S,4a4+16]
             # 第 80 轮: zh 整体 RMS 前置 (与更新侧 _rms(zh) 对称) — z4_lm 段三阶在
