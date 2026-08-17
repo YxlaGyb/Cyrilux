@@ -31,6 +31,10 @@ class DensePCConfig:
     """PPA 网络配置."""
 
     d_input: int = 256  # 输入字节维度 (固定 vocab_size, 无 PE)
+    # 第 89 轮 (最小具身): 动作输出维度 — W_act 列数. 默认 = d_input (256 字节,
+    # 字节域行为不变); 具身模式设 2 (前进/停留). 与字节域隔离: 字节路径的
+    # _theta_act/_freq_act/mask_print 仍按 256 硬编码, 仅 W_act 形状受控.
+    d_act: int = 256
     d_l4: int = 1024
     d_l2: int = 384
     d_l3: int = 384
@@ -278,7 +282,7 @@ class DensePCNet(nn.Module):
         # 概念槽 z_bind → 离散字节脉冲: potential = z_bind @ W_act; 推理 argmax 脉冲
         # 输出, 学习三因子赫布 (目标列强化 + softmax 稳态抑制 + dop_gain 门控).
         # 行 = 槽 (随 W_bind 同 perm 修剪), 列 = 256 字节 (soft_norm 列归一有界)
-        self.W_act = nn.Parameter(torch.empty(self.bind_slot_dim, self.cfg.d_input, dtype=torch.float16))
+        self.W_act = nn.Parameter(torch.empty(self.bind_slot_dim, self.cfg.d_act, dtype=torch.float16))
         # W_act 输出端 BCM 滑阈 (防字节垄断): theta = EMA(potential²), 高电位字节
         # 抑制 → 稳态 (与 _theta_wlm 同款剪刀)
         self.register_buffer("_theta_act", torch.full((self.cfg.d_input,), 0.01, dtype=torch.float16))
