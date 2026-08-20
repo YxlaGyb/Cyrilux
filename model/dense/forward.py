@@ -85,7 +85,8 @@ class ForwardEngine:
         if not hasattr(net, "_block_stats"):
             net._block_stats = {"rep": 0, "utf8": 0, "gen": 0}
         stats = net._block_stats
-        freq_safe = net._freq + 1e-2  # 频率去偏基线 (两读出分支共用)
+        # 第 102e 轮: 频率去偏已全部移除 (见两分支注释), 不再需要 freq_safe
+        # 基线; _freq 缓冲保留 (诊断/学习端频率统计用)
         for _ in range(n_gen):
             bv = cur[:, -64:]  # 上下文窗口 64 (任务语义)
             _ = self._predict(bv, store_state=True, is_inference=True)
@@ -131,9 +132,10 @@ class ForwardEngine:
                 mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
                 mask_print[32:] = 1.0
                 pot = pot + (1.0 - mask_print) * -1e4
-                # 频率去偏对齐 W_lm 生成路径 (第 76 轮): 无去偏时 argmax 恒选
-                # 最高频字节 (0xEF/续字节/空格) → 屏蔽一个选次高 → � 周期复读
-                pot = pot - (6.0 * torch.log(freq_safe)).to(torch.float16).unsqueeze(0)
+                # 第 102e 轮: 移除频率去偏 (原 -6·log(freq)/freq_act) — 与 W_lm
+                # 分支同因: 去偏量级与电位相当, 把表达结构压平 (chat102d 表达
+                # dec 0.03 实证). 表达结构由 W_act 学习塑造 (决策态自洽 + 感知
+                # 相位锚定), 去偏是旧 bias 时代的对抗手段, 前提已消除
                 last = pot / (pot.abs().max(dim=-1, keepdim=True).values + 1e-4) * 60.0  # fp16
             else:
                 a4 = net.active_size["l4"]
@@ -156,7 +158,9 @@ class ForwardEngine:
                     mu0_top.std(dim=-1, keepdim=True) + 1e-4
                 )
                 mu0_top = logits_c / logits_c.abs().max(dim=-1, keepdim=True).values * 60.0
-                mu0_top = mu0_top - (6.0 * torch.log(freq_safe)).to(torch.float16).unsqueeze(0).unsqueeze(0)
+                # 第 102e 轮: 移除频率去偏 — 与学习端同因 (见 learning.py 同款
+                # 注释): 去偏量级与 logits 相当, 把 W_lm 输出结构压平 → 生成
+                # 恒平复读. bias_lm 已降 (target=10), 高频垄断前提消除
                 mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
                 mask_print[32:] = 1.0
                 mu0_top = mu0_top + (1.0 - mask_print) * -1e4
@@ -495,7 +499,7 @@ class ForwardEngine:
             if getattr(net, "_fr_vf", None) is not None:
                 stp_bind = (net._stp_r_bind, net._stp_tau_bind, net._stp_u_bind)
             # 跨窗延续 (去窗口化第 77 轮): 不再传递槽末帧 — 每窗独立起步
-            z_bind = torch.relu(raw[:, :1] - net._theta_bind)  # t=0 无历史
+            z_bind = self._bind_sparse(raw[:, :1] - net._theta_bind)  # t=0 无历史
             z_binds = [z_bind]
             r_bind = stp_bind[0].unsqueeze(0) if stp_bind else None
             inv_tau_b = (1.0 / stp_bind[1]).unsqueeze(0) if stp_bind else None
@@ -504,7 +508,7 @@ class ForwardEngine:
                 raw_t = raw[:, t : t + 1] + 0.5 * (z_bind @ net.W_bind_self)
                 if stp_bind:
                     raw_t = raw_t * r_bind  # 槽输入 × 可用资源
-                z_bind = torch.relu(raw_t - net._theta_bind)
+                z_bind = self._bind_sparse(raw_t - net._theta_bind)
                 z_binds.append(z_bind)
                 if stp_bind:
                     act = z_bind.abs().mean(dim=1)  # [1,K] (同递归层修正)
@@ -523,7 +527,7 @@ class ForwardEngine:
                 net._stp_r_end["bind"] = r_bind.squeeze(0).clone()
             z_bind = torch.cat(z_binds, dim=1)
         else:
-            z_bind = torch.relu(raw - net._theta_bind)
+            z_bind = self._bind_sparse(raw - net._theta_bind)
         # 分流抑制: 上界 1.0, 幅度保留 (无 sum=1 归一化, 范数 = 自由度)
         th_b = net._theta_bind
         th_b.mul_(0.98).add_(0.02 * (z_bind * z_bind).mean(dim=(0, 1)))
@@ -535,6 +539,28 @@ class ForwardEngine:
                 self._stp_update("bind", net._stp_r_end["bind"], z_bind)  # 槽 STP 资源写回
         # 动作电位 (第 76 轮): 概念槽 → W_act → 256 字节脉冲潜能, 供学习器三因子更新
         net._act_pot = z_bind @ net.W_act  # [N,S,256] (soft_norm 列归一有界)
+
+    def _bind_sparse(self, pre_act: torch.Tensor, k: int = 4) -> torch.Tensor:
+        """槽稀疏竞争 (第 102q 轮, 用户批准架构变更): 每位置只保留 top-k 强
+        激活槽, 其余清零 — 替代 relu(raw-θ) 的"全部正激活通过".
+
+        背景 (chat102 全链实证): relu 竞争无 WTA 机制 → z_bind 每位置激活
+        11-16 槽 (稠密) → 槽模式间 cos 0.7 (首/续字节) → 线性读出 pot 趋
+        均匀 (中心极限) → W_act 学不出条件映射. 稀疏 top-k 恢复区分度:
+        - 保留连续值幅度 (relu 后值, 非二值) — 第 76 轮"超完备连续编码"
+          的语义不变, 范数仍是自由度
+        - k=4/32 (12.5%) — 强竞争但保留多样 (软 WTA 时代 K=16 top-k=10
+          的先例是 62%)
+        - 阈值 θ 仍起"弱激活过滤"作用 (先 relu(raw-θ), 再 top-k 选择)
+        - 纯张量: topk 零 GPU→CPU 同步, fp16 安全
+        """
+        x = torch.relu(pre_act)  # [...,K] 弱激活过滤
+        if x.shape[-1] <= k:
+            return x
+        # 每位置 top-k 掩码: 只保留最大的 k 个值
+        thr = x.topk(k, dim=-1).values[..., -1:]  # 第 k 大值
+        mask = (x >= thr).to(x.dtype)
+        return x * mask
 
     def _precise(self, eps: torch.Tensor) -> torch.Tensor:
         """精度加权: π_l = 1/(σ_εl + c), 归一化每层误差尺度."""

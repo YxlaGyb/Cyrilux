@@ -138,11 +138,49 @@ class LearningEngine:
             # 字节 (非监督交互环境: 他者 = 系统自己的生成, 无标签无奖励).
             # 生成沿 W_act 动作回路 (与 closed_loop 同管线), 结果作为本窗输入,
             # 激活字节域学习 (W_04/W_42/W_diff/W_lm 家族解冻, 见下方同块开关)
+            # 第 102c 轮修正 (chat102b 4000 步 dec 0.03 实证): 表达相位锚定
+            # 真实种子 — 从感知相位存的真实文本尾部续写. 零种子 → 生成流
+            # 纯乱码 → W_lm 对乱码上下文的预测 = 乱码统计 → surprise 把表达
+            # 引向乱码 (chat102b 实证); 真实种子 → 生成流前段上下文 = 真实
+            # 文本 → W_lm 预测 = 真实续写统计 → surprise 把 W_act 推向真实
+            # 续写 (牙牙学语: 模仿环境声音). 世界模型冻结 (echo_world_frozen)
+            # 保证 W_lm 是纯净的真实文本模型, 无论上下文是什么都偏向真实统计.
+            # 第 102f 轮修正 (chat102e 4000 步 dec 0.00 实证): 生成必须走
+            # W_lm 分支 (use_w_act=False) — 表达相位学的是"世界模型对真实
+            # 上下文的续写预测", 不是"随机 W_act 的输出". W_act 尚在从零
+            # 学习, 用它生成 → 生成流仍乱码 → W_lm 预测乱码 → surprise 无
+            # 结构 (死循环). W_lm 分支 (感知相位 2000 步, hit1 0.187/hit3
+            # 0.374 实证) 对真实种子的续写预测携带真实结构 → 该预测分布
+            # 就是 W_act 要学的目标分布. 暂时关闭 use_w_act 标志, 生成后
+            # 恢复 (训练循环并发无, 单线程安全)
+            # 第 102h 轮修正 (chat102h2 实证): 改回 W_act 分支生成 — 软目标
+            # 学习下训练分布必须 = 生成分布: W_act 学 (zb_g, probs_g) 配对
+            # 来自生成流, 若生成流由 W_lm 分支产生, 则 z_bind 状态分布与
+            # W_act 生成时的状态分布不匹配 → 学的映射用不上 (chat102h2
+            # 5% 信任域 200 步表达仍均匀实证). W_act 分支生成 → 流状态 =
+            # W_act 自己的状态 → 软目标把该状态推向 W_lm 高概率字节 (牙牙
+            # 学语: 不管发出什么, 听自己的声音, 向世界模型收缩)
+            # 第 102l 轮修正 (chat102k 30 步 pot 仍均匀实证): 改回 W_lm 分支
+            # 生成 — W_act 分支生成的乱码流让 W_lm 的 probs_g 退化为乱码
+            # 统计 (无结构) → dW_act 无方向 (信任域修复后 30 步 pot 仍均匀
+            # 0.007 实证). W_lm 分支从真实种子续写 → 生成流前段携带真实
+            # 结构 → probs_g 有结构 → dW_act = zb^T@(8·probs−oh) 把 W_act
+            # 推向真实续写. 训练/生成分布差异由"生成时也用 W_lm 分支续写
+            # 真实种子"弥合 (观测器同款路径), W_act 学的是"真实上下文状态
+            # → 真实续写分布"的映射, 直接可用
             N, S = 1, net.cfg.free_run_window
-            net._gen_bytes = net.forward_engine.continuation(
-                torch.zeros(1, 1, dtype=torch.long, device=net._osc_f_cnt.device), S - 1,
-                temperature=0.0, rep_backstop=True,
-            )[:, 1:]  # 去掉种子字节 (0x00), 输入 = 纯生成流
+            seed = getattr(net, "_echo_seed", None)
+            if seed is None or seed.numel() == 0:
+                seed = torch.zeros(1, 1, dtype=torch.long, device=net._osc_f_cnt.device)
+            saved_w_act = getattr(net, "use_w_act", False)
+            net.use_w_act = False
+            try:
+                out = net.forward_engine.continuation(
+                    seed, S - 1, temperature=0.0, rep_backstop=True
+                )
+            finally:
+                net.use_w_act = saved_w_act
+            net._gen_bytes = out[:, -(S - 1):]  # 去掉种子, 输入 = 纯生成流
             inp = net._gen_bytes
         else:
             inp = byte_ids
@@ -153,9 +191,18 @@ class LearningEngine:
         # 第 80 轮: 自回声模式 (free_run=False, byte_ids=None) 激活字节域学习 —
         # 输入是系统自己的生成流 (他者响应), W_04/W_42/W_diff/W_lm 家族随
         # 普通训练路径学习该输入流的结构 (无标签, 目标 = 输入自身)
+        # 第 102 轮修正 (chat101 15k 步失败根因 1): 回声相位冻结世界模型 —
+        # 从零初始化时 W_lm 尚未学到 UTF-8 结构, 回声输入 = 模型自己的乱码;
+        # 世界模型在乱码上学习 → 感知被污染 (chat101c 末态 top-5 位置无关).
+        # 生命第一因合规: 回声仍是"他者 = 自己的生成"交互, 但"世界模型"
+        # (W_04/W_42/W_diff/W_lm 家族/W1/W_bind/W_bind_self/bias_lm/_freq) 只
+        # 在感知相位 (真实输入) 更新 — 世界模型是感知的物理载体, 乱码不是
+        # 世界的结构. 表达端 W_act (动作) 在回声相位照常学习 (表达 = 行为,
+        # 不冻结), 与具身域"感知输入干净/行为域闭环"同构.
         echo_loop = (not free_run) and (byte_ids is None)
         if echo_loop:
             byte_ids = inp  # 自回声: 目标 = 自身生成流 (他者响应), 下游同普通训练
+        echo_world_frozen = echo_loop
         # 生成段掩码 (closed_loop 时只有后半参与误差, 前半锚定只看不学):
         # 对齐 S-1 (t+1 目标), 位置 i 对应目标 byte_ids[:, i+1]
         learn_mask = torch.ones(S - 1, dtype=torch.bool, device=dev)
@@ -223,7 +270,9 @@ class LearningEngine:
         # 下一状态预测 (显式预测目标): pred_delta = z4 @ W_diff, target_delta = z4[t] - z4[t-1]
         # eps_diff = pred_delta - target_delta (训练误差); 多尺度软窗同构保留
         # (free_run: W_diff 冻结, 整块死计算 — 第 78 轮跳过)
-        if not free_run:
+        # 第 102 轮: 回声相位整块冻结 (W_diff 是世界模型, 且其 EMA/BCM 缓冲
+        # 不能被乱码统计污染)
+        if not free_run and not echo_world_frozen:
             dz4 = net._z4[:, 1:] - net._z4[:, :-1]
             dz4 = dz4 / (dz4.norm(dim=-1, keepdim=True) + 1e-3)  # RMS 归一化
             z4r = net._z4  # [N,S,a4]
@@ -302,7 +351,10 @@ class LearningEngine:
         # 改增量抑制: Δbias ← Δbias / (1.0 + β·excess), β = oja_elasticity.
         # 只限高活动单元的 bias 继续增长, 不削已有存量.
         # fp16 下 1+β·excess 对 excess<~0.01 舍入为 1 (隐式门槛: 仅突发级超基线被抑制).
-        if free_run or echo_loop:
+        # 第 102 轮: echo_world_frozen 时跳过整个 bias 积分块 — 层 bias 是感知
+        # 链的均值支柱 (W_04/W_42 的读出), 乱码输入流不配塑造它; 回声相位
+        # 只有行为域 W_act 学习.
+        if (free_run or echo_loop) and not echo_world_frozen:
             _, ex4 = _activity_baseline(net, z4, "_act_ema_b4")
             _, ex2 = _activity_baseline(net, z2, "_act_ema_b2")
             _, ex3 = _activity_baseline(net, z3, "_act_ema_b3")
@@ -414,7 +466,7 @@ class LearningEngine:
             h_deriv = 1.0 - 1.5 * h_in.pow(2)  # 激活导数 (转置误差传播用, 纯张量)
             inv_h = 1.0 / math.sqrt(d_h)
             logits_lm = (h @ net.W_lm + net.bias_lm) * inv_h  # [N,S,256]
-            # ── 读出端能量调制 + 频率去偏 + 可打印掩码 (第 54/55/56 轮) ──
+            # ── 读出端能量调制 + 可打印掩码 (第 54/55/56 轮) ──
             # 1) 能量调制 (完整标准化): 先中心化 (减均值 — raw mean +0.03 被 ×60
             #    放大成 +3.11 系统性偏移), 再归一化 (除 std); 然后 max_abs 归一化
             #    严格落在 [-60, +60] (fp16 黄金法则: 避免极值溢出 — std 缩放把
@@ -423,16 +475,22 @@ class LearningEngine:
                 logits_lm.std(dim=-1, keepdim=True) + 1e-4
             )
             logits_lm = logits_c / logits_c.abs().max(dim=-1, keepdim=True).values * 60.0
-            # 2) 去偏: logits -= 6·log(freq), 高频字节主场优势被抹平, 低频结构字符
-            #    浮出. freq = 模型内部 EMA of target 分布, 加性保护 1e-6
-            # 3) 可打印物理掩码: 0x20-0xFF 合法, 0x00-0x1F 强制 -1e4 (fp16 安全极弱值)
+            # 2) 可打印物理掩码: 0x20-0xFF 合法, 0x00-0x1F 强制 -1e4 (fp16 安全极弱值)
+            # 第 102e 轮: 移除频率去偏 (logits -= 6·log(freq)) — 第 54 轮加去偏
+            # 是为对抗 bias_lm 范数锁 100 的高频垄断; 第 102 轮已把 bias_lm 降到
+            # target=10 (bias_std 0.625 与 h 同量级), 去偏前提消除. 诊断实证
+            # (chat102d_step900): 任何去偏系数 (1-6) 使 hit1/hit3 归零 — 去偏
+            # 量级 (~8-46) 与 logits 相当, 把 W_lm 学习的误差信号抹平: 训练和
+            # 生成共用同一去偏, W_lm 学到"输出反相去偏"的权重 → 两相抵消 →
+            # 输出恒平 (hit1 0.03 位置无关, chat102 4000 步实证). 频率统计
+            # (_freq) 保留 (诊断/其他路径用), 只是不再注入 logits.
             if closed_loop:
                 target_oh = F.one_hot(byte_ids[:, 1:], num_classes=256).to(torch.float16).mean(dim=(0, 1))
             else:
                 target_oh = F.one_hot(byte_ids, num_classes=256).to(torch.float16).mean(dim=(0, 1))
-            net._freq.mul_(0.99).add_(0.01 * target_oh.detach())
-            freq_safe = net._freq + 1e-2
-            logits_lm = logits_lm - (6.0 * torch.log(freq_safe)).to(torch.float16).unsqueeze(0).unsqueeze(0)
+            # 第 102 轮: 回声相位冻结频率统计 — 乱码输入流不配做世界结构
+            if not echo_world_frozen:
+                net._freq.mul_(0.99).add_(0.01 * target_oh.detach())
             mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
             mask_print[32:] = 1.0
             logits_lm = logits_lm + (1.0 - mask_print) * -1e4
@@ -527,7 +585,7 @@ class LearningEngine:
         # 突触后增益控制: 归一化基于当前误差自身的 std (统计去耦), 不依赖维度 —
         # 修剪缩小 L4 时误差方差自然变小, 分母自动适应, 无 1/A4 静态系数
         inv_s = 1.0 / S
-        if not free_run:
+        if not free_run and not echo_world_frozen:
             # ── W_04 主辅误差交换: 预测误差为主, 重建为辅 ──
             # 重建任务不需要词序 (稳定信号拉权重回单一解); 预测误差才需要词序.
             # final_error = err_pred_norm + 0.2 * err_recon_norm (量级对齐)
@@ -589,6 +647,8 @@ class LearningEngine:
             # W_42 权重去同质化 (行收敛 ±w → 投影秩 1 根因)
             _decorr_W(net.W_42[:a2].data, net.E_42[:a2, :a2])
         # ── 字节域块结束 (free_run 跳过: W_lm 家族/W_04/W_42, 冻结) ──
+        # 第 102 轮: echo_world_frozen 时 W_42 冻结 — 乱码输入流不配做感知结构
+        # (W_04/W_42 是感知链, 回声相位只有行为域 W_act 学习)
         # W_56 保留更新 (L5→L6 内部动力学, 自由运行同样学习)
         dW_56 = (eps6_p.transpose(-2, -1) @ _rms(z5)).mean(dim=0) * inv_s
         dW_56 = _energy_constraint(net, net.W_56[:a6].data, dW_56, eps6_p, "_act_ema_w56")
@@ -628,7 +688,7 @@ class LearningEngine:
         # 线性加权 (禁止 exp/非线性), 保留样本差异, 抹平效应消除
         n_sub = 4
         sub = max(1, N // n_sub)
-        if not free_run:
+        if not free_run and not echo_world_frozen:
             # 预测编码向下平移: W_lm 预测误差 → a3 空间
             # eps_lm_proj 已算 [N,S-1,a4], 补零到 S 对齐完整序列, 经 W_42 逆映射到 a3
             eps_lm_proj_pad = torch.cat(
@@ -641,7 +701,7 @@ class LearningEngine:
         eps_b = z5_b[:, 1:] - z5_b[:, :-1]  # 时序差分误差
         z3_b = z3[:, :-1]
         z3_bp = z3_b * (torch.rand_like(z3_b) > 0.3).to(torch.float16)
-        if not free_run:
+        if not free_run and not echo_world_frozen:
             # 预测编码融合: eps_b = 时序差分 + 0.5 × LM 预测误差投影回 L5 空间
             eps_lm_b = eps_lm_a3[:, :-1] @ net.W_35[:a5].T  # [N,S-1,a5]
             eps_lm_b = _rms(eps_lm_b)
@@ -813,23 +873,26 @@ class LearningEngine:
         # (行范数 = 增益自由度归系统, soft_norm 会每步抹平缩放造成的异质; 训练模式保持)
         if not (free_run and net.cfg.wt_syn_scaling):
             soft_norm_preserve(Wb.data)
-        if not free_run:
+        if not free_run and not echo_world_frozen:
             # W_42 注入: local_err_L4 经 W_42 逆映射到 a2 (mask 有效位)
-            # (free_run 跳过 — W_42 冻结)
+            # (free_run 跳过 — W_42 冻结; 回声相位同冻结 — 乱码流不配做感知结构)
             z4_m = z4[:, mask4]
             local_err_l4_a2 = _rms(err4_m @ net.W_42[:a2].T)
             dW_pred42 = (local_err_l4_a2.transpose(-2, -1) @ _rms(z4_m)).mean(dim=0) / max(1, int(mask4.sum()))
             net.W_42[:a2].data += _rho_ctrl(dW_pred42 * eta * rpe * 1.5, net.W_42[:a2], "inj42")
             soft_norm_preserve(net.W_42[:a2].data)
         # W_pred 矩阵自更新 (纯外积, 输入调制后 z4/z3 保持一致, 注入强度 1.0)
-        dWp54 = (err5_m.transpose(-2, -1) @ z4_pred_in[:, mask5]).mean(dim=0)
-        dWp54 = _energy_constraint(net, Wp54_a.data, dWp54, err5_m, "_act_ema_wp54")
-        Wp54_a.data += _rho_ctrl(dWp54 * eta, Wp54_a, "wp54")
-        dWp43 = (err4_m.transpose(-2, -1) @ z3_pred_in[:, mask4]).mean(dim=0)
-        dWp43 = _energy_constraint(net, Wp43_a.data, dWp43, err4_m, "_act_ema_wp43")
-        Wp43_a.data += _rho_ctrl(dWp43 * eta, Wp43_a, "wp43")
-        soft_norm_preserve(Wp54_a.data)
-        soft_norm_preserve(Wp43_a.data)
+        # 第 102 轮: 回声相位冻结 — W_pred_* 是世界模型 (层间预测), 乱码输入流
+        # 不配塑造它
+        if not echo_world_frozen:
+            dWp54 = (err5_m.transpose(-2, -1) @ z4_pred_in[:, mask5]).mean(dim=0)
+            dWp54 = _energy_constraint(net, Wp54_a.data, dWp54, err5_m, "_act_ema_wp54")
+            Wp54_a.data += _rho_ctrl(dWp54 * eta, Wp54_a, "wp54")
+            dWp43 = (err4_m.transpose(-2, -1) @ z3_pred_in[:, mask4]).mean(dim=0)
+            dWp43 = _energy_constraint(net, Wp43_a.data, dWp43, err4_m, "_act_ema_wp43")
+            Wp43_a.data += _rho_ctrl(dWp43 * eta, Wp43_a, "wp43")
+            soft_norm_preserve(Wp54_a.data)
+            soft_norm_preserve(Wp43_a.data)
         # 诊断: local_err 相对能量 (红线指标), z5 加性保护分母 (修复二:
         # z5 去中心化后近 0 样本 → 直接除 z5 能量 → inf; scale = std +
         # 0.01·mean_std + 1e-4 加性保护, 非 clamp, 保留信号方向)
@@ -849,9 +912,9 @@ class LearningEngine:
         eye_mask = 1.0 - torch.eye(a5, device=dev, dtype=torch.float16)
         net.M_l5[:a5, :a5].data.mul_(0.99).add_((cov * eye_mask) * (0.01 * learn_boost))
 
-        if not free_run:
+        if not free_run and not echo_world_frozen:
             # W_diff 下一状态预测更新 (4 步时间窗平均外积) + b_diff 偏置 (L4 空间)
-            # (free_run 跳过 — W_diff 冻结, 依赖外部字节序列)
+            # (free_run 跳过 — W_diff 冻结, 依赖外部字节序列; 回声相位同冻结)
             fut_mask = torch.rand(a4, 1, device=dev) < net.cfg.column_dropout
             W_diff_a.data += (dW_avg * (~fut_mask).to(torch.float16)) * eta
             future_e = (dz4 - pred_d).mean(dim=(0, 1))
@@ -944,7 +1007,7 @@ class LearningEngine:
         for wt in (net.W_t4, net.W_t2, net.W_t3, net.W_t5, net.W_t6):
             _spectral_radius_guard(wt.data, bound=net.cfg.spectral_guard_bound)
 
-        if not free_run:
+        if not free_run and not echo_world_frozen:
             # LM 头自监督赫布 (复用闭环段已算的 logits_lm/eps_total):
             # 突触前增益控制: error 先 RMS 缩放到单位能量再外积 — 更新幅度完全由
             # 内部误差能量自适应决定, 不依赖外部 eta 缩放 (替代 W_04 解码死锁)
@@ -1005,18 +1068,26 @@ class LearningEngine:
             # 单步更新幅度上界 (W_04 同款幅度-方向解耦): 防极端 batch 单步爆
             dW_lm_n = dW_lm.norm() + 1e-8
             dW_lm = dW_lm / dW_lm_n
-            net.W_lm.data.mul_(0.999)
-            net.W_lm.data += dW_lm * eta_lm
-            # bias 硬复位: 范数锁定 (target=100, 除法缩放非 clamp) — 切断自由生长,
-            # 死守 bias_std≈6.26. 去均值只学相对偏置.
+            # 第 102 轮修正 (chat101 15k 步失败根因 3): 信任域 — 单位向量 ×
+            # eta_lm=1.0 = 每步 100% 相对扰动 (W_lm 行范数 ~1), 从零初始化时
+            # 信号被噪声淹没 → W_lm 只学到频率先验 (chat101c 末态 top-5
+            # 位置无关的实证). 单步相对扰动收敛到 1%: 信号可积累, 噪声被
+            # 遗忘项 (×0.999) 平均掉. 与 W_04 幅度-方向解耦同族 (最大单步
+            # 幅度 = eta·‖W‖·0.01, 结构化缩放非 clamp)
+            net.W_lm.data += dW_lm * (eta_lm * net.W_lm.norm() * 0.01)
+            # bias 硬复位: 范数锁定 + 更新降幅 (第 102 轮) — 旧 target=100 →
+            # bias_std 6.25, 经 inv_h 后仍 6× 主导 h 信号 → 中心化归一化后
+            # bias 列排序存活 → 输出钉死频率先验 (位置无关 top-5 实证).
+            # target=10 → bias_std 0.625 (与 h 信号同量级); 更新降 20× →
+            # 频率先验慢速建立, 上下文信号赢得竞争. 去均值只学相对偏置.
             # 误差用原始概率误差 (不经单位能量归一化): 混合层下去偏项 ±45 让
             # softmax 尖锐, 单位能量归一化把稀疏误差放大 10 倍 (bias_d 0.03→0.58,
             # 单步增量 5.8 → 10 步爆, 实测 step 7)
             bias_err = eps_lm  # [N,S-1,256] 原始 target - probs, 无归一化
             bias_d = bias_err.mean(dim=(0, 1))
-            net.bias_lm.data += (bias_d - bias_d.mean()) * eta_lm
+            net.bias_lm.data += (bias_d - bias_d.mean()) * (eta_lm / 20.0)
             bn = net.bias_lm.norm()
-            target_norm = 100.0
+            target_norm = 10.0
             if bn > target_norm:
                 net.bias_lm.data.mul_(target_norm / bn)
             soft_norm_preserve(net.W_lm.data)
@@ -1030,8 +1101,9 @@ class LearningEngine:
             dW1 = (_rms(zh[:, :-1]).transpose(-2, -1) @ _rms(e_h)).mean(dim=0) * math.sqrt(d_h)
             dW1_n = dW1.norm() + 1e-8
             dW1 = dW1 / dW1_n
-            W1_a.data.mul_(0.999)
-            W1_a.data += dW1 * eta_lm
+            # 第 102 轮: 同 W_lm 信任域 (见上) — 从零初始化时单位向量全量更新
+            # 使 W1 每步整体重排, 学不到结构
+            W1_a.data += dW1 * (eta_lm * W1_a.norm() * 0.01)
             soft_norm_preserve(W1_a.data)
 
             # W_lm_2 独立更新 (Q3 解耦): 吃 t+2 误差 + 差分误差 (eps_t2_total), 与 W_lm 完全独立
@@ -1055,24 +1127,30 @@ class LearningEngine:
             ).mean(dim=0) * math.sqrt(d_h)
             dW_lm2_n = dW_lm2.norm() + 1e-8
             dW_lm2 = dW_lm2 / dW_lm2_n  # 单步更新幅度上界 (防突爆)
-            net.W_lm_2.data.mul_(0.999)
-            net.W_lm_2.data += dW_lm2 * eta_lm
+            # 第 102 轮: 同 W_lm 信任域 (见上)
+            net.W_lm_2.data += dW_lm2 * (eta_lm * net.W_lm_2.norm() * 0.01)
             soft_norm_preserve(net.W_lm_2.data)
             # 每步清除新奇度 (前向已更新, 防陈旧信号跨步复用)
             if hasattr(net, "_novelty"):
                 del net._novelty
 
         # 状态预测矩阵自更新 (纯赫布): dW_sp = z4^T @ eps_state, 零 BP
-        dW_sp = (net._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0)
-        dW_sp = _energy_constraint(net, W_sp_a.data, dW_sp, net._z4, "_act_ema_wsp")
-        W_sp_a.data += dW_sp * eta
-        soft_norm_preserve(W_sp_a.data)
+        # 第 102 轮: echo_world_frozen 时冻结 — W_state_pred 是世界模型
+        # (预测 z4 下一步), 乱码输入流不配塑造它
+        if not echo_world_frozen:
+            dW_sp = (net._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0)
+            dW_sp = _energy_constraint(net, W_sp_a.data, dW_sp, net._z4, "_act_ema_wsp")
+            W_sp_a.data += dW_sp * eta
+            soft_norm_preserve(W_sp_a.data)
 
         # ── 竞争性概念绑定层赫布更新 (任务 4, 纯外积, 零 BP): ──
         # dW_bind = z4_pre^T @ (z_bind - mean(z_bind)) — 槽位激活去均值 (Oja 式):
         # 高激活槽位强化 z4→槽映射, 低激活槽位削弱, 竞争分化; 零均值防单槽垄断.
         # W_bind 行范数保持 (0.8-1.2) 防坍缩, 软竞争 (L2 归一化) 无死亡
-        if hasattr(net, "_bind_vec"):
+        # 第 102 轮: 回声相位冻结 W_bind/W_bind_self (世界模型) — 槽映射是
+        # 感知表示的一部分 (bind_vec 进 W_lm 输入), 乱码输入流不配塑造它.
+        # W_act (行为) 在回声相位照常学习 (下方独立块, 不受此冻结影响)
+        if hasattr(net, "_bind_vec") and not echo_world_frozen:
             z4n = _rms(z4)
             bind_t = net._bind_vec  # 纯 z_bind (第 75 轮: 去均值对称抹差异 → 无偏置积累,
             # 高激活槽保留幅度差 → Hebbian 正反馈放大 → 分化种子; 分流抑制防垄断)
@@ -1170,95 +1248,173 @@ class LearningEngine:
                 _decorr_W(net.W_bind_self.data.T, net.E_bind_self)
                 soft_norm_preserve(net.W_bind_self.data)
 
-            # ── 闭环自洽生成 (第 76 轮最终裁决: 表达者范式) ──
-            # W_act 从"预测器"转"行为生成器": 切断一切外部目标字节驱动.
-            # 核心: 系统生成字节 → 内部世界模型 (W_lm) 重感知 → 自洽性惊喜
-            # = 1 - probs_lm[gen_byte] → 三因子赫布. 高惊喜 (内部模型意外) →
-            # 负向更新抑制该行为; 低惊喜 (内部自洽) → 弱负向保留. 复读是零
-            # 惊喜稳定基态 → 自然强化为起点, 从稳定中诞生复杂 (牙牙学语).
-            # 哲学: 系统不再匹配外部, 而是维持内部自洽 — 主动表达, 非被动回答.
-            # 实现: closed_loop 或自回声 (第 80 轮) 时学习 — 自回声的生成段
-            # 就是本窗输入流, 同一批 _gen_bytes 复用 (W_act 表达 → 重感知 →
-            # 自洽惊喜 → 三因子赫布, 无标签无奖励)
-            if (
-                (closed_loop or echo_loop)
-                and hasattr(net, "_act_pot")
-                and hasattr(net, "_gen_bytes")
-                and getattr(net, "_act_enabled", True)
-            ):
-                pot = net._act_pot  # [N,S,256] 动作电位
-                zbind = net._bind_vec
-                gb = net._gen_bytes  # [N,N_gen] 自生成字节 (表达)
-                N_gen = gb.shape[1]
-                zb_g = zbind[:, -N_gen:]  # [N,N_gen,16] 生成段槽状态
-                # ── 学习进步信号 (裁决 16): 从"最小化预测误差"到"最大化学习进步" ──
-                # 复读是"最小化当前预测误差"的全局最优解 — 必须放弃该目标.
-                # LP_t = ε_{t-1} - ε_t (预测误差的负时间差分):
-                #   LP>0: 误差下降, 系统"学会了" → 正强化 (保留该行为)
-                #   LP<0: 误差上升, 系统"变笨了" → 负强化 (抑制该行为)
-                # 复读: ε_{t-1}≈ε_t → LP≈0 → 行为不被强化 → 逐渐遗忘 (打破复读)
-                # 探索新字节若提升可预测性 (LP>0) → 强化 → 表达库向复杂演化.
-                # 多巴胺真实角色: 奖励预测误差 (比预期更好 = 学习进步), 非奖赏本身
-                # 实现: φ = 0.5·(1 - tanh(α·LP)) ∈ [0,1] — LP 大 → φ→0 (弱抑制=
-                # 保留), LP 小 → φ→1 (强抑制). 符号保持, 幅度受限, 纯局部.
-                # (裁决公式 ΔW=-η·tanh(LP)·... 与"LP>0 正强化"矛盾, 按物理
-                # 意图实现: LP>0 保留, LP<0 抑制)
-                zb_prev = torch.cat([zb_g[:, :1], zb_g[:, :-1]], dim=1)  # [N,N_gen,16]
-                pred_self = torch.softmax((zb_prev @ net.W_bind_self) * 4.0, dim=-1)
-                eps_t = (zb_g - pred_self).square().mean(dim=-1, keepdim=True)  # [N,N_gen,1] ε_t
-                eps_prev = torch.cat([eps_t[:, :1], eps_t[:, :-1]], dim=1)  # ε_{t-1}
-                LP = (eps_prev - eps_t).detach()  # 学习进步 [N,N_gen,1]
-                alpha = 50.0  # tanh 缩放 (ε 量级 ~0.003, ×50 → LP 归一)
-                phi = 0.5 * (1.0 - torch.tanh(alpha * LP))  # 增益 [0,1]
-                probs_g = probs_lm[:, -N_gen:]  # [N,N_gen,256] 生成段概率
-                # (第 80 轮: 自回声时生成段 = 整个输入流 S 长, 对齐 S 无需偏移;
-                # closed_loop 时生成段是后半, 偏移 S-N_gen-1)
-                oh_g = F.one_hot(gb, num_classes=256).to(torch.float16)  # [N,N_gen,256]
-                p_gen = (probs_g * oh_g).sum(dim=-1, keepdim=True)  # [N,N_gen,1]
-                wlm_err = (1.0 - p_gen).detach()  # [N,N_gen,1] 外部弱约束
-                surprise = (0.9 * phi + 0.1 * wlm_err).detach()  # 学习进步增益 + W_lm 弱约束
-                # ── 字节频率门控 (裁决 15): 罕见字节抑制衰减 (辅助调制) ──
-                fa = net._freq_act
-                oh_gen = F.one_hot(gb, num_classes=256).to(torch.float16)  # [N,N_gen,256]
-                fa.mul_(0.99).add_(0.01 * oh_gen.mean(dim=(0, 1)))
-                beta = 0.5  # 新颖偏好强度
-                freq_gate = (1.0 - beta * (1.0 - fa)).unsqueeze(0).unsqueeze(0)  # [1,1,256]
-                surprise = surprise * freq_gate  # 逐字节频率调制
-                net._LP = LP  # 诊断: 学习进步分布
-                # 三因子赫布 (表达者版): dW_act = -η·(z_bind^T ⊗ one_hot(gen_byte))·surprise
-                # 负号是裁决核心: 高惊喜 (内部模型意外) → 负向更新抑制该行为;
-                # 低惊喜 (内部自洽) → 弱负向, 通路保留. 复读是低惊喜稳定基态
-                # → 自然强化为起点. (第 76 轮修正: 旧实现正号把高惊喜表达
-                # 反向强化 → 越表达越陌生→越强化→表达库钉死 2 字节自锁)
-                dW_act = -(zb_g.transpose(-2, -1) @ (oh_g * surprise)).mean(dim=0)
-                # 稳态抑制保留 (防字节垄断): 全列 -= 0.1·z_bind^T @ softmax(potential)
-                pot_sm = torch.softmax(pot[:, -N_gen:].detach(), dim=-1)
-                dW_act = dW_act - 0.1 * (zb_g.transpose(-2, -1) @ pot_sm).mean(dim=0)
-                # 单步幅度上界 (W_lm 同款幅度-方向解耦)
-                dW_act = dW_act / (dW_act.norm() + 1e-8)
-                # 学习率: W_lm 读出端量级 × 0.2 × intrinsic 并列调制 (纯张量,
-                # 零 GPU→CPU 同步 — _intr_drive 已是 fp16 张量, 直接张量乘法)
-                intr_d = getattr(net, "_intr_drive", torch.tensor(0.5, device=dev, dtype=torch.float16))
-                net.W_act.data += dW_act * (net.cfg.lm_lr_boost * 0.2) * (0.5 + intr_d)
-                # ── 复读检测跟踪 (裁决 12): 随机扰动已升级为内部状态错误配对
-                # (forward.py 生成路径, W_bind_self 定向扰动替代各向同性噪声).
-                # 此处保留复读状态跟踪供诊断/监控
-                gb_recent = gb[:, -10:]  # [N,10] 最近 10 字节
-                oh_r = F.one_hot(gb_recent, num_classes=256).to(torch.float16)  # [N,10,256]
-                n_uniq = (oh_r.sum(dim=1) > 0).sum(dim=-1).to(torch.float16)  # [N]
-                rep_run = getattr(net, "_rep_run", torch.zeros(N, device=dev, dtype=torch.float16))
-                in_rep = (n_uniq < 3).to(torch.float16)  # [N]
-                rep_run = torch.where(in_rep > 0, rep_run + 1.0, torch.zeros_like(rep_run))
-                net._rep_run = rep_run
-                net._rep_frac = in_rep.mean().to(torch.float16)  # 诊断 (fp16 张量, 零同步)
-                # 列范数保持 (0.8-1.2): 槽列有界防溢出; 转置视图 in-place 直接
-                # 写回原参数 (第 76 轮修复: 旧 .contiguous() 副本装饰性失效)
-                soft_norm_preserve(net.W_act.data.T)
+        # ── 闭环自洽生成 (第 76 轮最终裁决: 表达者范式) ──
+        # W_act 从"预测器"转"行为生成器": 切断一切外部目标字节驱动.
+        # 核心: 系统生成字节 → 内部世界模型 (W_lm) 重感知 → 自洽性惊喜
+        # = 1 - probs_lm[gen_byte] → 三因子赫布. 高惊喜 (内部模型意外) →
+        # 负向更新抑制该行为; 低惊喜 (内部自洽) → 弱负向保留. 复读是零
+        # 惊喜稳定基态 → 自然强化为起点, 从稳定中诞生复杂 (牙牙学语).
+        # 哲学: 系统不再匹配外部, 而是维持内部自洽 — 主动表达, 非被动回答.
+        # 实现: closed_loop 或自回声 (第 80 轮) 时学习 — 自回声的生成段
+        # 就是本窗输入流, 同一批 _gen_bytes 复用 (W_act 表达 → 重感知 →
+        # 自洽惊喜 → 三因子赫布, 无标签无奖励)
+        # 第 102h 轮修正 (chat102g 1400 步 W_act 零更新实证): W_act 块
+        # 从冻结块 (echo_world_frozen) 中提出 — 旧代码把它嵌在 W_bind
+        # 更新块内, 第 102 轮加冻结守卫后 W_act 在回声相位被一起跳过
+        # (W_act 变化范数 0.0 实证). W_act 是行为域, 回声相位必须学习.
+        if (
+            (closed_loop or echo_loop)
+            and hasattr(net, "_act_pot")
+            and hasattr(net, "_gen_bytes")
+            and getattr(net, "_act_enabled", True)
+        ):
+            pot = net._act_pot  # [N,S,256] 动作电位
+            zbind = net._bind_vec
+            gb = net._gen_bytes  # [N,N_gen] 自生成字节 (表达)
+            N_gen = gb.shape[1]
+            # 第 102 轮: 决策态对齐偏移 — zb_g 与 gb_a/oh_g/probs_g 同偏移
+            # (槽状态取"字节进入前"的决策时点, 见下方对齐注释)
+            n_a = N_gen - 1  # 决策态对齐长度
+            zb_g = zbind[:, -N_gen:-1]  # [N,n_a,16] 决策时点槽状态
+            # ── 学习进步信号 (裁决 16): 从"最小化预测误差"到"最大化学习进步" ──
+            # 复读是"最小化当前预测误差"的全局最优解 — 必须放弃该目标.
+            # LP_t = ε_{t-1} - ε_t (预测误差的负时间差分):
+            #   LP>0: 误差下降, 系统"学会了" → 正强化 (保留该行为)
+            #   LP<0: 误差上升, 系统"变笨了" → 负强化 (抑制该行为)
+            # 复读: ε_{t-1}≈ε_t → LP≈0 → 行为不被强化 → 逐渐遗忘 (打破复读)
+            # 探索新字节若提升可预测性 (LP>0) → 强化 → 表达库向复杂演化.
+            # 多巴胺真实角色: 奖励预测误差 (比预期更好 = 学习进步), 非奖赏本身
+            # 实现: φ = 0.5·(1 - tanh(α·LP)) ∈ [0,1] — LP 大 → φ→0 (弱抑制=
+            # 保留), LP 小 → φ→1 (强抑制). 符号保持, 幅度受限, 纯局部.
+            # (裁决公式 ΔW=-η·tanh(LP)·... 与"LP>0 正强化"矛盾, 按物理
+            # 意图实现: LP>0 保留, LP<0 抑制)
+            # 第 102 轮: LP 轨迹同用决策态对齐后的槽序列 (zb_g 在下方定义,
+            # 与 gb_a/oh_g 同偏移 — 转移误差 ε 的时序与表达字节时序一致)
+            zb_prev = torch.cat([zb_g[:, :1], zb_g[:, :-1]], dim=1)  # [N,n_a,16]
+            pred_self = torch.softmax((zb_prev @ net.W_bind_self) * 4.0, dim=-1)
+            eps_t = (zb_g - pred_self).square().mean(dim=-1, keepdim=True)  # [N,n_a,1] ε_t
+            eps_prev = torch.cat([eps_t[:, :1], eps_t[:, :-1]], dim=1)  # ε_{t-1}
+            LP = (eps_prev - eps_t).detach()  # 学习进步 [N,n_a,1]
+            alpha = 50.0  # tanh 缩放 (ε 量级 ~0.003, ×50 → LP 归一)
+            phi = 0.5 * (1.0 - torch.tanh(alpha * LP))  # 增益 [0,1]
+            # 第 102 轮修正 (chat101 15k 步失败根因 4): 决策态对齐 —
+            # 旧实现把 gb[t] 与 probs_lm 后段逐位配对: probs_lm 的 t' 行是
+            # "基于 t' 之前上下文的预测", 其中 gb[t'] 已进入上下文 → p_gen =
+            # P(g_t | 上下文含 g_t) 在复读时恒 1 (生成 = 继续复读同字节),
+            # 自洽惊喜恒 0 → 复读被三因子负号规则"低惊喜 → 弱负向保留"
+            # 永久强化 = 复读自锁 (第 76 轮已知吸引子).
+            # 修正: 决策态对齐 — gb[t] 的决策上下文止于 gb[t-1], 对应
+            # probs_lm 的 t-1 行 (含该字节之前的状态). 三要素统一偏移:
+            #   gb_aligned = gb[:, 1:]           (t ≥ 1, 首字节决策上下文
+            #                                     是回声种子/锚定段, 不在流内)
+            #   probs_g = probs_lm[:, S-1-n_a : S-1]  (t-1 行, n_a = N_gen-1)
+            #   zb_g     = zbind[:, -N_gen:-1]  (决策时点槽状态 = 字节进入前)
+            # 偏移后 p_gen = P(g_t | 上下文不含 g_t) — 复读时 <1 (软采样给
+            # 其他字节留了概率) → 复读的自洽惊喜 >0 → 负向抑制 → 复读不
+            # 被固化; 表达向"高概率字节"收缩, 与感知相位学的频率结构对齐.
+            # 零新机制, 纯对齐修正.
+            gb_a = gb[:, 1:]  # [N,n_a] 对齐生成字节
+            oh_g = F.one_hot(gb_a, num_classes=256).to(torch.float16)  # [N,n_a,256]
+            # 决策态分布: probs_lm[i] = P(第 i+1 字节 | 前 i+1 字节上下文).
+            # gb[t] 在完整序列位置 gb_start+t, 其决策上下文 = 前 gb_start+t 个
+            # 字节 → 决策态行 = probs_lm[gb_start+t-1]. 对 gb_a[i]=gb[i+1]:
+            # 行 = probs_lm[gb_start+i], i=0..n_a-1
+            gb_start = S - N_gen  # 生成段在完整序列中的起始位置
+            probs_g = probs_lm[:, gb_start : gb_start + n_a]  # [N,n_a,256]
+            # (第 102c 轮: 回声锚定种子后 inp = 纯生成流 [N,S-1], gb_start=0
+            #  恒成立 — gb_a[i] 的决策态 = probs_lm[i] (上下文 = 种子+生成段
+            #  前缀). 闭环时 gb_start=64, 切片含锚定段后语义不变)
+            p_gen = (probs_g * oh_g).sum(dim=-1, keepdim=True)  # [N,n_a,1]
+            wlm_err = (1.0 - p_gen).detach()  # [N,n_a,1] 外部弱约束
+            # 第 102b 轮修正 (chat102 4000 步实证): surprise 权重交换 —
+            # 旧 0.9·phi + 0.1·wlm_err 是第 76 轮"从成熟检查点起步"的裁决:
+            # 世界模型已成熟时 W_bind_self 转移误差是可靠的自洽信号. 但
+            # 从零重建时 W_bind_self 也是随机的, phi (LP 门控转移误差) 与
+            # 字节结构无关 → 0.9 权重把 W_act 学习引向与字节无关的方向
+            # (chat102: W_lm hit3 0.53 已学结构, 表达 dec 仍 0.03 实证).
+            # wlm_err (W_lm 决策态概率) 是唯一携带字节结构的信号 — 交换
+            # 权重让表达向"世界模型高概率的下一字节"收缩: 非法字节概率
+            # 低 → 高 surprise → 负向抑制; 合法 UTF-8 字节概率高 → 弱
+            # 抑制保留. 牙牙学语机制: 婴儿发声被自己听觉模型筛选.
+            surprise = (0.1 * phi + 0.9 * wlm_err).detach()  # 世界模型主导 + 内部转移弱约束
+            # ── 字节频率门控 (裁决 15): 罕见字节抑制衰减 (辅助调制) ──
+            fa = net._freq_act
+            oh_gen = F.one_hot(gb_a, num_classes=256).to(torch.float16)  # [N,n_a,256]
+            fa.mul_(0.99).add_(0.01 * oh_gen.mean(dim=(0, 1)))
+            beta = 0.5  # 新颖偏好强度
+            freq_gate = (1.0 - beta * (1.0 - fa)).unsqueeze(0).unsqueeze(0)  # [1,1,256]
+            surprise = surprise * freq_gate  # 逐字节频率调制
+            net._LP = LP  # 诊断: 学习进步分布
+            # 第 102g 轮修正 (chat102b-f 全部 dec 0.00-0.09 实证): 软目标学习
+            # 替代三因子负号 — 旧三因子 dW = -(zb^T ⊗ oh_g)·surprise 的死结:
+            # W_lm hit1 0.03-0.19 → 所有生成字节的 wlm_err≈0.8-0.95 恒高
+            # 且无区分度 → dW_act 归一化后是噪声方向 → W_act 学不到
+            # (chat102f 4000 步表达仍乱码实证). 死循环: W_lm 预测差 →
+            # surprise 无区分 → W_act 学不到 → 表达乱码 → W_lm 对乱码
+            # 预测差. 修正: dW_act = zb_g^T @ (probs_g - oh_g) — 软目标
+            # 赫布: 当前槽状态 → 世界模型预测分布 (正项强化高概率字节,
+            # 负项弱化实际生成字节). 这正是第 76 轮裁决"表达受内部世界
+            # 模型约束"的直接实现 — probs_g 是内部模型预测 (非外部目标),
+            # 纯外积零 BP. 死结打破: 只要 W_lm 对真实种子有结构 (hit3
+            # 0.5+), 高概率字节就获得强化, W_act 向世界模型收缩.
+            # 决策态对齐: gb_a[i] 决策上下文 = 前 i+1 字节 → 目标分布 =
+            # probs_g[i] (P(第 i+1 字节 | 前 i+1 字节)) — 槽状态 zb_g[i]
+            # 与该分布的配对即"该状态下世界模型认为下一步是什么"
+            # 第 102j 轮修正 (chat102i 2100 步 pot 恒均匀实证): 梯度平衡 —
+            # 实测 dW 分量: onehot 项范数 5.09 > probs 项 3.67 (cos 0.42),
+            # 稀疏 onehot 的抑制远强于均匀 probs 的强化 → 净梯度 = 均匀
+            # 抑制无结构 (W_act 学不出条件映射). 平衡: probs 项 ×K —
+            # W_lm 峰值概率 ~0.2, ×8 → 1.6 超过 onehot 的 1.0, 强化主导.
+            # 纯梯度尺度平衡 (非新机制), K=8 使两分量同量级
+            dW_act = (zb_g.transpose(-2, -1) @ (8.0 * probs_g - oh_g)).mean(dim=0)
+            # 稳态抑制保留 (防字节垄断): 全列 -= 0.1·z_bind^T @ softmax(potential)
+            pot_sm = torch.softmax(pot[:, -N_gen:-1].detach(), dim=-1)  # 决策态对齐
+            dW_act = dW_act - 0.1 * (zb_g.transpose(-2, -1) @ pot_sm).mean(dim=0)
+            # 单步幅度上界 (W_lm 同款幅度-方向解耦)
+            dW_act = dW_act / (dW_act.norm() + 1e-8)
+            # 第 102 轮修正 (chat101 15k 步失败根因 2): 信任域 — 旧实现
+            # 单位向量 × 0.2 = 每步 20% 相对扰动 (W_act 列范数 ~1), 从零
+            # 初始化时表达库方向被噪声推着随机游走 (chat101c 表达 80%+
+            # 0x80 高字节的实证 — 随机游走停在高频先验区). 单步相对扰动
+            # 收敛到 1%: 表达方向可积累, 自洽信号 (决策态对齐后) 才有
+            # 机会塑造表达库. 与 W_lm/W1 同族信任域
+            # 第 102h 轮修正 (chat102h 1300 步 W_act 输出仍均匀实证): 软目标
+            # dW 的期望近零 (probs - one_hot 都归一化), 只有 z_bind 与 probs
+            # 的协方差部分有效 → 1% 信任域 700 回声步只转 ~7% 方向, 均匀
+            # 分布看不到偏差. 提高 W_act 信任域到 5% (行为域比读出端更快,
+            # 与 lm_lr_boost*0.2 的原始量级对齐; W_act 列范数 ~0.5, 5% 步幅
+            # ~0.025 仍在 fp16 安全区)
+            # 第 102k 轮修正 (chat102i 2100 步列方向 cos 1.0 实证): 信任域
+            # bug — 旧式 net.W_act.norm()*0.05 用整个矩阵范数 (16 = √256×
+            # 列范数 1.0), 且 dW 是单位向量: 实际步幅 = 0.2×0.75×0.05×16
+            # = 0.12 = 0.75%‖W‖/步 (意图 5%), 2000 步只转 ~6° → pot 恒均匀.
+            # 修正: 信任域基准 = 平均列范数 (≈1.0), 系数提到 5.0 使步幅 =
+            # 0.2×0.75×5.0 = 0.75 = 4.7%‖W‖/步 — 真正的 5% 信任域
+            # 学习率: W_lm 读出端量级 × 0.2 × intrinsic 并列调制 (纯张量,
+            # 零 GPU→CPU 同步 — _intr_drive 已是 fp16 张量, 直接张量乘法)
+            intr_d = getattr(net, "_intr_drive", torch.tensor(0.5, device=dev, dtype=torch.float16))
+            col_norm = net.W_act.data.norm(dim=0).mean()  # 平均列范数 (~1.0)
+            net.W_act.data += dW_act * (net.cfg.lm_lr_boost * 0.2) * (0.5 + intr_d) * col_norm * 5.0
+            # ── 复读检测跟踪 (裁决 12): 随机扰动已升级为内部状态错误配对
+            # (forward.py 生成路径, W_bind_self 定向扰动替代各向同性噪声).
+            # 此处保留复读状态跟踪供诊断/监控
+            gb_recent = gb[:, -10:]  # [N,10] 最近 10 字节
+            oh_r = F.one_hot(gb_recent, num_classes=256).to(torch.float16)  # [N,10,256]
+            n_uniq = (oh_r.sum(dim=1) > 0).sum(dim=-1).to(torch.float16)  # [N]
+            rep_run = getattr(net, "_rep_run", torch.zeros(N, device=dev, dtype=torch.float16))
+            in_rep = (n_uniq < 3).to(torch.float16)  # [N]
+            rep_run = torch.where(in_rep > 0, rep_run + 1.0, torch.zeros_like(rep_run))
+            net._rep_run = rep_run
+            net._rep_frac = in_rep.mean().to(torch.float16)  # 诊断 (fp16 张量, 零同步)
+            # 列范数保持 (0.8-1.2): 槽列有界防溢出; 转置视图 in-place 直接
+            # 写回原参数 (第 76 轮修复: 旧 .contiguous() 副本装饰性失效)
+            soft_norm_preserve(net.W_act.data.T)
 
         # 前馈权重软范数保持 (0.8-1.2): W_04/W_42/W_56 无 BCM 约束,
         # 长训累积溢出 fp16 → NaN; 幅度差异保留 (结构化非 clamp)
         # (free_run: W_04/W_42 冻结不更新, 但保持范数约束仍安全 — 不动它们)
-        if not free_run:
+        # 第 102 轮: echo_world_frozen 时 W_04/W_42/W_diff 冻结, 不触碰
+        if not free_run and not echo_world_frozen:
             for W, a_sz in zip([net.W_04, net.W_42], [a4, a2]):
                 soft_norm_preserve(W[:a_sz].data)
             # W_diff 同款软范数保持 (行范数)
@@ -1278,8 +1434,8 @@ class LearningEngine:
                 + eps5_td.square().mean()
                 + eps6.square().mean()
             ),
-            "future_err": (dz4 - pred_d).square().mean() if not free_run else 0.0,
-            "d_polarity": float(d_t.mean()) if (not free_run and hasattr(net, "_novelty")) else 1.0,
+            "future_err": (dz4 - pred_d).square().mean() if (not free_run and not echo_world_frozen) else 0.0,
+            "d_polarity": float(d_t.mean()) if (not free_run and not echo_world_frozen and hasattr(net, "_novelty")) else 1.0,
             # 观测器 (第 70 轮 v2): 原始 L5 局部误差能量 (同量纲, 供贡献率计算).
             # 诊断用, 不参与任何更新
             "l5_local_err": local_err_l5[:, mask5].square().mean().detach(),
