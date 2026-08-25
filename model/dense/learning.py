@@ -28,6 +28,11 @@ from .forward import _rms
 if TYPE_CHECKING:
     from .network import DensePCNet
 
+# 第 103 轮实验: 读出端信任域 — round-102 从零防噪设 1% (chat101 从零噪声淹没
+# 实证). 中期训练 (14000+ 步) 噪声已均值掉, 1% 可能钳制内容学习 (hit1 平台
+# ~0.14). 提升到 2.5% 测试内容是否突破. 若不稳定回退 0.01.
+LM_TRUST_REGION = 0.025
+
 
 def _activity_baseline(net: DensePCNet, post: torch.Tensor, ema_name: str) -> tuple[torch.Tensor, torch.Tensor]:
     """活动² 慢速局部基线 (第 79 轮抽取, 与第 78 轮能量约束同源): 返回 (p2, excess),
@@ -1074,7 +1079,7 @@ class LearningEngine:
             # 位置无关的实证). 单步相对扰动收敛到 1%: 信号可积累, 噪声被
             # 遗忘项 (×0.999) 平均掉. 与 W_04 幅度-方向解耦同族 (最大单步
             # 幅度 = eta·‖W‖·0.01, 结构化缩放非 clamp)
-            net.W_lm.data += dW_lm * (eta_lm * net.W_lm.norm() * 0.01)
+            net.W_lm.data += dW_lm * (eta_lm * net.W_lm.norm() * LM_TRUST_REGION)
             # bias 硬复位: 范数锁定 + 更新降幅 (第 102 轮) — 旧 target=100 →
             # bias_std 6.25, 经 inv_h 后仍 6× 主导 h 信号 → 中心化归一化后
             # bias 列排序存活 → 输出钉死频率先验 (位置无关 top-5 实证).
@@ -1103,7 +1108,7 @@ class LearningEngine:
             dW1 = dW1 / dW1_n
             # 第 102 轮: 同 W_lm 信任域 (见上) — 从零初始化时单位向量全量更新
             # 使 W1 每步整体重排, 学不到结构
-            W1_a.data += dW1 * (eta_lm * W1_a.norm() * 0.01)
+            W1_a.data += dW1 * (eta_lm * W1_a.norm() * LM_TRUST_REGION)
             soft_norm_preserve(W1_a.data)
 
             # W_lm_2 独立更新 (Q3 解耦): 吃 t+2 误差 + 差分误差 (eps_t2_total), 与 W_lm 完全独立
@@ -1128,7 +1133,7 @@ class LearningEngine:
             dW_lm2_n = dW_lm2.norm() + 1e-8
             dW_lm2 = dW_lm2 / dW_lm2_n  # 单步更新幅度上界 (防突爆)
             # 第 102 轮: 同 W_lm 信任域 (见上)
-            net.W_lm_2.data += dW_lm2 * (eta_lm * net.W_lm_2.norm() * 0.01)
+            net.W_lm_2.data += dW_lm2 * (eta_lm * net.W_lm_2.norm() * LM_TRUST_REGION)
             soft_norm_preserve(net.W_lm_2.data)
             # 每步清除新奇度 (前向已更新, 防陈旧信号跨步复用)
             if hasattr(net, "_novelty"):

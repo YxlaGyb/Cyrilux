@@ -81,7 +81,10 @@ class ForwardEngine:
         dev = byte_ids.device
         cur = byte_ids.clone()
         last_byte = torch.full((N,), -1, dtype=torch.long, device=dev)
-        utf8_run = torch.zeros(N, dtype=torch.long, device=dev)
+        # 第 103 轮: UTF-8 语法状态机 — 当前字符还需续字节数 (0 = 字符边界).
+        # 替代旧 bad_start 逻辑 (见 blocker 注释: 旧逻辑屏蔽续字节 → 多字节字符
+        # 永远无法完成, 生成恒 "lead+1续" 死循环的根因)
+        expect_cont = torch.zeros(N, dtype=torch.long, device=dev)
         if not hasattr(net, "_block_stats"):
             net._block_stats = {"rep": 0, "utf8": 0, "gen": 0}
         stats = net._block_stats
@@ -167,15 +170,15 @@ class ForwardEngine:
                 last = mu0_top[:, -1]  # [N,256] fp16
             if temperature > 0:
                 last = last / temperature
-            is_utf8_cont = (last_byte >= 0x80) & (last_byte <= 0xBF)
-            utf8_run = torch.where(is_utf8_cont, utf8_run + 1, torch.zeros_like(utf8_run))
             if rep_backstop:
                 stats["gen"] += N
                 # n-gram 周期检测 (第 64 轮): 最近 p 字节模式 == 前 p 字节模式
                 # (周期重复 ≥2 次) → 物理屏蔽周期末字节. p=3 覆盖 3 字节字符
                 # 循环 (ef bf bd), p=2 覆盖双字符交替, p=4 覆盖字符与 ASCII
-                # 交错. 词干 (nn/nn+functional) 无 ≥2 次周期重复, 不受影响
-                for p in (2, 3, 4):
+                # 交错. 词干 (nn/nn+functional) 无 ≥2 次周期重复, 不受影响.
+                # 第 103 轮: 扩展 p=5,6,8,10,12 — 模型逃逸到长周期循环 (周期
+                # 6-9 实测), p≤4 挡不住; 24 字节级精确重复必是循环, 非合法文本
+                for p in (2, 3, 4, 5, 6, 8, 10, 12):
                     if cur.shape[1] >= 2 * p:
                         pat = cur[:, -p:]  # [N,p] 最近 p 字节模式
                         prev = cur[:, -2 * p : -p]  # [N,p] 再前 p 字节模式
@@ -184,15 +187,22 @@ class ForwardEngine:
                         if n_block:
                             last[period, cur[:, -1][period]] = -1e4
                             stats["rep"] += n_block
-                # UTF-8 结构阻断: 当前字节是非法起始字节 (0x80-0xC1) 后紧跟续字节,
-                # 或续字节超长 (≥3, 合法单字符上限) — 屏蔽全部续字节 + 非法起始,
-                # 模型被迫从 ASCII / 合法起始字节 (0xC2-0xF4) 中选新字符
-                bad_start = (last_byte >= 0x80) & (last_byte <= 0xC1)
-                overrun = (utf8_run >= 3) | bad_start
-                n_utf8 = int(overrun.sum().item())
+                # UTF-8 语法阻断 (第 103 轮修复): 按 expect_cont 判定合法集合.
+                # 旧实现 (round 64) 把"上一字节是续字节"当 bad_start 屏蔽续字节 —
+                # 三字节/四字节字符永远无法完成, 生成恒 "lead+1续" 死循环
+                # (chat102 全链 dec 0.00-0.09 根因). 正确语义:
+                #   expect_cont>0 (字符中途): 下一字节必须是续字节 0x80-0xBF
+                #   expect_cont==0 (字符边界): 下一字节是 ASCII 或合法起始 0xC2-0xF4
+                # 结构阻断是解码器语法 (与 rep_backstop 同族), 非学习 clamp
+                n_utf8 = int((expect_cont > 0).sum().item())
                 if n_utf8:
-                    last[overrun, 0x80:0xC2] = -1e4
+                    last[expect_cont > 0, 0x00:0x80] = -1e4  # 中途禁 ASCII
+                    last[expect_cont > 0, 0xC0:0x100] = -1e4  # 中途禁 lead/非法
                     stats["utf8"] += n_utf8
+                n_bad = int((expect_cont == 0).sum().item())
+                if n_bad:
+                    # 边界禁续字节 0x80-0xBF + 非法起始 0xC0-0xC1 (overlong)
+                    last[expect_cont == 0, 0x80:0xC2] = -1e4
             topv, _ = torch.topk(last, min(15, 256), dim=-1)
             last[last < topv[:, -1:]] = -float("inf")
             probs = torch.softmax(last, dim=-1)
@@ -212,6 +222,12 @@ class ForwardEngine:
                 b = torch.multinomial(probs, 1).squeeze(-1)
             cur = torch.cat([cur, b.unsqueeze(-1)], dim=1)
             last_byte = b
+            # 更新 UTF-8 字符状态: 边界发合法起始 → 记录续字节需求; 中途发续 → 递减
+            is_l2 = (b >= 0xC2) & (b <= 0xDF)
+            is_l3 = (b >= 0xE0) & (b <= 0xEF)
+            is_l4 = (b >= 0xF0) & (b <= 0xF4)
+            lead_len = torch.where(is_l2, 1, torch.where(is_l3, 2, torch.where(is_l4, 3, torch.zeros_like(b))))
+            expect_cont = torch.where(expect_cont > 0, expect_cont - 1, lead_len)
         return cur
 
     def _recurrent(
