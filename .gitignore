@@ -9,7 +9,6 @@ py_models
 
 # data
 /dataset
-/docs
 *.pt
 *.jsonl
 *.egg-info
@@ -24,9 +23,6 @@ py_models
 # IDE
 /.vscode
 /.idea
-
-# AI
-.claude
 
 # Added by code-review-graph
 .code-review-graph/
