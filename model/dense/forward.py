@@ -150,7 +150,16 @@ class ForwardEngine:
                 z4_nl = z4_next / (1.0 + z4_next.abs())
                 z4_nl = _rms(z4_nl)
                 z4_nl = z4_nl * (1.0 - 0.5 * z4_nl.pow(2))
+                # 第 104 轮: 三阶输出分流止血 (与 learning.py 第 101 轮同款) —
+                # 生成路径此前缺此步, 训练端有 → 部署分布尾巴厚于训练 (|x|>1.4
+                # 三阶放大区), 属同族口径错配. 分流 x/(1+|x|), 结构化非 clamp.
+                z4_nl = z4_nl / (1.0 + z4_nl.abs())
                 zh_next = torch.cat([z4_nl, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)
+                # 第 104 轮: zh 整体 RMS 前置 — 与训练端 (learning.py) 和观测器
+                # (chat103/104 _wlm_logits) 同口径. 此前生成路径直连 W1, 训练分布
+                # (rms(zh)) 与部署分布 (未归一) 不同源 — 与 z4/z4_next 错配同族.
+                # 结构化 pre-norm, 非 clamp, 零行为风险 (echo 模式 z4 3x 防护同款).
+                zh_next = _rms(zh_next)
                 h_next = zh_next @ net.W1
                 h_next = h_next / (1.0 + h_next.abs())  # 分流抑制 (与训练同款)
                 h_next = h_next / (h_next.square().mean(dim=-1, keepdim=True).sqrt() * 1.01 + 1e-8)
@@ -178,14 +187,25 @@ class ForwardEngine:
                 # 交错. 词干 (nn/nn+functional) 无 ≥2 次周期重复, 不受影响.
                 # 第 103 轮: 扩展 p=5,6,8,10,12 — 模型逃逸到长周期循环 (周期
                 # 6-9 实测), p≤4 挡不住; 24 字节级精确重复必是循环, 非合法文本
-                for p in (2, 3, 4, 5, 6, 8, 10, 12):
+                # 第 104 轮: p 连续 2-24 — 旧列表 (2,3,4,5,6,8,10,12) 漏 7/9/11/13/14/15
+                # 字节周期 (实测 "句子的"=9B 双词循环逃逸), 长短语复读
+                # ("宠物，这些天。"=17B) 需更长 p; 短语级重复必是循环
+                for p in range(2, 25):
                     if cur.shape[1] >= 2 * p:
                         pat = cur[:, -p:]  # [N,p] 最近 p 字节模式
                         prev = cur[:, -2 * p : -p]  # [N,p] 再前 p 字节模式
                         period = (pat == prev).all(dim=-1)  # [N] 周期重复
                         n_block = int(period.sum().item())
                         if n_block:
-                            last[period, cur[:, -1][period]] = -1e4
+                            # 第 104 轮: 屏蔽整个模式字节值 — 单字节屏蔽 (旧:
+                            # 只屏蔽周期末字节) 只挡相位命中时刻, 模型逃逸到
+                            # +1 相位继续同一循环 (实测 澘=e6b88c 三轮换挡).
+                            # 命中时已完成 >=2 份周期, 屏蔽模式值只影响第 3 份
+                            # 及以后 — "谢谢"类双字词 (2 份) 完整保留, 长循环
+                            # 被切断. 解码器物理约束, 非学习 clamp.
+                            cyc_vals = torch.unique(pat[period])
+                            for bv_ in cyc_vals.tolist():
+                                last[period, bv_] = -1e4
                             stats["rep"] += n_block
                 # UTF-8 语法阻断 (第 103 轮修复): 按 expect_cont 判定合法集合.
                 # 旧实现 (round 64) 把"上一字节是续字节"当 bad_start 屏蔽续字节 —
@@ -372,7 +392,7 @@ class ForwardEngine:
             stp=(net._stp_r_l2[:a2], net._stp_tau_l2[:a2], net._stp_u_l2[:a2]) if free_run else None,
             stp_tag="l2" if free_run else None,
         )
-        # 预投影 RMSNorm (CLAUDE.md 铁律: 投影前加 RMSNorm 防 fp16 溢出):
+        # 预投影 RMSNorm :
         # 只归一化输入, 保方向压尖峰; 不归一化输出 mu, 不抹平差异
         z2_n = _l2_norm(z2)
         mu3 = z2_n @ W_23_a.T + net.bias_l3[:a3]

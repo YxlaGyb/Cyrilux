@@ -122,6 +122,15 @@ class DensePCConfig:
     # 实验参数: 绑定模式 (none/hard/soft) + 正交化开关
     bind_mode: str = "hard"
     bind_orth: bool = False
+    # 第 104 轮诊断开关: 冻结 W1 混合层 (只训练 W_lm). 验证读出端欠拟合
+    # 是否来自 W1/W_lm 共适应互扰 (两者同步 2.5% 信任域旋转, 目标在跑).
+    lm_freeze_w1: bool = False
+    # 第 104 轮诊断: 读出端调制开关 (第 58 轮对比度惩罚与 BCM phi 抑制).
+    # 假说: contrast_w 把 Hebbian 梯度拉离标准交叉熵方向 -> W_lm 欠拟合
+    # (ridge 解 0.26-0.38 vs 现状 0.06-0.15, 4-6 倍差距). 关闭后梯度=
+    # 纯交叉熵方向, 应逼近 ridge 解.
+    lm_no_contrast: bool = False
+    lm_no_bcm: bool = False
 
     def dims(self) -> dict[str, int]:
         return {
@@ -424,6 +433,25 @@ class DensePCNet(nn.Module):
         self.register_buffer("_gain_mask", (0.5 + torch.rand(d["l5"], d["l3"])).to(torch.float16))
         # L3 种子: W_23 固定随机增益掩码 (上游扰动级联到 L5)
         self.register_buffer("_gain_l3", (0.5 + torch.rand(d["l3"], d["l2"])).to(torch.float16))
+
+        # ── 突触资格迹缓冲区 (第 105 轮, 用户授权架构变更) ──
+        # 为每个 Hebbian 外积可塑性权重配同形迹矩阵 E_elig, 零初始化.
+        # 迹 = 过去外积的指数衰减记录 (单位增益归一化: E <- g·E + (1-g)·dW,
+        # 稳态量级 = 瞬时外积 — R=1.0 时 ΔW=η·R·E 平滑退化为现有 Hebbian,
+        # 不发散). 纯局部, 零全局统计, 零 BP, 全 fp16, 零 clamp.
+        # 用途 (未来): 延迟生存信号 R 到来时, ΔW = η·R·E 把"刚刚行动过的
+        # 突触"与"迟到的后果"绑定 (跨窗口因果). 默认 R=1.0 不启用.
+        # 「彳亍」— 让突触记住走过的路, 等待那个迟到的好结果.
+        # 排除: bias (无 pre⊗post 外积), E_*/M_l5 (反赫布机制, 非 Hebbian 外积).
+        _hebb_para_names = (
+            "W_04", "W_42", "W_23", "W_35", "W_56",
+            "W_t4", "W_t2", "W_t3", "W_t5", "W_t6",
+            "W_diff", "W_state_pred", "W_pred_54", "W_pred_43",
+            "W_bind", "W_bind_self", "W_act",
+            "W_lm", "W_lm_2", "W1",
+        )
+        for _wn in _hebb_para_names:
+            self.register_buffer(f"{_wn}_elig", torch.zeros_like(getattr(self, _wn).data))
 
         self._init_weights()
 

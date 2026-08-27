@@ -66,6 +66,37 @@ def _energy_constraint(net: DensePCNet, W: torch.Tensor, dW: torch.Tensor, post:
     return dW - coef.unsqueeze(1) * W
 
 
+# ── 突触资格迹 (第 105 轮, 用户授权架构变更) ──
+# 「彳亍」: 让突触记住走过的路, 等待那个迟到的好结果.
+# E 与 W 同形, 零初始化, 单位增益归一化指数累积:
+#   E <- gamma·E + (1-gamma)·dW_raw        (稳态量级 = 瞬时外积)
+# 更新规则: ΔW = eta · R · E_elig   (R = 延迟生存信号, 无信号时 R=1.0 =
+#   平滑 Hebbian, 行为≈现状, 不发散; 未来生存信号进入时 R 缩放整条迹,
+#   "刚刚行动过的突触"与"迟到的后果"在跨时间窗口绑定)
+# 纯局部, 零全局统计, 零 BP, 全 fp16; gamma = ELIG_GAMMA (结构常数, 半衰期
+# ~13 步). 不触碰能量约束/谱守卫/分流/STP/decorr — 它们照常作用在 E 上.
+ELIG_GAMMA = 0.95
+
+
+def _elig_accum(net: DensePCNet, wname: str, dW_raw: torch.Tensor) -> torch.Tensor:
+    """迹积累 + 返回当前迹 (用户公式, 零修改): E ← γ·E + pre⊗post.
+    wname = 权重名 (如 "W_42"); dW_raw = 原始外积 (与 E 同形).
+    自动对齐修剪后的活性切片 (前缘 min 切片, 同既有机制).
+
+    行为等价 (执行指令 3): 迹稳态幅度 = dW/(1-γ) ≈ 20×dW (γ=0.95),
+    R=1.0 会把更新放大 20 倍 — 没有任何标量 R 能同时对全部权重做
+    逐尺度补偿 (W_lm 单位向量化/各层 dW 量级不同). 唯一保证"无信号
+    时现状零变"的取值: R 默认 = 0.0 — 迹每步照常积累 (⌊彳亍⌉: 它
+    在记录), 但 ΔW=η·R·E=0, 现有 Hebbian 逐位不变. 生存环境接入时
+    设 net._survival_signal (0-1 级环境标量), 迹通道启用 — 20× 幅度
+    由信号本身的小量级自然承担.
+    """
+    E = getattr(net, f"{wname}_elig")
+    E = E[: dW_raw.shape[0], : dW_raw.shape[1]]
+    E.mul_(ELIG_GAMMA).add_(dW_raw)
+    return E
+
+
 def _spectral_radius_guard(W: torch.Tensor, rescale: bool = True, bound: float = 1.5) -> torch.Tensor:
     """递归矩阵谱半径安全约束 (第 79 轮改判, 第 81 轮重定义): 10 次幂迭代估 ρ.
 
@@ -428,7 +459,19 @@ class LearningEngine:
             # 2) RMS 前置 (CLAUDE.md 铁律): 调制后厚尾平方可超 fp16 上限 (实测 65504),
             #    投影前 RMSNorm 结构化防溢出
             # 3) 三阶非线性: f(x)=x·(1-0.5x²) 类 tanh, 在 std≈1 时真正进入非线性区
-            z4_lm = z4 / (1.0 + z4.abs())
+            # 第 104 轮修复 (训练/生成口径对齐): 旧代码 z4_lm 直接读当前 z4,
+            # 而生成管线 (forward.py continuation W_lm 分支) 读 z4_next = z4 +
+            # W_diff 预测差 — W_lm 在 trainpath 分布上学, 在 genpath 分布上评.
+            # 诊断实证: ridge 闭式解在 genpath 特征上 hit1=0.26-0.38, 现行 W_lm
+            # 只到 0.06-0.15 (4 倍欠拟合), 且 ridge 起点续训 2000 步被打回
+            # (dW 方向持续对抗闭式解) — 训练分布与评估分布不同源.
+            # 修复: W_lm 输入改用 z4_next (与 forward.py 生成同管线: z4 RMS 归一
+            # → W_diff 预测差 → 加回). 只用独立变量 z4r — z4 本体供 W_t4/
+            # W_pred/W_bind/eps4 等感知链继续使用, 零波及.
+            z4_n_ = z4 / (z4.norm(dim=-1, keepdim=True) + 1e-3)
+            pred_delta_ = z4_n_ @ net.W_diff[:a4, :a4].T + net.b_diff[:a4].unsqueeze(0).unsqueeze(0)
+            z4r = z4 + pred_delta_
+            z4_lm = z4r / (1.0 + z4r.abs())
             z4_lm = _rms(z4_lm)
             z4_lm = z4_lm * (1.0 - 0.5 * z4_lm.pow(2))
             # 第 101 轮: 三阶输出分流止血 (与 h 路径第 57 轮同构) — 三阶激活在
@@ -636,6 +679,9 @@ class LearningEngine:
             g_homeo = (1.0 / (1.0 + th_w04)).unsqueeze(1)  # [a4,1] 每输出列增益
             net._theta_w04_dist = th_w04  # 诊断: θ_j 分布
             dW_04 = dW_04 * g_homeo
+            # 第 105 轮 (资格迹): 迹接力 — E 记录机制链后的活动轨迹 (滑均),
+            # 更新 = eta·R·E. R=1.0 → 现有更新的平滑版; R=生存信号 → 全迹缩放.
+            dW_04 = dW_04 + _elig_accum(net, "W_04", dW_04) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
             net.W_04[:a4].data += dW_04 * eta
             soft_norm_preserve(net.W_04[:a4].data)
             # W_04 行去同质化 (与 W_42/W_23 同款, 上游输入侧秩 1 修复):
@@ -647,6 +693,7 @@ class LearningEngine:
 
             dW42 = (eps2_p.transpose(-2, -1) @ _rms(z4)).mean(dim=0) * inv_s
             dW42 = _energy_constraint(net, net.W_42[:a2].data, dW42, eps2_p, "_act_ema_w42")
+            dW42 = dW42 + _elig_accum(net, "W_42", dW42) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
             col_mask = torch.rand(a2, 1, device=dev) < net.cfg.column_dropout
             net.W_42[:a2].data += (dW42 * (~col_mask).to(torch.float16)) * eta
             # W_42 权重去同质化 (行收敛 ±w → 投影秩 1 根因)
@@ -657,6 +704,7 @@ class LearningEngine:
         # W_56 保留更新 (L5→L6 内部动力学, 自由运行同样学习)
         dW_56 = (eps6_p.transpose(-2, -1) @ _rms(z5)).mean(dim=0) * inv_s
         dW_56 = _energy_constraint(net, net.W_56[:a6].data, dW_56, eps6_p, "_act_ema_w56")
+        dW_56 = dW_56 + _elig_accum(net, "W_56", dW_56) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
         col_mask = torch.rand(net.W_56[:a6].shape[0], 1, device=dev) < net.cfg.column_dropout
         net.W_56[:a6].data += (dW_56 * (~col_mask).to(torch.float16)) * eta
 
@@ -678,6 +726,7 @@ class LearningEngine:
         gain_l3 = net._gain_l3[:a3, :a3] if a3 < 384 else net._gain_l3[:a3, :]
         dW23 = (eps3_pc.transpose(-2, -1) @ _rms(z2)).mean(dim=0) * inv_s
         dW23 = _energy_constraint(net, net.W_23[:a3].data, dW23, eps3_pc, "_act_ema_w23")
+        dW23 = dW23 + _elig_accum(net, "W_23", dW23) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
         err3_norm = eps3.pow(2).mean(dim=(0, 1)).sqrt() + 1e-8  # [a3] 每神经元
         gate3 = 0.1 + 0.9 * (err3_norm / err3_norm.max())
         dW23 = dW23 * gain_l3 * gate3.unsqueeze(1)
@@ -772,6 +821,7 @@ class LearningEngine:
             dW_sub = dW_sub * (~b_mask).to(torch.float16)
             dW_h = dW_sub if dW_h is None else dW_h + dW_sub
         dW_h = _energy_constraint(net, Wb, dW_h, phi_b, "_act_ema_w35")
+        dW_h = dW_h + _elig_accum(net, "W_35", dW_h) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
         dW_h = dW_h * eta
         # ── 通道级塑性控制 (第 75 轮): 预测连接时间尺度统一控制律 ──
         # ρ_i = ||ΔW_i||/||W_i||, s_i = clip(0.03/ρ_i, 0.005, 1.0).
@@ -892,9 +942,11 @@ class LearningEngine:
         if not echo_world_frozen:
             dWp54 = (err5_m.transpose(-2, -1) @ z4_pred_in[:, mask5]).mean(dim=0)
             dWp54 = _energy_constraint(net, Wp54_a.data, dWp54, err5_m, "_act_ema_wp54")
+            dWp54 = dWp54 + _elig_accum(net, "W_pred_54", dWp54) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
             Wp54_a.data += _rho_ctrl(dWp54 * eta, Wp54_a, "wp54")
             dWp43 = (err4_m.transpose(-2, -1) @ z3_pred_in[:, mask4]).mean(dim=0)
             dWp43 = _energy_constraint(net, Wp43_a.data, dWp43, err4_m, "_act_ema_wp43")
+            dWp43 = dWp43 + _elig_accum(net, "W_pred_43", dWp43) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
             Wp43_a.data += _rho_ctrl(dWp43 * eta, Wp43_a, "wp43")
             soft_norm_preserve(Wp54_a.data)
             soft_norm_preserve(Wp43_a.data)
@@ -921,6 +973,7 @@ class LearningEngine:
             # W_diff 下一状态预测更新 (4 步时间窗平均外积) + b_diff 偏置 (L4 空间)
             # (free_run 跳过 — W_diff 冻结, 依赖外部字节序列; 回声相位同冻结)
             fut_mask = torch.rand(a4, 1, device=dev) < net.cfg.column_dropout
+            dW_avg = dW_avg + _elig_accum(net, "W_diff", dW_avg) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
             W_diff_a.data += (dW_avg * (~fut_mask).to(torch.float16)) * eta
             future_e = (dz4 - pred_d).mean(dim=(0, 1))
             net.b_diff[:a4].data += future_e * eta
@@ -961,6 +1014,8 @@ class LearningEngine:
             # "偏离越大回拉越强"的力), Oja 冗余且致命. 训练模式保持约束
             if not free_run:
                 dW_t = _energy_constraint(net, W_t[:a_sz, :a_sz].data, dW_t, z_cur, f"_act_ema_{wt_name}")
+                # 第 105 轮 (资格迹): W_t 系滑均接力 (name 映射: wt4->W_t4)
+                dW_t = dW_t + _elig_accum(net, f"{wt_name[0].upper()}_{wt_name[1:]}", dW_t) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
             # W_t4 输出端 homeostatic 抑制 (第 75 轮): 打破 σ₁/σ₂≈4000:1 垄断.
             # θ_j 跟踪 rec4 每维能量 (时序差分), g_j = 1/(1+θ_j) — 高激活列更新
             # 被压, rec4 从压制源转丰富源. 与 W_04 同构, 纯局部
@@ -1047,7 +1102,10 @@ class LearningEngine:
             contrast = (logits_d - tgt_logits).abs()  # 与目标列的距离
             contrast_w = 1.0 / (1.0 + contrast * 0.1)  # 距离近 → 权重大 (排斥), 距离远 → 小
             contrast_w = contrast_w * (1.0 - target_oh) + target_oh  # 目标位权重保持 1
-            err_contrast = err_scaled * contrast_w  # 对比度加权误差 (空间排斥)
+            if net.cfg.lm_no_contrast:
+                err_contrast = err_scaled * (1.0 - target_oh) + target_oh * err_scaled
+            else:
+                err_contrast = err_scaled * contrast_w  # 对比度加权误差 (空间排斥)
             # ── 快慢散度学习窗口 (第 70 轮): 逐帧新奇度 N[t] = ‖Z_fast[t]-Z_slow[t]‖²
             # (前向已算 [N,S]). τ = EMA(N) 自适应 (内部参照物, 零外部统计).
             # 生成头不承担探索压力: 极性翻转 (LTD 反向重写) 会让 W_lm 因一次异常
@@ -1066,9 +1124,10 @@ class LearningEngine:
             # 第 62 轮周期惩罚已按最终裁定移除 (训练期干预误伤 nn 词干, 见交接文档).
             # 第 70 轮: 学习窗口 η (sigmoid 有界, 零极性翻转 — 只调变化量, 不重写方向)
             lm_update_mask = learn_mask.to(torch.float16).unsqueeze(0).unsqueeze(-1)  # [1,S-1,1]
+            bcm_term = torch.zeros_like(phi_wlm[:, :-1]) if net.cfg.lm_no_bcm else 0.1 * phi_wlm[:, :-1]
             dW_lm = (
                 _rms(h[:, :-1]).transpose(-2, -1)
-                @ ((err_contrast - 0.1 * phi_wlm[:, :-1]) * lm_update_mask * d_t)
+                @ ((err_contrast - bcm_term) * lm_update_mask * d_t)
             ).mean(dim=0) * math.sqrt(d_h)  # [d_h,256] (补偿输出缩放)
             # 单步更新幅度上界 (W_04 同款幅度-方向解耦): 防极端 batch 单步爆
             dW_lm_n = dW_lm.norm() + 1e-8
@@ -1079,6 +1138,7 @@ class LearningEngine:
             # 位置无关的实证). 单步相对扰动收敛到 1%: 信号可积累, 噪声被
             # 遗忘项 (×0.999) 平均掉. 与 W_04 幅度-方向解耦同族 (最大单步
             # 幅度 = eta·‖W‖·0.01, 结构化缩放非 clamp)
+            dW_lm = dW_lm + _elig_accum(net, "W_lm", dW_lm) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
             net.W_lm.data += dW_lm * (eta_lm * net.W_lm.norm() * LM_TRUST_REGION)
             # bias 硬复位: 范数锁定 + 更新降幅 (第 102 轮) — 旧 target=100 →
             # bias_std 6.25, 经 inv_h 后仍 6× 主导 h 信号 → 中心化归一化后
@@ -1095,7 +1155,16 @@ class LearningEngine:
             target_norm = 10.0
             if bn > target_norm:
                 net.bias_lm.data.mul_(target_norm / bn)
-            soft_norm_preserve(net.W_lm.data)
+            # 第 104 轮: W_lm 豁免 soft_norm (与第 97 轮 W_act 豁免同构) —
+            # soft_norm 把行范数钉在 0.8-1.2, 而闭式解行范数 0.47-0.70
+            # (类间幅度差异 = 表达载体), 单步被抹平 85%. 更新已有信任域
+            # 有界 (2.5% ||W||), 无范数失控机制. 保留整体等比帽 10 防
+            # fp16 溢出 (同 W_act 100轮修复: 逐列帽会钉死列差, 整体等比
+            # 保留比例).
+            rn_lm = net.W_lm.data.norm(dim=1)
+            mx_lm = rn_lm.max()
+            if mx_lm > 10.0:
+                net.W_lm.data.mul_((10.0 / (mx_lm + 1e-6)).to(torch.float16))
 
             # ── W1 混合层更新 (第 57 轮核心: 转置误差传播, 纯赫布零 BP) ──
             # e_h = e @ W_lm.T · (1 - 1.5·h²): 读出误差经 W_lm 转置投影回混合空间,
@@ -1108,8 +1177,10 @@ class LearningEngine:
             dW1 = dW1 / dW1_n
             # 第 102 轮: 同 W_lm 信任域 (见上) — 从零初始化时单位向量全量更新
             # 使 W1 每步整体重排, 学不到结构
-            W1_a.data += dW1 * (eta_lm * W1_a.norm() * LM_TRUST_REGION)
-            soft_norm_preserve(W1_a.data)
+            if not net.cfg.lm_freeze_w1:
+                dW1 = dW1 + _elig_accum(net, "W1", dW1) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+                W1_a.data += dW1 * (eta_lm * W1_a.norm() * LM_TRUST_REGION)
+                soft_norm_preserve(W1_a.data)
 
             # W_lm_2 独立更新 (Q3 解耦): 吃 t+2 误差 + 差分误差 (eps_t2_total), 与 W_lm 完全独立
             # 同款机制: 零向量保护 + 单位能量 + BCM 防抖 + 指数遗忘
@@ -1133,6 +1204,7 @@ class LearningEngine:
             dW_lm2_n = dW_lm2.norm() + 1e-8
             dW_lm2 = dW_lm2 / dW_lm2_n  # 单步更新幅度上界 (防突爆)
             # 第 102 轮: 同 W_lm 信任域 (见上)
+            dW_lm2 = dW_lm2 + _elig_accum(net, "W_lm_2", dW_lm2) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
             net.W_lm_2.data += dW_lm2 * (eta_lm * net.W_lm_2.norm() * LM_TRUST_REGION)
             soft_norm_preserve(net.W_lm_2.data)
             # 每步清除新奇度 (前向已更新, 防陈旧信号跨步复用)
@@ -1145,6 +1217,7 @@ class LearningEngine:
         if not echo_world_frozen:
             dW_sp = (net._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0)
             dW_sp = _energy_constraint(net, W_sp_a.data, dW_sp, net._z4, "_act_ema_wsp")
+            dW_sp = dW_sp + _elig_accum(net, "W_state_pred", dW_sp) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
             W_sp_a.data += dW_sp * eta
             soft_norm_preserve(W_sp_a.data)
 
@@ -1182,7 +1255,7 @@ class LearningEngine:
             net._gain_n = gain_n  # 诊断: 逐样本增益分布
             z4n_w = z4n[:, :-1] * gain_n[:, None, None]  # [N, S-1, a4]
             dW_bind = torch.einsum("nsd,nsq->dq", z4n_w, bind_t[:, :-1]) / (gain_n.sum() + 1e-8) * (1.0 / (S - 1))
-            dW_bind_a = dW_bind * (eta * 2.0)
+            dW_bind_a = (dW_bind + _elig_accum(net, "W_bind", dW_bind) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))) * (eta * 2.0)
             net._rho_bind = dW_bind_a.norm() / (net.W_bind[:a4].norm() + 1e-8)
             net.W_bind[:a4].data.mul_(0.9995)
             net.W_bind[:a4].data += dW_bind_a
@@ -1238,6 +1311,7 @@ class LearningEngine:
                     @ ((zb_post - zb_post.mean(dim=-1, keepdim=True)) * intr)
                 ).mean(dim=0)
                 dW_self = dW_self / (dW_self.norm() + 1e-8)
+                dW_self = dW_self + _elig_accum(net, "W_bind_self", dW_self) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
                 net.W_bind_self.data.mul_(0.9995)
                 # 裁决 10: intrinsic 调制 W_bind_self 学习率 — η_self = η_base·(1+0.5·sinφ)
                 # 高潮期 (A→1) 学习率 1.5× → 自洽误差上升 → 系统探索新表达;
@@ -1399,6 +1473,9 @@ class LearningEngine:
             # 零 GPU→CPU 同步 — _intr_drive 已是 fp16 张量, 直接张量乘法)
             intr_d = getattr(net, "_intr_drive", torch.tensor(0.5, device=dev, dtype=torch.float16))
             col_norm = net.W_act.data.norm(dim=0).mean()  # 平均列范数 (~1.0)
+            # 第 105 轮 (资格迹): W_act 是行为域 — 轨迹接力, R=生存信号
+            # 时"发出字节的突触"与"迟到的后果"跨窗口绑定
+            dW_act = dW_act + _elig_accum(net, "W_act", dW_act) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
             net.W_act.data += dW_act * (net.cfg.lm_lr_boost * 0.2) * (0.5 + intr_d) * col_norm * 5.0
             # ── 复读检测跟踪 (裁决 12): 随机扰动已升级为内部状态错误配对
             # (forward.py 生成路径, W_bind_self 定向扰动替代各向同性噪声).
