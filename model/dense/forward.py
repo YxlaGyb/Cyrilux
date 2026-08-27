@@ -132,9 +132,12 @@ class ForwardEngine:
                     net._mismatch_active = in_rep.mean()  # 诊断: 复读占比
                 pot = z_bind @ net.W_act  # [N,256] 动作电位
                 # 可打印掩码对齐训练读出空间 (第 76 轮): 0x00-0x1F 物理屏蔽
-                mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
-                mask_print[32:] = 1.0
-                pot = pot + (1.0 - mask_print) * -1e4
+                # 第 108 轮: _act_bare=True 时免除 — 表达学习由 W_lm 裁判
+                # (exp108: 环境 = 冻结世界模型, 唯一裁判不是解码器语法)
+                if not getattr(net, "_act_bare", False):
+                    mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
+                    mask_print[32:] = 1.0
+                    pot = pot + (1.0 - mask_print) * -1e4
                 # 第 102e 轮: 移除频率去偏 (原 -6·log(freq)/freq_act) — 与 W_lm
                 # 分支同因: 去偏量级与电位相当, 把表达结构压平 (chat102d 表达
                 # dec 0.03 实证). 表达结构由 W_act 学习塑造 (决策态自洽 + 感知
@@ -146,7 +149,7 @@ class ForwardEngine:
                 z4_n = net._z4 / (net._z4.norm(dim=-1, keepdim=True) + 1e-3)
                 pred_delta = z4_n @ W_diff_a.T + net.b_diff[:a4].unsqueeze(0).unsqueeze(0)
                 z4_next = net._z4 + pred_delta
-                # 与训练头同款: 分流抑制 → RMS → 三阶 → 记忆池+绑定拼接 → W1 混合层
+                # 与训练头同款: 分流抑制 → RMS → 三阶 → 记忆单元+绑定拼接 → W1 混合层
                 z4_nl = z4_next / (1.0 + z4_next.abs())
                 z4_nl = _rms(z4_nl)
                 z4_nl = z4_nl * (1.0 - 0.5 * z4_nl.pow(2))
@@ -154,7 +157,7 @@ class ForwardEngine:
                 # 生成路径此前缺此步, 训练端有 → 部署分布尾巴厚于训练 (|x|>1.4
                 # 三阶放大区), 属同族口径错配. 分流 x/(1+|x|), 结构化非 clamp.
                 z4_nl = z4_nl / (1.0 + z4_nl.abs())
-                zh_next = torch.cat([z4_nl, net._m2, net._m8, net._m32, net._bind_vec], dim=-1)
+                zh_next = torch.cat([z4_nl, net._bind_vec, net._mem_out], dim=-1)
                 # 第 104 轮: zh 整体 RMS 前置 — 与训练端 (learning.py) 和观测器
                 # (chat103/104 _wlm_logits) 同口径. 此前生成路径直连 W1, 训练分布
                 # (rms(zh)) 与部署分布 (未归一) 不同源 — 与 z4/z4_next 错配同族.
@@ -457,23 +460,23 @@ class ForwardEngine:
                 for sln, sz in (("l4", z4), ("l2", z2), ("l3", z3), ("l6", z6)):
                     if sln in net._stp_r_end:
                         self._stp_update(sln, net._stp_r_end[sln], sz)
-            # 多级记忆池 (3 级因果卷积核, 替代单变量 h): 即时 2 步 / 短时 8 步 /
-            # 长时 32 步 — 每级 = 核窗口内 z4 的因果滑动平均 (纯机制, 无超参权重),
-            # 位置信息由各级窗口保留, 跨序列经 _m_pool 延续 (零填充 = 接续上序列末态)
+            # 竞争性记忆单元群 (第 109 轮): K 个泄漏积分单元 (时间常数 α 自持),
+            # m_c[t] = (1-α_c)·m_c[t-1] + α_c·z4[t]. 跨窗延续 = 批均值写回
+            # (同 _m_pool 语义), 时间尺度谱由适应度/出生/死亡机制涌现
+            # (learning.py), 此处仅演化+展平供读出.
             # 注: 保留循环版 — 张量化 (幂次权重矩阵) 在 fp16 下与循环乘法链
             # 舍入不同 (0.5^64 下溢为 0 vs 逐步乘保留), 数学不等价 (第 76 轮实测
             # 最大差 17.9), 不可用于训练
-            m_prev = net._m_pool.unsqueeze(0).unsqueeze(0).expand(N, 1, -1).clone()  # [N,1,3a4]
-            m2 = m_prev[:, :, :a4]
-            m8 = m_prev[:, :, a4 : 2 * a4]
-            m32 = m_prev[:, :, 2 * a4 :]
+            K = net._mem_m.shape[0]
+            a4_ = net._mem_m.shape[1]
+            m_prev = net._mem_m.unsqueeze(0).unsqueeze(0).expand(N, 1, K, a4_).clone()  # [N,1,K,a4]
+            m = m_prev
             for t in range(1, S):
-                zt = z4[:, t : t + 1]  # [N,1,a4]
-                m2 = torch.cat([m2, 0.5 * m2[:, -1:] + 0.5 * zt], dim=1)
-                m8 = torch.cat([m8, 0.125 * m8[:, -1:] + 0.875 * zt], dim=1)
-                m32 = torch.cat([m32, 0.03125 * m32[:, -1:] + 0.96875 * zt], dim=1)
-            net._m_pool = torch.cat([m2[:, -1], m8[:, -1], m32[:, -1]], dim=-1).mean(dim=0)  # [3a4]
-            net._m2, net._m8, net._m32 = m2, m8, m32  # [N,S,a4] 每级记忆池
+                zt = z4[:, t : t + 1].unsqueeze(2)  # [N,1,1,a4]
+                mt = (1 - net._mem_a)[None, None, :, None] * m[:, -1:] + net._mem_a[None, None, :, None] * zt
+                m = torch.cat([m, mt], dim=1)
+            net._mem_out = m.reshape(N, S, K * a4_)  # [N,S,K·a4] 展平供 zh 拼接
+            net._mem_m = m[:, -1].mean(dim=0).detach()  # [K,a4] 批均值写回
             # 才是"状态是否推进"的信号. tau 按原始量级自动校准 (EMA).
             # 死循环: 帧不再转移 → 慢通道收敛向快通道 → N → 0 (LTD 主动遗忘);
             # 正常推进: z4 持续领先 → N 健康正值 (LTP)

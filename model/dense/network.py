@@ -131,6 +131,22 @@ class DensePCConfig:
     # 纯交叉熵方向, 应逼近 ridge 解.
     lm_no_contrast: bool = False
     lm_no_bcm: bool = False
+    # ── 竞争性记忆单元群 (第 109 轮: 替代第 107 轮 6 级手写时间常数梯子) ──
+    # 每单元 = 对 z4 的泄漏积分 m (时间常数 α 自持), 增益 g 由"单元记忆与
+    # 读出误差的余弦相关"赫布驱动; 误差持续偏高 → 从增益最高单元二分出子
+    # (α×2 或 ÷2), g 长期低 → 死亡. 时间尺度谱从机制涌现, 非人手指定.
+    # α 域边界 (2 幂保证 fp16 精确) 是细胞可实现边界, 非任务调参.
+    mem_k0: int = 6  # 初始单元数 (= 旧 6 级, 纯初始条件)
+    mem_k_max: int = 16  # 单元数上限 (显存预算, 硬上界)
+    mem_alpha_min: float = 1.0 / 1024.0  # 时间常数下限 (1024 步窗)
+    mem_alpha_max: float = 0.5  # 时间常数上限 (2 步窗)
+    mem_g_max: float = 2.0  # 增益上界 (有界参数, 非梯度路径)
+    mem_g_min: float = 0.05  # 增益死亡阈值
+    mem_eta_g: float = 0.01  # 增益更新速率 (沿 q 同向)
+    mem_g_decay: float = 0.001  # 增益乘性衰减 (零贡献单元 g→0, 死亡可达)
+    mem_birth_thresh: float = 1.2  # 出生阈值: 误差 EMA > 长程均值 × 此值
+    mem_birth_cooldown: int = 2000  # 两次出生最小间隔 (步)
+    mem_death_steps: int = 2000  # 增益低于阈值持续步数 (死亡判决)
 
     def dims(self) -> dict[str, int]:
         return {
@@ -205,7 +221,9 @@ class DensePCNet(nn.Module):
         # 预测, 由 W_lm 端学习哪些槽组合预测哪字节. 槽位更新纯赫布外积 + 去均值
         # (Oja 式, 零 BP), 归一化防坍缩
         self.bind_slot_dim = 32  # 裁决 14: 16→32 槽扩容 (容量上限 16→32, 20+ 可达)
-        self._lm_in = d["l4"] * 4 + self.bind_slot_dim
+        # zh 输入维 = z4_lm + bind + 记忆单元块 (第 109 轮: K0=6 时 = 7a4+32, 同旧
+        # 8 段布局数值; K 随出生/死亡变化, W1 行数同步增减)
+        self._lm_in = d["l4"] * (1 + self.cfg.mem_k0) + self.bind_slot_dim
         self.W_bind = nn.Parameter(torch.empty(d["l4"], self.bind_slot_dim, dtype=torch.float16))
         # 概念槽 homeostatic 滑阈 (第 75 轮): θ_j 跟踪 z_bind_j² 槽能量,
         # z_bind_j /= (1+θ_j) — 高激活槽增益低 → 对称性自发破缺 → 软 WTA 涌现
@@ -310,7 +328,33 @@ class DensePCNet(nn.Module):
         # W_lm 唯一任务: 把状态映射到下一字节, 纯外积.
         # 多级记忆池拼接进 W_lm 输入 (输入维 = 4×d_l4 + bind): 3 级因果卷积核
         # (2/8/32 步) 承载跨序列低分辨率信息; 池间竞争由各通路 BCM 滑阈自动调节 (注意力雏形)
-        self.register_buffer("_m_pool", torch.zeros(3 * d["l4"], dtype=torch.float16))
+        # ── 竞争性记忆单元群 (第 109 轮: 替代 6 级手写时间常数梯子) ──
+        # _mem_m [K, a4] 单元状态 (对 z4 的泄漏积分); _mem_a [K] 时间常数 (2 幂,
+        # 出生时二分探索); _mem_g [K] 增益 (余弦相关赫布驱动); _mem_q [K] 适应度
+        # EMA. K 随出生/死亡动态变化 (buffer 重注册, 修剪 _shrink_columns 先例).
+        # 初始 α 复用旧 6 值 (仅初始条件; 其后由机制接管). 纯属性 (非 buffer):
+        # _mem_birth_cd 冷却计数, _mem_death_cnt 死亡判决计数, _mem_alt α 交替方向
+        self.register_buffer("_mem_m", torch.zeros(self.cfg.mem_k0, d["l4"], dtype=torch.float16))
+        self.register_buffer(
+            "_mem_a",
+            torch.tensor(
+                [0.5, 0.125, 0.03125, 0.015625, 0.0078125, 0.00390625][: self.cfg.mem_k0],
+                dtype=torch.float16,
+            ),
+        )
+        self.register_buffer("_mem_g", torch.full((self.cfg.mem_k0,), self.cfg.mem_g_max / 2.0, dtype=torch.float16))
+        self.register_buffer("_mem_q", torch.zeros(self.cfg.mem_k0, dtype=torch.float16))
+        self._mem_birth_cd = 0
+        self.register_buffer(
+            "_mem_death_cnt", torch.zeros(self.cfg.mem_k0, dtype=torch.int32)
+        )  # register_buffer: 普通属性不随 .to(device) 迁移 → GPU 设备不匹配
+        self._mem_alt = 0
+        # 误差驱动出生: 快 EMA (误差当前水平) vs 慢 EMA (长程基线), 零维 buffer
+        # (随设备迁移; 更新在 learning.py, 全 fp16 原地, 无 .item())
+        self.register_buffer("_mem_err_ema", torch.zeros(1, dtype=torch.float16))
+        self.register_buffer("_mem_err_long", torch.zeros(1, dtype=torch.float16))
+        if self.cfg.mem_k0 > 6:
+            raise ValueError("mem_k0 > 6 需要补充初始 α 谱")
         # 内部 EMA 频率 (第 54 轮读出端去偏): 纯模型内部累计 target 分布,
         # 绝不依赖外部统计. 全 fp16 (0.01 级增量 fp16 可精确表示, 1/256 初值
         # 与增量同量级, 无精度损失)
@@ -423,6 +467,9 @@ class DensePCNet(nn.Module):
         self.E_t3 = nn.Parameter(torch.zeros(d["l3"], d["l3"], dtype=torch.float16))
         self.E_t4 = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))  # W_t4 漏挂修复
         self.E_t5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
+        # 第 107 轮 (用户改判): W_t6 纳入 decorr 家族 — R-迹 × W_t6 top 特征值
+        # 攀升五连 NaN (471/281/493/881/1366) 的根因; E_t6 零起步同族同式
+        self.E_t6 = nn.Parameter(torch.zeros(d["l6"], d["l6"], dtype=torch.float16))
         # W_bind 行去同质化矩阵 (与 E_l5/E_42/E_23 同款, 防秩 1 自锁)
         self.E_bind = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
         self.E_04 = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
@@ -465,16 +512,11 @@ class DensePCNet(nn.Module):
         self.pruner = PruningEngine(self)
 
     def _init_weights(self):
-        """Kaiming 初始化所有权重 (行范数 ≈ 1.0, 配合 Oja 稳态).
-
-        例外: W_lm/W_lm_2 的记忆池段 (m2/m8/m32, 后 3/4) 初始化接近 0 (1e-4) —
-        新池从"无贡献"开始学 (生物发育: 突触从杂乱到有效), 由池门控自然放大
-        有用的池; z4 段保持 Kaiming (加载旧权重时被覆盖).
-        """
+        """Kaiming 初始化所有权重 (行范数 ≈ 1.0, 配合 Oja 稳态)."""
         for name, p in self.named_parameters():
             if "bias" in name:
                 continue
-            if name in ("E_l5", "E_42", "E_23", "M_l5", "E_t2", "E_t3", "E_t4", "E_t5", "E_bind", "E_bind_col", "E_04", "E_bind_self"):
+            if name in ("E_l5", "E_42", "E_23", "M_l5", "E_t2", "E_t3", "E_t4", "E_t5", "E_t6", "E_bind", "E_bind_col", "E_04", "E_bind_self"):
                 continue  # 去相关矩阵零起步 (M=0 → 前向恒等)
             if name == "W_act":
                 nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(self.bind_slot_dim))
@@ -540,6 +582,12 @@ class DensePCNet(nn.Module):
                 input_history=sd["W_04"].shape[1] != 256,
             )
         net = cls(config)
+        # ── 旧检查点 (第 107 轮 6 级梯子) 一次性迁移到记忆单元群 ──
+        # 旧 W1 行布局 [z4 | m2 | m8 | m32 | bind | m64 | m128 | m256] →
+        # 新 [z4 | bind | cells c0..c5]; 新 cell c 源索引 = 4·a4 + 32 + c·a4.
+        # _m_pool [6·a4] 拆 6 段 → _mem_m; _mem_a 复用旧 6 α; g=1.0 起步.
+        if "_m_pool" in sd and "_mem_m" not in sd:
+            net._migrate_mem(sd)
         nsd = net.state_dict()
         for k, v in sd.items():
             if k not in nsd:
@@ -564,9 +612,40 @@ class DensePCNet(nn.Module):
             if buf.numel() > 0 and buf.abs().sum() == 0:
                 buf.fill_(0.01)
 
-        # _m_pool (多级记忆池) 对齐活性 L4 (旧检查点无此缓冲 → init 全量, 需裁 3 段)
-        if net._m_pool.shape[0] != 3 * net.active_size["l4"]:
-            old_m = net._m_pool.data
-            net.register_buffer("_m_pool", old_m[: 3 * net.active_size["l4"]].contiguous())
+        # _mem_m 对齐活性 L4 (修剪后检查点, 单元状态列数 = 活性维)
+        if net._mem_m.shape[1] != net.active_size["l4"]:
+            old_m = net._mem_m.data
+            net.register_buffer("_mem_m", old_m[:, : net.active_size["l4"]].contiguous())
             del old_m
         return net
+
+    def _migrate_mem(self, sd: dict) -> None:
+        """旧 _m_pool 检查点 (第 104/107 轮) → 记忆单元群迁移 (一次性).
+
+        旧 W1 行布局 [z4 | 池段×p | bind] → 新 [z4 | bind | 单元×k0].
+        p = 旧池级数 (3 或 6); 不足 k0 的单元零起步.
+        """
+        a4 = sd["W_04"].shape[0]
+        p = sd["_m_pool"].shape[0] // a4
+        k0 = self.cfg.mem_k0
+        bind_sz = self.bind_slot_dim
+        old_w1 = sd["W1"]
+        d_h = old_w1.shape[1]
+        # 旧布局: [z4(a4) | 池×p(a4 each) | bind(bind_sz)] — bind 紧跟在池段后
+        segs = [old_w1[(1 + i) * a4 : (2 + i) * a4] for i in range(p)]
+        bind_off = (1 + p) * a4
+        sd["W1"] = torch.cat(
+            [old_w1[:a4], old_w1[bind_off : bind_off + bind_sz], *segs],
+            dim=0,
+        ).contiguous()
+        if p < k0:
+            sd["W1"] = torch.cat(
+                [sd["W1"], torch.zeros((k0 - p) * a4, d_h, dtype=torch.float16)],
+                dim=0,
+            ).contiguous()
+        m_segs = sd["_m_pool"].reshape(p, a4)
+        cells = [m_segs[i] for i in range(p)]
+        if p < k0:
+            cells += [torch.zeros(a4, dtype=torch.float16)] * (k0 - p)
+        sd["_mem_m"] = torch.stack(cells).contiguous()
+        del sd["_m_pool"]
