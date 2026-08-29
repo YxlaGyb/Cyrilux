@@ -622,8 +622,9 @@ class DensePCNet(nn.Module):
     def _migrate_mem(self, sd: dict) -> None:
         """旧 _m_pool 检查点 (第 104/107 轮) → 记忆单元群迁移 (一次性).
 
-        旧 W1 行布局 [z4 | 池段×p | bind] → 新 [z4 | bind | 单元×k0].
-        p = 旧池级数 (3 或 6); 不足 k0 的单元零起步.
+        旧 W1 行布局 [z4 | m2 | m8 | m32 | bind | (m64|m128|m256)] → 新 [z4 | bind | 单元×k0].
+        bind 恒在 m32 之后 (offset 4·a4); p=6 时 3 长池在 bind 之后. 新单元行序 = 旧池序
+        [m2,m8,m32,m64,m128,m256] (与 _mem_m 行序/α 谱一致); 不足 k0 的单元零起步.
         """
         a4 = sd["W_04"].shape[0]
         p = sd["_m_pool"].shape[0] // a4
@@ -631,9 +632,16 @@ class DensePCNet(nn.Module):
         bind_sz = self.bind_slot_dim
         old_w1 = sd["W1"]
         d_h = old_w1.shape[1]
-        # 旧布局: [z4(a4) | 池×p(a4 each) | bind(bind_sz)] — bind 紧跟在池段后
-        segs = [old_w1[(1 + i) * a4 : (2 + i) * a4] for i in range(p)]
-        bind_off = (1 + p) * a4
+        # 旧布局: [z4(a4) | m2 | m8 | m32 (3 短池, a4 each) | bind(bind_sz) | 长池×max(p-3,0)]
+        # bind 恒在短池段后 → offset 恒为 4·a4 (代码此前假设 bind 在尾, 与旧布局不符).
+        n_short = 3
+        bind_off = (n_short + 1) * a4
+        segs = [old_w1[(1 + i) * a4 : (2 + i) * a4] for i in range(n_short)]  # m2/m8/m32
+        if p > n_short:  # p=6 长池 (m64/m128/m256) 在 bind 之后
+            segs += [
+                old_w1[(bind_off + bind_sz + (i - n_short) * a4) : (bind_off + bind_sz + (i - n_short + 1) * a4)]
+                for i in range(n_short, p)
+            ]
         sd["W1"] = torch.cat(
             [old_w1[:a4], old_w1[bind_off : bind_off + bind_sz], *segs],
             dim=0,

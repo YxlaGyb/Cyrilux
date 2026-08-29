@@ -156,6 +156,22 @@ class ReadoutMixin(_MixinBase):
         eps_total = (eps_lm + 0.2 * diff2).detach()  # W_lm: t+1 误差 + 差分误差 (S-1 对齐)
         eps_t2_total = (eps_t2 + 0.2 * diff2[:, :-1]).detach()  # W_lm_2: t+2 误差 + 差分误差 (S-2)
 
+        # 第 110 轮 D2 (语言带自校准), 110c 带宽自校准: 感知相位记录真实语言
+        # 的 ε 中心与弥散 — 纯统计零学习, 供 echo 相位带状 R 校准 (action.py).
+        # 中心 = EMA; 弥散 = 窗间 MAD 的 EMA — 带宽不再是设计者常数, 是
+        # "她听到的语言天然有多散". 口径与 echo 侧 wlm_err=1−p_gen 对齐.
+        # echo 相位冻结 (echo_world_frozen) 不更新 — 生成流不配定义语言带.
+        if not ctx.echo_world_frozen:
+            eps_lang = 1.0 - (probs_lm[:, :-1] * target_lm).sum(dim=-1).mean()
+            _lang_ema = getattr(net, "_lang_eps_ema", None)
+            if _lang_ema is None:
+                net._lang_eps_ema = eps_lang.detach().clone()
+                net._lang_eps_mad = torch.zeros_like(eps_lang.detach())
+            else:
+                net._lang_eps_ema.mul_(0.995).add_(0.005 * eps_lang)
+                devi = (eps_lang - net._lang_eps_ema).abs()
+                net._lang_eps_mad.mul_(0.95).add_(0.05 * devi)
+
         # 动态稳态竞争: 每步记录 batch 级 W_lm 熵 (全 fp16, 零精度依赖:
         # 0·log(0)≡0 信息论定义, torch.where 屏蔽零概率项 — 不用 epsilon
         # 保护常数, fp16 下 1e-9 舍入为 0 → log(0)=-inf → 熵 NaN → 全链崩,

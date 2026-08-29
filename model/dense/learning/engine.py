@@ -168,29 +168,30 @@ class EngineCore(
             inp = self._closed_loop_input(byte_ids)
         elif byte_ids is None:
             # 108轮 自回声自由运行 — 无外部输入, 输入=上一窗生成字节.
-            # 最终采用 W_lm 分支生成 (use_w_act=False): 从感知相位保存的真实文本尾部
-            # 续写, 生成流前段带真实结构; 冻结 W_lm 给出有结构的续写预测, 作为
-            # W_act 的软目标 (zb_g, probs_g). W_act 分支会生成乱码, 使 W_lm 预测
-            # 退化为乱码统计, 软目标无结构, 学不到有效映射 (102f/102l 实证;
-            # 102h 曾短暂改回 W_act 失败).
+            # 第 110 轮 D1 (声道合一): W_lm 读出为唯一声道 — use_w_act 发射
+            # 分支已删除 (108 实验: W_act 发射=乱码 + ε_lm 极性倒挂双证伪),
+            # W_act 降格为意图调制器 (continuation 内注入 logits, ≤15%).
+            # 生成流 = 冻结世界模型在内部状态调制下的自续写.
             s_frw = net.cfg.free_run_window
             seed = getattr(net, "_echo_seed", None)
             if seed is None or seed.numel() == 0:
                 seed = torch.zeros(1, 1, dtype=torch.long, device=net._osc_f_cnt.device)
-            # 108 轮: 生成分支可开关 — _echo_w_act=True 时走 W_act 动作回路
-            # (exp108 核心: 系统先"发出"声音, 世界模型 W_lm 再裁判). 102l 的
-            # 暂停恢复 (Hard) 是历史基线, 默认关 = 既有行为逐位不变.
-            saved_w_act = getattr(net, "use_w_act", False)
-            net.use_w_act = getattr(net, "_echo_w_act", False)
+            # 第 110 轮 D5 (声道探索): 温度采样为变异通道 — probe110b 扫描
+            # 实测 ε(τ) 单调: 贪心 0.55 (循环带) → τ*=4.0 落语言带心 0.88 →
+            # τ≥16 滑乱码带. 温度由恒温器负反馈自调 (action.py: ε 自测偏差
+            # → 温度修正, 纯内部量), 默认 4.0 = 物理校准值 (107 κ 先例).
+            # 110c: rep_backstop 默认关 — 反循环外部物理门从她的声音移除,
+            # 循环由她自己的裁判 (语言带 R 惩罚循环带) + 恒温器处置.
             saved_entropy = getattr(net, "_entropy_sample", False)
             net._entropy_sample = getattr(net, "_echo_entropy", False)
-            saved_rep = getattr(net, "_echo_rep", True)
+            saved_rep = getattr(net, "_echo_rep", False)
+            _gt = getattr(net, "_gen_temp", None)
+            _temp = float(_gt.item()) if _gt is not None else 4.0
             try:
                 out = net.forward_engine.continuation(
-                    seed, s_frw - 1, temperature=0.0, rep_backstop=saved_rep
+                    seed, s_frw - 1, temperature=_temp, rep_backstop=saved_rep
                 )
             finally:
-                net.use_w_act = saved_w_act
                 net._entropy_sample = saved_entropy
             net._gen_bytes = out[:, -(s_frw - 1):]  # 去掉种子, 输入 = 纯生成流
             inp = net._gen_bytes

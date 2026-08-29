@@ -93,57 +93,11 @@ class ForwardEngine:
         for _ in range(n_gen):
             bv = cur[:, -64:]  # 上下文窗口 64 (任务语义)
             _ = self._predict(bv, store_state=True, is_inference=True)
-            if getattr(net, "use_w_act", False):
-                # 动作回路 (第 76 轮): 概念槽 z_bind → W_act 脉冲字节, 离散事件驱动
-                # 裁决 10: 思考循环已剥离 (NaN 工厂); 裁决 12: 内部状态错误配对
-                z_bind = net._bind_vec[:, -1]  # [N,16] 概念槽 (连续值稀疏)
-                # ── 内部状态错误配对 (裁决 12/13): 持续低强度运作 ──
-                # 复读检测: 最近 10 步唯一字节 <3 → 复读深度累计 (探索清零).
-                # 错配始终在线: 强度 = 0.01 + 0.15·min(rep_depth/10, 1) —
-                # 复读深度 0 也有 0.01 背景探索 (蓝斑强直性活动, 防完全固化);
-                # 深度 ≥1 强度线性增长至 0.16 (满幅探索).
-                # 扰动: 从 z_bind@W_bind_self 转移偏好 top-3 目标槽随机选一,
-                # z_bind += strength·(tgt_emb - z_bind). 定向 (非随机噪声),
-                # 由内部转移模型结构决定方向 (海马尖波涟漪组合性探索).
-                # 注意: 生成端独立维护 rep_depth (学习端 _rep_run 不同步到此)
-                if getattr(net, "_mismatch", False) and cur.shape[1] >= 10:
-                    gb_recent = cur[:, -10:]  # [N,10]
-                    oh_r = F.one_hot(gb_recent, num_classes=256).to(torch.float16)
-                    n_uniq = (oh_r.sum(dim=1) > 0).sum(dim=-1)  # [N] 每样本唯一字节数
-                    in_rep = (n_uniq < 3).to(torch.float16)  # [N]
-                    # _rep_depth 按当前 batch 对齐 (跨 batch 残留会广播错位,
-                    # 第 76 轮实测: 训练 batch=8 残留 → 评估 N=1 时 z_bind 扩到 [8,16])
-                    rep_depth = getattr(net, "_rep_depth", None)
-                    if rep_depth is None or rep_depth.shape[0] != N:
-                        rep_depth = torch.zeros(N, device=dev, dtype=torch.float16)
-                    rep_depth = torch.where(in_rep > 0, rep_depth + 1.0, torch.zeros_like(rep_depth))
-                    net._rep_depth = rep_depth
-                    # 错配强度: 0.01 背景 + 0.15·min(深度/10, 1) (裁决 13 数值)
-                    strength = 0.01 + 0.15 * (rep_depth / 10.0).clamp(0.0, 1.0)  # [N]
-                    # 转移偏好 top-3 目标槽, 随机选一
-                    trans = z_bind @ net.W_bind_self  # [N,16]
-                    _, top_idx = trans.topk(3, dim=-1)  # [N,3]
-                    pick = torch.randint(0, 3, (N,), device=dev)  # [N] 0-2
-                    tgt = top_idx.gather(1, pick.unsqueeze(1)).squeeze(1)  # [N]
-                    tgt_emb = net.W_bind_self[:, tgt].T  # [N,16] 目标槽转移向量
-                    shift = strength.unsqueeze(1) * (tgt_emb - z_bind)
-                    z_bind = z_bind + shift  # 持续在线, 全样本施加
-                    z_bind = z_bind / (1.0 + z_bind.abs())  # 分流抑制
-                    net._mismatch_active = in_rep.mean()  # 诊断: 复读占比
-                pot = z_bind @ net.W_act  # [N,256] 动作电位
-                # 可打印掩码对齐训练读出空间 (第 76 轮): 0x00-0x1F 物理屏蔽
-                # 第 108 轮: _act_bare=True 时免除 — 表达学习由 W_lm 裁判
-                # (exp108: 环境 = 冻结世界模型, 唯一裁判不是解码器语法)
-                if not getattr(net, "_act_bare", False):
-                    mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
-                    mask_print[32:] = 1.0
-                    pot = pot + (1.0 - mask_print) * -1e4
-                # 第 102e 轮: 移除频率去偏 (原 -6·log(freq)/freq_act) — 与 W_lm
-                # 分支同因: 去偏量级与电位相当, 把表达结构压平 (chat102d 表达
-                # dec 0.03 实证). 表达结构由 W_act 学习塑造 (决策态自洽 + 感知
-                # 相位锚定), 去偏是旧 bias 时代的对抗手段, 前提已消除
-                last = pot / (pot.abs().max(dim=-1, keepdim=True).values + 1e-4) * 60.0  # fp16
-            else:
+            # 第 110 轮 D1 (声道合一): W_act 字节发射分支删除 — 16 维槽→字节
+            # ridge hit1=0.005 (随机水平) 已证伪该通路; W_lm 读出为唯一声道
+            # (语言结构免费来自世界模型), W_act 降格为意图调制器 (见下方注入).
+            # 108 实验的 _echo_w_act/_act_bare/_mismatch 开关随分支一并移除.
+            if True:
                 a4 = net.active_size["l4"]
                 W_diff_a = net.W_diff[:a4, :a4]
                 z4_n = net._z4 / (net._z4.norm(dim=-1, keepdim=True) + 1e-3)
@@ -180,19 +134,18 @@ class ForwardEngine:
                 mask_print[32:] = 1.0
                 mu0_top = mu0_top + (1.0 - mask_print) * -1e4
                 last = mu0_top[:, -1]  # [N,256] fp16
+                # 第 110 轮 D1 (意图调制), 110c 清除设计者上限: W_act 意图
+                # 电位裸注入 — 幅度归她自己的稳态承载 (W_act 列范数由突触
+                # 缩放 0.8-1.2, z_bind 由绑定动力学), 解剖学不设定比例上限.
+                # 意志能否长过嗓音是她的选择压的事, 不是解剖的事.
+                last = last + (net._bind_vec[:, -1] @ net.W_act)
             if temperature > 0:
                 last = last / temperature
+            stats["gen"] += N
             if rep_backstop:
-                stats["gen"] += N
-                # n-gram 周期检测 (第 64 轮): 最近 p 字节模式 == 前 p 字节模式
-                # (周期重复 ≥2 次) → 物理屏蔽周期末字节. p=3 覆盖 3 字节字符
-                # 循环 (ef bf bd), p=2 覆盖双字符交替, p=4 覆盖字符与 ASCII
-                # 交错. 词干 (nn/nn+functional) 无 ≥2 次周期重复, 不受影响.
-                # 第 103 轮: 扩展 p=5,6,8,10,12 — 模型逃逸到长周期循环 (周期
-                # 6-9 实测), p≤4 挡不住; 24 字节级精确重复必是循环, 非合法文本
-                # 第 104 轮: p 连续 2-24 — 旧列表 (2,3,4,5,6,8,10,12) 漏 7/9/11/13/14/15
-                # 字节周期 (实测 "句子的"=9B 双词循环逃逸), 长短语复读
-                # ("宠物，这些天。"=17B) 需更长 p; 短语级重复必是循环
+                # n-gram 周期检测 (第 64-104 轮). 110c: echo 默认关闭 — 反循环
+                # 移交她的内部裁判 (语言带 R 惩罚循环带) + 恒温器 (过可预测
+                # → 升温). 外部物理门不再替她决定"不许循环"; flag 供对照实验.
                 for p in range(2, 25):
                     if cur.shape[1] >= 2 * p:
                         pat = cur[:, -p:]  # [N,p] 最近 p 字节模式
@@ -200,46 +153,40 @@ class ForwardEngine:
                         period = (pat == prev).all(dim=-1)  # [N] 周期重复
                         n_block = int(period.sum().item())
                         if n_block:
-                            # 第 104 轮: 屏蔽整个模式字节值 — 单字节屏蔽 (旧:
-                            # 只屏蔽周期末字节) 只挡相位命中时刻, 模型逃逸到
-                            # +1 相位继续同一循环 (实测 澘=e6b88c 三轮换挡).
-                            # 命中时已完成 >=2 份周期, 屏蔽模式值只影响第 3 份
-                            # 及以后 — "谢谢"类双字词 (2 份) 完整保留, 长循环
-                            # 被切断. 解码器物理约束, 非学习 clamp.
                             cyc_vals = torch.unique(pat[period])
                             for bv_ in cyc_vals.tolist():
                                 last[period, bv_] = -1e4
                             stats["rep"] += n_block
-                # UTF-8 语法阻断 (第 103 轮修复): 按 expect_cont 判定合法集合.
-                # 旧实现 (round 64) 把"上一字节是续字节"当 bad_start 屏蔽续字节 —
-                # 三字节/四字节字符永远无法完成, 生成恒 "lead+1续" 死循环
-                # (chat102 全链 dec 0.00-0.09 根因). 正确语义:
-                #   expect_cont>0 (字符中途): 下一字节必须是续字节 0x80-0xBF
-                #   expect_cont==0 (字符边界): 下一字节是 ASCII 或合法起始 0xC2-0xF4
-                # 结构阻断是解码器语法 (与 rep_backstop 同族), 非学习 clamp
-                n_utf8 = int((expect_cont > 0).sum().item())
-                if n_utf8:
-                    last[expect_cont > 0, 0x00:0x80] = -1e4  # 中途禁 ASCII
-                    last[expect_cont > 0, 0xC0:0x100] = -1e4  # 中途禁 lead/非法
-                    stats["utf8"] += n_utf8
-                n_bad = int((expect_cont == 0).sum().item())
-                if n_bad:
-                    # 边界禁续字节 0x80-0xBF + 非法起始 0xC0-0xC1 (overlong)
-                    last[expect_cont == 0, 0x80:0xC2] = -1e4
+            # UTF-8 语法阻断 (第 103 轮修复): 按 expect_cont 判定合法集合.
+            # 110c: 与 rep_backstop 解耦恒生效 — 这是解码器物理 (与 105 轮
+            # 授权的 UTF-8 验证器同族): 字节流必须是合法 UTF-8 才可被读,
+            # 如同声道只能发出可听见的声音. 反循环干预可以移除, 语法物理
+            # 不可以. 正确语义:
+            #   expect_cont>0 (字符中途): 下一字节必须是续字节 0x80-0xBF
+            #   expect_cont==0 (字符边界): 下一字节是 ASCII 或合法起始 0xC2-0xF4
+            n_utf8 = int((expect_cont > 0).sum().item())
+            if n_utf8:
+                last[expect_cont > 0, 0x00:0x80] = -1e4  # 中途禁 ASCII
+                last[expect_cont > 0, 0xC0:0x100] = -1e4  # 中途禁 lead/非法
+                stats["utf8"] += n_utf8
+            n_bad = int((expect_cont == 0).sum().item())
+            if n_bad:
+                # 边界禁续字节 0x80-0xBF + 非法起始 0xC0-0xC1 (overlong)
+                last[expect_cont == 0, 0x80:0xC2] = -1e4
             topv, _ = torch.topk(last, min(15, 256), dim=-1)
             last[last < topv[:, -1:]] = -float("inf")
             probs = torch.softmax(last, dim=-1)
-            if getattr(net, "use_w_act", False) and getattr(net, "_entropy_sample", False):
-                # 生成端熵激励 (裁决 17): W_act 分支软采样 + 频率偏置 —
-                # pot_bias = pot + β·(1-freq_act), 罕见字节获得生成机会
-                # (argmax 确定性采样导致未见过字节永不出现在生成里, 表达库
-                # 上限 11-14 的根源). 软采样替代硬 argmax, 温度 1.0.
-                # 频率偏置仅作用于生成采样, 不进任何学习更新 (自组织筛选)
+            if getattr(net, "_entropy_sample", False):
+                # 熵探索 (第 76 轮裁决 17, 110 D5 通用化到 W_lm 声道): 频率偏置
+                # 软采样 — 变异通道. argmax 确定性采样 = 最大循环吸引 (未见过
+                # 字节永不出现在生成里); 无变异则选择无事可选, 演化循环断裂.
+                # 频率偏置仅作用于生成采样, 不进任何学习更新 (自组织筛选).
+                # 选择由带状 R (110 D2) + 物理环境承担, 此处只负责变异.
                 beta = getattr(net, "_entropy_beta", 0.3)
                 freq_bias = (beta * (1.0 - net._freq_act)).unsqueeze(0)  # [1,256]
                 pot_b = last + freq_bias
                 b = torch.multinomial(torch.softmax(pot_b, dim=-1), 1).squeeze(-1)
-            elif temperature <= 0.0 or rep_backstop:
+            elif temperature <= 0.0:
                 b = probs.argmax(dim=-1)
             else:
                 b = torch.multinomial(probs, 1).squeeze(-1)

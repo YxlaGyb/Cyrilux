@@ -133,32 +133,40 @@ class ActionMixin(_MixinBase):
         """
         intr_d = getattr(net, "_intr_drive", torch.tensor(0.5, device=dev, dtype=torch.float16))
         col_norm = net.W_act.data.norm(dim=0).mean()  # 平均列范数 (~1.0)
-        """
-        第 108 轮: 内部裁判 R (用户公式 ΔW_act = η·R·E, 资格迹通道)
-        信号 = W_lm 对本窗生成字节串 s 的预测误差 ε_lm(s) 的时间差分:
-          R = 0.05·tanh((ε_prev − ε_now)/0.05)
-        ε_now = wlm_err 串级均值 (现成量, 零额外前向); Δε>0 (本窗比上窗
-        更可预测) → 正奖励 — "发出该字节串的突触"经迹 E 与"被世界模型
-        认可"绑定. 纯内部: 零解码器, 零外部标签, 零人类反馈; W_lm 在
-        回声相位冻结 (裁判不变). 未开 _survival_signal 时 R=0 既有零变.
-        ε_lm 峰值 ≈0.6-0.9, 步间差 0.01-0.2; tanh 归一 0.05 按 107 校准
-        量级 (R≈±0.04-0.05 与 dW 同量级 → 学习发生); 复读时 Δε≈0 → R≈0
-        (不强化复读自身, 只强化"更可预测"的探索).
-        """
-        # 第 108b 修正: 差分基线从"上一窗 ε"改"慢速预期 EMA" — 逐窗差分正负
-        # 平衡 (108 探针实证 249/246) 无净信号; EMA 基线慢漂移只跟踪预期,
-        # 持续改进 → 持续正 R (净学习方向), 单窗噪声不主导.
-        lm_eps_prev = getattr(net, "_lm_eps_ema", None)
-        if lm_eps_prev is not None:
-            lm_deps = lm_eps_prev - wlm_err.mean()
-            net._survival_signal = 0.05 * torch.tanh(lm_deps / 0.05)
+        # 第 111 轮: R 来源替换 — ε band 判别删除. probe111 实测 ε 维度上
+        # 高温汤 (0.913) 与真实语言 (0.920) 不可分 — 110c 舒适高原 (恒温器
+        # 升温展平落带) 的根因即此代理失效. 世界语言物理 (脚本层
+        # WorldLangPhysics: 覆盖率+3gram 结构+新颖度 → E 代谢) 成为唯一裁判,
+        # R 由脚本注入 _world_R (fp16); 无世界时 R=0 既有零变 (行为同旧
+        # 冷启动). 循环防护由世界接管 (循环的 L/S 双低, probe111: 贪心
+        # ε=0.54 但 S=0.92 — S 不罚贪心, L 罚汤). ε 统计降为诊断.
+        eps_now = wlm_err.mean()
+        _wr = getattr(net, "_world_R", None)
+        net._survival_signal = (_wr if _wr is not None
+                                else torch.zeros(1, dtype=torch.float16, device=dev))
+        net._lm_eps = eps_now  # 诊断: 本窗 ε_lm (fp16 张量, 零同步)
+        # 恒温器 (110 D5 保留 ε 单调方向控制, 111 双改造):
+        #   锚升级 — _world_eps_ema (E 认证的发声 ε 统计, 脚本层世界维护,
+        #   probe111 实测认证区 ε≈0.54-0.60) > _lang_eps_ema (感知带 0.92,
+        #   冷启动继承). 汤的 ε 不被认证 → 认证锚指向高 q 区 → 降温方向.
+        #   饥饿应激降温 — E (_world_E) 低于维持线 (_world_E_ref = c·q_ref/d,
+        #   即认证生存的平衡能量) 时压缩行为变异: 高温采样 = 高能耗探索,
+        #   饥饿时付不起 (代谢-行为耦合: 代谢状态调制行为参数, 系统内部量
+        #   无外部目标, relu 结构化非 clamp).
+        _gt = getattr(net, "_gen_temp", None)
+        if _gt is None:
+            net._gen_temp = torch.tensor(4.0, dtype=torch.float16, device=dev)
         else:
-            net._survival_signal = torch.zeros(1, dtype=torch.float16, device=dev)
-        net._lm_eps = wlm_err.mean()  # 诊断: 本窗 ε_lm (fp16 张量, 零同步)
-        if lm_eps_prev is None:
-            net._lm_eps_ema = wlm_err.mean().detach().clone()
-        else:
-            net._lm_eps_ema.mul_(0.98).add_(0.02 * wlm_err.mean())
+            _anchor = getattr(net, "_world_eps_ema", None)
+            if _anchor is None:
+                _anchor = getattr(net, "_lang_eps_ema", None)
+            if _anchor is not None:
+                _t2 = _gt * torch.exp(0.5 * (_anchor - eps_now))
+                _we = getattr(net, "_world_E", None)
+                _er = getattr(net, "_world_E_ref", None)
+                if _we is not None and _er is not None:
+                    _t2 = _t2 * torch.exp(-0.2 * torch.relu(_er - _we))
+                net._gen_temp = torch.minimum(torch.maximum(_t2, torch.tensor(1.0, dtype=torch.float16, device=dev)), torch.tensor(16.0, dtype=torch.float16, device=dev))
         # 第 105 轮 (资格迹): W_act 是行为域 — 轨迹接力, R=生存信号
         # 时"发出字节的突触"与"迟到的后果"跨窗口绑定. 迹输入 = 行为外积
         # (决策态槽 × 实际发出字节 one-hot), 即用户公式 W_act 生成字节串 s
