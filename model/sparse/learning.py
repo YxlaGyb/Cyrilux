@@ -1,6 +1,5 @@
 """
 LearningEngine
-
 Hebbian 可塑性 + 稳态 + 阈值调节.
 """
 

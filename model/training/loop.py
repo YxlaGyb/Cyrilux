@@ -1,4 +1,6 @@
-"""TrainingLoop — 事件驱动, 纯局部 Hebbian, 零 autograd.
+"""
+TrainingLoop
+事件驱动, 纯局部 Hebbian, 零 autograd.
 
 一次前馈全序列, 批 LM head Hebbian (唯一 target 去重, 防高频列垄断).
 z*10 仅推理 compute_lm_logits 生效, 训练时用原生 z.
@@ -12,7 +14,7 @@ import os
 import torch
 from tqdm import tqdm
 
-from model.model_cyrene import CyreneConfig, CyreneModel
+from model._archived_sparse import CyreneConfig, CyreneModel
 from pkg.device.cuda import setup_cuda_device
 from pkg.utils.trainer_utils import setup_seed
 

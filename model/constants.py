@@ -1,6 +1,4 @@
-"""共享常量 — 状态字段索引、层架构、连接类型、页参数."""
-
-# ── 神经元状态列索引 ─────────────────────────────────────────────────
+# 神经元状态列索引
 F_Z = 0
 F_MU = 1
 F_EPS = 2
@@ -21,7 +19,7 @@ LAYER_L5 = 13  # 内锥体层: 深度输出, LM Head 读取
 LAYER_L6 = 14  # 多形层: 反馈调节, 最慢
 
 HIDDEN_LAYERS = [LAYER_L4, LAYER_L2, LAYER_L3, LAYER_L5, LAYER_L6]
-TOP_LAYER = LAYER_L4  # LM Head 输出层 — L4 有输入区分度, L5 经过3层随机投影后坍缩
+TOP_LAYER = LAYER_L4  # LM Head 输出层: L4 有输入区分度, L5 经 3 层随机投影后坍缩
 
 # 每层配置 (神经元数, 惯性α, k-WTA比例)
 LAYER_CONFIG = {
@@ -42,3 +40,6 @@ PAGE_NEURONS = 4096
 PAGE_SYNAPSES = 16384
 PAGE_TD = 16384
 K_FAN = 128
+
+LM_TRUST_REGION = 0.025  # 读出端信任域
+ELIG_GAMMA = 0.95        # 突触资格迹折扣

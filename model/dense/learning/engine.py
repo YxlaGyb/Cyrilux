@@ -1,14 +1,6 @@
-"""LearningEngine 编排: learn() 主循环 + 共享上下文字段.
-
-学习机制按域拆分在六个 mixin 模块 (类在 __init__.py 组合):
-- feedforward.py: W_04/W_42/W_23/W_35/W_56/bias 稳态/W_state_pred
-- temporal.py: 多尺度时间窗 + W_diff + W_t 家族 + 谱守卫
-- readout.py: LM 信号构建 + W_lm/W_lm_2/W1/bias_lm
-- predict.py: 自组织预测引擎 (W_pred_*)
-- bind.py: M_l5 + W_bind/W_bind_self
-- action.py: W_act 表达通路
-
-域间调用顺序与原始 learn() 单函数逐行一致 (数值逐位等价).
+"""
+LearningEngine 编排
+learn() 主循环 + 共享上下文字段.
 """
 
 from __future__ import annotations
@@ -26,7 +18,7 @@ from .readout import ReadoutMixin
 from .temporal import TemporalMixin
 
 if TYPE_CHECKING:
-    from ..network import DensePCNet
+    from model.model_cyrene import DensePCNet
 
 
 @dataclass
@@ -45,11 +37,11 @@ class LearnCtx:
     echo_loop: bool
     echo_world_frozen: bool
     learn_mask: torch.Tensor
-    a4: int
-    a2: int
-    a3: int
-    a5: int
-    a6: int
+    dim_4: int
+    dim_2: int
+    dim_3: int
+    dim_5: int
+    dim_6: int
     eta: float | torch.Tensor
     eta_t: float | torch.Tensor
     eta_lm: float
@@ -93,10 +85,10 @@ class LayerErrs:
     eps4: torch.Tensor
     eps2: torch.Tensor
     eps3: torch.Tensor
-    eps5_td: torch.Tensor
+    eps5: torch.Tensor
     eps6: torch.Tensor
-    eps2_p: torch.Tensor
-    eps6_p: torch.Tensor
+    eps2_precise: torch.Tensor
+    eps6_precise: torch.Tensor
 
 
 @dataclass
@@ -141,22 +133,16 @@ class EngineCore(
         return out
 
     def learn(self, byte_ids: torch.Tensor | None = None, closed_loop: bool = False, free_run: bool = False) -> dict:
-        """Hebbian 学习 (零反传, 零误差回路). 不接收 targets.
+        """Hebbian 学习: 前馈 → 逐域误差 → 局部权重更新, 无反向传播, 不接收 targets.
 
         Args:
-            byte_ids: [N, S] long 输入. free_run=True 时忽略 (恒零输入).
-            closed_loop: 自回归暴露训练 — 输入 = 前 k 真实 + 后 S-k 模型自生成
-            (k=S//2), targets 始终是真实 byte_ids. 只有生成段 (k:) 参与误差,
-            锚定段 (k 之前) 只看不学: 网络从自己的错误输出中学习重新找回
-            真实目标, 打破 (输出→z4→输出) 复读自锁.
-            free_run: 自由运行 (第 77 轮, 生命第一因) — 外部输入恒零, 活动由
-            内部递归 + 三尺度振荡器驱动. 字节域权重全部冻结 (W_04/W_42/W_diff/
-            W_lm 家族/W_act), 只更新内部动力学权重 (W_t*/W_35/W_23/W_56/W_bind/
-            W_bind_self/W_pred_*/W_state_pred/M_l5/bias), 学习率恒基准值 (第 78 轮:
-            无全局调制), 目标: 系统活着 (不 NaN, 不冻结, 不发散).
-            自回声 (第 80 轮): byte_ids=None 且 free_run=False — 非监督交互环境,
-            输入 = 上一窗 W_act 生成字节 (他者 = 系统自己的生成), 字节域学习解冻
-            (同普通训练路径), 无标签无奖励, 目标 = 输入流自身的预测结构.
+            byte_ids: [N, S] long 输入. free_run=True 时忽略.
+            closed_loop: 自回归暴露训练. 输入 = 前 k 真实 + 后 S-k 自生成 (k=S//2),
+                仅生成段参与误差, targets 始终是真实 byte_ids.
+            free_run: 输入恒零, 内部递归 + 三尺度振荡器驱动, 字节域权重冻结,
+                只更新内部动力学权重 (W_t* 家族).
+            自回声 (byte_ids=None 且 free_run=False): 输入 = 上一窗生成字节,
+                无标签无奖励, 学输入流自身的预测结构.
 
         Returns:
             stats dict (future_err, 各层误差范数).
@@ -167,21 +153,14 @@ class EngineCore(
         elif closed_loop:
             inp = self._closed_loop_input(byte_ids)
         elif byte_ids is None:
-            # 108轮 自回声自由运行 — 无外部输入, 输入=上一窗生成字节.
-            # 第 110 轮 D1 (声道合一): W_lm 读出为唯一声道 — use_w_act 发射
-            # 分支已删除 (108 实验: W_act 发射=乱码 + ε_lm 极性倒挂双证伪),
-            # W_act 降格为意图调制器 (continuation 内注入 logits, ≤15%).
-            # 生成流 = 冻结世界模型在内部状态调制下的自续写.
+            # 自回声: 无外部输入, 输入 = 上一窗生成字节 (冻结世界模型的自续写).
+            # W_lm 读出为唯一声道, W_act 降格为意图调制器 (continuation 内注入 logits, ≤15%).
             s_frw = net.cfg.free_run_window
             seed = getattr(net, "_echo_seed", None)
             if seed is None or seed.numel() == 0:
                 seed = torch.zeros(1, 1, dtype=torch.long, device=net._osc_f_cnt.device)
-            # 第 110 轮 D5 (声道探索): 温度采样为变异通道 — probe110b 扫描
-            # 实测 ε(τ) 单调: 贪心 0.55 (循环带) → τ*=4.0 落语言带心 0.88 →
-            # τ≥16 滑乱码带. 温度由恒温器负反馈自调 (action.py: ε 自测偏差
-            # → 温度修正, 纯内部量), 默认 4.0 = 物理校准值 (107 κ 先例).
-            # 110c: rep_backstop 默认关 — 反循环外部物理门从她的声音移除,
-            # 循环由她自己的裁判 (语言带 R 惩罚循环带) + 恒温器处置.
+            # 温度采样为变异通道; 温度由恒温器负反馈自调 (action.py), 默认 4.0.
+            # rep_backstop 默认关 (反循环门已移除, 循环由内部裁判 + 恒温器处置).
             saved_entropy = getattr(net, "_entropy_sample", False)
             net._entropy_sample = getattr(net, "_echo_entropy", False)
             saved_rep = getattr(net, "_echo_rep", False)
@@ -201,10 +180,8 @@ class EngineCore(
         N, S = inp.shape if inp is not None else (1, net.cfg.free_run_window)
         dev = next(net.parameters()).device
         k = S // 2 if closed_loop else 0
-        # 第80轮: 自回声模式激活字节域学习, 输入=自身生成流.
-        # 第102轮修正: 回声相位冻结世界模型 (W_04/W_42/W_diff/W_lm 等), 仅更新表达端 W_act.
-        # 原因: 从零初始化时 W_lm 未学到 UTF-8 结构, 回声输入=乱码, 世界模型在乱码上学习会污染感知.
-        # 世界模型只在感知相位 (真实输入) 更新, 表达端照常学习.
+        # 自回声激活字节域学习; 回声相位冻结世界模型 (W_04/W_42/W_diff/W_lm 等),
+        # 仅更新表达端 W_act, 避免在乱码回声上学习污染感知.
         echo_loop = (not free_run) and (byte_ids is None)
         if echo_loop:
             byte_ids = inp  # 自回声: 目标 = 自身生成流 (他者响应), 下游同普通训练
@@ -214,38 +191,37 @@ class EngineCore(
         learn_mask = torch.ones(S - 1, dtype=torch.bool, device=dev)
         if closed_loop:
             learn_mask[: k - 1] = False
-        a4, a2, a3, a5, a6 = (net.active_size[k] for k in ("l4", "l2", "l3", "l5", "l6"))
+        dim_4, dim_2, dim_3, dim_5, dim_6 = (
+            net.active_size[k] for k in ("l4", "l2", "l3", "l5", "l6")
+        )
 
-        W_23_a = net.W_23[:a3]
+        W_23_a = net.W_23[:dim_3]
         z0 = net._z0
         z4, z2, z3, z5, z6 = net._z4, net._z2, net._z3, net._z5, net._z6
 
         # 逐层预测误差 (自下而上 PC); L5 用时序差分误差, L6 用时间自预测
-        eps4 = z4 - (z0 @ net.W_04[:a4].T + net.bias_l4[:a4])
-        eps2 = z2 - (z4 @ net.W_42[:a2].T + net.bias_l2[:a2])
-        eps3 = z3 - (z2 @ W_23_a.T + net.bias_l3[:a3])
-        z6_pre = torch.cat([torch.zeros(N, 1, a6, dtype=z6.dtype, device=dev), z6[:, :-1]], dim=1)
+        eps4 = z4 - (z0 @ net.W_04[:dim_4].T + net.bias_l4[:dim_4])
+        eps2 = z2 - (z4 @ net.W_42[:dim_2].T + net.bias_l2[:dim_2])
+        eps3 = z3 - (z2 @ W_23_a.T + net.bias_l3[:dim_3])
+        z6_pre = torch.cat([torch.zeros(N, 1, dim_6, dtype=z6.dtype, device=dev), z6[:, :-1]], dim=1)
         eps6 = z6 - z6_pre
-        eps5_td = z5[:, 1:] - z5[:, :-1]  # L5: 跨时刻变化 z5[t]-z5[t-1]
+        eps5 = z5[:, 1:] - z5[:, :-1]  # L5: 跨时刻变化 z5[t]-z5[t-1]
 
         fe = net.forward_engine
-        eps2_p, eps6_p = (
+        eps2_precise, eps6_precise = (
             fe._precise(eps2),
             fe._precise(eps6),
         )
 
-        # 权重去主成分投影的 learn_boost (超量抑制系数, 第 70-74 轮机制):
-        # 在熵竞争更新 _traction_scale 之前取样 (原 learn() 顺序, 数值等价)
+        # learn_boost (去主成分超量抑制系数): 在 _traction_scale 更新前取样
         learn_boost = 2.0 - net._traction_scale.to(torch.float16)
 
-        # 学习率 (第 78 轮: 无全局调制 — 恒基准值, 无上帝之手); 前 50 步减半 (先稳后放)
+        # 学习率恒基准值 (无全局调制); 前 50 步减半 (先稳后放)
         eta = net.cfg.lr_hebbian
         if net._step_counter < 50:
             eta = eta * 0.5
         eta_t = eta * net.cfg.temporal_lr_ratio
-        # 动态稳态竞争 (速率自适应): 按 W_lm 熵斜率调节表示层更新幅度 —
-        # 熵加速下降 (W_lm 预测好) → scale→0 表示层放慢; 熵停滞/上升 → scale→2
-        # 表示层放大 (强迫重组供新信息). scale 每 100 步更新, 用上一步值 (滞后一步无影响)
+        # 速率自适应: W_lm 熵下降 (预测好) → 表示层放慢; 熵上升 → 放大重组. scale 每 100 步更新
         if net.cfg.adaptive_traction:
             eta = eta * net._traction_scale.to(torch.float16)
             eta_t = eta_t * net._traction_scale.to(torch.float16)
@@ -256,13 +232,13 @@ class EngineCore(
             net=net, N=N, S=S, k=k, dev=dev, inp=inp, byte_ids=byte_ids,
             closed_loop=closed_loop, free_run=free_run, echo_loop=echo_loop,
             echo_world_frozen=echo_world_frozen, learn_mask=learn_mask,
-            a4=a4, a2=a2, a3=a3, a5=a5, a6=a6,
+            dim_4=dim_4, dim_2=dim_2, dim_3=dim_3, dim_5=dim_5, dim_6=dim_6,
             eta=eta, eta_t=eta_t, eta_lm=eta_lm, inv_s=inv_s,
             learn_boost=learn_boost,
         )
-        sh = Shared(errs=LayerErrs(eps4, eps2, eps3, eps5_td, eps6, eps2_p, eps6_p))
+        sh = Shared(errs=LayerErrs(eps4, eps2, eps3, eps5, eps6, eps2_precise, eps6_precise))
 
-        # ── 域调用 (顺序 = 原 learn() 逐块顺序, 数值逐位等价) ──
+        # 域调用 (顺序固定, 数值逐位等价)
         sh.diff = self._build_diff_window(ctx)
         self._update_bias(ctx, sh)
         sh.lm = self._build_lm_signal(ctx)
@@ -278,17 +254,15 @@ class EngineCore(
         self._update_w_act(ctx, sh)
         self._final_softnorm(ctx, sh)
 
-        # ── 拓扑重塑 ──
+        # 拓扑重塑: 修剪触发权由编排层经 net.maybe_prune(step) 显式交出
         net._step_counter += 1
-        if net._step_counter > net.cfg.prune_warmup and net._step_counter % net.cfg.prune_interval == 0:
-            net.pruner._prune()
 
         stats = {
             "free_energy": (
                 eps4.square().mean()
                 + eps2.square().mean()
                 + eps3.square().mean()
-                + eps5_td.square().mean()
+                + eps5.square().mean()
                 + eps6.square().mean()
             ),
             "future_err": (sh.diff.dz4 - sh.diff.pred_d).square().mean()
@@ -297,18 +271,16 @@ class EngineCore(
             "d_polarity": float(sh.d_t.mean())
             if (not free_run and not echo_world_frozen and sh.d_t is not None and hasattr(net, "_novelty"))
             else 1.0,
-            # 观测器 (第 70 轮 v2): 原始 L5 局部误差能量 (同量纲, 供贡献率计算).
-            # 诊断用, 不参与任何更新
+            # 观测器: 原始 L5 局部误差能量 (诊断用, 不参与更新)
             "l5_local_err": sh.l5_local_err,
         }
-        # 释放每步状态引用 (显存按需): _z* 是 store_state 存的大张量,
-        # 不释放则 caching allocator 无法复用, 4GB 卡上逐步累积到 OOM
-        # 诊断插桩 (第 77 轮): 观测器用, 释放前保留 z4/z5 引用
+        # 释放每步状态引用: _z* 是 store_state 存的大张量, 不释放则显存逐步累积 OOM.
+        # 释放前保留 z4/z5/z3/z2/z6 引用供观测器 (z3 = NaN 前哨)
         net._last_z4 = net._z4.detach()
         net._last_z5 = net._z5.detach()
-        net._last_z3 = net._z3.detach()  # 第 78 轮: 观测 z3 幅度 (NaN 前哨)
-        net._last_z2 = net._z2.detach()  # 第 83 轮: 观测 l2 活动 (G8 exc)
-        net._last_z6 = net._z6.detach()  # 第 83 轮: 观测 l6 活动 (G8 exc)
+        net._last_z3 = net._z3.detach()
+        net._last_z2 = net._z2.detach()
+        net._last_z6 = net._z6.detach()
         for k_ in ("_z0", "_z4", "_z2", "_z3", "_z5", "_z5_raw", "_z6"):
             if hasattr(net, k_):
                 delattr(net, k_)

@@ -1,13 +1,9 @@
-"""ForwardEngine
+"""
+ForwardEngine
+前馈/推理/生成/稀疏绑定.
 
-密集 PPA 前馈/推理/生成/稀疏绑定.
-
-感知: L0(纯 one-hot, 时序双通道) → L4 → L2 → L3 → L5(微柱阵列) → L6
-时序: 每层时间核 W_t 递归 z[t] 依赖 z[t-1]
-生成: L4 状态 + W_diff 预测差分 → W_lm 解码字节
-绑定: z4 → W_bind → K=16 概念槽, 软竞争归一化
-
-全 fp16, 零 .float(), 零反向传播.
+感知 L0 → L4 → L2 → L3 → L5 → L6; 时序经时间核 W_t 递归;
+生成经 W_diff 预测差分 + W_lm 解码; 绑定 z4 → W_bind → 概念槽.
 """
 
 from __future__ import annotations
@@ -19,23 +15,9 @@ import torch
 import torch.nn.functional as F
 
 if TYPE_CHECKING:
-    from .network import DensePCNet
+    from model.model_cyrene import DensePCNet
 
-
-def _rms(x: torch.Tensor) -> torch.Tensor:
-    """零向量保护 RMS 归一化 (fp16 下 1e-8 舍入为 0, 需掩码保护分母)."""
-    rms = x.square().mean(dim=-1, keepdim=True)
-    alive = (rms > 1e-8).to(x.dtype)
-    denom = torch.where(alive > 0, (rms * 1.01).sqrt(), torch.ones_like(rms))
-    return x * alive / denom
-
-
-def _l2_norm(x: torch.Tensor) -> torch.Tensor:
-    """零向量保护 L2 范数归一化 (前馈投影前的原语义, 与 _rms 量纲不同)."""
-    nrm = x.norm(dim=-1, keepdim=True)
-    alive = (nrm > 1e-8).to(x.dtype)
-    denom = torch.where(alive > 0, nrm * 1.01, torch.ones_like(nrm))
-    return x * alive / denom
+from model.modulation import l2_norm, rms_norm
 
 
 class ForwardEngine:
@@ -65,58 +47,39 @@ class ForwardEngine:
         temperature: float = 0.7,
         rep_backstop: bool = False,
     ) -> torch.Tensor:
-        """自回归续写: 基于 [N,S] 前缀批量并行生成 n_gen 字节, 返回 [N, S+n_gen].
+        """自回归续写: 基于 [N,S] 前缀批量并行生成, 返回 [N, S+n_gen].
 
-        训练 (rollout) 与验证 (generate) 共用同一 logits 管线, 保证训练看到的
-        自生成分布与最终生成测试一致. 纯前向, 零梯度. 全批并行 (每步一次
-        前向覆盖 N 样本), 生成后段逐字节推进. 生成期 n-gram 习惯化
-        (rep_backstop, 第 64 轮): 最近 2/3/4 字节模式重复 ≥2 次 → 物理屏蔽
-        周期末字节的 logits (置 -1e4). 第 68 轮 TF 锚点门控已移除 (被证
-        无法防坍缩); 复读对治 = 第 69 轮快慢散度多巴胺 (learning.py D 极性
-        翻转, 内生判别, 无外部干预). 以及 UTF-8 续字节超长阻断: 连续 3 个
-        续字节 (合法单字符上限) 后屏蔽全部续字节.
+        训练 (rollout) 与验证 (generate) 共用同一 logits 管线.
+        rep_backstop: 屏蔽近期 2..24 字节周期末字节的 logits.
+        UTF-8 续字节超长阻断: 连续 3 个续字节后屏蔽全部续字节.
         """
         net = self.net
         N, S = byte_ids.shape
         dev = byte_ids.device
         cur = byte_ids.clone()
         last_byte = torch.full((N,), -1, dtype=torch.long, device=dev)
-        # 第 103 轮: UTF-8 语法状态机 — 当前字符还需续字节数 (0 = 字符边界).
-        # 替代旧 bad_start 逻辑 (见 blocker 注释: 旧逻辑屏蔽续字节 → 多字节字符
-        # 永远无法完成, 生成恒 "lead+1续" 死循环的根因)
+        # UTF-8 语法状态机: 当前字符还需续字节数 (0 = 字符边界)
         expect_cont = torch.zeros(N, dtype=torch.long, device=dev)
         if not hasattr(net, "_block_stats"):
             net._block_stats = {"rep": 0, "utf8": 0, "gen": 0}
         stats = net._block_stats
-        # 第 102e 轮: 频率去偏已全部移除 (见两分支注释), 不再需要 freq_safe
-        # 基线; _freq 缓冲保留 (诊断/学习端频率统计用)
         for _ in range(n_gen):
             bv = cur[:, -64:]  # 上下文窗口 64 (任务语义)
             _ = self._predict(bv, store_state=True, is_inference=True)
-            # 第 110 轮 D1 (声道合一): W_act 字节发射分支删除 — 16 维槽→字节
-            # ridge hit1=0.005 (随机水平) 已证伪该通路; W_lm 读出为唯一声道
-            # (语言结构免费来自世界模型), W_act 降格为意图调制器 (见下方注入).
-            # 108 实验的 _echo_w_act/_act_bare/_mismatch 开关随分支一并移除.
+            # W_lm 读出为唯一声道; W_act 降格为意图调制器 (见下方注入)
             if True:
-                a4 = net.active_size["l4"]
-                W_diff_a = net.W_diff[:a4, :a4]
+                dim_4 = net.active_size["l4"]
+                W_diff_a = net.W_diff[:dim_4, :dim_4]
                 z4_n = net._z4 / (net._z4.norm(dim=-1, keepdim=True) + 1e-3)
-                pred_delta = z4_n @ W_diff_a.T + net.b_diff[:a4].unsqueeze(0).unsqueeze(0)
+                pred_delta = z4_n @ W_diff_a.T + net.b_diff[:dim_4].unsqueeze(0).unsqueeze(0)
                 z4_next = net._z4 + pred_delta
                 # 与训练头同款: 分流抑制 → RMS → 三阶 → 记忆单元+绑定拼接 → W1 混合层
                 z4_nl = z4_next / (1.0 + z4_next.abs())
-                z4_nl = _rms(z4_nl)
+                z4_nl = rms_norm(z4_nl)
                 z4_nl = z4_nl * (1.0 - 0.5 * z4_nl.pow(2))
-                # 第 104 轮: 三阶输出分流止血 (与 learning.py 第 101 轮同款) —
-                # 生成路径此前缺此步, 训练端有 → 部署分布尾巴厚于训练 (|x|>1.4
-                # 三阶放大区), 属同族口径错配. 分流 x/(1+|x|), 结构化非 clamp.
-                z4_nl = z4_nl / (1.0 + z4_nl.abs())
+                z4_nl = z4_nl / (1.0 + z4_nl.abs())  # 与训练端同款分流抑制
                 zh_next = torch.cat([z4_nl, net._bind_vec, net._mem_out], dim=-1)
-                # 第 104 轮: zh 整体 RMS 前置 — 与训练端 (learning.py) 和观测器
-                # (chat103/104 _wlm_logits) 同口径. 此前生成路径直连 W1, 训练分布
-                # (rms(zh)) 与部署分布 (未归一) 不同源 — 与 z4/z4_next 错配同族.
-                # 结构化 pre-norm, 非 clamp, 零行为风险 (echo 模式 z4 3x 防护同款).
-                zh_next = _rms(zh_next)
+                zh_next = rms_norm(zh_next)  # 与训练端同口径 pre-norm
                 h_next = zh_next @ net.W1
                 h_next = h_next / (1.0 + h_next.abs())  # 分流抑制 (与训练同款)
                 h_next = h_next / (h_next.square().mean(dim=-1, keepdim=True).sqrt() * 1.01 + 1e-8)
@@ -127,25 +90,17 @@ class ForwardEngine:
                     mu0_top.std(dim=-1, keepdim=True) + 1e-4
                 )
                 mu0_top = logits_c / logits_c.abs().max(dim=-1, keepdim=True).values * 60.0
-                # 第 102e 轮: 移除频率去偏 — 与学习端同因 (见 learning.py 同款
-                # 注释): 去偏量级与 logits 相当, 把 W_lm 输出结构压平 → 生成
-                # 恒平复读. bias_lm 已降 (target=10), 高频垄断前提消除
                 mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
                 mask_print[32:] = 1.0
                 mu0_top = mu0_top + (1.0 - mask_print) * -1e4
                 last = mu0_top[:, -1]  # [N,256] fp16
-                # 第 110 轮 D1 (意图调制), 110c 清除设计者上限: W_act 意图
-                # 电位裸注入 — 幅度归她自己的稳态承载 (W_act 列范数由突触
-                # 缩放 0.8-1.2, z_bind 由绑定动力学), 解剖学不设定比例上限.
-                # 意志能否长过嗓音是她的选择压的事, 不是解剖的事.
+                # W_act 意图电位裸注入, 幅度归其自身稳态承载
                 last = last + (net._bind_vec[:, -1] @ net.W_act)
             if temperature > 0:
                 last = last / temperature
             stats["gen"] += N
             if rep_backstop:
-                # n-gram 周期检测 (第 64-104 轮). 110c: echo 默认关闭 — 反循环
-                # 移交她的内部裁判 (语言带 R 惩罚循环带) + 恒温器 (过可预测
-                # → 升温). 外部物理门不再替她决定"不许循环"; flag 供对照实验.
+                # n-gram 周期检测 (2..24): 重复周期末字节置 -1e4
                 for p in range(2, 25):
                     if cur.shape[1] >= 2 * p:
                         pat = cur[:, -p:]  # [N,p] 最近 p 字节模式
@@ -157,13 +112,9 @@ class ForwardEngine:
                             for bv_ in cyc_vals.tolist():
                                 last[period, bv_] = -1e4
                             stats["rep"] += n_block
-            # UTF-8 语法阻断 (第 103 轮修复): 按 expect_cont 判定合法集合.
-            # 110c: 与 rep_backstop 解耦恒生效 — 这是解码器物理 (与 105 轮
-            # 授权的 UTF-8 验证器同族): 字节流必须是合法 UTF-8 才可被读,
-            # 如同声道只能发出可听见的声音. 反循环干预可以移除, 语法物理
-            # 不可以. 正确语义:
-            #   expect_cont>0 (字符中途): 下一字节必须是续字节 0x80-0xBF
-            #   expect_cont==0 (字符边界): 下一字节是 ASCII 或合法起始 0xC2-0xF4
+            # UTF-8 语法阻断 (恒生效): 字节流必须合法才可被读
+            #   expect_cont>0 (字符中途): 下一字节须为续字节 0x80-0xBF
+            #   expect_cont==0 (字符边界): 下一字节为 ASCII 或合法起始 0xC2-0xF4
             n_utf8 = int((expect_cont > 0).sum().item())
             if n_utf8:
                 last[expect_cont > 0, 0x00:0x80] = -1e4  # 中途禁 ASCII
@@ -177,11 +128,7 @@ class ForwardEngine:
             last[last < topv[:, -1:]] = -float("inf")
             probs = torch.softmax(last, dim=-1)
             if getattr(net, "_entropy_sample", False):
-                # 熵探索 (第 76 轮裁决 17, 110 D5 通用化到 W_lm 声道): 频率偏置
-                # 软采样 — 变异通道. argmax 确定性采样 = 最大循环吸引 (未见过
-                # 字节永不出现在生成里); 无变异则选择无事可选, 演化循环断裂.
-                # 频率偏置仅作用于生成采样, 不进任何学习更新 (自组织筛选).
-                # 选择由带状 R (110 D2) + 物理环境承担, 此处只负责变异.
+                # 熵探索: 频率偏置软采样 = 变异通道 (仅采样, 不进学习更新)
                 beta = getattr(net, "_entropy_beta", 0.3)
                 freq_bias = (beta * (1.0 - net._freq_act)).unsqueeze(0)  # [1,256]
                 pot_b = last + freq_bias
@@ -209,16 +156,11 @@ class ForwardEngine:
         stp: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         stp_tag: str | None = None,
     ) -> torch.Tensor:
-        """时间核递归: z[t] 依赖 z[t-1] (经学习到的 W_t), 纯 matmul 全 fp16.
+        """时间核递归: z[t] 依赖 z[t-1] (经 W_t), 纯 matmul.
 
-        因果移位 + 前向卷积式扫描. 只归一化递归项, 不归一化整体 z —
-        保留 mu 携带的输入语义区分度 (mu4 跨上下文 cos=0.26, 旧实现递归后
-        整体 RMS 归一化把方向抹到 0.985; sweeps=1 单次微扰防递归项累积污染方向).
-
-        stp (第 77 轮): (r, tau, u) 资源慢变量 — 逐帧递归项 ×r[t] (资源耗尽
-        → 递归减弱), r 逐帧更新 r ← r + (1−r)/τ − U·r·|z| (活动爆发消耗资源,
-        静默期恢复 → 自发间歇). 仅在自由运行 (free_run) 时启用.
-        stp_tag: 层名, 用于把末资源写回 net._stp_r_end (供窗末写回)
+        只归一化递归项, 保留 mu 携带的输入语义方向.
+        stp (r, tau, u): 逐帧递归项 ×r[t] (资源耗尽 → 递归减弱, 自发间歇), 仅自由运行启用.
+        stp_tag: 层名, 用于末资源写回 net._stp_r_end.
         """
         N, S, d = mu.shape
         z = mu
@@ -226,19 +168,12 @@ class ForwardEngine:
         if stp is None:
             for _ in range(sweeps):
                 shift = torch.cat([torch.zeros(N, 1, d, dtype=z.dtype, device=dev), z[:, :-1]], dim=1)
-                shift_n = _rms(shift)
+                shift_n = rms_norm(shift)
                 rec = (shift_n @ W_t.T) * inv_d
-                # 递归项单独归一化再乘 inv_d 小扰动: 保 mu 语义方向 (cos 0.69→0.98 抹平),
-                # 同时幅度有界防逐层累积 (旧整体 RMS 压幅度但抹方向; 无约束则 58 步 NaN)
-                rec = _rms(rec) * inv_d
+                rec = rms_norm(rec) * inv_d  # 单独归一化保方向, 幅度有界防累积
                 z = z + rec
             return z
-        # STP 路径 (第 77 轮): 逐帧 — 递归项 × 当前资源, 资源随活动消耗/恢复.
-        # 第 81 轮 (生命第一因): 双重 RMS 归一化把递归幅度焊死 (~0.03 常数, 与
-        # W_t 范数无关) — 递归增益成为硬编码常数, E-I 平衡自由度被架空的直接证据
-        # (slope -2.06 冻结). 撤销二重归一化: rec = shift_n@W_t^T (RMS 输入只防
-        # 溢出), 幅度由 W_t 行范数承载 — 行范数就是增益, 归系统自己. 防发散不再
-        # 靠范数锁, 靠能量: STP 资源耗尽 + 分流抑制 (层外) + Oja (学习端).
+        # STP 路径: 逐帧递归项 × 当前资源; 幅度由 W_t 行范数承载 (防发散靠能量而非范数锁)
         # 递推用 z_out (含 STP 调制的输出), 首帧 = mu 首帧 (无递归)
         r, tau, u = stp
         r = r.unsqueeze(0)  # [1,d]
@@ -247,18 +182,15 @@ class ForwardEngine:
         z_out = z[:, :1].clone()  # 首帧无递归 (shift=0)
         for t in range(1, S):
             shift = z_out[:, t - 1 : t]  # [N,1,d] 用已调制的输出递推
-            shift_n = _rms(shift)
+            shift_n = rms_norm(shift)
             rec = (shift_n @ W_t.T) * inv_d  # 幅度 = W_t 行范数 (增益自由度)
             z_t = z[:, t : t + 1] + rec * r  # 递归项 × 可用资源
             z_out = torch.cat([z_out, z_t], dim=1)
-            # 资源更新: r ← r + (1−r)/τ − U_eff·r·|z|. U_eff (第 81 轮) = U·act/(act+ema):
-            # 活动与自身时间均值之比 — 高活动耗尽加速, 低活动恢复. 自参照
-            # (rel_n 家族, 零外部目标), ema 首步 = act (U_eff=U/2, 无尖峰)
-            act = z_t.abs().mean(dim=1)  # [1,d] 帧均值 (原形状语义)
-            ema = getattr(self.net, f"_stp_act_ema_{stp_tag}")[: r.shape[1]]  # 修剪后对齐活性尺寸
+            # 资源更新: r ← r + (1−r)/τ − U_eff·r·|z|; U_eff = U·act/(act+ema) 自参照, 高活动耗尽加速
+            act = z_t.abs().mean(dim=1)
+            ema = getattr(self.net, f"_stp_active_ema_{stp_tag}")[: r.shape[1]]  # 修剪后对齐活性尺寸
             ema.mul_(0.99).add_(0.01 * act.squeeze(0))
-            # 第 82 轮: 局部 U 自适应 — 活动高于自身慢基线 → 释放概率升高
-            # (钙积累); 活动低于基线 → U 回落. 纯局部负反馈, 无外部目标.
+            # 局部 U 自适应: 活动 vs 自身慢基线 → 释放概率双向调节 (纯局部负反馈)
             if self.net.cfg.stp_u_adapt:
                 rel = (act - ema.unsqueeze(0)) / (ema.unsqueeze(0) + 1e-6)
                 u_b.add_(self.net.cfg.stp_u_adapt_rate * rel * u_b)
@@ -272,20 +204,15 @@ class ForwardEngine:
         return z_out
 
     def _predict(self, byte_ids: torch.Tensor, store_state: bool = True, is_inference: bool = False) -> dict:
-        """核心前馈: 感知 (L0→L6) + 微柱路由 + Foldiak 去相关 + 去中心化 + 增量预测.
+        """核心前馈: 感知 (L0→L6) + Foldiak 去相关 + 去中心化 + 增量预测.
 
-        机制:
-        - 无位置编码, 时序全靠学习的时间核 W_t 递归
-        - 微柱阵列 (L5 拆 4 块, 时间步交错路由), 输出经 Foldiak 去相关后去中心化
-          (z5 去均值喂下游保持 PR; z5_raw 原始幅度喂 W_diff 增量预测, 路由分离)
-        - ACh 噪声注入 L3 投影输入, is_inference=True 时关闭 (推理确定性)
+        无位置编码, 时序全靠 W_t 递归; z5 去均值喂下游, z5_raw 喂 W_diff;
+        ACh 噪声注入 L3, is_inference=True 时关闭.
         """
         net = self.net
         free_run = byte_ids is None
         if free_run:
-            # 自由运行 (第 77 轮, 生命第一因): 外部输入恒零, 活动由内部递归 +
-            # 三尺度加性振荡器驱动. 跨窗延续: 上一窗末帧 z 前置拼接进 _recurrent
-            # (shift[0]=0 → carry 帧精确复现), 时间核递归跨窗生效
+            # 自由运行: 外部输入恒零, 活动由内部递归 + 三尺度加性振荡器驱动
             N, S = 1, net.cfg.free_run_window
             dev = next(net.parameters()).device
             z0 = torch.zeros(N, S, net._in_dim, dtype=torch.float16, device=dev)
@@ -305,13 +232,13 @@ class ForwardEngine:
         else:
             N, S = byte_ids.shape
             dev = byte_ids.device
-        a4, a2, a3, a5, a6 = (net.active_size[k] for k in ("l4", "l2", "l3", "l5", "l6"))
+        dim_4, dim_2, dim_3, dim_5, dim_6 = (net.active_size[k] for k in ("l4", "l2", "l3", "l5", "l6"))
 
-        W_04_a = net.W_04[:a4]
-        W_42_a = net.W_42[:a2]
-        W_23_a = net.W_23[:a3]
-        W_56_a = net.W_56[:a6]
-        W_diff_a = net.W_diff[:a4, :a4]
+        W_04_a = net.W_04[:dim_4]
+        W_42_a = net.W_42[:dim_2]
+        W_23_a = net.W_23[:dim_3]
+        W_56_a = net.W_56[:dim_6]
+        W_diff_a = net.W_diff[:dim_4, :dim_4]
 
         if not free_run:
             # L0 纯 one-hot; 时序双通道: [z0[t], z0[t-1]] 拼接 (词序信息进入表示层)
@@ -320,76 +247,64 @@ class ForwardEngine:
                 z0_prev = torch.cat([torch.zeros(N, 1, 256, dtype=z0.dtype, device=dev), z0[:, :-1]], dim=1)
                 z0 = torch.cat([z0, z0_prev], dim=-1)  # [N,S,512]
 
-        mu4 = z0 @ W_04_a.T + net.bias_l4[:a4]
+        mu4 = z0 @ W_04_a.T + net.bias_l4[:dim_4]
         if free_run:
             mu4 = mu4 + net.cfg.osc_amp_m * vm  # 中节律加性电流 → L4 预激活
-        # --- 诊断插桩 (第 75 轮, 零行为影响): 采集 PR(mu4) 区分 W_04 vs W_t4 坍缩 ---
-        net._mu4_diag = mu4
-        # --- 插桩结束 ---
-        # 去窗口化 (第 77 轮裁决): 移除跨窗 carry 拼接 — 自由运行是连续时间演化,
-        # 每窗首帧从零/注入起步 (无上一窗末帧注入, 消除跨窗能量累积通道)
+        net._mu4_diag = mu4  # 诊断插桩: 采集 PR(mu4) 区分 W_04 vs W_t4 坍缩
+        # 去窗口化: 移除跨窗 carry 拼接, 每窗首帧从零起步
         if free_run:
-            stp4 = (net._stp_r_l4[:a4], net._stp_tau_l4[:a4], net._stp_u_l4[:a4])
+            stp4 = (net._stp_r_l4[:dim_4], net._stp_tau_l4[:dim_4], net._stp_u_l4[:dim_4])
         else:
             stp4 = None
-        z4 = self._recurrent(mu4, dev, net.W_t4[:a4, :a4], stp=stp4, stp_tag="l4" if free_run else None)
-        z4_n = _l2_norm(z4)
-        mu2 = z4_n @ W_42_a.T + net.bias_l2[:a2]
+        z4 = self._recurrent(mu4, dev, net.W_t4[:dim_4, :dim_4], stp=stp4, stp_tag="l4" if free_run else None)
+        z4_n = l2_norm(z4)
+        mu2 = z4_n @ W_42_a.T + net.bias_l2[:dim_2]
         if free_run:
             mu2 = mu2 + net.cfg.osc_amp_m * vm  # 中节律 → L2
         z2 = self._recurrent(
-            mu2, dev, net.W_t2[:a2, :a2],
-            stp=(net._stp_r_l2[:a2], net._stp_tau_l2[:a2], net._stp_u_l2[:a2]) if free_run else None,
+            mu2, dev, net.W_t2[:dim_2, :dim_2],
+            stp=(net._stp_r_l2[:dim_2], net._stp_tau_l2[:dim_2], net._stp_u_l2[:dim_2]) if free_run else None,
             stp_tag="l2" if free_run else None,
         )
-        # 预投影 RMSNorm :
-        # 只归一化输入, 保方向压尖峰; 不归一化输出 mu, 不抹平差异
-        z2_n = _l2_norm(z2)
-        mu3 = z2_n @ W_23_a.T + net.bias_l3[:a3]
+        z2_n = l2_norm(z2)  # 只归一化输入, 保方向压尖峰
+        mu3 = z2_n @ W_23_a.T + net.bias_l3[:dim_3]
         if free_run:
             mu3 = mu3 + net.cfg.osc_amp_s * vs  # 慢节律 → L3
         if not is_inference:
             mu3 = mu3 + torch.sign(2.0 * (torch.rand_like(mu3) - 0.5)) * 0.03  # ACh 噪声
         z3 = self._recurrent(
-            mu3, dev, net.W_t3[:a3, :a3],
-            stp=(net._stp_r_l3[:a3], net._stp_tau_l3[:a3], net._stp_u_l3[:a3]) if free_run else None,
+            mu3, dev, net.W_t3[:dim_3, :dim_3],
+            stp=(net._stp_r_l3[:dim_3], net._stp_tau_l3[:dim_3], net._stp_u_l3[:dim_3]) if free_run else None,
             stp_tag="l3" if free_run else None,
         )
-        # 分流抑制 (第 78 轮, 仅自由运行): z3 上界 ±1 — 断 z3→z5→eps_b→phi_b
-        # 尖峰链 (第 77 轮 NaN 根因), 非线性由 z3 承载 (见下方注释)
         if free_run:
-            z3 = z3 / (1.0 + z3.abs())
-        z3_n = _l2_norm(z3)
-        # L5 统一矩阵 (撤销微柱硬切块): 全量 z3 → 单 W_35 [a5, a3]
-        z5 = z3_n @ net.W_35[:a5].T + net.bias_l5[:a5]
+            z3 = z3 / (1.0 + z3.abs())  # 分流抑制: 断 z3 下游尖峰链, 仅自由运行
+        z3_n = l2_norm(z3)
+        # L5 统一单矩阵
+        z5 = z3_n @ net.W_35[:dim_5].T + net.bias_l5[:dim_5]
         if free_run:
             z5 = z5 + net.cfg.osc_amp_f * vf  # 快节律 → L5 预激活
         # 路由分离: z5_raw 原始幅度喂 W_diff, z5 去中心化喂下游.
-        # Foldiak 反赫布侧抑制 (方案 D): z5 -= 0.2·M@z5, M 零起步 = 恒等;
-        # M 学 z_out 协方差 → 白化去相关 → 打破行收敛 ±w 的共线激活
-        # 注: z5 不做三阶 — z5 有稀疏尖峰结构 (Foldiak 侧抑制孤立放大),
-        # 任何范数归一化保留相对形状, 尖峰经三阶翻转放大 → W_35 差分 NaN (实测
-        # step 111, 全局 std 与逐行 RMS 均压不住). z5 保留线性, 非线性由 z3 承载
-        z5_fd = z5 - 0.2 * (net.M_l5[:a5, :a5] @ z5.transpose(-2, -1)).transpose(-2, -1)
+        # Foldiak 反赫布侧抑制: M 学协方差 → 白化去相关 (零起步 = 恒等).
+        # z5 不做三阶: 稀疏尖峰经三阶翻转放大 → W_diff 差分 NaN, 非线性由 z3 承载
+        z5_fd = z5 - 0.2 * (net.M_l5[:dim_5, :dim_5] @ z5.transpose(-2, -1)).transpose(-2, -1)
         z5_raw = z5_fd
         z5 = z5_raw - z5_raw.mean(dim=-1, keepdim=True)
-        mu6 = z5 @ W_56_a.T + net.bias_l6[:a6]
+        mu6 = z5 @ W_56_a.T + net.bias_l6[:dim_6]
         if free_run:
             mu6 = mu6 + net.cfg.osc_amp_s * vs  # 慢节律 → L6
         z6 = self._recurrent(
-            mu6, dev, net.W_t6[:a6, :a6],
-            stp=(net._stp_r_l6[:a6], net._stp_tau_l6[:a6], net._stp_u_l6[:a6]) if free_run else None,
+            mu6, dev, net.W_t6[:dim_6, :dim_6],
+            stp=(net._stp_r_l6[:dim_6], net._stp_tau_l6[:dim_6], net._stp_u_l6[:dim_6]) if free_run else None,
             stp_tag="l6" if free_run else None,
         )
 
-        # 下一状态预测 (显式预测目标): W_diff 在 L4 空间预测 Δz4 = z4[t] - z4[t-1]
-        # target_delta = z4_next - z4; pred_delta = z4 @ W_diff;
-        # eps_diff = pred_delta - target_delta (训练误差, 驱动 W_diff 学习动力学)
+        # W_diff 在 L4 空间预测 Δz4, eps_diff 驱动 W_diff 学习动力学
         dz4_pred = z4[:, 1:] - z4[:, :-1]
         dz4_pred = dz4_pred / (dz4_pred.norm(dim=-1, keepdim=True) + 1e-3)  # RMS 归一化
         z4_prev = z4[:, :-1] / (z4[:, :-1].norm(dim=-1, keepdim=True) + 1e-3)
-        z4_prev_pad = torch.cat([torch.zeros(N, 1, a4, dtype=z4.dtype, device=dev), z4_prev], dim=1)
-        bd = net.b_diff[:a4].unsqueeze(0).unsqueeze(0)
+        z4_prev_pad = torch.cat([torch.zeros(N, 1, dim_4, dtype=z4.dtype, device=dev), z4_prev], dim=1)
+        bd = net.b_diff[:dim_4].unsqueeze(0).unsqueeze(0)
         mu_diff = z4_prev_pad @ W_diff_a.T + bd
         diff_err = (dz4_pred - mu_diff[:, :-1]).square().mean()  # eps_diff 训练误差
 
@@ -402,42 +317,30 @@ class ForwardEngine:
             net._z5_raw = z5_raw
             net._z6 = z6
             if free_run:
-                # 去窗口化 (第 77 轮裁决): 不再传递 z 末帧 — 连续时间演化,
-                # 每窗独立起步 (消除跨窗能量累积). STP 资源状态跨窗延续
+                # 去窗口化: 每窗独立起步, STP 资源状态跨窗延续
                 for sln, sz in (("l4", z4), ("l2", z2), ("l3", z3), ("l6", z6)):
                     if sln in net._stp_r_end:
                         self._stp_update(sln, net._stp_r_end[sln], sz)
-            # 竞争性记忆单元群 (第 109 轮): K 个泄漏积分单元 (时间常数 α 自持),
-            # m_c[t] = (1-α_c)·m_c[t-1] + α_c·z4[t]. 跨窗延续 = 批均值写回
-            # (同 _m_pool 语义), 时间尺度谱由适应度/出生/死亡机制涌现
-            # (learning.py), 此处仅演化+展平供读出.
-            # 注: 保留循环版 — 张量化 (幂次权重矩阵) 在 fp16 下与循环乘法链
-            # 舍入不同 (0.5^64 下溢为 0 vs 逐步乘保留), 数学不等价 (第 76 轮实测
-            # 最大差 17.9), 不可用于训练
+            # 竞争性记忆单元群: K 个泄漏积分单元, m_c[t] = (1-α_c)·m_c[t-1] + α_c·z4[t].
+            # 保留循环版: 张量化在 fp16 下下溢/舍入不同, 数学不等价
             K = net._mem_m.shape[0]
             a4_ = net._mem_m.shape[1]
-            m_prev = net._mem_m.unsqueeze(0).unsqueeze(0).expand(N, 1, K, a4_).clone()  # [N,1,K,a4]
+            m_prev = net._mem_m.unsqueeze(0).unsqueeze(0).expand(N, 1, K, a4_).clone()  # [N,1,K,dim_4]
             m = m_prev
             for t in range(1, S):
-                zt = z4[:, t : t + 1].unsqueeze(2)  # [N,1,1,a4]
+                zt = z4[:, t : t + 1].unsqueeze(2)  # [N,1,1,dim_4]
                 mt = (1 - net._mem_a)[None, None, :, None] * m[:, -1:] + net._mem_a[None, None, :, None] * zt
                 m = torch.cat([m, mt], dim=1)
-            net._mem_out = m.reshape(N, S, K * a4_)  # [N,S,K·a4] 展平供 zh 拼接
-            net._mem_m = m[:, -1].mean(dim=0).detach()  # [K,a4] 批均值写回
-            # 才是"状态是否推进"的信号. tau 按原始量级自动校准 (EMA).
-            # 死循环: 帧不再转移 → 慢通道收敛向快通道 → N → 0 (LTD 主动遗忘);
-            # 正常推进: z4 持续领先 → N 健康正值 (LTP)
-            # 注: 保留循环版 — 张量化 (0.99^t 幂次矩阵) fp16 下溢 (0.99^63≈0.53
-            # 但 0.01·0.99^63 累加链舍入不同), 与循环乘法链不等价
+            net._mem_out = m.reshape(N, S, K * a4_)  # [N,S,K·dim_4] 展平供 zh 拼接
+            net._mem_m = m[:, -1].mean(dim=0).detach()  # [K,dim_4] 批均值写回
+            # 新奇度 (快慢散度): 死循环→N→0 (LTD); 正常推进→N 正 (LTP). 保留循环版 (张量化 fp16 下溢)
             zslow = torch.zeros_like(z4)
             zslow[:, 0] = z4[:, 0]
             for t in range(1, S):
                 zslow[:, t] = 0.99 * zslow[:, t - 1] + 0.01 * z4[:, t]
             net._novelty = ((z4 - zslow).square().mean(dim=-1)).detach()  # [N,S] 逐帧新奇度
 
-        # 稀疏绑定 (角色分离三槽): 连续 z4 → W_bind 三块 → 槽内 top-k WTA 硬稀疏
-        # bind_vec = [实体(256) | 角色(256) | 谓语(256)] 拼进 W_lm 输入 (第 5 段);
-        # 推理也计算 (生成/评估与训练同构)
+        # 稀疏绑定: 连续 z4 → W_bind → 槽内 top-k WTA; 推理也计算 (与训练同构)
         if net.cfg.bind_mode != "none":
             net._fr_vf = vf if free_run else None  # 快节律向量供 _bind 注入
             self._bind(z4)
@@ -452,39 +355,28 @@ class ForwardEngine:
         }
 
     def _stp_update(self, layer: str, r_end: torch.Tensor, z: torch.Tensor) -> None:
-        """STP 资源写回 (窗末): r 末帧写回 buffer (跨窗延续资源状态).
-        τ/U 固定初值, 不再自适应 (第 78 轮裁决: EMA 类失败机制移除)."""
+        """STP 资源写回 (窗末): r 末帧写回 buffer (跨窗延续)."""
         r_buf = getattr(self.net, f"_stp_r_{layer}")
         r_buf[: r_end.shape[0]].copy_(r_end)  # 修剪后 active 收缩: 只写头部切片
 
     def _bind(self, z4: torch.Tensor) -> None:
-        """竞争性概念绑定: z4 → W_bind → K=16 槽位 → 连续值稀疏激活向量.
+        """竞争性概念绑定: z4 → W_bind → 槽位 → 连续值稀疏激活向量.
 
-        第 76 轮终局升级 (裁决: z_bind 表示层从概率分布 → 超完备连续编码):
-        - 旧: softmax(T_inv=4) + sum=1 归一化 → 15 维单纯形, 区分度天花板
-          ~0.003 量级 → 三任信号源 (外部目标/W_lm 陌生度/W_bind_self 转移
-          误差) 全部无梯度失效 (实测).
-        - 新: relu(raw - θ) 阈值竞争 + 分流抑制 x/(1+|x|), 无 sum=1 约束.
-          输出 = 连续值稀疏向量: 大多数槽零, 少数激活槽携带幅度信息.
-          范数成为自由度 → 不同上下文的 z_bind 差异不再被压缩.
-        - θ 复用已有分流抑制滑阈 (_theta_bind 跟踪槽能量, 高激活槽被压).
-        - 软 WTA 竞争内核保留 (relu 阈值 = 竞争), 无温度参数.
-        - W_act/W_bind_self/decorr/自适应全部保持不变 (输入仍是 [N,S,16]).
+        relu(raw - θ) 阈值竞争 + 分流抑制, 无 sum=1 约束, 输出为连续值稀疏向量.
+        θ 复用 _theta_bind (跟踪槽能量).
         """
         net = self.net
-        a4 = net.active_size["l4"]
-        z4_n = _l2_norm(z4)
-        raw = z4_n @ net.W_bind[:a4]  # [N,S,K] 自下而上投影
+        dim_4 = net.active_size["l4"]
+        z4_n = l2_norm(z4)
+        raw = z4_n @ net.W_bind[:dim_4]  # [N,S,K] 自下而上投影
         if getattr(net, "_bind_loop", True):
-            # 自由运行快节律注入 (第 77 轮): 加性电流 → z_bind 预激活 (基准幅度)
+            # 自由运行快节律注入: 加性电流 → z_bind 预激活
             if getattr(net, "_fr_vf", None) is not None:
                 raw = raw + net.cfg.osc_amp_f * net._fr_vf
-            # STP 槽资源 (第 77 轮): 逐帧 z_bind 输出 ×r (资源耗尽 → 槽间歇切换),
-            # r 随槽活动消耗/恢复 (同递归层规则)
+            # STP 槽资源: 逐帧输出 ×r (资源耗尽 → 槽间歇切换)
             stp_bind = None
             if getattr(net, "_fr_vf", None) is not None:
                 stp_bind = (net._stp_r_bind, net._stp_tau_bind, net._stp_u_bind)
-            # 跨窗延续 (去窗口化第 77 轮): 不再传递槽末帧 — 每窗独立起步
             z_bind = self._bind_sparse(raw[:, :1] - net._theta_bind)  # t=0 无历史
             z_binds = [z_bind]
             r_bind = stp_bind[0].unsqueeze(0) if stp_bind else None
@@ -498,15 +390,15 @@ class ForwardEngine:
                 z_binds.append(z_bind)
                 if stp_bind:
                     act = z_bind.abs().mean(dim=1)  # [1,K] (同递归层修正)
-                    ema_b = getattr(net, "_stp_act_ema_bind")[: r_bind.shape[1]]
+                    ema_b = getattr(net, "_stp_active_ema_bind")[: r_bind.shape[1]]
                     ema_b.mul_(0.99).add_(0.01 * act.squeeze(0))
-                    # 第 82 轮: 槽位局部 U 自适应 (同递归层, 纯局部负反馈).
+                    # 槽位局部 U 自适应 (同递归层, 纯局部负反馈)
                     if self.net.cfg.stp_u_adapt:
                         rel_b = (act - ema_b.unsqueeze(0)) / (ema_b.unsqueeze(0) + 1e-6)
                         u_bind_b.add_(self.net.cfg.stp_u_adapt_rate * rel_b * u_bind_b)
                         u_bind_b.clamp_(self.net.cfg.stp_u_min, self.net.cfg.stp_u_max)
 
-                    u_eff_b = u_bind_b * act / (act + ema_b + 1e-6)  # 第 81 轮自参照耗尽
+                    u_eff_b = u_bind_b * act / (act + ema_b + 1e-6)  # 自参照耗尽
                     r_bind = r_bind + (1.0 - r_bind) * inv_tau_b - u_eff_b * r_bind * act
                     r_bind = r_bind.clamp(0.01, 1.0)
             if stp_bind and r_bind is not None:
@@ -514,7 +406,7 @@ class ForwardEngine:
             z_bind = torch.cat(z_binds, dim=1)
         else:
             z_bind = self._bind_sparse(raw - net._theta_bind)
-        # 分流抑制: 上界 1.0, 幅度保留 (无 sum=1 归一化, 范数 = 自由度)
+        # 分流抑制: 上界 1.0, 范数保留为自由度
         th_b = net._theta_bind
         th_b.mul_(0.98).add_(0.02 * (z_bind * z_bind).mean(dim=(0, 1)))
         z_bind = z_bind / (1.0 + z_bind.abs())
@@ -523,22 +415,13 @@ class ForwardEngine:
         if getattr(net, "_fr_vf", None) is not None:
             if "bind" in net._stp_r_end:
                 self._stp_update("bind", net._stp_r_end["bind"], z_bind)  # 槽 STP 资源写回
-        # 动作电位 (第 76 轮): 概念槽 → W_act → 256 字节脉冲潜能, 供学习器三因子更新
-        net._act_pot = z_bind @ net.W_act  # [N,S,256] (soft_norm 列归一有界)
+        # 动作电位: 概念槽 → W_act → 字节脉冲潜能
+        net._intent_pot = z_bind @ net.W_act  # [N,S,256] (soft_norm 列归一有界)
 
     def _bind_sparse(self, pre_act: torch.Tensor, k: int = 4) -> torch.Tensor:
-        """槽稀疏竞争 (第 102q 轮, 用户批准架构变更): 每位置只保留 top-k 强
-        激活槽, 其余清零 — 替代 relu(raw-θ) 的"全部正激活通过".
+        """槽稀疏竞争: 每位置只保留 top-k 强激活槽, 其余清零.
 
-        背景 (chat102 全链实证): relu 竞争无 WTA 机制 → z_bind 每位置激活
-        11-16 槽 (稠密) → 槽模式间 cos 0.7 (首/续字节) → 线性读出 pot 趋
-        均匀 (中心极限) → W_act 学不出条件映射. 稀疏 top-k 恢复区分度:
-        - 保留连续值幅度 (relu 后值, 非二值) — 第 76 轮"超完备连续编码"
-          的语义不变, 范数仍是自由度
-        - k=4/32 (12.5%) — 强竞争但保留多样 (软 WTA 时代 K=16 top-k=10
-          的先例是 62%)
-        - 阈值 θ 仍起"弱激活过滤"作用 (先 relu(raw-θ), 再 top-k 选择)
-        - 纯张量: topk 零 GPU→CPU 同步, fp16 安全
+        保留连续值幅度 (relu 后值, 非二值), 范数仍是自由度; 阈值 θ 先弱激活过滤再 top-k.
         """
         x = torch.relu(pre_act)  # [...,K] 弱激活过滤
         if x.shape[-1] <= k:

@@ -1,19 +1,4 @@
-"""持续自主运行 — AutonomousMind
-
-无限循环: WAKE → PLAY → SLEEP, 永不停止.
-
-StreamRunner 适配版: 所有 Hebbian 更新由 StreamRunner.step() 内部完成.
-
-架构:
-  WAKE  (好奇生成): CuriositySampler 通过 runner.step() 自回归生成字节
-  PLAY  (在线交互): 回放数据送入 runner.step(), 内部触发 Hebbian 可塑性
-  SLEEP (离线巩固): 批量回放 replay buffer 数据
-
-用法:
-    from model.autonomous.autonomous_mind import AutonomousMind
-    mind = AutonomousMind(runner)
-    mind.run_forever()
-"""
+"""持续自主运行"""
 
 import json
 import math
@@ -26,7 +11,7 @@ from collections.abc import Callable
 import torch
 
 from model.continual.concept_discovery import ConceptDiscovery
-from model.model_cyrene import CyreneModel
+from model._archived_sparse import CyreneModel
 from pkg.utils.trainer_utils import Logger
 
 # ═══════════════════════════════════════════════════════════════════

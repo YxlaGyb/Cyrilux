@@ -1,11 +1,10 @@
 """
-多巴胺效用驱动的 Memory Bank — 存储旧任务 exemplars 用于回放.
+多巴胺效用驱动的 Memory Bank
+存储旧任务 exemplars 用于回放.
 
 每个 Exemplar 保存 byte_tensor + label_tensor + task_id + dopamine_score + baseline_loss
 MemoryBank 按 task_id 分组, 每任务容量上限 max_per_task, FIFO 淘汰.
 采样策略: dopamine 加权 (高分值样本被回放的概率更高).
-
-Ponytail: 存张量而非文本 — 反序列化零解析开销, 直接喂模型.
 """
 
 from __future__ import annotations

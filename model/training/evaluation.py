@@ -1,4 +1,6 @@
-"""统一评估模块 — StreamRunner Perplexity + 文本生成。
+"""
+统一评估模块
+StreamRunner Perplexity + 文本生成。
 
 用法:
     from model.training.evaluation import (
@@ -12,7 +14,7 @@ import math
 import torch
 from torch.utils.data import DataLoader
 
-from model.model_cyrene import CyreneConfig, CyreneModel
+from model._archived_sparse import CyreneConfig, CyreneModel
 from model.training.dataset import DualChannelDataset
 from model.training.loop import warmup
 

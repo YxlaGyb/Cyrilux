@@ -1,9 +1,4 @@
-"""model.sparse
-
-稀疏/事件驱动后端 (页式槽位 + alive 掩码 + 邻接表).
-
-全张量化神经元池, scatter_add 预测聚合, 零 matmul 依赖.
-"""
+"""全张量化神经元池, scatter_add 预测聚合"""
 
 from ..constants import (
     CONN_FEEDBACK,

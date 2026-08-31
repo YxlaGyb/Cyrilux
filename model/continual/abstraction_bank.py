@@ -1,14 +1,6 @@
-"""抽象记忆银行 — StreamRunner 适配版。
-
-核心转变:
-  MemoryBank 存"模型见过什么"(原始字节),
-  AbstractionBank 存"模型学会了什么"(神经元稳态表示 + 原型).
-
-架构:
-  AbstractionEntry  — 单条抽象记忆 (神经元快照)
-  AbstractionBank   — 多任务原型银行, 支持 k-means 压缩 + 表示级回放
-  VariationalReplayer — 结构变体生成 + 吸引子强度测试
-  AbstractionSniffer  — 抽象级遗忘检测 (余弦距离到原型)
+"""
+抽象记忆银行
+StreamRunner 适配版
 """
 
 from __future__ import annotations
@@ -17,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from model.constants import F_EPS, F_Z
-from model.model_cyrene import CyreneModel
+from model._archived_sparse import CyreneModel
 
 
 @torch.no_grad()

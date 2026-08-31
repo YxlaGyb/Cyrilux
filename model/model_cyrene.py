@@ -1,625 +1,488 @@
-"""Cyrene 模型
+"""Cyrene 模型定义
 
-架构:
-    TensorNeuronPool (scatter_add 预测 + 批量 Hebbian)
-    + 时序/topdown/LM 投影 + 神经调制 + 稳态
+密集 PPA 感知-预测-行动闭环网络.
 """
 
 from __future__ import annotations
 
-import os
-import random
-from collections.abc import Callable
-from dataclasses import dataclass, fields
+import math
+from dataclasses import dataclass
 
 import torch
-
-from model.constants import F_Z
-from model.modulation import combine_modulation, compute_ach, compute_dopamine, compute_uncertainty
-from model.sparse import TensorNeuronPool, compute_precision_scales
-from pkg.device.cuda import setup_cuda_device
+from torch import nn
 
 
 @dataclass
-class CyreneConfig:
-    """Cyrene 模型配置."""
+class DensePCConfig:
+    """PPA 网络配置."""
 
-    hidden_size: int = 64
-    num_hidden_layers: int = 1
-    max_memory_bytes: int = 2_147_483_648  # 内存预算上限 (2GB)
-    K_fan: int = 128
-    warmup_steps: int = 50
-    hebbian_base_eta: float = 3e-4
+    # 维度
+    d_input: int = 256
+    d_act: int = 256  # W_act 列数 (字节域 256, 具身模式 2)
+    d_l4: int = 1024
+    d_l2: int = 384
+    d_l3: int = 384
+    d_l5: int = 1024
+    d_l6: int = 128
+    max_seq_len: int = 256
+    input_history: bool = True  # W_04 输入拼接 [z0[t], z0[t-1]], 词序进入表示层
+
+    # Hebbian 学习
+    lr_hebbian: float = 0.003
+    temporal_lr_ratio: float = 5.0
     oja_alpha: float = 0.05
-    ach_beta_0: float = 0.0
-    hidden_neurons: int = 256
-    connection_density: float = 0.2
-    bias_strength: float = 0.7  # connect_layer 偏好池权重 (0=随机, 1=纯本地)
-    use_mu_lm: bool = True  # LM head 用 MU (有更强的输入选择性)
-    prune_interval: int = 100
-    grow_interval: int = 200
-    homeostasis_interval: int = 50
-
-
-class LMHead:
-    """LM Head 薄封装 — 委托到 TensorNeuronPool 的 lm_weight 计算."""
-
-    def __init__(self, pool):
-        self._pool = pool
-
-    def predict_logits(self, pool, top_layer: int, use_mu: bool = True) -> list[float]:
-        """返回 256 个字节的 logits (list[float], CPU)."""
-        logits = pool.compute_lm_logits(top_layer, use_mu=use_mu)
-        return logits.cpu().tolist()
-
-    def cross_entropy_loss(self, logits: list[float], target: int) -> float:
-        """计算 CE loss."""
-        import torch
-
-        t = torch.tensor(logits, dtype=torch.float32).unsqueeze(0)
-        target_t = torch.tensor([target])
-        return float(torch.nn.functional.cross_entropy(t, target_t).item())
-
-
-class CyreneModel:
-    """Cyrene 模型 — 全张量化字节级 PC 持续学习.
-
-    Usage:
-        config = CyreneConfig(hidden_size=64)
-        model = CyreneModel(config)
-        model.add_hidden_layer()
-        stats = model.step(byte_seq)
-    """
-
-    _EVENTS = [
-        "before_step",
-        "after_step",
-        "before_encode",
-        "after_encode",
-        "before_sensory",
-        "after_sensory",
-        "before_predict",
-        "after_predict",
-        "before_modulate",
-        "after_modulate",
-        "before_hebbian",
-        "after_hebbian",
-        "before_homeostasis",
-        "after_homeostasis",
-    ]
-
-    def __init__(self, config: CyreneConfig):
-        self.config = config
-        self.device = setup_cuda_device()
-
-        # 页式动态神经元池 (自组织, 2GB 约束内生长/修剪)
-        self.pool = TensorNeuronPool(
-            K=config.K_fan,
-            device=self.device,
-            max_memory_bytes=config.max_memory_bytes,
-        )
-
-        # LM Head (委托到 pool)
-        self.lm_head = LMHead(self.pool)
-
-        # 运行状态
-        self._step: int = 0
-        self._top_layer: int = 0
-        self._hidden_layer_created: bool = False
-        self._pending_connects: list = []
-        self._free_energy_history: list[float] = []
-
-        # 神经调制状态
-        self._last_D: float = 0.5
-        self._last_ACh: float = 0.5
-        self._last_modulation: float = 0.5
-        self._last_pred_byte: int = -1
-
-        # hook 系统
-        self._hooks: dict[str, list[Callable]] = {e: [] for e in self._EVENTS}
-
-    # ═══════════════════════════════════════════════════════════════
-    # Hook 系统
-    # ═══════════════════════════════════════════════════════════════
-
-    def hook(self, event: str, fn: Callable):
-        if event not in self._EVENTS:
-            raise ValueError(f"Unknown hook event: {event}")
-        self._hooks.setdefault(event, []).append(fn)
-
-    def unhook(self, event: str, fn: Callable | None = None):
-        if event not in self._EVENTS:
-            raise ValueError(f"Unknown hook event: {event}")
-        if fn is None:
-            self._hooks[event].clear()
-        else:
-            self._hooks[event] = [h for h in self._hooks[event] if h is not fn]
-
-    def _fire(self, event: str, **ctx):
-        for fn in self._hooks.get(event, ()):
-            fn(self, **ctx)
-
-    # ═══════════════════════════════════════════════════════════════
-    # 架构构建
-    # ═══════════════════════════════════════════════════════════════
-
-    def add_hidden_layer(self):
-        """创建 5 层皮层架构:
-        L4(感觉输入) → L2 → L3 → L5(输出) → L6(反馈调节).
-
-        每个层有不同的惯性 (时间常数) 和 k-WTA 比例.
-        连接延迟到 warmup 后 (感官神经元届时已存在).
-        隐藏层神经元按 nid % 8 分组, 保留字节分组通路.
-        """
-        from model.constants import (
-            CONN_FEEDBACK,
-            CONN_FEEDFORWARD,
-            LAYER_CONFIG,
-            LAYER_L2,
-            LAYER_L3,
-            LAYER_L4,
-            LAYER_L5,
-            LAYER_L6,
-            TOP_LAYER,
-        )
-
-        for layer, (n, alpha, kwta) in LAYER_CONFIG.items():
-            nids = [self.pool.neuron.create_neuron(layer=layer) for _ in range(n)]
-            self.pool.projections.temporal_connect(nids)
-            # 隐藏层神经元分配信道标签, L4 按列分配 (0-255)
-            if layer == LAYER_L4:
-                per_ch = max(1, n // 256)
-                for i, nid in enumerate(nids):
-                    self.pool.channel[nid] = i // per_ch
-            elif layer > 0:
-                per_ch = n // 8
-                for i, nid in enumerate(nids):
-                    self.pool.channel[nid] = i // per_ch
-
-        self._top_layer = TOP_LAYER
-        self._hidden_layer_created = True
-
-        # 延迟连接 (warmup 结束后触发)
-        self._pending_connects = [
-            (0, LAYER_L4, 0.25, CONN_FEEDFORWARD),
-            (LAYER_L4, LAYER_L2, 0.25, CONN_FEEDFORWARD),
-            (LAYER_L2, LAYER_L3, 0.30, CONN_FEEDFORWARD),
-            (LAYER_L3, LAYER_L5, 0.30, CONN_FEEDFORWARD),
-            (LAYER_L5, LAYER_L6, 0.30, CONN_FEEDFORWARD),
-            (LAYER_L6, LAYER_L5, 0.20, CONN_FEEDBACK),
-            (LAYER_L5, LAYER_L3, 0.20, CONN_FEEDBACK),
-            (LAYER_L3, LAYER_L2, 0.15, CONN_FEEDBACK),
-            (LAYER_L2, LAYER_L4, 0.15, CONN_FEEDBACK),
-        ]
-
-    # ═══════════════════════════════════════════════════════════════
-    # 显式阶段方法
-    # ═══════════════════════════════════════════════════════════════
-
-    def encode(self, byte_ids: torch.Tensor) -> list[tuple[int, int]]:
-        """
-        Stage 1:
-            字节ID → (position, byte_value) 对列表.
-        byte_ids:
-            [1, S] long (0..255).
-        """
-        vals = byte_ids.squeeze(0).tolist()  # [S]
-        return [(pos, int(v)) for pos, v in enumerate(vals) if v != 0]
-
-    def process_sensory_events(self, byte_events: list[tuple[int, int]]) -> int:
-        """
-        Stage 2+3: 按 (position, byte_value) 匹配/创建 L0 神经元.
-        每个字节值在每个位置有专属神经元 — 纯离散, 零嵌入.
-        """
-        self._fire("before_sensory")
-        if not byte_events:
-            self._fire("after_sensory", n_processed=0)
-            return 0
-
-        is_warmup_now = self._step <= self.config.warmup_steps
-        max_ev = 2000 if is_warmup_now else 500
-        if len(byte_events) > max_ev:
-            byte_events = byte_events[:max_ev]
-
-        positions_l = [p for p, _ in byte_events]
-        byte_vals_l = [b for _, b in byte_events]
-
-        # 匹配: key = (layer=0, position, byte_value)
-        matched_nids, matched_idx, unmatched_idx = self.pool.query.match_sensory_events(
-            [0] * len(byte_events), positions_l, byte_vals_l
-        )
-
-        n_total = len(matched_nids) + len(unmatched_idx)
-        if n_total == 0:
-            self._fire("after_sensory", n_processed=0)
-            return 0
-
-        # 创建未匹配的神经元
-        if unmatched_idx:
-            new_nids = self.pool.neuron.create_neurons_batch(
-                layers=[0] * len(unmatched_idx),
-                positions=[positions_l[i] for i in unmatched_idx],
-                channels=[byte_vals_l[i] for i in unmatched_idx],
-                thresholds=[0.05] * len(unmatched_idx),
-            )
-            if self._top_layer > 0 and not self._pending_connects:
-                l4_nids = self.pool.query.get_neurons_by_layer(10)  # LAYER_L4
-                if len(l4_nids) > 0:
-                    hl = l4_nids.tolist()
-                    pre_list, post_list = [], []
-                    # 构建 L4 信道索引 (仅需一次, 纯 Python)
-                    l4_ch = {h: int(self.pool.channel[h].item()) for h in hl}
-                    for snid, bv in zip(new_nids, [byte_vals_l[i] for i in unmatched_idx]):
-                        k = max(1, int(len(hl) * 0.25))
-                        group = bv % 8
-                        preferred = [h for h in hl if l4_ch[h] == group]
-                        rest = [h for h in hl if l4_ch[h] != group]
-                        ordered = preferred + rest
-                        for hnid in ordered[:k]:
-                            pre_list.append(snid)
-                            post_list.append(hnid)
-                    if pre_list:
-                        self.pool.synapse.create_synapses_batch(pre_list, post_list, init_scale=7.5)
-        else:
-            new_nids = []
-
-        all_nids = matched_nids + new_nids
-        # z=1.0 纯离散 on/off: 神经元身份本身编码字节值, 不需要嵌入
-
-        all_nids_t = torch.tensor(all_nids, dtype=torch.int32, device=self.device)
-        z_new_t = torch.ones(len(all_nids), dtype=torch.float16, device=self.device)
-        self.pool.forward.update_batch(all_nids_t, z_new_t)
-
-        self._fire("after_sensory", n_processed=n_total)
-        return n_total
-
-    @torch.inference_mode()
-    def process_network_events(self, max_events: int = 10) -> int:
-        """
-        Stage 4: 网络事件处理
-        已简化, 不再使用 EventBridge.
-        """
-        return 0
-
-    @torch.inference_mode()
-    def predict_pass(self):
-        """Stage 5: 前馈预测 + 时序/topdown."""
-        self._fire("before_predict")
-        self.pool.forward.predict_all()
-        self.pool.forward.temporal_topdown_pass(self._top_layer)
-        self._fire("after_predict")
-
-    @torch.inference_mode()
-    def compute_stats(self) -> tuple[float, float, int]:
-        """Stage 6: 自由能 + LM logits."""
-        free_energy = float(self.pool.forward.compute_free_energy().item())
-        pred_byte = -1
-        if self._top_layer > 0 and self.pool.query.get_layer_width(self._top_layer) > 0:
-            logits = self.pool.forward.compute_lm_logits(self._top_layer)
-            pred_byte = int(logits.argmax().item())
-            self._last_pred_byte = pred_byte
-        self._free_energy_history.append(free_energy)
-        return free_energy, 0.0, pred_byte
-
-    @torch.inference_mode()
-    def modulate(self, free_energy: float):
-        """Stage 7: 神经调质 D/ACh 计算."""
-        self._fire("before_modulate", free_energy=free_energy)
-        uncertainty = compute_uncertainty(self._free_energy_history)
-        F_prev = self._free_energy_history[-2] if len(self._free_energy_history) >= 2 else free_energy
-        D = compute_dopamine(free_energy, F_prev)
-        ACh = compute_ach(uncertainty, self.config.ach_beta_0)
-        modulation = combine_modulation(D, ACh)
-        self._last_D = D
-        self._last_ACh = ACh
-        self._last_modulation = modulation
-        compute_precision_scales(self.pool, D, ACh)
-        self._fire("after_modulate", D=D, ACh=ACh, modulation=modulation, uncertainty=uncertainty)
-
-    @torch.inference_mode()
-    def hebbian_pass(self, modulation: float):
-        """Stage 8: Hebbian + Oja + 时序更新."""
-        self._fire("before_hebbian", modulation=modulation)
-        active = self.pool.query.get_active_neurons()
-        eta = self.config.hebbian_base_eta
-        if active.shape[0] > 0:
-            # 全量 Hebbian (前馈+反馈共用 weight 数组, hebbian_pass 通过 in_ptrs 全覆盖)
-            eta_ff = eta * 60.0
-            self.pool.learning.hebbian_pass(
-                active, eta=eta_ff, oja_alpha=self.config.oja_alpha, dopamine=modulation
-            )
-        # 时序学习: 覆盖所有隐藏层
-        hidden_mask = (self.pool.layer > 0) & self.pool.alive
-        hidden_active = torch.where(hidden_mask)[0]
-        if hidden_active.shape[0] > 0:
-            self.pool.learning.hebbian_temporal(hidden_active, eta=eta * 50.0, dopamine=modulation)
-        self._fire("after_hebbian", n_active=int(active.shape[0]))
-
-    @torch.inference_mode()
-    def homeostasis_pass(self) -> dict:
-        """Stage 8b: 稳态可塑性 + 隐藏层动态生长."""
-        self._fire("before_homeostasis")
-        hs = self.pool.learning.homeostasis_step(
-            self._step,
-            prune_interval=self.config.prune_interval,
-            grow_interval=self.config.grow_interval,
-        )
-
-        # 隐藏层动态生长: 自动补充修剪损失, 维持层容量
-        if self._step % max(1, self.config.grow_interval) == 0:
-            from model.constants import HIDDEN_LAYERS, LAYER_CONFIG
-
-            for layer in HIDDEN_LAYERS:
-                base_n = LAYER_CONFIG[layer][0]
-                alive_nids = self.pool.query.get_neurons_by_layer(layer)
-                current_n = len(alive_nids)
-                if current_n < base_n:
-                    # 补充至 base_n
-                    to_grow = base_n - current_n
-                    new_nids = self.pool.neuron.grow_hidden_neurons(layer, to_grow)
-                    # 将新神经元连入网络
-                    self._wire_hidden_neurons(layer, new_nids)
-                    hs.setdefault("grown_hidden", 0)
-                    hs["grown_hidden"] += len(new_nids)
-                # 长期: 允许层生长超出 base_n (1.5x 上限, 基于高误差)
-                max_n = int(base_n * 1.5)
-                if current_n < max_n and current_n >= base_n:
-                    alive = self.pool.alive[alive_nids]
-                    if alive.any():
-                        high_err = self.pool.state[alive_nids[alive], 2].abs() > 0.3
-                        n_extra = int(high_err.sum().item())
-                        if n_extra > max(1, (max_n - current_n) // 2):
-                            to_grow = min(n_extra // 2, max_n - current_n)
-                            new_nids = self.pool.neuron.grow_hidden_neurons(layer, to_grow)
-                            self._wire_hidden_neurons(layer, new_nids)
-                            hs["grown_hidden"] = hs.get("grown_hidden", 0) + len(new_nids)
-
-        self._fire("after_homeostasis", hs_stats=hs)
-        return hs
-
-    def _wire_hidden_neurons(self, layer: int, nids: list[int]):
-        """将新神经元连入现有前馈网络.
-        根据层的上下游关系创建对应连接.
-        """
-        from model.constants import (
-            CONN_FEEDFORWARD,
-            LAYER_L2,
-            LAYER_L3,
-            LAYER_L4,
-            LAYER_L5,
-            LAYER_L6,
-            LAYER_SENSORY,
-        )
-
-        if not nids:
-            return
-
-        # 前馈: 前一层 → 本层
-        feedforward_src = {
-            LAYER_L4: LAYER_SENSORY,
-            LAYER_L2: LAYER_L4,
-            LAYER_L3: LAYER_L2,
-            LAYER_L5: LAYER_L3,
-            LAYER_L6: LAYER_L5,
-        }
-        src_layer = feedforward_src.get(layer)
-        if src_layer is not None:
-            src_nids = self.pool.query.get_neurons_by_layer(src_layer)
-            if len(src_nids) > 0:
-                src_list = src_nids.tolist()
-                pre_list, post_list = [], []
-                density = 0.25 if layer == LAYER_L4 else 0.30
-                for dst in nids:
-                    k = max(1, int(len(src_list) * density))
-                    for pre in random.sample(src_list, k):
-                        pre_list.append(pre)
-                        post_list.append(dst)
-                if pre_list:
-                    is_sensory = src_layer == LAYER_SENSORY
-                    self.pool.synapse.create_synapses_batch(
-                        pre_list,
-                        post_list,
-                        init_scale=7.5 if is_sensory else 3.0,
-                        conn_type=CONN_FEEDFORWARD,
-                    )
-
-        # 反馈: 本层 → 前一层 (独立 td 通路)
-        feedback_src = {
-            LAYER_L6: LAYER_L5,
-            LAYER_L5: LAYER_L3,
-            LAYER_L3: LAYER_L2,
-            LAYER_L2: LAYER_L4,
-        }
-        fb_src = feedback_src.get(layer)
-        if fb_src is not None:
-            self.pool.projections.topdown_connect_layer(layer, fb_src, density=0.2)
-
-        # L4 → LM head (TOP_LAYER)
-        if layer == self._top_layer:
-            self.pool.projections.lm_ensure_top_connected(self._top_layer)
-
-    @torch.inference_mode()
-    def finalize_step(self):
-        """Stage 9: 保存 z_prev."""
-        self.pool.learning.finalize_step()
-
-    @torch.inference_mode()
-    def reset_hidden_state(self):
-        """重置隐藏层状态 (layer>0) 为 0. 感官层不改动."""
-        from model.constants import F_EPS, F_MU, F_Z, F_Z_PREV
-
-        mask = (self.pool.layer > 0) & self.pool.alive
-        if mask.any():
-            for col in (F_Z, F_MU, F_EPS, F_Z_PREV):
-                self.pool.state[mask, col] = 0.0
-
-    # ═══════════════════════════════════════════════════════════════
-    # 核心 step
-    # ═══════════════════════════════════════════════════════════════
-
-    @torch.inference_mode()
-    def step(self, byte_seq: torch.Tensor, target_byte: int = -1) -> dict:
-        """执行一个完整步.
-
-        Args:
-            byte_seq: [1, 2, S] fp16 双通道字节编码
-            target_byte: 目标字节 (0..255), -1 = 无监督信号
-
-        Returns:
-            统计字典.
-        """
-        self._step += 1
-        is_warmup = self._step <= self.config.warmup_steps
-
-        # warmup 结束后触发延迟连接 (全密度双向, 共用 weight 数组)
-        if not is_warmup and self._pending_connects:
-            for from_l, to_l, density, conn_type in self._pending_connects:
-                is_sensory = from_l == 0
-                if conn_type == 1:
-                    self.pool.projections.topdown_connect_layer(from_l, to_l, density=density)
-                else:
-                    self.pool.synapse.connect_layer(
-                        from_l,
-                        to_l,
-                        density=density,
-                        bias_strength=self.config.bias_strength,
-                        conn_type=conn_type,
-                        init_scale=7.5 if is_sensory else 3.0,
-                    )
-            self._pending_connects = []
-            # 确保 LM head 连接
-            if self._top_layer > 0:
-                self.pool.projections.lm_ensure_top_connected(self._top_layer)
-
-        self._fire("before_step", byte_seq=byte_seq)
-
-        byte_events = self.encode(byte_seq)
-        self.process_sensory_events(byte_events)
-
-        self.process_network_events(max_events=10)
-        self.predict_pass()
-        free_energy, lm_loss, pred_byte = self.compute_stats()
-
-        # 每步阈值调节 (不管 homeostasis 间隔, 强反馈压制过度发放)
-        self.pool.learning.adjust_thresholds(target_rate=0.15, rate_eta=0.05)
-
-        hs_stats: dict = {}
-        if self._step % self.config.homeostasis_interval == 0:
-            hs_stats = self.homeostasis_pass()
-            # LM head 稳态: 已禁用, 误差门控 Hebbian 本身有自调节 (正确时 gate=0.1)
-            # L2 归一化破坏条件权重不对称性, 导致退化为全局频率预测
-            # if not is_warmup and self._top_layer > 0:
-            #     self.pool.learning.homeostasis_lm_head(self._top_layer)
-
-        if not is_warmup and free_energy > 1e-8:
-            self.modulate(free_energy)
-            self.hebbian_pass(self._last_modulation)
-            # LM head: 纯 Hebbian (pre-post 共现, 无误差信号)
-            if target_byte >= 0 and self._top_layer > 0:
-                self.pool.learning.hebbian_lm_head(
-                    self._top_layer,
-                    target_byte,
-                    eta=self.config.hebbian_base_eta * 5000.0,
-                    dopamine=self._last_modulation,
-                    use_mu=self.config.use_mu_lm,
-                )
-
-        uncertainty = (
-            0.5
-            if is_warmup or len(self._free_energy_history) < 3
-            else compute_uncertainty(self._free_energy_history[-20:])
-        )
-        self.finalize_step()
-
-        # 每步结尾重置感官层 z=0: 只保留当前步的 L0 信号, 旧 L0 不干扰前馈
-        sensory_mask = (self.pool.layer == 0) & self.pool.alive
-        if sensory_mask.any():
-            self.pool.state[sensory_mask, F_Z] = 0.0
-
-        activity = self.pool.query.get_activity_stats()
-        stats = {
-            "step": self._step,
-            "free_energy": free_energy,
-            "lm_loss": lm_loss,
-            "pred_byte": pred_byte,
-            "n_neurons": activity["total_neurons"],
-            "n_synapses": activity["total_synapses"],
-            "firing_rate": activity["avg_firing_rate"],
-            "threshold": activity["avg_threshold"],
-            "warmup": is_warmup,
-            "D": self._last_D,
-            "ACh": self._last_ACh,
-            "modulation": self._last_modulation,
-            "uncertainty": uncertainty,
-            **hs_stats,
-        }
-
-        self._fire("after_step", stats=stats)
-        return stats
-
-    # ═══════════════════════════════════════════════════════════════
-    # 高级 API
-    # ═══════════════════════════════════════════════════════════════
-
-    def connect_topdown(self, upper_layer: int, lower_layer: int, max_per_upper: int = 8):
-        """建立 topdown 连接."""
-        return self.pool.projections.topdown_connect_active(upper_layer, lower_layer, max_per_upper)
-
-    def get_state(self) -> dict:
-        activity = self.pool.query.get_activity_stats()
+    column_dropout: float = 0.25
+    inertia_alpha: float = 0.3
+
+    # 修剪
+    prune_interval: int = 1000
+    prune_warmup: int = 5000
+    prune_fraction: float = 0.05
+    death_probation: int = 200
+    death_threshold: float = 1e-4
+    active_size_lower_bound: int = 128
+    l4_lower_bound: int = 512  # L4 承载表示+预测双任务, 维度坍缩到 NaN
+    adaptive_traction: bool = False
+    lm_lr_boost: float = 1.0
+    adaptive_rho: bool = False
+
+    # 自由运行振荡器
+    free_run_window: int = 64
+    osc_amp_f: float = 0.10
+    osc_amp_m: float = 0.03
+    osc_amp_s: float = 0.01
+
+    # 短期突触可塑性 (STP)
+    stp_tau_min: float = 8.0
+    stp_tau_max: float = 256.0
+    stp_u_init: float = 0.05
+    stp_u_adapt: bool = True
+    stp_u_adapt_rate: float = 0.01
+    stp_u_min: float = 0.01
+    stp_u_max: float = 0.5
+
+    # 突触缩放 / 谱守卫
+    wt_syn_scaling: bool = True
+    wt_syn_scaling_rate: float = 0.1
+    spectral_guard_bound: float = 1.5
+    bias_leak_rate: float = 1e-4
+    oja_elasticity: float = 0.05
+    probation_decay: float = 0.5
+
+    # 生成 / 绑定
+    gen_precision: float = 1.0
+    bind_dim: int = 4096
+    bind_k: int = 10
+    bind_mode: str = "hard"
+    bind_orth: bool = False
+
+    # 读出端诊断开关
+    lm_freeze_w1: bool = False
+    lm_no_contrast: bool = False
+    lm_no_bcm: bool = False
+
+    # 竞争性记忆单元群
+    mem_k0: int = 6
+    mem_k_max: int = 16
+    mem_alpha_min: float = 1.0 / 1024.0
+    mem_alpha_max: float = 0.5
+    mem_g_max: float = 2.0
+    mem_g_min: float = 0.05
+    mem_eta_g: float = 0.01
+    mem_g_decay: float = 0.001
+    mem_birth_thresh: float = 1.2
+    mem_birth_cooldown: int = 2000
+    mem_death_steps: int = 2000
+
+    def dims(self) -> dict[str, int]:
         return {
-            "step": self._step,
-            "pool_stats": activity,
-            "bridge_stats": {},
-            "free_energy": (self._free_energy_history[-1] if self._free_energy_history else 0.0),
-            "warmup_remaining": max(0, self.config.warmup_steps - self._step),
-            "D": self._last_D,
-            "ACh": self._last_ACh,
-            "modulation": self._last_modulation,
-            "last_pred_byte": self._last_pred_byte,
-            "temporal_connections": int(self.pool.t_connected.sum().item()),
-            "topdown_connections": int(self.pool.td_alive.sum().item()),
+            "l4": self.d_l4,
+            "l2": self.d_l2,
+            "l3": self.d_l3,
+            "l5": self.d_l5,
+            "l6": self.d_l6,
         }
+
+    def param_count(self) -> int:
+        """预估参数量 (含生成连接与时间核)."""
+        d = self.dims()
+        n = 0
+        n += d["l4"] * self.d_input  # W_04
+        n += d["l2"] * d["l4"]  # W_42
+        n += d["l3"] * d["l2"]  # W_23
+        n += d["l5"] * d["l3"]  # W_35
+        n += d["l6"] * d["l5"]  # W_56
+        n += d["l4"] * d["l5"]  # W_diff (L5_t → ΔL4_t)
+        for k in ("l4", "l2", "l3", "l5", "l6"):
+            n += d[k] * d[k]
+        n += sum(d[k] for k in ("l4", "l2", "l3", "l5", "l6"))
+        return n
+
+
+class DensePCNet(nn.Module):
+    """PPA 闭环网络 (门面: 权重声明 + 引擎委托)."""
+
+    def __init__(self, config: DensePCConfig | None = None):
+        super().__init__()
+        self.cfg = config or DensePCConfig()
+        d = self.cfg.dims()
+
+        # 前馈权重 (自下而上感知)
+        self._in_dim = self.cfg.d_input * (2 if self.cfg.input_history else 1)
+        self.W_04 = nn.Parameter(torch.empty(d["l4"], self._in_dim, dtype=torch.float16))
+        self.W_42 = nn.Parameter(torch.empty(d["l2"], d["l4"], dtype=torch.float16))
+        self.W_23 = nn.Parameter(torch.empty(d["l3"], d["l2"], dtype=torch.float16))
+        self.W_35 = nn.Parameter(torch.empty(d["l5"], d["l3"], dtype=torch.float16))
+        self.W_56 = nn.Parameter(torch.empty(d["l6"], d["l5"], dtype=torch.float16))
+
+        # 世界模型: W_diff 在 L4 空间预测 Δz4; W_state_pred 独立供表示层预测误差
+        self.W_diff = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
+        self.b_diff = nn.Parameter(torch.zeros(d["l4"], dtype=torch.float16))
+        self.W_state_pred = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
+
+        # 自组织预测引擎: 层间局部预测矩阵
+        self.W_pred_54 = nn.Parameter(torch.empty(d["l5"], d["l4"], dtype=torch.float16))
+        self.W_pred_43 = nn.Parameter(torch.empty(d["l4"], d["l3"], dtype=torch.float16))
+
+        # 竞争性概念绑定层
+        self.bind_slot_dim = 32
+        self._lm_in = d["l4"] * (1 + self.cfg.mem_k0) + self.bind_slot_dim
+        self.W_bind = nn.Parameter(torch.empty(d["l4"], self.bind_slot_dim, dtype=torch.float16))
+        self.register_buffer("_theta_bind", torch.zeros(self.bind_slot_dim, dtype=torch.float16))
+        self.E_bind_col = nn.Parameter(torch.zeros(self.bind_slot_dim, self.bind_slot_dim, dtype=torch.float16))
+
+        # 槽自循环 (CA3 循环侧支): z_bind 携带自身历史
+        self.W_bind_self = nn.Parameter(torch.empty(self.bind_slot_dim, self.bind_slot_dim, dtype=torch.float16))
+        self.E_bind_self = nn.Parameter(torch.zeros(self.bind_slot_dim, self.bind_slot_dim, dtype=torch.float16))
+
+        # 自发活动发生器
+        self.register_buffer("_intr_cnt", torch.zeros(1, dtype=torch.float16))
+        self.register_buffer(
+            "_intr_sin",
+            torch.tensor(
+                [0.5 + 0.5 * math.sin(2.0 * math.pi * i / 20.0) for i in range(20)],
+                dtype=torch.float16,
+            ),
+        )
+        self.register_buffer("_intr_omega", torch.tensor(0.3, dtype=torch.float16))
+
+        # 三尺度内源节律振荡器 (阶梯方波, fp16 可精确表示)
+        for osc_name, osc_n in (("f", 64), ("m", 256), ("s", 1024)):
+            self.register_buffer(f"_osc_{osc_name}_cnt", torch.zeros(1, dtype=torch.float16))
+            self.register_buffer(
+                f"_osc_{osc_name}_tab",
+                (1.0 - 2.0 * torch.arange(osc_n, dtype=torch.float16) / osc_n),
+            )
+
+        # 内建能量约束活动基线 (每可塑性矩阵一个 EMA)
+        act_ema_dims = {
+            "w56": d["l6"], "w23": d["l3"], "w35": d["l5"],
+            "wt4": d["l4"], "wt2": d["l2"], "wt3": d["l3"], "wt5": d["l5"], "wt6": d["l6"],
+            "wsp": d["l4"], "wp54": d["l5"], "wp43": d["l4"], "w42": d["l2"],
+            "b4": d["l4"], "b2": d["l2"], "b3": d["l3"], "b5": d["l5"], "b6": d["l6"],
+        }
+        for aen, adim in act_ema_dims.items():
+            self.register_buffer(f"_active_ema_{aen}", torch.zeros(adim, dtype=torch.float16))
+        self._active_ema_init: set[str] = set()
+
+        # STP 资源慢变量 (每递归层 + z_bind)
+        stp_layers = [("l4", d["l4"]), ("l2", d["l2"]), ("l3", d["l3"]), ("l5", d["l5"]), ("l6", d["l6"]), ("bind", self.bind_slot_dim)]
+        for sln, sdim in stp_layers:
+            self.register_buffer(f"_stp_r_{sln}", torch.ones(sdim, dtype=torch.float16))
+            self.register_buffer(f"_stp_active_ema_{sln}", torch.full((sdim,), 0.01, dtype=torch.float16))
+            tau_log = (
+                torch.log(torch.tensor(self.cfg.stp_tau_min, dtype=torch.float32))
+                + (torch.log(torch.tensor(self.cfg.stp_tau_max, dtype=torch.float32))
+                   - torch.log(torch.tensor(self.cfg.stp_tau_min, dtype=torch.float32)))
+                * torch.rand(sdim)
+            )
+            self.register_buffer(f"_stp_tau_{sln}", torch.exp(tau_log).to(torch.float16))
+            self.register_buffer(f"_stp_u_{sln}", torch.full((sdim,), self.cfg.stp_u_init, dtype=torch.float16))
+        self._fr_state: dict[str, torch.Tensor] = {}
+        self._stp_r_end: dict[str, torch.Tensor] = {}
+
+        # 动作读出矩阵 W_act
+        self.W_act = nn.Parameter(torch.empty(self.bind_slot_dim, self.cfg.d_act, dtype=torch.float16))
+        self.register_buffer("_theta_act", torch.full((self.cfg.d_input,), 0.01, dtype=torch.float16))
+        self.register_buffer("_freq_act", torch.full((self.cfg.d_input,), 1.0 / 256.0, dtype=torch.float16))
+        self.register_buffer("_s_ema_n", torch.ones(8, dtype=torch.float16))
+
+        # 竞争性记忆单元群
+        self.register_buffer("_mem_m", torch.zeros(self.cfg.mem_k0, d["l4"], dtype=torch.float16))
+        self.register_buffer(
+            "_mem_a",
+            torch.tensor(
+                [0.5, 0.125, 0.03125, 0.015625, 0.0078125, 0.00390625][: self.cfg.mem_k0],
+                dtype=torch.float16,
+            ),
+        )
+        self.register_buffer("_mem_g", torch.full((self.cfg.mem_k0,), self.cfg.mem_g_max / 2.0, dtype=torch.float16))
+        self.register_buffer("_mem_q", torch.zeros(self.cfg.mem_k0, dtype=torch.float16))
+        self._mem_birth_cd = 0
+        self.register_buffer("_mem_death_cnt", torch.zeros(self.cfg.mem_k0, dtype=torch.int32))
+        self._mem_alt = 0
+        self.register_buffer("_mem_err_ema", torch.zeros(1, dtype=torch.float16))
+        self.register_buffer("_mem_err_long", torch.zeros(1, dtype=torch.float16))
+        if self.cfg.mem_k0 > 6:
+            raise ValueError("mem_k0 > 6 需要补充初始 α 谱")
+
+        # 内部 EMA 频率 (纯模型内部累计 target 分布)
+        self.register_buffer("_freq", torch.full((self.cfg.d_input,), 1.0 / 256.0, dtype=torch.float16))
+
+        # 非线性混合层: h = zh @ W1; logits = h @ W_lm
+        self.d_h = 256
+        self.W1 = nn.Parameter(torch.empty(self._lm_in, self.d_h, dtype=torch.float16))
+        self.W_lm = nn.Parameter(torch.empty(self.d_h, self.cfg.d_input, dtype=torch.float16))
+        self.W_lm_2 = nn.Parameter(torch.empty(self.d_h, self.cfg.d_input, dtype=torch.float16))
+        self.bias_lm = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=torch.float16))
+
+        # 多尺度软加权时间窗
+        self.register_buffer("_w_soft", torch.tensor([0.1, 0.8, 0.1], dtype=torch.float16))
+        self.register_buffer("_e_ema_2", torch.tensor(0.05, dtype=torch.float16))
+        self.register_buffer("_e_ema_4", torch.tensor(0.05, dtype=torch.float16))
+        self.register_buffer("_e_ema_8", torch.tensor(0.05, dtype=torch.float16))
+        for i in range(4):
+            self.register_buffer(f"_dw_buf_{i}", torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
+        self._buf_i = 0
+        self.register_buffer("_theta_w", torch.full((d["l4"],), 0.01, dtype=torch.float16))
+        self.register_buffer("_theta_w04", torch.full((d["l4"],), 0.01, dtype=torch.float16))
+        self.register_buffer("_theta_wt4", torch.zeros(d["l4"], dtype=torch.float16))
+
+        # 时序权重 (每层时间核)
+        self.W_t4 = nn.Parameter(torch.empty(d["l4"], d["l4"], dtype=torch.float16))
+        self.W_t2 = nn.Parameter(torch.empty(d["l2"], d["l2"], dtype=torch.float16))
+        self.W_t3 = nn.Parameter(torch.empty(d["l3"], d["l3"], dtype=torch.float16))
+        self.W_t5 = nn.Parameter(torch.empty(d["l5"], d["l5"], dtype=torch.float16))
+        self.W_t6 = nn.Parameter(torch.empty(d["l6"], d["l6"], dtype=torch.float16))
+
+        # 层偏置
+        self.bias_l4 = nn.Parameter(torch.zeros(d["l4"], dtype=torch.float16))
+        self.bias_l2 = nn.Parameter(torch.zeros(d["l2"], dtype=torch.float16))
+        self.bias_l3 = nn.Parameter(torch.zeros(d["l3"], dtype=torch.float16))
+        self.bias_l5 = nn.Parameter(torch.zeros(d["l5"], dtype=torch.float16))
+        self.bias_l6 = nn.Parameter(torch.zeros(d["l6"], dtype=torch.float16))
+
+        # 动态生长状态
+        self.active_size = {"l4": d["l4"], "l2": d["l2"], "l3": d["l3"], "l5": d["l5"], "l6": d["l6"]}
+        self._step_counter = 0
+        self._death_row: dict[str, torch.Tensor | None] = {
+            "l4": None, "l2": None, "l3": None, "l5": None, "l6": None,
+        }
+        self._probation_counter: dict[str, torch.Tensor | None] = {
+            "l4": None, "l2": None, "l3": None, "l5": None, "l6": None,
+        }
+
+        # 神经调制与竞争机制
+        self.register_buffer("_ent_ema", torch.tensor(5.5, dtype=torch.float16))
+        self.register_buffer("_ent_buf", torch.zeros(20, dtype=torch.float16))
+        self.register_buffer("_t_center", torch.arange(20, dtype=torch.float16) - 9.5)
+        self.register_buffer("_t_denom", (torch.arange(20, dtype=torch.float16) - 9.5).square().sum())
+        self._ent_i = 0
+        self.register_buffer("_traction_scale", torch.tensor(1.0, dtype=torch.float16))
+        self.register_buffer("_z_slow", torch.zeros(d["l4"], dtype=torch.float16))
+        self.register_buffer("_theta_novelty", torch.full((1,), 0.001, dtype=torch.float16))
+        for ln, dim in (("l4", d["l4"]), ("l2", d["l2"]), ("l3", d["l3"]), ("l5", d["l5"]), ("l6", d["l6"])):
+            self.register_buffer(f"_theta_{ln}", torch.full((dim,), 0.01, dtype=torch.float16))
+        self.register_buffer("_theta_diff", torch.full((d["l4"],), 0.01, dtype=torch.float16))
+        self.register_buffer("_theta_wlm", torch.full((self.cfg.d_input,), 0.01, dtype=torch.float16))
+        self.register_buffer("_theta_wlm2", torch.full((self.cfg.d_input,), 0.01, dtype=torch.float16))
+        self.register_buffer("_theta_pool", torch.full((4,), 0.01, dtype=torch.float16))
+
+        # Foldiak 反赫布去同质化矩阵 (零起步 = 无抑制)
+        self.E_l5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
+        self.E_42 = nn.Parameter(torch.zeros(d["l2"], d["l2"], dtype=torch.float16))
+        self.E_23 = nn.Parameter(torch.zeros(d["l3"], d["l3"], dtype=torch.float16))
+        self.E_t2 = nn.Parameter(torch.zeros(d["l2"], d["l2"], dtype=torch.float16))
+        self.E_t3 = nn.Parameter(torch.zeros(d["l3"], d["l3"], dtype=torch.float16))
+        self.E_t4 = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
+        self.E_t5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
+        self.E_t6 = nn.Parameter(torch.zeros(d["l6"], d["l6"], dtype=torch.float16))
+        self.E_bind = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
+        self.E_04 = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
+        # 侧抑制矩阵 (L5 激活去相关)
+        self.M_l5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
+        self.register_buffer("_gain_mask", (0.5 + torch.rand(d["l5"], d["l3"])).to(torch.float16))
+        self.register_buffer("_gain_l3", (0.5 + torch.rand(d["l3"], d["l2"])).to(torch.float16))
+
+        # 突触资格迹 (每 Hebbian 外积矩阵同形, 零初始化)
+        _hebb_para_names = (
+            "W_04", "W_42", "W_23", "W_35", "W_56",
+            "W_t4", "W_t2", "W_t3", "W_t5", "W_t6",
+            "W_diff", "W_state_pred", "W_pred_54", "W_pred_43",
+            "W_bind", "W_bind_self", "W_act",
+            "W_lm", "W_lm_2", "W1",
+        )
+        for _wn in _hebb_para_names:
+            self.register_buffer(f"{_wn}_elig", torch.zeros_like(getattr(self, _wn).data))
+
+        self._init_weights()
+
+        # 引擎委托
+        from model.dense.forward import ForwardEngine
+        from model.dense.learning import LearningEngine
+        from model.dense.pruning import PruningEngine
+
+        self.forward_engine = ForwardEngine(self)
+        self.learning_engine = LearningEngine(self)
+        self.pruner = PruningEngine(self)
+
+    def _init_weights(self):
+        for name, p in self.named_parameters():
+            if "bias" in name:
+                continue
+            if name in ("E_l5", "E_42", "E_23", "M_l5", "E_t2", "E_t3", "E_t4", "E_t5", "E_t6", "E_bind", "E_bind_col", "E_04", "E_bind_self"):
+                continue
+            if name == "W_act":
+                nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(self.bind_slot_dim))
+            if name == "W_bind_self":
+                nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(self.bind_slot_dim))
+            if name in ("W_lm", "W_lm_2"):
+                nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(self.d_h))
+            elif name == "W1":
+                nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(p.shape[0]))
+            else:
+                nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(p.shape[-1]))
+
+    # 门面: 一行委托
+
+    def forward(self, byte_ids: torch.Tensor) -> dict:
+        """推理前馈: 返回未来预测偏差."""
+        return self.forward_engine.forward(byte_ids)
+
+    def generate(
+        self, prompt: str, n_tokens: int = 40, temperature: float = 0.7, dev: torch.device | None = None
+    ) -> bytes:
+        """行动: L4 状态 + 预测差分 → W_lm 解码生成字节."""
+        return self.forward_engine.generate(prompt, n_tokens=n_tokens, temperature=temperature, dev=dev)
+
+    def _predict(self, byte_ids: torch.Tensor, store_state: bool = True, is_inference: bool = False) -> dict:
+        """核心前馈: 感知 (L0→L6) + 去相关 + 增量预测."""
+        return self.forward_engine._predict(byte_ids, store_state=store_state, is_inference=is_inference)
+
+    def learn(self, byte_ids: torch.Tensor | None = None, closed_loop: bool = False, free_run: bool = False) -> dict:
+        """Hebbian 学习: 前馈 → 逐域误差 → 局部权重更新, 无反向传播."""
+        return self.learning_engine.learn(byte_ids, closed_loop=closed_loop, free_run=free_run)
+
+    def maybe_prune(self, step: int) -> None:
+        """墙钟修剪接缝: 修剪触发权由编排层显式交出."""
+        if step > self.cfg.prune_warmup and step % self.cfg.prune_interval == 0:
+            self.pruner._prune()
+
+    def inject_world(self, E, E_ref=None, R=None, eps_ema=None, eps_mad=None) -> None:
+        """生命-世界口: 显式接口位, 传标量/None 写入 net._world_*."""
+        d = next(self.parameters()).device
+        if E is not None:
+            self._world_E = torch.tensor(E, dtype=torch.float16, device=d)
+        if E_ref is not None:
+            self._world_E_ref = torch.tensor(E_ref, dtype=torch.float16, device=d)
+        if R is not None:
+            self._world_R = torch.tensor(R, dtype=torch.float16, device=d)
+        if eps_ema is not None:
+            self._world_eps_ema = torch.tensor(eps_ema, dtype=torch.float16, device=d)
+        if eps_mad is not None:
+            self._world_eps_mad = torch.tensor(eps_mad, dtype=torch.float16, device=d)
+
+    def _prune(self):
+        self.pruner._prune()
 
     def save(self, path: str):
-        state = {
-            "config": {f.name: getattr(self.config, f.name) for f in fields(CyreneConfig)},
-            "pool": self.pool.state_dict(),
-            "stats": self.get_state(),
-            "step": self._step,
-            "top_layer": self._top_layer,
-        }
+        """保存模型权重."""
+        import os
+
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        torch.save(state, path)
+        torch.save(self.state_dict(), path)
 
     @classmethod
-    def load(cls, path: str) -> CyreneModel:
-        data = torch.load(path, map_location="cpu", weights_only=True)
-        config = CyreneConfig(**data.get("config", {}))
-        model = cls(config)
-        if "pool" in data:
-            model.pool.load_state_dict(data["pool"])
-        model._step = data.get("step", 0)
-        model._top_layer = data.get("top_layer", 0)
-        if config.num_hidden_layers > 0:
-            if model.pool.get_layer_width(model._top_layer) == 0:
-                # 隐藏层被修剪: 重建神经元和连接
-                model.add_hidden_layer()
+    def load(cls, path: str, config: DensePCConfig | None = None) -> DensePCNet:
+        """加载模型权重 (含修剪后检查点: 按检查点形状对齐, 重设 active_size)."""
+        sd = torch.load(path, map_location="cpu", weights_only=True)
+        if config is None:
+            config = DensePCConfig(
+                d_l4=sd["W_04"].shape[0],
+                d_l2=sd["W_42"].shape[0],
+                d_l3=sd["W_23"].shape[0],
+                d_l5=sd["W_56"].shape[1],
+                d_l6=sd["W_56"].shape[0],
+                input_history=sd["W_04"].shape[1] != 256,
+            )
+        net = cls(config)
+        # 旧键 → 新键 (活动统计缓冲更名), 旧检查点写回新键才不丢值
+        for old, new in (("_act_ema_", "_active_ema_"), ("_stp_act_ema_", "_stp_active_ema_")):
+            for k in list(sd.keys()):
+                if old in k:
+                    sd[new + k.split(old, 1)[1]] = sd.pop(k)
+        # 旧 _m_pool 检查点一次性迁移到记忆单元群
+        if "_m_pool" in sd and "_mem_m" not in sd:
+            net._migrate_mem(sd)
+        # 记忆单元群是运行时状态, 按检查点重建 K 形缓冲与 W1
+        for _bn in ("_mem_m", "_mem_g", "_mem_q", "_mem_a", "_mem_death_cnt"):
+            if _bn in sd and sd[_bn].shape != getattr(net, _bn).shape:
+                net.register_buffer(_bn, torch.zeros_like(sd[_bn]))
+        if "W1" in sd and sd["W1"].shape != net.W1.shape:
+            net.W1 = nn.Parameter(torch.zeros_like(sd["W1"], dtype=torch.float16))
+            net.register_buffer("W1_elig", torch.zeros_like(sd["W1"], dtype=torch.float16))
+            net._lm_in = sd["W1"].shape[0]
+        nsd = net.state_dict()
+        for k, v in sd.items():
+            if k not in nsd:
+                continue
+            if nsd[k].shape == v.shape:
+                nsd[k] = v
             else:
-                model._hidden_layer_created = True
-        # warmup 已在 step() 中自动处理 (is_warmup = _step <= warmup_steps)
-        return model
+                idx = tuple(slice(0, min(a, b)) for a, b in zip(nsd[k].shape, v.shape))
+                nsd[k][idx] = v[idx]
+        net.load_state_dict(nsd)
+        net.active_size = {
+            "l4": net.W_04.shape[0],
+            "l2": net.W_42.shape[0],
+            "l3": net.W_23.shape[0],
+            "l5": net.W_56.shape[1],
+            "l6": net.W_56.shape[0],
+        }
+        # 旧检查点 _stp_active_ema 可能为 0 → 统一垫到小正数
+        for sln in ("l4", "l2", "l3", "l5", "l6", "bind"):
+            buf = getattr(net, f"_stp_active_ema_{sln}")
+            if buf.numel() > 0 and buf.abs().sum() == 0:
+                buf.fill_(0.01)
+        # _mem_m 对齐活性 L4 (修剪后检查点)
+        if net._mem_m.shape[1] != net.active_size["l4"]:
+            old_m = net._mem_m.data
+            net.register_buffer("_mem_m", old_m[:, : net.active_size["l4"]].contiguous())
+            del old_m
+        return net
 
+    def _migrate_mem(self, sd: dict) -> None:
+        """旧 _m_pool 检查点 → 记忆单元群迁移 (一次性).
 
-# ═══════════════════════════════════════════════════════════════════
-# 工厂函数
-# ═══════════════════════════════════════════════════════════════════
-
-
-def create_cyrene(config: CyreneConfig | None = None) -> CyreneModel:
-    """创建并初始化一个 Cyrene 模型."""
-    config = config or CyreneConfig()
-    model = CyreneModel(config)
-    if config.num_hidden_layers > 0:
-        model.add_hidden_layer()
-    return model
+        旧 W1 行布局 [z4 | m2 | m8 | m32 | bind | 长池] → 新 [z4 | bind | 单元×k0].
+        bind 恒在短池段后 (offset 4·dim_4); 不足 k0 的单元零起步.
+        """
+        dim_4 = sd["W_04"].shape[0]
+        p = sd["_m_pool"].shape[0] // dim_4
+        k0 = self.cfg.mem_k0
+        bind_sz = self.bind_slot_dim
+        old_w1 = sd["W1"]
+        d_h = old_w1.shape[1]
+        n_short = 3
+        bind_off = (n_short + 1) * dim_4
+        segs = [old_w1[(1 + i) * dim_4 : (2 + i) * dim_4] for i in range(n_short)]
+        if p > n_short:
+            segs += [
+                old_w1[(bind_off + bind_sz + (i - n_short) * dim_4) : (bind_off + bind_sz + (i - n_short + 1) * dim_4)]
+                for i in range(n_short, p)
+            ]
+        sd["W1"] = torch.cat(
+            [old_w1[:dim_4], old_w1[bind_off : bind_off + bind_sz], *segs],
+            dim=0,
+        ).contiguous()
+        if p < k0:
+            sd["W1"] = torch.cat(
+                [sd["W1"], torch.zeros((k0 - p) * dim_4, d_h, dtype=torch.float16)],
+                dim=0,
+            ).contiguous()
+        m_segs = sd["_m_pool"].reshape(p, dim_4)
+        cells = [m_segs[i] for i in range(p)]
+        if p < k0:
+            cells += [torch.zeros(dim_4, dtype=torch.float16)] * (k0 - p)
+        sd["_mem_m"] = torch.stack(cells).contiguous()
+        del sd["_m_pool"]

@@ -2,19 +2,7 @@
 无监督概念发现 (Unsupervised Concept Discovery)
 
 在 PC latent space 中对 z_states 做在线流式聚类，自动发现数据中的自然概念/技能，
-彻底摆脱外部 task_id 依赖。
-
-架构:
-  - _concepts: dict[str, Concept] — 自动命名的概念
-  - _stream_buffer: list[z_state] — 待聚类缓冲
-  - 自适应阈值: 初始 0.85 → 随概念数衰减到 0.65
-  - 合并: cosine > 0.95 的相似概念自动合并
-  - 淘汰: 支持度 < 5 的脆弱概念
-
-与现有机制打配合:
-  - MemoryBank.add_samples() 可调用 concept_discovery.observe() 自动确定概念
-  - AbstractionBank.consolidate() 可在概念级别执行
-  - CuriositySampler 使用脆弱概念作为生成目标
+彻底摆脱外部 task_id 依赖
 """
 
 from __future__ import annotations

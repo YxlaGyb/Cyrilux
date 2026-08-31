@@ -1,5 +1,6 @@
 """
-遗忘嗅探器 — 检测旧任务 CE loss 超标 → 自触发修复.
+遗忘嗅探器
+检测旧任务 CE loss 超标 → 自触发修复.
 
 原理:
   每隔 check_interval 步, 从 MemoryBank 采样 N 条 exemplars 跑纯前向 CE loss.
@@ -7,8 +8,6 @@
     - LR 降至 repair_lr_factor × current_lr
     - 强制回放 repair_steps 步旧数据
     - 直到所有任务的 loss_ratio < threshold
-
-Ponytail: 嗅探器只做 T=0 纯前向 — 无 PC 推理, 开销约 = 1 步训练.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from __future__ import annotations
 import torch
 
 from model.continual.memory_bank import MemoryBank
-from model.model_cyrene import CyreneModel
+from model._archived_sparse import CyreneModel
 
 
 class ForgettingSniffer:

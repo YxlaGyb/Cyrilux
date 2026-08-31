@@ -5,8 +5,10 @@
   持不剪) — 然后把 L5 的一些 W_35 行手工赋成极小(触发"相对排名淘汰")。
 - 把 prune_warmup=0, prune_interval=1, prune_fraction=0.8, active_size_lower_bound=128,
   l4_lower_bound=512, mem_k0=1 让 K 最小化 (最小配置)。
-- 调用一次 learn(byte_ids, closed_loop=False, free_run=False) → learn 内部 step_counter 从
-  0→1, warmup=0 → 触发 prune → 检查所有 L5 同源张量形状 == active_size["l5"]。
+- 调用一次 learn(byte_ids, closed_loop=False, free_run=False) 使 _step_counter 0→1,
+  再显式 net.maybe_prune(net._step_counter) → warmup=0 → 触发 prune →
+  检查所有 L5 同源张量形状 == active_size["l5"]。
+  (117 轮 Round 2: 修剪触发权已移出 learn(), 测试改走公开 maybe_prune 接缝)
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import math
 import pytest
 import torch
 
-from model.dense import DensePCNet, DensePCConfig
+from model import DensePCNet, DensePCConfig
 
 # 字节域默认 256 (与 DensePCConfig.d_input 默认一致,动作域 d_act 同)
 D_INPUT = 256
@@ -105,6 +107,7 @@ def test_l5_prune_shapes_all_synced():
     # 不关心 loss — 只要 shape 对就好
     try:
         stats = net.learn(byte_ids, closed_loop=False, free_run=False)
+        net.maybe_prune(net._step_counter)
     except Exception as e:
         pytest.fail(f"首步 learn 直接抛异常 {type(e).__name__}: {e}")
 
@@ -139,12 +142,12 @@ def test_l5_prune_shapes_all_synced():
     assert tuple(net._theta_l5.shape) == (a5_new,)
 
     # 5. STP l5 四兄弟
-    for attr in ("_stp_r_l5", "_stp_tau_l5", "_stp_u_l5", "_stp_act_ema_l5"):
+    for attr in ("_stp_r_l5", "_stp_tau_l5", "_stp_u_l5", "_stp_active_ema_l5"):
         shape = tuple(getattr(net, attr).shape)
         assert shape == (a5_new,), f"{attr} shape {shape}≠({a5_new},)"
 
     # 6. act_ema L5 四兄弟
-    for attr in ("_act_ema_w35", "_act_ema_wt5", "_act_ema_wp54", "_act_ema_b5"):
+    for attr in ("_active_ema_w35", "_active_ema_wt5", "_active_ema_wp54", "_active_ema_b5"):
         shape = tuple(getattr(net, attr).shape)
         assert shape == (a5_new,), f"{attr} shape {shape}≠({a5_new},)"
 
@@ -186,6 +189,7 @@ def test_l5_prune_then_forward_no_crash():
 
     # Step1:修剪发生
     s1 = net.learn(byte_ids_a, closed_loop=False, free_run=False)
+    net.maybe_prune(net._step_counter)
     # 断言修剪真的发生
     assert net.active_size["l5"] < cfg.d_l5, "L5 未剪,测试前提失效"
 

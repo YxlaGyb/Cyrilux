@@ -1,26 +1,11 @@
 """
-海马体缓冲 (Hippocampus Buffer) — 快速循环缓冲 + 信息增益优先保留。
+海马体缓冲 (Hippocampus Buffer)
+快速循环缓冲 + 信息增益优先保留。
 
 生物动机:
   海马体临时快速编码新经验, 随后逐步整合到新皮层。
   此处实现一个轻量级"快速写入 + 基于信息增益的优先保留"缓冲,
   独立于 ConsolidationPipeline (慢速长期存储)。
-
-核心机制:
-  - FIFO 环形缓冲, 容量较小 (默认 200)
-  - 新样本按信息增益阈值过滤后才加入
-  - 缓冲满时自动驱逐最低信息增益的样本
-  - 支持按优先级采样用于快速回放
-
-用法 (在 training.py 的 train_step 中):
-  # 每步添加高信息增益样本
-  if info_gain > min_threshold:
-      hippocampus.add(z_states, byte_seq, labels, info_gain)
-
-  # 定期回放
-  if step % replay_interval == 0:
-      batch = hippocampus.sample_for_replay(batch_size)
-      # → 对 batch 执行一次 Hebbian update
 """
 
 from __future__ import annotations

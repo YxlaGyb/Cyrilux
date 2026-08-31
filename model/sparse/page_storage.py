@@ -1,15 +1,7 @@
-"""PageStorage
-
-页式 GPU 张量分配器.
-
-管理 TensorNeuronPool 中所有张量的页式存储:
-- 神经元页 (4096 个/页): state, layer, position, channel, in_ptrs, out_ptrs, ...
-- 突触页 (16384 个/页): weight, pre_id, post_id, trace, ...
-- Topdown 页 (16384 个/页): td_weight, td_pre, td_post, ...
-- LM Head: 随神经元页的列增长, [256, N] 稀疏视图
-
-生长策略: freelist 耗尽时翻倍扩容 (类似 std::vector), O(log n) 次重分配.
-对外暴露合并视图 (property), 与旧 torch.zeros(N) API 完全兼容.
+"""
+PageStorage
+页式 GPU 张量分配器
+管理 TensorNeuronPool 中所有张量的页式存储
 """
 
 from __future__ import annotations

@@ -1,6 +1,5 @@
 """
 PoolQuery
-
 只读查询与统计 (委托到 TensorNeuronPool 的张量).
 """
 

@@ -7,7 +7,7 @@
 - W_t 突触缩放: 逐神经元权重级慢稳态增益 (自由运行专用)
 """
 
-from model.dense.network import DensePCConfig
+from model import DensePCConfig
 
 
 def test_stp_u_adapt_default_on():
