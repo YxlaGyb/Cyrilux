@@ -11,10 +11,10 @@ from pkg.cli.utils import load_config, resolve_path
 
 
 def _dense_cfg(hidden_size: int, lr: float):
-    from model.dense import DensePCConfig, DensePCNet
+    from model import CyreneModel, DensePCNet
 
     ratio = hidden_size / 1024.0
-    d_cfg = DensePCConfig(
+    d_cfg = CyreneModel(
         d_l4=hidden_size,
         d_l2=max(64, int(384 * ratio)),
         d_l3=max(64, int(384 * ratio)),

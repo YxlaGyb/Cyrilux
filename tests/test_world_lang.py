@@ -1,6 +1,6 @@
-"""world_lang 世界语言物理单元测试: 评分 / 新颖税 / E 代谢 / 认证门.
-
-world_lang.py 在 scripts/ (非包), 用 importlib 加载 (与 probe 脚本同法).
+"""
+world_lang 世界语言物理单元测试
+评分 / 新颖税 / E 代谢 / 认证门.
 """
 import importlib.util
 import json

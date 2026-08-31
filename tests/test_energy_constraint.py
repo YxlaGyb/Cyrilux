@@ -1,6 +1,8 @@
-"""_energy_constraint 纯逻辑测试 (CPU fp16): 延迟初始化 / excess 激活 / 高活动衰减.
+"""
+_energy_constraint 纯逻辑测试
+延迟初始化 / excess 激活 / 高活动衰减.
 
-第 78 轮内建能量约束: dW ← dW − (α·post² + β·relu(post²−ema)) ⊙ W.
+dW ← dW − (α·post² + β·relu(post²−ema)) ⊙ W.
 """
 
 import torch

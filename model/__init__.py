@@ -1,6 +1,6 @@
-from model.model_cyrene import DensePCConfig, DensePCNet
+from model.model_cyrene import CyreneModel, DensePCNet
 
 __all__ = [
     "DensePCNet",
-    "DensePCConfig",
+    "CyreneModel",
 ]

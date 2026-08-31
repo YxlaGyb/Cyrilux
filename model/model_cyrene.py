@@ -13,7 +13,7 @@ from torch import nn
 
 
 @dataclass
-class DensePCConfig:
+class CyreneModel:
     """PPA 网络配置."""
 
     # 维度
@@ -122,9 +122,9 @@ class DensePCConfig:
 class DensePCNet(nn.Module):
     """PPA 闭环网络 (门面: 权重声明 + 引擎委托)."""
 
-    def __init__(self, config: DensePCConfig | None = None):
+    def __init__(self, config: CyreneModel | None = None):
         super().__init__()
-        self.cfg = config or DensePCConfig()
+        self.cfg = config or CyreneModel()
         d = self.cfg.dims()
 
         # 前馈权重 (自下而上感知)
@@ -393,11 +393,11 @@ class DensePCNet(nn.Module):
         torch.save(self.state_dict(), path)
 
     @classmethod
-    def load(cls, path: str, config: DensePCConfig | None = None) -> DensePCNet:
+    def load(cls, path: str, config: CyreneModel | None = None) -> DensePCNet:
         """加载模型权重 (含修剪后检查点: 按检查点形状对齐, 重设 active_size)."""
         sd = torch.load(path, map_location="cpu", weights_only=True)
         if config is None:
-            config = DensePCConfig(
+            config = CyreneModel(
                 d_l4=sd["W_04"].shape[0],
                 d_l2=sd["W_42"].shape[0],
                 d_l3=sd["W_23"].shape[0],

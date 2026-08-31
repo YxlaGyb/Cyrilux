@@ -1,14 +1,5 @@
-"""让 L5 参与修剪: RED 测试 → shape 断言 + 一步 learn forward 不崩.
-
-设计动机:
-- 构造一个足够小的 DensePCConfig (所有层默认下限之上才允许剪,所以 d_l2/d_l3/d_l5>128, d_l4>512 但我们 d_l4 用 512 刚好让 L4 保
-  持不剪) — 然后把 L5 的一些 W_35 行手工赋成极小(触发"相对排名淘汰")。
-- 把 prune_warmup=0, prune_interval=1, prune_fraction=0.8, active_size_lower_bound=128,
-  l4_lower_bound=512, mem_k0=1 让 K 最小化 (最小配置)。
-- 调用一次 learn(byte_ids, closed_loop=False, free_run=False) 使 _step_counter 0→1,
-  再显式 net.maybe_prune(net._step_counter) → warmup=0 → 触发 prune →
-  检查所有 L5 同源张量形状 == active_size["l5"]。
-  (117 轮 Round 2: 修剪触发权已移出 learn(), 测试改走公开 maybe_prune 接缝)
+"""让 L5 参与修剪
+RED 测试 → shape 断言 + 一步 learn forward 不崩.
 """
 
 from __future__ import annotations
@@ -18,9 +9,9 @@ import math
 import pytest
 import torch
 
-from model import DensePCNet, DensePCConfig
+from model import DensePCNet, CyreneModel
 
-# 字节域默认 256 (与 DensePCConfig.d_input 默认一致,动作域 d_act 同)
+# 字节域默认 256 (与 CyreneModel.d_input 默认一致,动作域 d_act 同)
 D_INPUT = 256
 D_ACT = 256
 
@@ -29,7 +20,7 @@ D_ACT = 256
 torch.manual_seed(0)
 
 
-def _tiny_cfg(**over) -> DensePCConfig:
+def _tiny_cfg(**over) -> CyreneModel:
     kw = dict(
         # 让 L4 精确等 l4_lower_bound → L4 不剪,专注观察 L5
         d_l4=512,
@@ -49,7 +40,7 @@ def _tiny_cfg(**over) -> DensePCConfig:
         max_seq_len=8,
     )
     kw.update(over)
-    return DensePCConfig(**kw)
+    return CyreneModel(**kw)
 
 
 def test_l5_enters_layers_list():
