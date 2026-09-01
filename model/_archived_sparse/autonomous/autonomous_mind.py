@@ -10,7 +10,7 @@ from collections.abc import Callable
 
 import torch
 
-from model.continual.concept_discovery import ConceptDiscovery
+from model._archived_sparse.continual.concept_discovery import ConceptDiscovery
 from model._archived_sparse import CyreneModel
 from pkg.utils.trainer_utils import Logger
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import torch
 
-from ..constants import K_FAN, N_STATE_FIELDS, PAGE_NEURONS, PAGE_SYNAPSES, PAGE_TD
+from model.constants import K_FAN, N_STATE_FIELDS, PAGE_NEURONS, PAGE_SYNAPSES, PAGE_TD
 
 # 默认内存预算 (2GB)
 DEFAULT_MAX_MEMORY = 2_147_483_648

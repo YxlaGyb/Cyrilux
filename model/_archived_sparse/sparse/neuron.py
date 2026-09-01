@@ -9,7 +9,7 @@ import random
 
 import torch
 
-from ..constants import (
+from model.constants import (
     F_BCM_SLOPE,
     F_BCM_ZERO,
     F_EPS,

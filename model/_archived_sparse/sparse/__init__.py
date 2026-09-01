@@ -1,6 +1,6 @@
 """全张量化神经元池, scatter_add 预测聚合"""
 
-from ..constants import (
+from model.constants import (
     CONN_FEEDBACK,
     CONN_FEEDFORWARD,
     CONN_LATERAL,
