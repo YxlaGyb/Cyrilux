@@ -69,16 +69,9 @@ class FeedforwardMixin(_MixinBase):
 
         # 突触后增益控制: 用误差自身 std 归一化, 随修剪缩维自适应 (无静态系数)
         if not free_run and not echo_world_frozen:
-            # W_04 主辅误差: 预测误差为主 + 0.2×重建误差 (重建不需要词序, 只稳定信号)
-            eps_lm_pad = sh.lm.eps_lm_pad
-            eps4 = sh.errs.eps4
-            eps_pred_scale = eps_lm_pad.std(dim=-1, keepdim=True)
-            eps_pred_scale = eps_pred_scale * 1.01 + eps_lm_pad.std() * 1e-3
-            err_pred_norm = eps_lm_pad / eps_pred_scale
-            eps_recon_scale = eps4.std(dim=-1, keepdim=True)
-            eps_recon_scale = eps_recon_scale * 1.01 + eps4.std() * 1e-3
-            err_recon_norm = eps4 / eps_recon_scale
-            final_error = err_pred_norm + 0.2 * err_recon_norm
+            # W_04 主辅误差: 预测误差为主 + 0.2×重建误差 (重建不需要词序, 只稳定信号);
+            # F 由 _update_metabolism 同式计算 (单一出处, 保证驱动 W_04 与代谢账本同 F)
+            final_error = sh.metab_f
 
             # 幅度-方向解耦: dW 归一化单位向量, 显著性只选方向不放大幅度
             # → 单步最大幅度 = lr, 防极端样本单步爆 NaN

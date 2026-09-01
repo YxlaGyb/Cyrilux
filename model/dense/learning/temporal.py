@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 
 from ...modulation import soft_norm_preserve
+from model.constants import DIFF_TRUST_REGION
 from model.modulation import rms_norm
 from ._common import _decorr_W, _elig_accum, _energy_constraint, _MixinBase, _spectral_radius_guard
 
@@ -96,8 +97,17 @@ class TemporalMixin(_MixinBase):
         dim_4 = ctx.dim_4
         W_diff_a = net.W_diff[:dim_4, :dim_4]
         fut_mask = torch.rand(dim_4, 1, device=dev) < net.cfg.column_dropout
-        dW_avg = sh.diff.dW_avg + _elig_accum(net, "W_diff", sh.diff.dW_avg) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
-        W_diff_a.data += (dW_avg * (~fut_mask).to(torch.float16)) * ctx.eta
+        # W_diff 预缩放 (W1 同型): 遥测 → ÷absmax÷64 (fp16 平方和防溢) → 单位范数 (方向保留).
+        # 死锁根因: raw dW_avg 结构健康 (‖dW‖_F≈0.11) 但 ×η(0.003) 后条目 1e-7 ≈ 0.7% ULP →
+        # 亚 ULP 静默死锁 (W1 能解冻因 η_lm=1.0, 本族 η=0.003 差 333×, 信任域系数单独给定).
+        # 应用增益 = DIFF_TRUST_REGION·‖W_diff‖_F (2% 每步, ≈W1 解冻实测 2.5%; 每条目 ≈20 ULP).
+        dW_avg = sh.diff.dW_avg
+        net._dW_diff_absmax_raw = dW_avg.abs().max().detach()
+        mx = dW_avg.abs().max() + 1e-4
+        dW_avg = dW_avg / mx / 64.0
+        dW_avg = dW_avg / (dW_avg.norm() + 1e-8)
+        dW_avg = dW_avg + _elig_accum(net, "W_diff", dW_avg) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+        W_diff_a.data += (dW_avg * (~fut_mask).to(torch.float16)) * (DIFF_TRUST_REGION * W_diff_a.norm())
         future_e = (sh.diff.dz4 - sh.diff.pred_d).mean(dim=(0, 1))
         net.b_diff[:dim_4].data += future_e * ctx.eta
 

@@ -94,6 +94,14 @@ class CyreneModel:
     mem_birth_cooldown: int = 2000
     mem_death_steps: int = 2000
 
+    # 体内代谢 (P1): E ← E·(1−metab_d) + metab_c·ΔF; MAD EMA 新息权 = 1−metab_mad_alpha.
+    # metab_mad_alpha=0.90 + metab_tanh_div=1.5 为 R1 契约标定值 (2026-09-01 P1 段标定:
+    # 0.95/2.0 下 median(leg)=0.26 低于 [0.3,1] 带; 标定后 0.38 复现 R1 历史值 0.39).
+    metab_d: float = 0.05
+    metab_c: float = 0.1
+    metab_mad_alpha: float = 0.90
+    metab_tanh_div: float = 1.5
+
     def dims(self) -> dict[str, int]:
         return {
             "l4": self.d_l4,
@@ -225,6 +233,13 @@ class DensePCNet(nn.Module):
         self.register_buffer("_mem_err_long", torch.zeros(1, dtype=torch.float16))
         if self.cfg.mem_k0 > 6:
             raise ValueError("mem_k0 > 6 需要补充初始 α 谱")
+
+        # 体内代谢账本 (P1): 随 state_dict 持久化 (P2 死亡契约消费);
+        # _metab_F_prev < 0 = 首步哨兵; _metab_de_mad == 0 = 冷启动哨兵
+        self.register_buffer("_metab_E", torch.zeros(1, dtype=torch.float16))
+        self.register_buffer("_metab_E_ref", torch.zeros(1, dtype=torch.float16))
+        self.register_buffer("_metab_de_mad", torch.zeros(1, dtype=torch.float16))
+        self.register_buffer("_metab_F_prev", torch.full((1,), -1.0, dtype=torch.float16))
 
         # 内部 EMA 频率 (纯模型内部累计 target 分布)
         self.register_buffer("_freq", torch.full((self.cfg.d_input,), 1.0 / 256.0, dtype=torch.float16))

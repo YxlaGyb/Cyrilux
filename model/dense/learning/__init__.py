@@ -16,11 +16,13 @@ from ._common import (
     _spectral_radius_guard,
 )
 from .engine import EngineCore
+from model.constants import DIFF_TRUST_REGION
 
 __all__ = [
     "LearningEngine",
     "LM_TRUST_REGION",
     "ELIG_GAMMA",
+    "DIFF_TRUST_REGION",
     "_activity_baseline",
     "_decorr_W",
     "_elig_accum",

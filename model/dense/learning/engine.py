@@ -13,6 +13,7 @@ import torch
 from .action import ActionMixin
 from .bind import BindMixin
 from .feedforward import FeedforwardMixin
+from .metabolism import MetabolismMixin
 from .predict import PredictMixin
 from .readout import ReadoutMixin
 from .temporal import TemporalMixin
@@ -100,6 +101,7 @@ class Shared:
     lm: LmSignal | None = None
     l5_local_err: torch.Tensor | None = None
     d_t: torch.Tensor | None = None
+    metab_f: torch.Tensor | None = None
 
 
 class EngineCore(
@@ -109,6 +111,7 @@ class EngineCore(
     PredictMixin,
     BindMixin,
     ActionMixin,
+    MetabolismMixin,
 ):
     """学习引擎基类: 持 net 引用, 组装 learn() 编排 (域逻辑在 mixin).
 
@@ -242,6 +245,8 @@ class EngineCore(
         sh.diff = self._build_diff_window(ctx)
         self._update_bias(ctx, sh)
         sh.lm = self._build_lm_signal(ctx)
+        # 体内代谢: F 每步计价 (感知/回声) → E → R; 必须在 _update_w_act 前 (本步 R 本步消费)
+        self._update_metabolism(ctx, sh)
         self._update_feed_ff(ctx, sh)
         self._update_W35(ctx, sh)
         self._update_pred_engine(ctx, sh)

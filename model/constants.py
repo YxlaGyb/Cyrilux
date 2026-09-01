@@ -43,3 +43,4 @@ K_FAN = 128
 
 LM_TRUST_REGION = 0.025  # 读出端信任域
 ELIG_GAMMA = 0.95        # 突触资格迹折扣
+DIFF_TRUST_REGION = 0.02  # W_diff 信任域: 每步 ‖ΔW‖_F = 2%·‖W_diff‖_F (W1 解冻实测 2.5% 同数量级)
