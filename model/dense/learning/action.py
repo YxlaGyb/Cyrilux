@@ -23,7 +23,6 @@ class ActionMixin(_MixinBase):
             or not getattr(net, "_act_enabled", True)
         ):
             return
-        N = ctx.N
         pot = net._intent_pot  # [N,S,256] 动作电位
         zbind = net._bind_vec
         gb = net._gen_bytes  # [N,N_gen] 自生成字节 (表达)
@@ -63,26 +62,37 @@ class ActionMixin(_MixinBase):
         dW_act = dW_act - 0.1 * (zb_g.transpose(-2, -1) @ pot_sm).mean(dim=0)
         dW_act = dW_act / (dW_act.norm() + 1e-8)  # 单步幅度上界 (幅度-方向解耦)
         # 信任域: 单位化方向 × 平均列范数 × 5.0 = 真 5% 步幅
-        intr_d = getattr(net, "_intr_drive", torch.tensor(0.5, device=dev, dtype=torch.float16))
+        intr_d = getattr(net, "_intr_drive", None)
+        if intr_d is None:
+            intr_d = net._intr_d0  # 预分配默认 (首个感知步前)  # tensor-guard: rare (冷启动)
         col_norm = net.W_act.data.norm(dim=0).mean()  # 平均列范数 (~1.0)
         # 生存信号 R 由体内代谢产原语 (_metab_R = tanh(ΔE/2MAD)); ε 维度降为诊断.
         # 除迹在消费端 (迹更新后): 注入幅 = tanh(ΔE/2MAD) ∈ (−1,1) (R1 契约, 无 /0 爆炸).
         eps_now = wlm_err.mean()
         net._lm_eps = eps_now  # 诊断: 本窗 ε_lm (fp16 张量, 零同步)
-        # 恒温器: 内部自校准锚 (_lang_eps_ema, 感知相位统计) + 饥饿应激压缩变异 (代谢-行为耦合)
+        # 恒温器 (P3-a 有界状态映射): 内部自校准锚 (_lang_eps_ema, 感知相位统计) +
+        # 体内应激压缩 (代谢-行为耦合). 无乘性累加 → 无积分漂移 → 无 clamp —
+        # 范围由映射余域给出: 噪声区 (τ≈9.5-10 展平骗裁判) 与贪心区 (τ→0 单字符自锁)
+        # 均物理不可达; 旧健康带 [1.0,1.54] 只是范围内一点, 不再是焊死的法律.
+        # 符号: 应变差 _d = anchor − eps_now > 0 (回声流比感知锚容易) → τ 升温 (想表达的变异性).
+        _anchor = getattr(net, "_lang_eps_ema", None)
         _gt = getattr(net, "_gen_temp", None)
-        if _gt is None:
-            net._gen_temp = torch.tensor(4.0, dtype=torch.float16, device=dev)
+        if not (torch.is_tensor(_gt) and _gt.shape == (1,) and _gt.device == dev):
+            # 固定 buffer 就地覆写: echo 整段 continuation 罩 CUDA Graph 后地址不得漂移
+            net._gen_temp = torch.zeros(1, dtype=net._metab_tau_d.dtype, device=dev)  # tensor-guard: rare
+        if _anchor is not None:
+            _d = _anchor - eps_now  # 自校准差分 ∈ (−1,1): ε 均为 1−p 余差 ∈ [0,1)
+            _sm = net.cfg.metab_tau_smooth
+            net._metab_tau_d.mul_(1.0 - _sm).add_(_sm * _d)  # 低通 (ε 差分噪声 ±0.8 → 稳)
+            _stress = getattr(net, "_metab_stress", None)
+            _s = _stress if _stress is not None else net._zero1
+            _g = net.cfg.metab_tau_beta_d * net._metab_tau_d - net.cfg.metab_tau_beta_s * _s
+            net._gen_temp.copy_(net.cfg.metab_tau_lo + (
+                net.cfg.metab_tau_hi - net.cfg.metab_tau_lo
+            ) * (0.5 + 0.5 * torch.tanh(_g)))
         else:
-            _anchor = getattr(net, "_lang_eps_ema", None)
-            if _anchor is not None:
-                _t2 = _gt * torch.exp(0.5 * (_anchor - eps_now))
-                _we = getattr(net, "_metab_E", None)
-                _er = getattr(net, "_metab_E_ref", None)
-                if _we is not None and _er is not None:
-                    _t2 = _t2 * torch.exp(-0.2 * torch.relu(_er - _we))
-                # τ 硬上限 2.0: 展平骗裁判的廉价解在 τ≈9.5-10, 上限 2.0 使其物理不可达 (保留选择压)
-                net._gen_temp = torch.minimum(torch.maximum(_t2, torch.tensor(1.0, dtype=torch.float16, device=dev)), torch.tensor(2.0, dtype=torch.float16, device=dev))
+            # 锚缺失 (从未跑过感知相位): d=0 → 映射中点 (无先验, 保守健康值)
+            net._gen_temp.fill_((net.cfg.metab_tau_lo + net.cfg.metab_tau_hi) / 2.0)
         # 资格迹: 迹输入 = 行为外积 (决策态槽 × 实际字节 one-hot), R 生存信号在迹更新后除迹调制
         zbg_ac = zb_g - zb_g.mean(dim=1, keepdim=True)
         dW_elig = (zbg_ac.transpose(-2, -1) @ oh_g).mean(dim=0)
@@ -90,7 +100,7 @@ class ActionMixin(_MixinBase):
         _wr = getattr(net, "_metab_R", None)
         net._survival_signal = (
             _wr / (E_act.norm() + 1e-6) if _wr is not None
-            else torch.zeros(1, dtype=torch.float16, device=dev)
+            else net._zero1  # tensor-guard: rare (代谢未结算冷启动)
         )
         dW_act = dW_act + E_act * net._survival_signal
         net.W_act.data += dW_act * (net.cfg.lm_lr_boost * 0.2) * (0.5 + intr_d) * col_norm * 5.0
@@ -98,7 +108,7 @@ class ActionMixin(_MixinBase):
         gb_recent = gb[:, -10:]  # [N,10] 最近 10 字节
         oh_r = F.one_hot(gb_recent, num_classes=256).to(torch.float16)  # [N,10,256]
         n_uniq = (oh_r.sum(dim=1) > 0).sum(dim=-1).to(torch.float16)  # [N]
-        rep_run = getattr(net, "_rep_run", torch.zeros(N, device=dev, dtype=torch.float16))
+        rep_run = getattr(net, "_rep_run", net._zero1)
         in_rep = (n_uniq < 3).to(torch.float16)  # [N]
         rep_run = torch.where(in_rep > 0, rep_run + 1.0, torch.zeros_like(rep_run))
         net._rep_run = rep_run

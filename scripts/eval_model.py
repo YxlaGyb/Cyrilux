@@ -1,4 +1,8 @@
-"""综合模型评估: 语言能力 + 记忆能力.
+"""综合模型评估: 语言能力 + 记忆能力.  — DEPRECATED sparse 管线
+
+DEPRECATED (117 轮 Round 1): 本脚本评估稀疏 CyreneModel, 已脱离活动主线。
+活跃主线 = model.dense.DensePCNet; dense 评估见 scripts/eval_dense.py。
+保留可跑: 依赖指向 model/_archived_sparse.
 
 Usage:
     python scripts/eval_model.py                    # 评估 final.pt
@@ -7,8 +11,8 @@ Usage:
 
 import argparse, math, random, time, torch
 from torch.utils.data import DataLoader
-from model.model_cyrene import CyreneModel
-from model.core.dataset import DualChannelDataset
+from model._archived_sparse import CyreneModel
+from dataset import DualChannelDataset
 
 torch.set_grad_enabled(False)
 

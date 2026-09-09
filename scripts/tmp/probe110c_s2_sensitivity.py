@@ -26,7 +26,7 @@ torch.set_grad_enabled(False)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from model.dense import DensePCConfig, DensePCNet
+from model import CyreneModel, DensePCNet
 
 _spec = importlib.util.spec_from_file_location("probe110", "scripts/probe110_langnoise.py")
 _mod = importlib.util.module_from_spec(_spec)
@@ -57,7 +57,7 @@ def main():
     ap.add_argument("--data", default=_mod.DATA)
     args = ap.parse_args()
 
-    cfg = DensePCConfig(d_input=256, d_act=256, max_seq_len=256)
+    cfg = CyreneModel(d_input=256, d_act=256, max_seq_len=256)
     net = DensePCNet.load(args.ckpt, cfg).to(DEV)
     net.use_w_act = False
     net._entropy_sample = False

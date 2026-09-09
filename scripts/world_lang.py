@@ -15,7 +15,9 @@
 
 E 代谢 (环境物理常数, 类比重力 g — 环境参数非学习规则):
   E ← E·(1-d) + c·q        d=0.05 消耗 / c=0.1 进食
-  R_world = 0.05·tanh(ΔE/0.02)   (107 轮量级先例, 与 dW 同级)
+  R_world = tanh(ΔE/(2·MAD_de)) / ‖W_act_elig‖   (113 R1 双侧自校准增益;
+           旧 0.05·tanh(ΔE/0.02) std=0.016, 距资格迹契约 0-1 级 ~19x,
+           112 实测学习腿饿死; 迹范数由调用方传入, 公式单点存放于此)
   平衡点 E* = c·q/d: q=0.9 → 1.8 (饱足), q=0.13 → 0.26 (汤=濒死)
 
 认证门: q ≥ cert_frac·q_base → 发声 ε 进认证带锚 (恒温器新目标,
@@ -141,6 +143,8 @@ class WorldLangPhysics:
         self.ema_alpha = ema_alpha
         self.mad_alpha = mad_alpha
         self.n_certified = 0
+        # R1 信号侧: 代谢流水 ΔE 的涨落尺度 (MAD EMA); 冷启动首笔 = |ΔE|
+        self.de_mad = None
 
     def score(self, gen_bytes):
         """发声字节流 → {L, S, X, q}. 只读 (不更新历史).
@@ -172,12 +176,30 @@ class WorldLangPhysics:
         if len(idx):
             self._hist.append(frozenset(int(v) for v in idx.tolist()))
 
-    def step_E(self, q):
-        """E 代谢: 消耗 d + 进食 c·q. 返回 R_world (107 量级先例)."""
+    def step_E(self, q, trace_norm):
+        """E 代谢: 消耗 d + 进食 c·q. 返回 R_world (113 R1 双侧自校准增益).
+
+        R = tanh(ΔE/(2·MAD)) / ‖迹‖: 信号侧除以世界自己的涨落 (de_mad EMA,
+        复用 mad_alpha=0.95, 半衰期 13.5 步 = 资格迹/E 同尺度), 消费侧除以
+        调用方传入的资格迹范数 (系统自己近期行为的尺度). 写入 = (迹/‖迹‖)·tanh
+        → 学习腿写入幅度结构性 ≈ |tanh| ≤ 1 (基线项单位范数口径).
+
+        探针裁决 (out/probe113_ab.json + out/probe113_ab_r1.json):
+        旧 R std=0.016 距契约 ~19x → 学习腿饿死 (112: W_act 2000 步不动);
+        B2 (仅除以 MAD) std=0.46 过冲 28x → 汤崩溃 + E 濒死 0.036 (D3 败);
+        R1 ratio_med=0.39 入目标区 [0.3,1], 零危机, D1'/D2'/D3' 全过.
+        迹膨胀 → R 自动收缩 — 对 B2 崩溃模式的内建负反馈. 零新增定数.
+        """
         e_old = self.E
         self.E = self.E * (1.0 - self.d) + self.c * q
         de = self.E - e_old
-        return 0.05 * math.tanh(de / 0.02)
+        if self.de_mad is None:
+            self.de_mad = abs(de)
+        else:
+            self.de_mad = (self.mad_alpha * self.de_mad
+                           + (1.0 - self.mad_alpha) * abs(de))
+        return (math.tanh(de / (2.0 * max(self.de_mad, 1e-6)))
+                / max(trace_norm, 1e-6))
 
     def certify(self, q, eps_value):
         """世界认证门: q ≥ q_ref → 该发声 ε 进认证带锚. 返回是否认证."""
@@ -194,3 +216,37 @@ class WorldLangPhysics:
             self.world_eps_ema = (self.ema_alpha * self.world_eps_ema
                                   + (1.0 - self.ema_alpha) * float(eps_value))
         return True
+
+    def save_state(self, step, gen_temp):
+        """世界动态状态 + 恒温器温度 → 可 JSON 侧车 (111 续跑三重丢失修复).
+
+        net.save() 只存权重; E/锚/τ/_hist 是运行时状态 — 长暴露分段续跑
+        必须靠此侧车保持连续 (exp112_say.py 每 500 步与 net.save 同步写).
+        """
+        return {
+            "step": int(step),
+            "E": self.E,
+            "de_mad": self.de_mad,
+            "world_eps_ema": self.world_eps_ema,
+            "world_eps_mad": self.world_eps_mad,
+            "n_certified": self.n_certified,
+            "hist": [sorted(s) for s in self._hist],
+            "gen_temp": float(gen_temp),
+            "k_history": self.k_history,
+        }
+
+    def load_state(self, st):
+        """侧车恢复; 返回 (step, gen_temp) 供实验循环接管."""
+        if st.get("k_history", self.k_history) != self.k_history:
+            raise ValueError(f"侧车 k_history={st.get('k_history')} ≠ 当前 "
+                             f"{self.k_history} — 历史语义不一致, 拒绝恢复")
+        self.E = float(st["E"])
+        self.de_mad = (None if st.get("de_mad") is None
+                       else float(st["de_mad"]))
+        self.world_eps_ema = (None if st["world_eps_ema"] is None
+                              else float(st["world_eps_ema"]))
+        self.world_eps_mad = float(st["world_eps_mad"])
+        self.n_certified = int(st["n_certified"])
+        self._hist = deque((frozenset(int(v) for v in h) for h in st.get("hist", [])),
+                           maxlen=self.k_history)
+        return int(st.get("step", 0)), float(st.get("gen_temp", 4.0))

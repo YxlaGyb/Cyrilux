@@ -1,22 +1,9 @@
-"""audit_char_coverage: 字符覆盖率质证审计 — "输出了任何中文吗?" 的硬测量 (只读).
-
-第 110 轮确立 (用户质询触发): (1) 输出里有没有常见字? (2) 为什么把
-\xe9\xa0\xb7 一类字节当中文? (3) 字节模型怎么学中文, 又为何能出 "英文"?
-本脚本不解释, 只测量:
-
-  A. 训练日志 40 条原始样本 (exp110c_world_stdout.log) 的字级统计
-  B. 终检查点重生成 (种子=语料文本尾 16B, 同 echo 语义, N=24×63B):
-     温度 0 (贪心) / 1.0 (自然采样) / 9.5 (实际运行温度, jsonl 末值)
-  C. 语料基线 (200 行感知文本, 同统计)
-  D. 纯物理下限: UTF-8 状态机 + 均匀随机合法字节, 零学习参照 —
-     回答 "合法 CJK 字符里有多少是常见字, 如果什么都不学"
-
-统计口径 (全部按解码后的字符, 非字节):
-  CJK 字数 / top-100 / top-1000 / top-3000 语料高频字覆盖率 / ASCII 占比
-  常见二字词命中 (我们/可以/他们/… 共 15 词)
-
-全部样本完整解码落盘 out/audit_char_coverage.txt (证据文件, 无截断).
-用法: uv run python scripts/audit_char_coverage.py
+"""
+audit_char_coverage 字符覆盖率质证审计
+用法: uv run python scripts/audit_char_coverage.py --ckpt out/exp113_say.pt \
+        --log out/exp113_say.log --temps 0.0,1.8,9.5
+--temps: B 系列重生成温度列表 (B1 = 首个恒贪心, 末位恒对照; 中间位
+113 起传实际末段 τ — 标签随参数自描述).
 """
 import ast
 import importlib.util
@@ -28,21 +15,42 @@ from collections import Counter
 
 import torch
 
+from pkg.cli.utils import run_file
+
 torch.set_grad_enabled(False)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from model.dense import DensePCConfig, DensePCNet
+from model import CyreneModel, DensePCNet
 
-_spec = importlib.util.spec_from_file_location("probe110", "scripts/probe110_langnoise.py")
-_mod = importlib.util.module_from_spec(_spec)
-sys.modules["probe110"] = _mod
-_spec.loader.exec_module(_mod)
-read_lines = _mod.read_lines
-snapshot_state = _mod.snapshot_state
-restore_state = _mod.restore_state
-DEV = _mod.DEV
-DATA = _mod.DATA
+# 原 import probe110_langnoise (110 波已删): 内联等价小工具 (功能不变)
+DATA = "dataset/pretrain_t2t_mini.jsonl"
+DEV = torch.device("cuda")
+
+
+def read_lines(data_path, n_lines=5000, max_len=300, min_len=160):
+    """语料行读取: 前 n_lines 行中长度 [min_len, max_len] 的文本."""
+    texts = []
+    with open(data_path, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i >= n_lines:
+                break
+            t = json.loads(line)["text"]
+            if min_len <= len(t) <= max_len:
+                texts.append(t)
+    return texts
+
+
+def snapshot_state(net):
+    """全状态快照 (生成重放前冻结, 温度系重生成须同一状态)."""
+    return {k: v.detach().clone() for k, v in net.state_dict().items()}
+
+
+def restore_state(net, snap):
+    for k, v in snap.items():
+        b = getattr(net, k, None)
+        if b is not None and b.shape == v.shape:
+            b.copy_(v)
 
 N_SEQ = 24
 COMMON_WORDS = ["我们", "可以", "他们", "什么", "自己", "知道", "这样", "没有",
@@ -103,8 +111,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="out/exp110c_world.pt")
     ap.add_argument("--log", default="out/exp110c_world_stdout.log")
-    ap.add_argument("--out", default="out/audit_char_coverage.txt")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--temps", default="0.0,1.0,9.5",
+                    help="B 系列重生成温度 (逗号分隔; B1 首位恒贪心, 末位恒对照)")
     args = ap.parse_args()
+    args.out = args.out or run_file("audit_char_coverage.txt")
 
     audit = open(args.out, "w", encoding="utf-8", buffering=1)
 
@@ -117,20 +128,30 @@ def main():
 
     conds = {}
 
-    # A. 训练日志原始样本
+    # A. 训练日志原始样本 (113 起日志格式 = 解码文本 repr, 111 及以前 = 字节 repr)
     log = open(args.log, encoding="utf-8", errors="replace").read()
     raws = [ast.literal_eval(m) for m in re.findall(r"gen=(b'[^']*')", log)]
     logged = "".join(r.decode("utf-8", errors="ignore") for r in raws)
+    strs = [ast.literal_eval(m) for m in re.findall(r"gen=('[^']*')", log)]
+    logged += "".join(strs)
     conds["A 日志40条(实际运行)"] = (logged, raws)
 
     # B. 终检查点重生成
-    cfg = DensePCConfig(d_input=256, d_act=256, max_seq_len=256)
-    net = DensePCNet.load(args.ckpt, cfg).to(DEV)
+    # config=None: 按检查点形状派生 (修剪后检查点兼容路径 — 显式 cfg 会走切片补齐,
+    # 产生 _mem_m 列数与 active_size 错位的 Frankenstein)
+    net = DensePCNet.load(args.ckpt).to(DEV)
     net._entropy_sample = False
     snap = snapshot_state(net)
     texts = read_lines(DATA, 5000, 300, 160)
     seeds = [t.encode("utf-8")[:16] for t in texts[:N_SEQ]]
-    for temp, name in ((0.0, "B1 贪心 τ=0"), (1.0, "B2 自然 τ=1.0"), (9.5, "B3 实际 τ=9.5")):
+    temps = [float(v) for v in args.temps.split(",") if v.strip()]
+    for j, temp in enumerate(temps):
+        if j == 0:
+            name = f"B1 贪心 τ={temp:g}"
+        elif j == len(temps) - 1:
+            name = f"B{j + 1} 对照 τ={temp:g}"
+        else:
+            name = f"B{j + 1} τ={temp:g}"
         streams = gen_at(net, snap, seeds, temp)
         conds[name] = ("".join(s.decode("utf-8", errors="ignore") for s in streams), streams)
 
@@ -165,7 +186,7 @@ def main():
             audit.write(text[:600] + " …\n")
 
     audit.close()
-    print("\n完整证据: out/audit_char_coverage.txt", flush=True)
+    print(f"\n完整证据: {args.out}", flush=True)
 
 
 if __name__ == "__main__":

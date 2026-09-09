@@ -151,6 +151,14 @@ class PruningEngine:
             + [head + i * a4p + perm for i in range(K)]
         )
         net.W1.data = net.W1.data[idx].contiguous()
+        """
+        W1_elig 迹必须与 W1 行同 idx 重排
+        否则迹留在原始行序, 与 W1 布局错位 → W1 解冻下每步把迹注入错误行
+        最终收缩块的 gather 也因布局不同而错位
+        """
+        old_e1 = net.W1_elig.data
+        net.register_buffer("W1_elig", old_e1[idx].contiguous())
+        del old_e1
         old_m2 = net._mem_m.data
         net.register_buffer("_mem_m", old_m2[:, perm].contiguous())  # 单元状态列 = L4 神经元
         del old_m2
@@ -159,10 +167,9 @@ class PruningEngine:
         net.W_pred_54.data = net.W_pred_54.data[:, perm].contiguous()  # 列 = L4
         net.W_pred_43.data = net.W_pred_43.data[perm].contiguous()  # 行 = L4
         net.W_bind.data = net.W_bind.data[perm].contiguous()
-        for i in range(4):  # 环形缓冲同 perm (缓冲与 W_diff 行错位 → 更新错乱)
-            old_buf = getattr(net, f"_dw_buf_{i}").data
-            net.register_buffer(f"_dw_buf_{i}", old_buf[perm][:, perm].contiguous())
-            del old_buf
+        old_buf = net._dw_buf.data  # [4,L,L] 环形缓冲同 perm (缓冲与 W_diff 行错位 → 更新错乱)
+        net.register_buffer("_dw_buf", old_buf[:, perm][:, :, perm].contiguous())
+        del old_buf
         old_thw = net._theta_w.data
         net.register_buffer("_theta_w", old_thw[perm].contiguous())  # BCM 滑阈对齐 W_diff 行
         del old_thw
@@ -362,25 +369,54 @@ class PruningEngine:
                 old_sp[: net.active_size["l4"], : net.active_size["l4"]].contiguous()
             )
             del old_sp
-            # W1 行 = [z4 | bind | 单元×K]; W_lm 行 = d_h 混合空间 (不裁剪)
+            """
+            W1 行 = [z4 | bind | 单元×K]; W_lm 行 = d_h 混合空间 (不裁剪).
+            W1 布局 = _sync_l4_aux 的 perm 顺序:
+            z4 块 (a4p 行, 已按 perm 排列) | bind 段 (n_bind) | 单元块×K (各 a4p 行, 已按 perm 排列).
+            收缩 = 显式 gather: z4 取前列 a4_new (keep+幸存 probation), bind 段与
+            单元块按 a4_new 切。头切片会把 z4 probation/死行误作 bind 与单元行，形状自洽不产 NaN, 是静默语义错位。
+            """
+            l4_perm = perm_map.get("l4")
+            a4_new = net.active_size["l4"]
             n_bind = net.bind_slot_dim
-            n_cell = net._mem_m.shape[0] * net.active_size["l4"]
+            k_new = net._mem_m.shape[0]
+            if l4_perm is not None:
+                a4p = l4_perm.numel()
+                head = a4p + n_bind
+
+                def _gather_w1(old: torch.Tensor) -> torch.Tensor:
+                    return torch.cat(
+                        [old[:a4_new], old[a4p:a4p + n_bind]]
+                        + [old[head + i * a4p : head + i * a4p + a4_new] for i in range(k_new)],
+                        dim=0,
+                    ).contiguous()
+
+            else:
+
+                def _gather_w1(old: torch.Tensor) -> torch.Tensor:
+                    # 地板无 perm (active≤bound): 布局未重排, 头切片即恒等
+                    return old[: a4_new + n_bind + k_new * a4_new].contiguous()
+
             old_w1 = net.W1.data
-            net.W1 = nn.Parameter(old_w1[: net.active_size["l4"] + n_bind + n_cell, :].contiguous())
+            net.W1 = nn.Parameter(_gather_w1(old_w1))
             del old_w1
+            # W1_elig 迹同形同步 (修剪路径曾遗漏: 迹行与 W1 行错位 → W1 解冻下注入错误行)
+            old_ew1 = net.W1_elig.data
+            net.register_buffer("W1_elig", _gather_w1(old_ew1))
+            del old_ew1
+            net._lm_in = net.W1.shape[0]  # zh 列数 = W1 行数 (虚不变式, 喂 _mem_out 守卫)
             old_mm = net._mem_m.data
             net.register_buffer("_mem_m", old_mm[:, : net.active_size["l4"]].contiguous())  # 单元状态列
             del old_mm
             old_bind = net.W_bind.data
             net.W_bind = nn.Parameter(old_bind[: net.active_size["l4"], :].contiguous())  # 列 = 槽位固定
             del old_bind
-            for i in range(4):  # 环形缓冲同步 (copy_ 形状错位即崩)
-                old_buf = getattr(net, f"_dw_buf_{i}").data
-                net.register_buffer(
-                    f"_dw_buf_{i}",
-                    old_buf[: net.active_size["l4"], : net.active_size["l4"]].contiguous(),
-                )
-                del old_buf
+            old_buf = net._dw_buf.data  # [4,L,L] 环形缓冲同步 (GPU 索引, 图捕获兼容)
+            net.register_buffer(
+                "_dw_buf",
+                old_buf[:, : net.active_size["l4"], : net.active_size["l4"]].contiguous(),
+            )
+            del old_buf
             old_thw = net._theta_w.data
             net.register_buffer("_theta_w", old_thw[: net.active_size["l4"]].contiguous())  # 滑阈对齐 W_diff 行
             del old_thw

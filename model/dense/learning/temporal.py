@@ -37,12 +37,12 @@ class TemporalMixin(_MixinBase):
         for k, kname in ((2, "2"), (4, "4"), (8, "8")):
             # 交互短输入收缩历史深度, 否则 z4r[:, :-k] 为空 → pred 形状错位
             k_eff = min(k, S_full - 1)
-            z_shift = torch.cat([torch.zeros(N, k_eff, dim_4, dtype=z4r.dtype, device=dev), z4r[:, :-k_eff]], dim=1)
+            z_shift = torch.cat([net._padmax[..., :dim_4].expand(N, k_eff, dim_4), z4r[:, :-k_eff]], dim=1)
             z_shift_n = z_shift / (z_shift.norm(dim=-1, keepdim=True) + 1e-3)
             pred_k = z_shift_n @ W_diff_a.T + net.b_diff[:dim_4]
             err_k = (dz4 - pred_k[:, :-1]).square().mean()
             if k == 8:
-                valid = torch.arange(S_full - 1, device=dev) >= (k_eff - 1)
+                valid = net._seq_arange[: S_full - 1] >= (k_eff - 1)  # 预分配 arange 缓冲 (H4)
                 err_k = ((dz4[:, valid] - pred_k[:, :-1][:, valid]).square()).mean()
             masks[kname] = valid if k == 8 else None
             preds_k[kname] = pred_k
@@ -75,14 +75,14 @@ class TemporalMixin(_MixinBase):
         z4_prev_n = z4r[:, :-1] / (z4r[:, :-1].norm(dim=-1, keepdim=True) + 1e-3)
         e_mod = e_t_all - 0.1 * phi_w
         dW_diff_t = torch.bmm(e_mod.transpose(-2, -1), z4_prev_n).mean(dim=0) * (1.0 / (ctx.S - 1))
-        # 4 步时间窗环形缓冲: 更新用最近 4 步平均外积 (保留误差记忆)
-        buf = getattr(net, f"_dw_buf_{net._buf_i}")
-        buf.copy_(dW_diff_t)
-        dW_avg = buf.clone()
-        for i in range(1, 4):
-            dW_avg = dW_avg + getattr(net, f"_dw_buf_{(net._buf_i - i) % 4}")
-        dW_avg = dW_avg * 0.25
-        net._buf_i = (net._buf_i + 1) % 4
+        # 4 步时间窗环形缓冲 (GPU 索引, 图捕获兼容 — python 索引会在捕获时焊死):
+        # 更新用最近 4 步平均外积 (保留误差记忆). 全持久缓冲零热路径新建:
+        # _dw_slot 就地接收本步外积 → index_copy 落环位; 环和与顺序无关 (空槽零垫
+        # 语义与旧实现一致) → 直接全环 sum ×0.25, 免索引归并.
+        net._dw_slot.copy_(dW_diff_t)
+        net._dw_buf.index_copy_(0, net._buf_i, net._dw_slot)
+        dW_avg = net._dw_buf.sum(dim=0) * 0.25
+        net._buf_i.add_(1).remainder_(4)
 
         from .engine import DiffWindow
 
@@ -106,7 +106,7 @@ class TemporalMixin(_MixinBase):
         mx = dW_avg.abs().max() + 1e-4
         dW_avg = dW_avg / mx / 64.0
         dW_avg = dW_avg / (dW_avg.norm() + 1e-8)
-        dW_avg = dW_avg + _elig_accum(net, "W_diff", dW_avg) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+        dW_avg = dW_avg + _elig_accum(net, "W_diff", dW_avg) * getattr(net, "_survival_signal", net._zero1)
         W_diff_a.data += (dW_avg * (~fut_mask).to(torch.float16)) * (DIFF_TRUST_REGION * W_diff_a.norm())
         future_e = (sh.diff.dz4 - sh.diff.pred_d).mean(dim=(0, 1))
         net.b_diff[:dim_4].data += future_e * ctx.eta
@@ -139,7 +139,7 @@ class TemporalMixin(_MixinBase):
             # free_run 豁免 Oja 能量约束: 增益解放后 Oja 成死亡吸引子, 递归耗散改由 STP/分流/谱守卫承担
             if not free_run:
                 dW_t = _energy_constraint(net, W_t[:a_sz, :a_sz].data, dW_t, z_cur, f"_active_ema_{wt_name}")
-                dW_t = dW_t + _elig_accum(net, f"{wt_name[0].upper()}_{wt_name[1:]}", dW_t) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+                dW_t = dW_t + _elig_accum(net, f"{wt_name[0].upper()}_{wt_name[1:]}", dW_t) * getattr(net, "_survival_signal", net._zero1)
             # W_t4 输出端 homeostatic 抑制: g_j=1/(1+θ_j), 破 σ₁/σ₂ 垄断, 与 W_04 同构
             if W_t is net.W_t4:
                 th_wt4 = net._theta_wt4[:a_sz]

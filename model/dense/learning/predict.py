@@ -34,18 +34,22 @@ class PredictMixin(_MixinBase):
         z4_pred_in = rms_norm(z4)
         z3_pred_in = rms_norm(z3)
         if free_run:
-            global_rpe = torch.tensor(0.0, dtype=torch.float16, device=dev)  # 无字节误差 → rpe=1
+            global_rpe = net._zero1  # tensor-guard: rare (自由运行, 无字节误差 → rpe=1)
         else:
-            global_rpe = (sh.lm.eps_total.square().mean().sqrt() * 10.0).clamp(max=1.0)  # 全局误差幅度
+            global_rpe = (sh.lm.eps_total.square().mean().sqrt() * 10.0).clamp(max=1.0)  # tensor-guard: bound (全局误差幅度界)
         Wp54_a = net.W_pred_54[:dim_5, :dim_4]
         Wp43_a = net.W_pred_43[:dim_4, :dim_3]
         pred_l5 = z4_pred_in @ Wp54_a.T  # [N,S,dim_5]
         pred_l4 = z3_pred_in @ Wp43_a.T  # [N,S,dim_4]
         # 未来折扣目标 z_future[t] = Σ_k γ^k·z[t+k+1]: 向未来轨迹漂移的牵引力, 末尾 K 位 mask 掉
-        z5_fut = torch.zeros_like(z5)
-        z4_fut = torch.zeros_like(z4)
-        mask5 = torch.zeros(ctx.S, dtype=torch.bool, device=dev)
-        mask4 = torch.zeros(ctx.S, dtype=torch.bool, device=dev)
+        z5_fut = net._z5_fut_buf[:ctx.N, :ctx.S, :dim_5]
+        z4_fut = net._z4_fut_buf[:ctx.N, :ctx.S, :dim_4]
+        z5_fut.zero_()
+        z4_fut.zero_()
+        mask5 = net._maskS_a[:ctx.S]
+        mask4 = net._maskS_b[:ctx.S]
+        mask5.zero_()
+        mask4.zero_()
         g = 1.0
         for k in range(K_FUT):
             if k + 1 < ctx.S:
@@ -77,11 +81,11 @@ class PredictMixin(_MixinBase):
         if not ctx.echo_world_frozen:
             dWp54 = (err5_m.transpose(-2, -1) @ z4_pred_in[:, mask5]).mean(dim=0)
             dWp54 = _energy_constraint(net, Wp54_a.data, dWp54, err5_m, "_active_ema_wp54")
-            dWp54 = dWp54 + _elig_accum(net, "W_pred_54", dWp54) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+            dWp54 = dWp54 + _elig_accum(net, "W_pred_54", dWp54) * getattr(net, "_survival_signal", net._zero1)
             Wp54_a.data += _rho_ctrl(dWp54 * ctx.eta, Wp54_a, "wp54", net)
             dWp43 = (err4_m.transpose(-2, -1) @ z3_pred_in[:, mask4]).mean(dim=0)
             dWp43 = _energy_constraint(net, Wp43_a.data, dWp43, err4_m, "_active_ema_wp43")
-            dWp43 = dWp43 + _elig_accum(net, "W_pred_43", dWp43) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+            dWp43 = dWp43 + _elig_accum(net, "W_pred_43", dWp43) * getattr(net, "_survival_signal", net._zero1)
             Wp43_a.data += _rho_ctrl(dWp43 * ctx.eta, Wp43_a, "wp43", net)
             soft_norm_preserve(Wp54_a.data)
             soft_norm_preserve(Wp43_a.data)

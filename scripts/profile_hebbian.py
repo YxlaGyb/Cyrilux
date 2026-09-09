@@ -1,7 +1,11 @@
-"""端到端性能基准: warmup -> connect_layer -> Hebbian training."""
+"""端到端性能基准: warmup -> connect_layer -> Hebbian training.  — DEPRECATED sparse 管线
+
+DEPRECATED (117 轮 Round 1): 本脚本基准稀疏 CyreneModel, 已脱离活动主线。
+活跃主线 = model.dense.DensePCNet。保留可跑: 依赖指向 model/_archived_sparse.
+"""
 import time
 import torch
-from model.model_cyrene import CyreneConfig, CyreneModel
+from model._archived_sparse import CyreneConfig, CyreneModel
 
 # 接近生产环境的配置
 cfg = CyreneConfig(

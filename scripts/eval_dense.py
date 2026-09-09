@@ -1,6 +1,8 @@
-"""PPA 模型评估 — 世界模型内在自洽 (自由能), 表示分化, 生成连贯性.
+"""
+PPA 模型评估
+世界模型内在自洽 (自由能), 表示分化, 生成连贯性.
 
-不做 PPL/Top-1 (用户裁决: 已弃用). 指标:
+不做 PPL/Top-1, 指标:
 - 自由能 (L5→L4 主误差 + 各层预测误差, 经精度加权)
 - cos(z5): 不同输入表示是否分化
 - 生成: W_future 时空共振自顶向下重建字节, ASCII 比例/连贯性
@@ -8,7 +10,7 @@
 """
 import time
 import torch
-from model.pc.dense.core import DensePCNet, DensePCConfig
+from model import DensePCNet, CyreneModel
 
 torch.set_grad_enabled(False)
 
@@ -21,7 +23,7 @@ def load_model(path):
     d_l3 = sd["W_23"].shape[0]
     d_l5 = sd["W_35"].shape[0]
     d_l6 = sd["W_56"].shape[0]
-    cfg = DensePCConfig(d_l4=d_l4, d_l2=d_l2, d_l3=d_l3,
+    cfg = CyreneModel(d_l4=d_l4, d_l2=d_l2, d_l3=d_l3,
                         d_l5=d_l5, d_l6=d_l6, max_seq_len=256)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = DensePCNet(cfg).to(dev)

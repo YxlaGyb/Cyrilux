@@ -99,7 +99,7 @@ class FeedforwardMixin(_MixinBase):
             net._theta_w04_dist = th_w04  # 诊断: θ_j 分布
             dW_04 = dW_04 * g_homeo
             # 资格迹接力: 更新 = η·R·E 的滑均形式 (R 为生存信号时全迹缩放)
-            dW_04 = dW_04 + _elig_accum(net, "W_04", dW_04) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+            dW_04 = dW_04 + _elig_accum(net, "W_04", dW_04) * getattr(net, "_survival_signal", net._zero1)
             net.W_04[:dim_4].data += dW_04 * eta
             soft_norm_preserve(net.W_04[:dim_4].data)
             # 行去同质化: 斜坡渐进 (coef 200 步升到 1) + 范数信任域 (单步 ≤5%‖W‖_F) 防 z4 突变换层
@@ -108,7 +108,7 @@ class FeedforwardMixin(_MixinBase):
 
             dW42 = (sh.errs.eps2_precise.transpose(-2, -1) @ rms_norm(z4)).mean(dim=0) * inv_s
             dW42 = _energy_constraint(net, net.W_42[:dim_2].data, dW42, sh.errs.eps2_precise, "_active_ema_w42")
-            dW42 = dW42 + _elig_accum(net, "W_42", dW42) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+            dW42 = dW42 + _elig_accum(net, "W_42", dW42) * getattr(net, "_survival_signal", net._zero1)
             col_mask = torch.rand(dim_2, 1, device=dev) < net.cfg.column_dropout
             net.W_42[:dim_2].data += (dW42 * (~col_mask).to(torch.float16)) * eta
             _decorr_W(net.W_42[:dim_2].data, net.E_42[:dim_2, :dim_2], learn_boost=ctx.learn_boost)
@@ -116,7 +116,7 @@ class FeedforwardMixin(_MixinBase):
         # W_56 (L5→L6 内部动力学) 在自由运行同样学习
         dW_56 = (sh.errs.eps6_precise.transpose(-2, -1) @ rms_norm(z5)).mean(dim=0) * inv_s
         dW_56 = _energy_constraint(net, net.W_56[:dim_6].data, dW_56, sh.errs.eps6_precise, "_active_ema_w56")
-        dW_56 = dW_56 + _elig_accum(net, "W_56", dW_56) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+        dW_56 = dW_56 + _elig_accum(net, "W_56", dW_56) * getattr(net, "_survival_signal", net._zero1)
         col_mask = torch.rand(net.W_56[:dim_6].shape[0], 1, device=dev) < net.cfg.column_dropout
         net.W_56[:dim_6].data += (dW_56 * (~col_mask).to(torch.float16)) * eta
 
@@ -127,7 +127,7 @@ class FeedforwardMixin(_MixinBase):
         eps_state = rms_norm(eps_state)
         eps_state_3 = eps_state @ net.W_42[:dim_2].T[:, :dim_3]  # dim_4 → dim_3 (经 W_42 逆映射)
         eps3_pc = sh.errs.eps3 + 0.3 * torch.cat(
-            [eps_state_3, torch.zeros(N, 1, dim_3, dtype=eps_state_3.dtype, device=dev)], dim=1
+            [eps_state_3, net._padmax[:, :, :dim_3]], dim=1
         )
         eps3_pc = net.forward_engine._precise(eps3_pc)
 
@@ -136,7 +136,7 @@ class FeedforwardMixin(_MixinBase):
         gain_l3 = net._gain_l3[:dim_3, :dim_3] if dim_3 < 384 else net._gain_l3[:dim_3, :]
         dW23 = (eps3_pc.transpose(-2, -1) @ rms_norm(z2)).mean(dim=0) * inv_s
         dW23 = _energy_constraint(net, net.W_23[:dim_3].data, dW23, eps3_pc, "_active_ema_w23")
-        dW23 = dW23 + _elig_accum(net, "W_23", dW23) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+        dW23 = dW23 + _elig_accum(net, "W_23", dW23) * getattr(net, "_survival_signal", net._zero1)
         err3_norm = sh.errs.eps3.pow(2).mean(dim=(0, 1)).sqrt() + 1e-8  # [dim_3] 每神经元
         gate3 = 0.1 + 0.9 * (err3_norm / err3_norm.max())
         dW23 = dW23 * gain_l3 * gate3.unsqueeze(1)
@@ -148,7 +148,7 @@ class FeedforwardMixin(_MixinBase):
         if not echo_world_frozen:
             dW_sp = (net._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0)
             dW_sp = _energy_constraint(net, W_sp_a.data, dW_sp, net._z4, "_active_ema_wsp")
-            dW_sp = dW_sp + _elig_accum(net, "W_state_pred", dW_sp) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+            dW_sp = dW_sp + _elig_accum(net, "W_state_pred", dW_sp) * getattr(net, "_survival_signal", net._zero1)
             W_sp_a.data += dW_sp * eta
             soft_norm_preserve(W_sp_a.data)
 
@@ -162,7 +162,7 @@ class FeedforwardMixin(_MixinBase):
         if not free_run and not echo_world_frozen:
             # 预测编码向下平移: W_lm 误差 → dim_3 (补零对齐 S, 经 W_42 逆映射)
             eps_lm_proj_pad = torch.cat(
-                [sh.lm.eps_lm_proj, torch.zeros(N, 1, ctx.dim_4, dtype=sh.lm.eps_lm_proj.dtype, device=dev)], dim=1
+                [sh.lm.eps_lm_proj, net._padmax[:, :, :ctx.dim_4]], dim=1
             )
             eps_lm_3 = eps_lm_proj_pad @ net.W_42[:ctx.dim_2].T[:, :dim_3]
             eps_lm_3 = rms_norm(eps_lm_3)
@@ -197,7 +197,7 @@ class FeedforwardMixin(_MixinBase):
         e_alive = (e_max > 1e-8).to(err_norm.dtype)
         upd_gate = 0.1 + 0.9 * (err_norm / torch.where(e_alive > 0, e_max, torch.ones_like(e_max)))
         # 资格调制: q_i = 每行时间残差能量 (时间差分无法解释的行获得更高学习资格)
-        z5_prev = torch.cat([torch.zeros(N, 1, dim_5, dtype=z5.dtype, device=dev), z5[:, :-1]], dim=1)
+        z5_prev = torch.cat([net._padmax[:, :, :dim_5], z5[:, :-1]], dim=1)
         z5_prev_n = rms_norm(z5_prev)
         z5_pred_t = z5_prev_n @ net.W_t5[:dim_5].T  # W_t5 时间预测
         # 残差平方前按 max|残差| 归一化: 直接平方溢出 → q_i=inf/inf=NaN; s² 在分子分母消去, 数学全等
@@ -219,7 +219,7 @@ class FeedforwardMixin(_MixinBase):
             dW_sub = dW_sub * (~b_mask).to(torch.float16)
             dW_h = dW_sub if dW_h is None else dW_h + dW_sub
         dW_h = _energy_constraint(net, Wb, dW_h, phi_b, "_active_ema_w35")
-        dW_h = dW_h + _elig_accum(net, "W_35", dW_h) * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+        dW_h = dW_h + _elig_accum(net, "W_35", dW_h) * getattr(net, "_survival_signal", net._zero1)
         dW_h = dW_h * eta
         # 通道级塑性控制: ρ_i=‖ΔW_i‖/‖W_i‖, s_i=clip(0.03/ρ_i, 0.005, 1.0), 统一预测连接时间尺度
         nW = Wb.norm() + 1e-8  # decorr 前统一基准

@@ -20,7 +20,7 @@ def checkpoints(directory, detail):
     """列出检查点文件."""
     import torch
 
-    ckpt_dir = resolve_path(directory or "out_pc_unified")
+    ckpt_dir = resolve_path(directory or "out")
     if not os.path.exists(ckpt_dir):
         raise click.ClickException(f"目录不存在: {ckpt_dir}")
 

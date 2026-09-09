@@ -29,7 +29,6 @@ def _tiny_cfg(**over) -> CyreneModel:
         d_l5=192,   # > bound 128 ← 本轮主角
         d_l6=128,   # = bound 128 (L6 不剪,测 L5→L6 列同步)
         prune_warmup=0,
-        prune_interval=1,
         prune_fraction=0.6,  # 每步最多砍 60%
         death_probation=1,   # 死缓 1 步直接过期 (本轮首步没 expired 就行)
         active_size_lower_bound=128,
@@ -93,12 +92,13 @@ def test_l5_prune_shapes_all_synced():
             p = getattr(net, name).data
             p.copy_((p / (p.norm(dim=1, keepdim=True) + 1e-6) * 1.0).to(torch.float16))
 
-    # 用一个极短的字节序列跑 learn,让 _step_counter 推进并触发 prune
+    # 用极短的字节序列跑 learn,推进内部状态后直调 _prune (白盒: 测剪裁机制,
+    # 不依赖 P2 后的代谢触发接缝 — maybe_prune 已由代谢门控)
     byte_ids = torch.randint(0, D_INPUT, (1, 4), dtype=torch.long)
     # 不关心 loss — 只要 shape 对就好
     try:
         stats = net.learn(byte_ids, closed_loop=False, free_run=False)
-        net.maybe_prune(net._step_counter)
+        net.pruner._prune()
     except Exception as e:
         pytest.fail(f"首步 learn 直接抛异常 {type(e).__name__}: {e}")
 
@@ -180,7 +180,7 @@ def test_l5_prune_then_forward_no_crash():
 
     # Step1:修剪发生
     s1 = net.learn(byte_ids_a, closed_loop=False, free_run=False)
-    net.maybe_prune(net._step_counter)
+    net.pruner._prune()
     # 断言修剪真的发生
     assert net.active_size["l5"] < cfg.d_l5, "L5 未剪,测试前提失效"
 
@@ -206,3 +206,66 @@ def test_l5_prune_then_forward_no_crash():
     fe = s2["free_energy"]
     if isinstance(fe, torch.Tensor):
         assert not torch.isnan(fe).any()
+
+
+def test_l4_shrink_w1_markers_aligned():
+    """缺陷 A/B 回归: L4 收缩时 W1/W1_elig 按 [z4 | bind | 单元×K] 布局 gather.
+
+    旧实现是头切片 — bind 段会命中 z4 probation 行 (静默语义错位: 形状自洽,
+    不产 NaN, 因此"剪后 forward 零 NaN"型测试永假阳性). 现有 _tiny_cfg 的
+    d_l4=512=bound 使 L4 永不 permute, 盲区原样. 本测试: d_l4=768 > bound,
+    行标记唯一化, 修剪后断言 bind 段完整保序、单元块只含本块标记、迹同形同步.
+    """
+    cfg = CyreneModel(
+        d_l4=768, d_l2=128, d_l3=128, d_l5=128, d_l6=128,
+        prune_warmup=0, prune_fraction=0.05,
+        active_size_lower_bound=128, l4_lower_bound=512,
+        mem_k0=3, mem_k_max=3, max_seq_len=8,
+    )
+    net = DensePCNet(cfg)
+    n_bind = net.bind_slot_dim  # 32
+    K = 3
+    head = 768 + n_bind
+    with torch.no_grad():
+        w1 = net.W1.data
+        w1.zero_()
+        for i in range(768):
+            w1[i, 0] = i  # z4 块: 0..767
+        for i in range(n_bind):
+            w1[768 + i, 0] = 1000 + i  # bind 块: 1000..1031
+        for k in range(K):
+            for i in range(768):
+                w1[head + k * 768 + i, 0] = 2000 + k * 1000 + i  # 单元块 k
+        net.W1_elig.copy_(net.W1.data)
+        # W_04 行范数严格递减 → 最弱 = 尾行 (topk 稳定; 断言本身不依赖具体 keep 集)
+        r = (torch.arange(768, dtype=torch.float32).flip(0) + 1).unsqueeze(1) / 768.0
+        net.W_04.data.copy_(
+            r.expand(-1, net.W_04.shape[1]).to(torch.float16)
+        )
+    # 死亡回合同序: mem 饥荒击杀 (K 3→2) → 拓扑修剪
+    net._mem_g.copy_(torch.tensor([0.9, 0.5, 0.1], dtype=torch.float16))
+    net.learning_engine._mem_famine_kill()
+    assert net._mem_m.shape[0] == K - 1
+    net.pruner._prune()
+    a4 = net.active_size["l4"]
+    assert a4 < 768 and a4 >= 512, f"L4 未剪/触底异常 a4={a4}"
+
+    e_w1 = net.W1[:, 0]
+    assert net.W1.shape[0] == a4 + n_bind + (K - 1) * a4, (
+        f"W1 行数 {net.W1.shape[0]} ≠ {a4 + n_bind + (K - 1) * a4}"
+    )
+    # 缺陷 B: 迹同形同步, 且标记逐位一致 (旧代码 pruning 路径从不同步 W1_elig)
+    assert net.W1_elig.shape == net.W1.shape
+    assert torch.equal(net.W1_elig[:, 0], e_w1)
+    assert net._lm_in == net.W1.shape[0]
+    # bind 段完整保序 (绑定行从不 permute — 旧头切片会把 z4 probation 行放这里)
+    bind_seg = e_w1[a4 : a4 + n_bind]
+    assert torch.equal(bind_seg, torch.arange(1000, 1000 + n_bind, device=bind_seg.device))
+    # 单元块只含本块标记 (z4/bind 泄漏即语义错位)
+    for k in range(K - 1):
+        blk = e_w1[a4 + n_bind + k * a4 : a4 + n_bind + (k + 1) * a4]
+        lo, hi = 2000 + k * 1000, 2000 + k * 1000 + 768
+        assert bool(((blk >= lo) & (blk < hi)).all()), f"单元块 {k} 标记泄漏"
+    # z4 块不含 bind/单元标记
+    z4 = e_w1[:a4]
+    assert bool(((z4 < 768) | (z4 == 0)).all()), "z4 块混入 bind/单元标记"

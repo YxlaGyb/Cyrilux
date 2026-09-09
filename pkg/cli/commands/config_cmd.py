@@ -38,7 +38,7 @@ TRAIN_TEMPLATE = {
     "n_prototypes": 8,
     "abstraction_replay_interval": 200,
     "save_interval": 10000,
-    "out_dir": "out_pc_unified",
+    "out_dir": "",
     "task_order": ["a", "b", "c", "d"],
     "data_paths": ["dataset/agent_rl_math.jsonl"],
 }
@@ -52,7 +52,7 @@ AUTO_TEMPLATE = {
     "gamma": 0.05,
     "T_infer": 1,
     "data_dir": "dataset",
-    "out_dir": "out_autonomous",
+    "out_dir": "",
 }
 
 

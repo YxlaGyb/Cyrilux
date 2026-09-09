@@ -40,12 +40,30 @@ class BindMixin(_MixinBase):
         echo_world_frozen = ctx.echo_world_frozen
         dim_4 = ctx.dim_4
         z4 = net._z4
-        if hasattr(net, "_bind_vec") and not echo_world_frozen:
+        # 自发活动发生器 (P3-b 移出回声守卫 — 节律基因每步推进, 感知/回声/自由运行全走;
+        # 行为门代谢域消费同一相位): 相位计数器 + 正弦查表 + 槽切换功率耦合
+        # (纯 fp16, index_select 无同步)
+        has_bind = hasattr(net, "_bind_vec") and net._bind_vec is not None
+        if has_bind:
+            zb_all = net._bind_vec
+            cnt = net._intr_cnt
+            cnt.add_(1.0)
+            cnt.remainder_(20.0)  # 整数取模, fp16 精确
+            A = net._intr_sin.index_select(0, cnt.long().squeeze(0))  # [1] fp16 查表
+            # 槽切换功率: z_bind 相邻步差能量 (内部状态, 非预测误差)
+            sw = (zb_all[:, 1:] - zb_all[:, :-1]).square().mean(dim=(0, 2))  # [S-1]
+            om = net._intr_omega
+            om.mul_(0.98).add_(0.02 * sw.mean())
+            omega = sw / (om + sw + 1e-6)  # 自归一化 [0,1] (同 rel_n 家族)
+            intr = (0.5 * A + 0.5 * omega).unsqueeze(0).unsqueeze(-1)  # [1,S-1,1]
+            # 诊断标量 (fp16 张量, 供监控; 训练不读)
+            net._intr_drive = (0.5 * A + 0.5 * omega.mean()).to(torch.float16)
+        if has_bind and not echo_world_frozen:
             z4n = rms_norm(z4)
             bind_t = net._bind_vec  # 纯 z_bind: 保留幅度差作 Hebbian 分化种子, 分流抑制防垄断
             # 每样本独立 surprise EMA 门控 gain_n = s_n/ema_n (clamp 0.3..5), 高惊喜样本外积放大
             if ctx.free_run:
-                gain_n = torch.ones(N, dtype=torch.float16, device=dev)
+                gain_n = net._one1  # 每样本独立 surprise EMA 门控 (预分配缓冲)
             else:
                 s_n = sh.lm.eps_total.square().mean(dim=-1).mean(dim=-1)  # [N] 每样本均方误差
                 # 缓冲按 batch 扩容 (新样本 EMA=1.0 起)
@@ -53,12 +71,12 @@ class BindMixin(_MixinBase):
                     old = net._s_ema_n
                     net.register_buffer(
                         "_s_ema_n",
-                        torch.cat([old, torch.ones(N - old.shape[0], dtype=torch.float16, device=dev)]),
+                        torch.cat([old, torch.ones(N - old.shape[0], dtype=torch.float16, device=dev)]),  # tensor-guard: rare (EMA 尺寸生长, 首步)
                     )
                     del old
                 ema_n = net._s_ema_n[:N]
                 rel_n = s_n / (ema_n + s_n + 1e-6)  # 自归一化相对惊喜 (量级无关, O(1))
-                gain_n = (rel_n * 5.0).clamp(0.3, 5.0)
+                gain_n = (rel_n * 5.0).clamp(0.3, 5.0)  # tensor-guard: bound (惊喜增益设计界)
                 net._s_ema_n[:N].mul_(0.95).add_(0.05 * s_n)
             net._gain_n = gain_n  # 诊断: 逐样本增益分布
             z4n_w = z4n[:, :-1] * gain_n[:, None, None]  # [N, S-1, dim_4]
@@ -68,7 +86,7 @@ class BindMixin(_MixinBase):
             dW_bind_a = (
                 dW_bind
                 + _elig_accum(net, "W_bind", dW_bind)
-                * getattr(net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16))
+                * getattr(net, "_survival_signal", net._zero1)
             ) * (ctx.eta * 2.0)
             net._rho_bind = dW_bind_a.norm() / (net.W_bind[:dim_4].norm() + 1e-8)
             net.W_bind[:dim_4].data.mul_(0.9995)
@@ -78,7 +96,7 @@ class BindMixin(_MixinBase):
             cov_col = W_col @ W_col.T  # [16,16] 列间协方差
             repulsion = cov_col @ W_col  # [16, dim_4] 各列受到的净共线拉力
             rel_rep = repulsion.norm(dim=1, keepdim=True) / (W_col.norm(dim=1, keepdim=True) + 1e-8)
-            scale = (1e-4 * rel_rep.clamp(min=1e-4)).to(torch.float16)  # [16,1]
+            scale = (1e-4 * rel_rep.clamp(min=1e-4)).to(torch.float16)  # tensor-guard: bound (复读尺度下界, 设计界)  # [16,1]
             noise = torch.randn_like(W_col) * scale
             net._noise_scale = scale.mean()  # 诊断: 平均噪声幅度
             net._col_cos = (
@@ -96,25 +114,13 @@ class BindMixin(_MixinBase):
                 zb_pre = zb[:, :-1]  # [N,S-1,K]
                 zb_post = zb[:, 1:]  # [N,S-1,K] 对齐 learn_mask (t+1)
                 zb_post = zb_post * ctx.learn_mask.to(torch.float16).unsqueeze(0).unsqueeze(-1)
-                # 自发活动发生器: 相位计数器 + 正弦查表 + 槽切换功率耦合 (纯 fp16, index_select 无同步)
-                cnt = net._intr_cnt
-                cnt.add_(1.0)
-                cnt.remainder_(20.0)  # 整数取模, fp16 精确
-                A = net._intr_sin.index_select(0, cnt.long().squeeze(0))  # [1] fp16 查表
-                # 槽切换功率: z_bind 相邻步差能量 (内部状态, 非预测误差)
-                sw = (zb[:, 1:] - zb[:, :-1]).square().mean(dim=(0, 2))  # [S-1]
-                om = net._intr_omega
-                om.mul_(0.98).add_(0.02 * sw.mean())
-                omega = sw / (om + sw + 1e-6)  # 自归一化 [0,1] (同 rel_n 家族)
-                intr = (0.5 * A + 0.5 * omega).unsqueeze(0).unsqueeze(-1)  # [1,S-1,1]
-                # 诊断标量 (fp16 张量, 供监控; 训练不读)
-                net._intr_drive = (0.5 * A + 0.5 * omega.mean()).to(torch.float16)
+                # (振荡器 A/intr 已在上方推进 — P3-b 每步; 此处用同一本步相位)
                 dW_self = (
                     zb_pre.transpose(-2, -1) @ ((zb_post - zb_post.mean(dim=-1, keepdim=True)) * intr)
                 ).mean(dim=0)
                 dW_self = dW_self / (dW_self.norm() + 1e-8)
                 dW_self = dW_self + _elig_accum(net, "W_bind_self", dW_self) * getattr(
-                    net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16)
+                    net, "_survival_signal", net._zero1
                 )
                 net.W_bind_self.data.mul_(0.9995)
                 # intrinsic 调制学习率 η_self = η_base·(1+0.5·A): 高潮期探索, 低谷期固化

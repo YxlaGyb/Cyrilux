@@ -44,27 +44,30 @@ class ForwardEngine:
         self,
         byte_ids: torch.Tensor,
         n_gen: int,
-        temperature: float = 0.7,
+        temperature: float | torch.Tensor | None = None,
         rep_backstop: bool = False,
     ) -> torch.Tensor:
         """自回归续写: 基于 [N,S] 前缀批量并行生成, 返回 [N, S+n_gen].
 
         训练 (rollout) 与验证 (generate) 共用同一 logits 管线.
+        temperature: float|Tensor|None — Tensor 时 GPU 直除 (零 .item()); None 或 float<=0 = 贪心.
         rep_backstop: 屏蔽近期 2..24 字节周期末字节的 logits.
         UTF-8 续字节超长阻断: 连续 3 个续字节后屏蔽全部续字节.
         """
         net = self.net
         N, S = byte_ids.shape
         dev = byte_ids.device
-        cur = byte_ids.clone()
-        last_byte = torch.full((N,), -1, dtype=torch.long, device=dev)
-        # UTF-8 语法状态机: 当前字符还需续字节数 (0 = 字符边界)
-        expect_cont = torch.zeros(N, dtype=torch.long, device=dev)
+        # 预分配工作缓冲: cur (续写流, 定长预分配 + 长度游标), last_byte/expect_cont (UTF-8 状态)
+        cur_buf = net._cont_cur[:, : S + n_gen]
+        cur_buf[:, :S].copy_(byte_ids)
+        cur_len = S
+        expect_cont = net._cont_expect
+        expect_cont.zero_()
         if not hasattr(net, "_block_stats"):
-            net._block_stats = {"rep": 0, "utf8": 0, "gen": 0}
+            net._block_stats = {"rep": 0, "gen": 0}
         stats = net._block_stats
         for _ in range(n_gen):
-            bv = cur[:, -64:]  # 上下文窗口 64 (任务语义)
+            bv = cur_buf[:, max(0, cur_len - 64) : cur_len]  # 上下文窗口 64 (任务语义, 前缀不足全取)
             _ = self._predict(bv, store_state=True, is_inference=True)
             # W_lm 读出为唯一声道; W_act 降格为意图调制器 (见下方注入)
             if True:
@@ -90,40 +93,33 @@ class ForwardEngine:
                     mu0_top.std(dim=-1, keepdim=True) + 1e-4
                 )
                 mu0_top = logits_c / logits_c.abs().max(dim=-1, keepdim=True).values * 60.0
-                mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
-                mask_print[32:] = 1.0
-                mu0_top = mu0_top + (1.0 - mask_print) * -1e4
+                mu0_top = mu0_top + (1.0 - net._mask_print) * -1e4  # tensor-guard: bound (打印屏蔽设计界)
                 last = mu0_top[:, -1]  # [N,256] fp16
                 # W_act 意图电位裸注入, 幅度归其自身稳态承载
                 last = last + (net._bind_vec[:, -1] @ net.W_act)
-            if temperature > 0:
-                last = last / temperature
+            if temperature is not None and (not isinstance(temperature, float) or temperature > 0.0):
+                last = last / temperature  # Tensor 时 GPU 直除, 零 .item()
             stats["gen"] += N
             if rep_backstop:
                 # n-gram 周期检测 (2..24): 重复周期末字节置 -1e4
                 for p in range(2, 25):
-                    if cur.shape[1] >= 2 * p:
-                        pat = cur[:, -p:]  # [N,p] 最近 p 字节模式
-                        prev = cur[:, -2 * p : -p]  # [N,p] 再前 p 字节模式
+                    if cur_len >= 2 * p:  # tensor-guard: rare (rep_backstop 默认关, 评估用)
+                        pat = cur_buf[:, cur_len - p : cur_len]  # [N,p] 最近 p 字节模式
+                        prev = cur_buf[:, cur_len - 2 * p : cur_len - p]  # [N,p] 再前 p 字节模式
                         period = (pat == prev).all(dim=-1)  # [N] 周期重复
-                        n_block = int(period.sum().item())
+                        n_block = int(period.sum().item())  # tensor-guard: rare (rep_backstop 默认关)
                         if n_block:
                             cyc_vals = torch.unique(pat[period])
                             for bv_ in cyc_vals.tolist():
                                 last[period, bv_] = -1e4
                             stats["rep"] += n_block
-            # UTF-8 语法阻断 (恒生效): 字节流必须合法才可被读
+            # UTF-8 语法阻断 (恒生效): 字节流必须合法才可被读 — 向量化 (预建掩码 +
+            # masked_fill_ 替代逐字节 .item() 布尔分支; 禁止集/值/条件逐位等价).
             #   expect_cont>0 (字符中途): 下一字节须为续字节 0x80-0xBF
             #   expect_cont==0 (字符边界): 下一字节为 ASCII 或合法起始 0xC2-0xF4
-            n_utf8 = int((expect_cont > 0).sum().item())
-            if n_utf8:
-                last[expect_cont > 0, 0x00:0x80] = -1e4  # 中途禁 ASCII
-                last[expect_cont > 0, 0xC0:0x100] = -1e4  # 中途禁 lead/非法
-                stats["utf8"] += n_utf8
-            n_bad = int((expect_cont == 0).sum().item())
-            if n_bad:
-                # 边界禁续字节 0x80-0xBF + 非法起始 0xC0-0xC1 (overlong)
-                last[expect_cont == 0, 0x80:0xC2] = -1e4
+            is_cont = (expect_cont > 0).unsqueeze(-1)  # [N,1]
+            last = last.masked_fill_(is_cont & net._utf8_block_cnt[None, :], -1e4)
+            last = last.masked_fill_(~is_cont & net._utf8_block_start[None, :], -1e4)
             topv, _ = torch.topk(last, min(15, 256), dim=-1)
             last[last < topv[:, -1:]] = -float("inf")
             probs = torch.softmax(last, dim=-1)
@@ -133,18 +129,19 @@ class ForwardEngine:
                 freq_bias = (beta * (1.0 - net._freq_act)).unsqueeze(0)  # [1,256]
                 pot_b = last + freq_bias
                 b = torch.multinomial(torch.softmax(pot_b, dim=-1), 1).squeeze(-1)
-            elif temperature <= 0.0:
+            elif temperature is None or (isinstance(temperature, float) and temperature <= 0.0):
                 b = probs.argmax(dim=-1)
             else:
                 b = torch.multinomial(probs, 1).squeeze(-1)
-            cur = torch.cat([cur, b.unsqueeze(-1)], dim=1)
-            last_byte = b
-            # 更新 UTF-8 字符状态: 边界发合法起始 → 记录续字节需求; 中途发续 → 递减
+            cur_buf[:, cur_len : cur_len + 1] = b.unsqueeze(-1)
+            cur_len += 1
+            # 更新 UTF-8 字符状态 (就地写回缓冲): 边界发合法起始 → 记录续字节需求; 中途发续 → 递减
             is_l2 = (b >= 0xC2) & (b <= 0xDF)
             is_l3 = (b >= 0xE0) & (b <= 0xEF)
             is_l4 = (b >= 0xF0) & (b <= 0xF4)
             lead_len = torch.where(is_l2, 1, torch.where(is_l3, 2, torch.where(is_l4, 3, torch.zeros_like(b))))
-            expect_cont = torch.where(expect_cont > 0, expect_cont - 1, lead_len)
+            expect_cont.copy_(torch.where(expect_cont > 0, expect_cont - 1, lead_len))
+        return cur_buf[:, :cur_len]
         return cur
 
     def _recurrent(
@@ -167,7 +164,7 @@ class ForwardEngine:
         inv_d = 1.0 / math.sqrt(d)
         if stp is None:
             for _ in range(sweeps):
-                shift = torch.cat([torch.zeros(N, 1, d, dtype=z.dtype, device=dev), z[:, :-1]], dim=1)
+                shift = torch.cat([self.net._padmax[:, :, :d], z[:, :-1]], dim=1)
                 shift_n = rms_norm(shift)
                 rec = (shift_n @ W_t.T) * inv_d
                 rec = rms_norm(rec) * inv_d  # 单独归一化保方向, 幅度有界防累积
@@ -179,7 +176,7 @@ class ForwardEngine:
         r = r.unsqueeze(0)  # [1,d]
         inv_tau = (1.0 / tau).unsqueeze(0)  # [1,d]
         u_b = u.unsqueeze(0)  # [1,d]
-        z_out = z[:, :1].clone()  # 首帧无递归 (shift=0)
+        z_out = z[:, :1].clone()  # tensor-guard: rare (自由运行 STP 路径, 探针专用)
         for t in range(1, S):
             shift = z_out[:, t - 1 : t]  # [N,1,d] 用已调制的输出递推
             shift_n = rms_norm(shift)
@@ -194,13 +191,13 @@ class ForwardEngine:
             if self.net.cfg.stp_u_adapt:
                 rel = (act - ema.unsqueeze(0)) / (ema.unsqueeze(0) + 1e-6)
                 u_b.add_(self.net.cfg.stp_u_adapt_rate * rel * u_b)
-                u_b.clamp_(self.net.cfg.stp_u_min, self.net.cfg.stp_u_max)
+                u_b.clamp_(self.net.cfg.stp_u_min, self.net.cfg.stp_u_max)  # tensor-guard: bound (STP 动力学设计界)
 
             u_eff = u_b * act / (act + ema + 1e-6)
             r = r + (1.0 - r) * inv_tau - u_eff * r * act
-            r = r.clamp(0.01, 1.0)  # 资源界 (有界防发散)
+            r = r.clamp(0.01, 1.0)  # tensor-guard: bound (STP 资源界, 有界防发散)
         if stp_tag is not None:
-            self.net._stp_r_end[stp_tag] = r.squeeze(0).clone()  # 窗末写回 (诊断/更新用)
+            self.net._stp_r_end[stp_tag] = r.squeeze(0).clone()  # tensor-guard: rare (自由运行窗末写回)
         return z_out
 
     def _predict(self, byte_ids: torch.Tensor, store_state: bool = True, is_inference: bool = False) -> dict:
@@ -215,16 +212,16 @@ class ForwardEngine:
             # 自由运行: 外部输入恒零, 活动由内部递归 + 三尺度加性振荡器驱动
             N, S = 1, net.cfg.free_run_window
             dev = next(net.parameters()).device
-            z0 = torch.zeros(N, S, net._in_dim, dtype=torch.float16, device=dev)
+            z0 = torch.zeros(N, S, net._in_dim, dtype=torch.float16, device=dev)  # tensor-guard: rare (自由运行, 探针)
             # 相位向量每窗一次 (查表 index_select, 零运行时三角): 值 = 1-2·phase
             vf = net._osc_f_tab[
-                (net._osc_f_cnt.long() + torch.arange(S, device=dev)) % 64
+                (net._osc_f_cnt.long() + torch.arange(S, device=dev)) % 64  # tensor-guard: rare (自由运行)
             ].unsqueeze(0).unsqueeze(-1)  # [1,S,1]
             vm = net._osc_m_tab[
-                (net._osc_m_cnt.long() + torch.arange(S, device=dev)) % 256
+                (net._osc_m_cnt.long() + torch.arange(S, device=dev)) % 256  # tensor-guard: rare (自由运行)
             ].unsqueeze(0).unsqueeze(-1)
             vs = net._osc_s_tab[
-                (net._osc_s_cnt.long() + torch.arange(S, device=dev)) % 1024
+                (net._osc_s_cnt.long() + torch.arange(S, device=dev)) % 1024  # tensor-guard: rare (自由运行)
             ].unsqueeze(0).unsqueeze(-1)
             net._osc_f_cnt.add_(S).remainder_(64)
             net._osc_m_cnt.add_(S).remainder_(256)
@@ -244,7 +241,7 @@ class ForwardEngine:
             # L0 纯 one-hot; 时序双通道: [z0[t], z0[t-1]] 拼接 (词序信息进入表示层)
             z0 = F.one_hot(byte_ids, num_classes=256).to(torch.float16)  # [N,S,256]
             if net.cfg.input_history:
-                z0_prev = torch.cat([torch.zeros(N, 1, 256, dtype=z0.dtype, device=dev), z0[:, :-1]], dim=1)
+                z0_prev = torch.cat([net._padmax[:, :, :256], z0[:, :-1]], dim=1)
                 z0 = torch.cat([z0, z0_prev], dim=-1)  # [N,S,512]
 
         mu4 = z0 @ W_04_a.T + net.bias_l4[:dim_4]
@@ -303,7 +300,7 @@ class ForwardEngine:
         dz4_pred = z4[:, 1:] - z4[:, :-1]
         dz4_pred = dz4_pred / (dz4_pred.norm(dim=-1, keepdim=True) + 1e-3)  # RMS 归一化
         z4_prev = z4[:, :-1] / (z4[:, :-1].norm(dim=-1, keepdim=True) + 1e-3)
-        z4_prev_pad = torch.cat([torch.zeros(N, 1, dim_4, dtype=z4.dtype, device=dev), z4_prev], dim=1)
+        z4_prev_pad = torch.cat([net._padmax[:, :, :dim_4], z4_prev], dim=1)
         bd = net.b_diff[:dim_4].unsqueeze(0).unsqueeze(0)
         mu_diff = z4_prev_pad @ W_diff_a.T + bd
         diff_err = (dz4_pred - mu_diff[:, :-1]).square().mean()  # eps_diff 训练误差
@@ -325,14 +322,14 @@ class ForwardEngine:
             # 保留循环版: 张量化在 fp16 下下溢/舍入不同, 数学不等价
             K = net._mem_m.shape[0]
             a4_ = net._mem_m.shape[1]
-            m_prev = net._mem_m.unsqueeze(0).unsqueeze(0).expand(N, 1, K, a4_).clone()  # [N,1,K,dim_4]
-            m = m_prev
+            m_seq = net._mem_m_seq[:N, :S, :K, :a4_]  # 预分配序列缓冲 (按当前 K/a4 切片)
+            m_seq[:, :1] = net._mem_m.unsqueeze(0).unsqueeze(0).expand(N, 1, K, a4_)
             for t in range(1, S):
                 zt = z4[:, t : t + 1].unsqueeze(2)  # [N,1,1,dim_4]
-                mt = (1 - net._mem_a)[None, None, :, None] * m[:, -1:] + net._mem_a[None, None, :, None] * zt
-                m = torch.cat([m, mt], dim=1)
-            net._mem_out = m.reshape(N, S, K * a4_)  # [N,S,K·dim_4] 展平供 zh 拼接
-            net._mem_m = m[:, -1].mean(dim=0).detach()  # [K,dim_4] 批均值写回
+                mt = (1 - net._mem_a)[None, None, :, None] * m_seq[:, t - 1 : t] + net._mem_a[None, None, :, None] * zt
+                m_seq[:, t : t + 1] = mt
+            net._mem_out = m_seq.reshape(N, S, K * a4_)  # [N,S,K·dim_4] 展平供 zh 拼接
+            net._mem_m = m_seq[:, -1].mean(dim=0).detach()  # [K,dim_4] 批均值写回
             # 新奇度 (快慢散度): 死循环→N→0 (LTD); 正常推进→N 正 (LTP). 保留循环版 (张量化 fp16 下溢)
             zslow = torch.zeros_like(z4)
             zslow[:, 0] = z4[:, 0]
@@ -396,13 +393,13 @@ class ForwardEngine:
                     if self.net.cfg.stp_u_adapt:
                         rel_b = (act - ema_b.unsqueeze(0)) / (ema_b.unsqueeze(0) + 1e-6)
                         u_bind_b.add_(self.net.cfg.stp_u_adapt_rate * rel_b * u_bind_b)
-                        u_bind_b.clamp_(self.net.cfg.stp_u_min, self.net.cfg.stp_u_max)
+                        u_bind_b.clamp_(self.net.cfg.stp_u_min, self.net.cfg.stp_u_max)  # tensor-guard: bound (STP 动力学设计界)
 
                     u_eff_b = u_bind_b * act / (act + ema_b + 1e-6)  # 自参照耗尽
                     r_bind = r_bind + (1.0 - r_bind) * inv_tau_b - u_eff_b * r_bind * act
-                    r_bind = r_bind.clamp(0.01, 1.0)
+                    r_bind = r_bind.clamp(0.01, 1.0)  # tensor-guard: bound (STP 资源界, 有界防发散)
             if stp_bind and r_bind is not None:
-                net._stp_r_end["bind"] = r_bind.squeeze(0).clone()
+                net._stp_r_end["bind"] = r_bind.squeeze(0).clone()  # tensor-guard: rare (自由运行窗末写回)
             z_bind = torch.cat(z_binds, dim=1)
         else:
             z_bind = self._bind_sparse(raw - net._theta_bind)

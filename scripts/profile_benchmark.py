@@ -1,4 +1,7 @@
-"""CyreneModel 性能基准测试 — 字节级指标。
+"""CyreneModel 性能基准测试 — 字节级指标.  — DEPRECATED sparse 管线
+
+DEPRECATED (117 轮 Round 1): 本脚本基准稀疏 CyreneModel, 已脱离活动主线。
+活跃主线 = model.dense.DensePCNet。保留可跑: 依赖指向 model/_archived_sparse.
 
 指标:
   - steps/s  (step 吞吐)
@@ -19,7 +22,7 @@ from argparse import ArgumentParser
 
 import torch
 
-from model.model_cyrene import CyreneConfig, CyreneModel, create_cyrene
+from model._archived_sparse import CyreneConfig, CyreneModel, create_cyrene
 
 
 def _make_seq(n_bytes: int = 512) -> torch.Tensor:

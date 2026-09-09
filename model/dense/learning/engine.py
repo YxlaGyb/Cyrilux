@@ -135,7 +135,8 @@ class EngineCore(
         net._gen_bytes = out[:, k:].detach()
         return out
 
-    def learn(self, byte_ids: torch.Tensor | None = None, closed_loop: bool = False, free_run: bool = False) -> dict:
+    def learn(self, byte_ids: torch.Tensor | None = None, closed_loop: bool = False, free_run: bool = False,
+              force_perception: bool = False) -> dict:
         """Hebbian 学习: 前馈 → 逐域误差 → 局部权重更新, 无反向传播, 不接收 targets.
 
         Args:
@@ -144,31 +145,45 @@ class EngineCore(
                 仅生成段参与误差, targets 始终是真实 byte_ids.
             free_run: 输入恒零, 内部递归 + 三尺度振荡器驱动, 字节域权重冻结,
                 只更新内部动力学权重 (W_t* 家族).
+            force_perception: P3-b 旁路 — 即使行为门选回声也强制感知 (首步/恢复期).
             自回声 (byte_ids=None 且 free_run=False): 输入 = 上一窗生成字节,
-                无标签无奖励, 学输入流自身的预测结构.
+                无标签无奖励, 学输入流自身的预测结构. P3-b 节律内生: byte_ids 非 None
+                时由行为门 (本步末算的上一步决策 _behavior_py) 决定走感知还是回声 —
+                回声分支以喂入窗尾部作种子走自续写 (脚本不再 step%2).
 
         Returns:
             stats dict (future_err, 各层误差范数).
         """
         net = self.net
+        # P3-b 内部路由: 门选回声 (或 byte_ids None 恒回声) → 回声分支; 感知默认/
+        # force_perception 旁路 → 感知分支; closed_loop 恒感知等价 (暴露训练语义不变)
+        route_echo = (not free_run) and (not closed_loop) and (
+            byte_ids is None
+            or (not force_perception and getattr(net, "_behavior_py", False))
+        )
         if free_run:
             inp = None
         elif closed_loop:
             inp = self._closed_loop_input(byte_ids)
-        elif byte_ids is None:
+        elif route_echo:
             # 自回声: 无外部输入, 输入 = 上一窗生成字节 (冻结世界模型的自续写).
             # W_lm 读出为唯一声道, W_act 降格为意图调制器 (continuation 内注入 logits, ≤15%).
             s_frw = net.cfg.free_run_window
-            seed = getattr(net, "_echo_seed", None)
-            if seed is None or seed.numel() == 0:
-                seed = torch.zeros(1, 1, dtype=torch.long, device=net._osc_f_cnt.device)
-            # 温度采样为变异通道; 温度由恒温器负反馈自调 (action.py), 默认 4.0.
+            if byte_ids is None:
+                seed = getattr(net, "_echo_seed", None)
+                if seed is None or seed.numel() == 0:
+                    seed = torch.zeros(1, 1, dtype=torch.long, device=net._osc_f_cnt.device)  # tensor-guard: rare (无种子回声首步)
+            else:
+                # 门选回声: 把喂入的世界样本尾部作种子 (替代脚本 last_text_tail 注射)
+                seed = byte_ids[:, -net.cfg.echo_seed_n:]
+            # 温度采样为变异通道; 温度由恒温器负反馈自调 (action.py). 首步 (从未回声) 无
+            # _gen_temp → 映射中点 (软带中位, 无先验保守值; 4.0 硬退场 — 超出软带).
             # rep_backstop 默认关 (反循环门已移除, 循环由内部裁判 + 恒温器处置).
             saved_entropy = getattr(net, "_entropy_sample", False)
             net._entropy_sample = getattr(net, "_echo_entropy", False)
             saved_rep = getattr(net, "_echo_rep", False)
             _gt = getattr(net, "_gen_temp", None)
-            _temp = float(_gt.item()) if _gt is not None else 4.0
+            _temp = _gt if _gt is not None else None  # GPU 张量直传 (温度契约: Tensor|float|None, 零 .item())
             try:
                 out = net.forward_engine.continuation(
                     seed, s_frw - 1, temperature=_temp, rep_backstop=saved_rep
@@ -185,14 +200,15 @@ class EngineCore(
         k = S // 2 if closed_loop else 0
         # 自回声激活字节域学习; 回声相位冻结世界模型 (W_04/W_42/W_diff/W_lm 等),
         # 仅更新表达端 W_act, 避免在乱码回声上学习污染感知.
-        echo_loop = (not free_run) and (byte_ids is None)
+        echo_loop = (not free_run) and route_echo
         if echo_loop:
             byte_ids = inp  # 自回声: 目标 = 自身生成流 (他者响应), 下游同普通训练
         echo_world_frozen = echo_loop
         # 生成段掩码 (closed_loop 时只有后半参与误差, 前半锚定只看不学):
         # 对齐 S-1 (t+1 目标), 位置 i 对应目标 byte_ids[:, i+1]
-        learn_mask = torch.ones(S - 1, dtype=torch.bool, device=dev)
+        learn_mask = net._learn_mask_all[: S - 1]
         if closed_loop:
+            learn_mask = torch.ones(S - 1, dtype=torch.bool, device=dev)  # tensor-guard: rare (闭环暴露路径)
             learn_mask[: k - 1] = False
         dim_4, dim_2, dim_3, dim_5, dim_6 = (
             net.active_size[k] for k in ("l4", "l2", "l3", "l5", "l6")
@@ -206,7 +222,7 @@ class EngineCore(
         eps4 = z4 - (z0 @ net.W_04[:dim_4].T + net.bias_l4[:dim_4])
         eps2 = z2 - (z4 @ net.W_42[:dim_2].T + net.bias_l2[:dim_2])
         eps3 = z3 - (z2 @ W_23_a.T + net.bias_l3[:dim_3])
-        z6_pre = torch.cat([torch.zeros(N, 1, dim_6, dtype=z6.dtype, device=dev), z6[:, :-1]], dim=1)
+        z6_pre = torch.cat([net._padmax[:, :, :dim_6], z6[:, :-1]], dim=1)
         eps6 = z6 - z6_pre
         eps5 = z5[:, 1:] - z5[:, :-1]  # L5: 跨时刻变化 z5[t]-z5[t-1]
 
@@ -258,9 +274,12 @@ class EngineCore(
         self._update_bind(ctx, sh)
         self._update_w_act(ctx, sh)
         self._final_softnorm(ctx, sh)
+        # P3-b 行为门: 本步末算下一步的路由决策 (全 GPU 零同步; 自由运行不结算)
+        self._update_gate(ctx, sh)
 
         # 拓扑重塑: 修剪触发权由编排层经 net.maybe_prune(step) 显式交出
         net._step_counter += 1
+        net._life_cnt.add_(1)  # 机体年龄 (P2): 跨 load 持久化, warmup 判据
 
         stats = {
             "free_energy": (
@@ -271,11 +290,11 @@ class EngineCore(
                 + eps6.square().mean()
             ),
             "future_err": (sh.diff.dz4 - sh.diff.pred_d).square().mean()
-            if (not free_run and not echo_world_frozen)
-            else 0.0,
-            "d_polarity": float(sh.d_t.mean())
+            if (not free_run and not echo_world_frozen and sh.diff is not None)
+            else net._zero1,
+            "d_polarity": sh.d_t.mean()
             if (not free_run and not echo_world_frozen and sh.d_t is not None and hasattr(net, "_novelty"))
-            else 1.0,
+            else net._zero1,
             # 观测器: 原始 L5 局部误差能量 (诊断用, 不参与更新)
             "l5_local_err": sh.l5_local_err,
         }

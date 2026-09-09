@@ -1,4 +1,6 @@
-"""第 110 轮 P0 (D0): W_lm 裁判判别力测绘 — 纯只读, 零训练, 零改权重.
+"""
+第 110 轮 P0 (D0):
+W_lm 裁判判别力测绘 — 纯只读, 零训练, 零改权重.
 
 设计文档: docs/es/110_design.md §5. 测 W_lm (R 信号的实际来源) 是否具备
 "语言 vs 噪声"判别力 — 修正交接文档两处口径错位:
@@ -46,8 +48,8 @@ torch.set_grad_enabled(False)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from model.dense import DensePCConfig, DensePCNet
-from model.dense.forward import _rms
+from model import CyreneModel, DensePCNet
+from model.modulation import rms_norm
 
 DEV = "cuda"
 S_LEN = 160
@@ -117,14 +119,14 @@ def p_target_series(net, ids):
     pred_delta_ = z4_n_ @ net.W_diff[:a4, :a4].T + net.b_diff[:a4].unsqueeze(0).unsqueeze(0)
     z4r = z4 + pred_delta_
     z4_lm = z4r / (1.0 + z4r.abs())
-    z4_lm = _rms(z4_lm)
+    z4_lm = rms_norm(z4_lm)
     z4_lm = z4_lm * (1.0 - 0.5 * z4_lm.pow(2))
     z4_lm = z4_lm / (1.0 + z4_lm.abs())
     zh = torch.cat([z4_lm, net._bind_vec, net._mem_out], dim=-1)
-    zh = _rms(zh)
+    zh = rms_norm(zh)
     h = zh @ net.W1
     h = h / (1.0 + h.abs())
-    h = _rms(h)
+    h = rms_norm(h)
     h = h * (1.0 - 0.5 * h.pow(2))
     inv_h = 1.0 / math.sqrt(d_h)
     logits_lm = (h @ net.W_lm + net.bias_lm) * inv_h
@@ -241,7 +243,7 @@ def main():
 
     # 冻结不变性: chat107_pool vs exp108_say3 (108 世界模型全程冻结的验证)
     if not args.smoke:
-        cfg = DensePCConfig(d_input=256, d_act=256, max_seq_len=256)
+        cfg = CyreneModel(d_input=256, d_act=256, max_seq_len=256)
         n_a = DensePCNet.load("out/chat107_pool.pt", cfg).to(DEV)
         n_b = DensePCNet.load("out/exp108_say3.pt", cfg).to(DEV)
         diffs = {}
@@ -254,7 +256,7 @@ def main():
         torch.cuda.empty_cache()
 
     for ck in CKPTS:
-        cfg = DensePCConfig(d_input=256, d_act=256, max_seq_len=256)
+        cfg = CyreneModel(d_input=256, d_act=256, max_seq_len=256)
         net = DensePCNet.load(ck, cfg).to(DEV)
         net.use_w_act = False
         w0 = {n_: getattr(net, n_).detach().clone() for n_ in FROZEN}

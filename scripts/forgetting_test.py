@@ -1,4 +1,8 @@
-"""多任务灾难性遗忘压力测试 — StreamRunner.
+"""
+多任务灾难性遗忘压力测试 StreamRunner.  — DEPRECATED sparse 管线
+
+DEPRECATED (117 轮 Round 1): 本脚本测稀疏 CyreneModel 灾难性遗忘, 已脱离活动主线。
+活跃主线 = model.dense.DensePCNet。保留可跑: 依赖指向 model/_archived_sparse.
 
 Phase 1: 无回放 (A→B→C→D 灾难性遗忘基线)
 Phase 2: MemoryBank + Sniffer 保护 (A→B→C→D 持续学习)
@@ -12,11 +16,10 @@ import time
 import torch
 from torch.utils.data import DataLoader
 
-from model.continual.forgetting_sniffer import ForgettingSniffer
-from model.continual.memory_bank import MemoryBank
-from model.core.dataset import DualChannelDataset
-import torch
-from model.model_cyrene import CyreneConfig, CyreneModel
+from model._archived_sparse.continual.forgetting_sniffer import ForgettingSniffer
+from model._archived_sparse.continual.memory_bank import MemoryBank
+from dataset import DualChannelDataset
+from model._archived_sparse import CyreneConfig, CyreneModel
 from pkg.utils.trainer_utils import setup_seed
 
 

@@ -2,12 +2,13 @@
 train
 """
 
+import glob
 import os
 
 import click
 import torch
 
-from pkg.cli.utils import load_config, resolve_path
+from pkg.cli.utils import load_config, resolve_path, run_dir
 
 
 def _build_net(hidden_size: int, lr: float, max_seq_len: int, checkpoint: str | None = None):
@@ -93,6 +94,8 @@ def _train_dense(
                     pbar.set_postfix({"step": step, "fe": f"{fe_sum / step:.4f}"})
                 pbar.close()
             print(f"    {fname} 全文件跑完: {n_lines} 行")
+    if not out_dir:
+        out_dir = run_dir()
     os.makedirs(out_dir, exist_ok=True)
     net.save(os.path.join(out_dir, "final.pt"))
     print(f"PPA model saved to {out_dir}/final.pt  final_free_energy_avg={fe_sum / max(step, 1):.4f}")
@@ -116,7 +119,7 @@ def _train_dense(
 @click.option("--dopamine-eta", default=1.0, type=float, help="多巴胺学习率 (dense 忽略)")
 @click.option("--dopamine-beta", default=0.5, type=float, help="多巴胺灵敏度 (dense 忽略)")
 @click.option("--dopamine-gamma", default=0.3, type=float, help="多巴胺衰减 (dense 忽略)")
-@click.option("--out-dir", "-o", default="out_pc_unified", help="输出目录")
+@click.option("--out-dir", "-o", default=None, help="输出目录 (默认 out/v{N}-时间戳/)")
 @click.option("--save-interval", default=10000, type=int, help="保存间隔 (dense 忽略, 结束时保存 final.pt)")
 @click.option("--abstraction-bank/--no-abstraction-bank", default=False, help="抽象记忆库 (dense 忽略)")
 @click.option("--auto-phase2", is_flag=True, default=False, help="训练后自动进入 Phase 2 (dense 忽略)")
@@ -174,9 +177,13 @@ def train(
     if ignored:
         print(f"dense 后端: 忽略稀疏参数 {', '.join(ignored)}")
     if resume and checkpoint is None:
-        checkpoint = os.path.join(out_dir, "final.pt")
-        if not os.path.exists(checkpoint):
-            raise click.ClickException(f"--resume 但找不到 {checkpoint}, 请用 -c 指定检查点")
+        if out_dir:
+            checkpoint = os.path.join(out_dir, "final.pt")
+        else:
+            cands = glob.glob(os.path.join(resolve_path("out"), "v*", "final.pt"))
+            checkpoint = max(cands, key=os.path.getmtime) if cands else ""
+        if not checkpoint or not os.path.exists(checkpoint):
+            raise click.ClickException("--resume 但找不到可续的 final.pt, 请用 -c 指定检查点")
     data_files = [resolve_path(f.strip()) for f in data]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _train_dense(
@@ -214,7 +221,7 @@ def from_config(config, batch_size, lr, epochs, out_dir, verbose):
     print(f"从配置启动训练: {config}")
     _train_dense(
         data_file_list,
-        out_dir or (cfg.get("output", {}).get("out_dir") or "out_pc_unified"),
+        out_dir or cfg.get("output", {}).get("out_dir"),
         batch_size or train_cfg.get("batch_size", 48),
         train_cfg.get("max_seq_len", 128),
         lr or train_cfg.get("lr", 3e-4),
@@ -255,7 +262,7 @@ def resume(checkpoint, data, batch_size, max_seq_len, epochs, lr, out_dir, verbo
     data_files = [resolve_path(f.strip()) for f in data]
     _train_dense(
         data_files,
-        out_dir or os.path.dirname(ckpt_path) or ".",
+        out_dir,
         batch_size,
         max_seq_len,
         net.cfg.lr_hebbian,

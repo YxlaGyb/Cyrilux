@@ -4,6 +4,8 @@ CLI 共享工具: 路径处理 & 配置加载.
 
 import json
 import os
+import re
+from datetime import datetime
 
 # 项目根目录 — 相对于 pkg/cli/utils.py 向上 3 层
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,6 +16,34 @@ def resolve_path(p: str) -> str:
     if os.path.isabs(p):
         return p
     return os.path.join(PROJECT_ROOT, p)
+
+
+_RUN_DIR: str | None = None
+
+
+def run_dir() -> str:
+    """本次运行的输出目录 out/v{N}-YYYYMMDD-HHMMSS/ — 每进程一个, 首次调用时创建.
+
+    N = out/ 下已有 v{N}-* 目录的最大值 + 1, 从 v1 起. 只认目录, out/*.pt / out/prof 不受影响.
+    """
+    global _RUN_DIR
+    if _RUN_DIR is None:
+        out = resolve_path("out")
+        os.makedirs(out, exist_ok=True)
+        nums = [
+            int(m.group(1))
+            for d in os.listdir(out)
+            if os.path.isdir(os.path.join(out, d)) and (m := re.match(r"v(\d+)-", d))
+        ]
+        n = 1 + max(nums, default=0)
+        _RUN_DIR = os.path.join(out, f"v{n}-{datetime.now():%Y%m%d-%H%M%S}")
+        os.makedirs(_RUN_DIR, exist_ok=True)
+    return _RUN_DIR
+
+
+def run_file(name: str) -> str:
+    """run_dir() 下的文件路径 (目录已创建)."""
+    return os.path.join(run_dir(), name)
 
 
 def load_config(path: str) -> dict:
@@ -77,7 +107,7 @@ TRAIN_CONFIG_TEMPLATE = {
         "enabled": False,
     },
     "output": {
-        "out_dir": "out_pc_unified",
+        "out_dir": "",
         "save_interval": 10000,
     },
 }
@@ -104,7 +134,7 @@ AUTONOMOUS_CONFIG_TEMPLATE = {
     "replay_batch_size": 16,
     "replay_ratio": 3,
     "save_interval": 10000,
-    "out_dir": "out_autonomous",
+    "out_dir": "",
     "data_dir": "dataset",
     "data_rotate_interval": 500,
 }

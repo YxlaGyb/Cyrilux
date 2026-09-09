@@ -69,9 +69,7 @@ class ReadoutMixin(_MixinBase):
             target_oh = F.one_hot(ctx.byte_ids, num_classes=256).to(torch.float16).mean(dim=(0, 1))
         if not ctx.echo_world_frozen:
             net._freq.mul_(0.99).add_(0.01 * target_oh.detach())  # 回声相位冻结频率统计
-        mask_print = torch.zeros(256, dtype=torch.float16, device=dev)
-        mask_print[32:] = 1.0
-        logits_lm = logits_lm + (1.0 - mask_print) * -1e4
+        logits_lm = logits_lm + (1.0 - net._mask_print) * -1e4  # tensor-guard: bound (打印屏蔽设计界)
 
         # 多步预测: W_lm 专责 t+1, W_lm_2 独立子预测器专责 t+2 (共享 h, 各自更新)
         zh2 = torch.cat([z4_lm[:, :-2], net._bind_vec[:, :-2], net._mem_out[:, :-2]], dim=-1)
@@ -94,7 +92,7 @@ class ReadoutMixin(_MixinBase):
         target_l1 = target_lm  # [N,S-1,256]
         target_l2 = target_lm2  # [N,S-2,256]
         diff2 = (target_l2 - target_l1[:, :-1]) - (probs_l2 - probs_l1[:, :-1])  # [N,S-2,256]
-        diff2 = torch.cat([diff2, torch.zeros(N, 1, 256, dtype=diff2.dtype, device=dev)], dim=1)  # S-1 对齐
+        diff2 = torch.cat([diff2, net._padmax[:, :, :256]], dim=1)  # S-1 对齐
         if ctx.closed_loop:
             lm_mask = ctx.learn_mask.unsqueeze(0).unsqueeze(-1)
             eps_lm = eps_lm * lm_mask
@@ -110,7 +108,7 @@ class ReadoutMixin(_MixinBase):
             eps_lang = 1.0 - (probs_lm[:, :-1] * target_lm).sum(dim=-1).mean()
             _lang_ema = getattr(net, "_lang_eps_ema", None)
             if _lang_ema is None:
-                net._lang_eps_ema = eps_lang.detach().clone()
+                net._lang_eps_ema = eps_lang.detach().clone()  # tensor-guard: rare (EMA 一次性建立)
                 net._lang_eps_mad = torch.zeros_like(eps_lang.detach())
             else:
                 net._lang_eps_ema.mul_(0.995).add_(0.005 * eps_lang)
@@ -125,7 +123,7 @@ class ReadoutMixin(_MixinBase):
             net._ent_buf[net._ent_i % 20].copy_(ent.detach())
             net._ent_i += 1
             if net._ent_i >= 20:
-                idx = (net._ent_i - 19 + torch.arange(20, device=dev)) % 20
+                idx = (net._ent_i - 19 + net._arange20[None, :]) % 20  # 按时间正序重排 (预分配 arange)
                 w = net._ent_buf[idx]  # 按时间正序重排
                 slope20 = (net._t_center * w).sum() / net._t_denom * 20.0  # 20 步总变化
                 sigma = w.std() + 1e-4
@@ -146,7 +144,7 @@ class ReadoutMixin(_MixinBase):
             eps_lm_proj = (eps_total @ net.W_lm.T @ W1_a.T)[:, :, :dim_4]  # 均匀回传
             eps_lm_proj = rms_norm(eps_lm_proj)
         eps_lm_pad = torch.cat(
-            [eps_lm_proj, torch.zeros(N, 1, dim_4, dtype=eps_lm_proj.dtype, device=dev)], dim=1
+            [eps_lm_proj, net._padmax[:, :, :dim_4]], dim=1
         )
 
         from .engine import LmSignal
@@ -170,7 +168,7 @@ class ReadoutMixin(_MixinBase):
         """LM 头自监督赫布更新: W_lm/W_lm_2/W1/bias_lm. 返回 d_t."""
         net = self.net
         if ctx.free_run or ctx.echo_world_frozen:
-            return torch.ones(ctx.N, ctx.S - 1, 1, dtype=torch.float16, device=ctx.dev)
+            return net._one_s[: ctx.N, : ctx.S - 1]  # tensor-guard: bound (冻结步恒一 d_t, 预分配)
         dev = ctx.dev
         d_h = net.d_h
         inv_h = 1.0 / math.sqrt(d_h)
@@ -210,7 +208,7 @@ class ReadoutMixin(_MixinBase):
             d_t = torch.sigmoid((nov - tau) * 500.0).unsqueeze(-1)  # [N,S,1] η ∈ (0,1)
             d_t = d_t[:, :-1]  # 对齐 S-1 (t+1 目标)
         else:
-            d_t = torch.ones(ctx.N, ctx.S - 1, 1, dtype=torch.float16, device=dev)
+            d_t = net._one_s[:ctx.N, : ctx.S - 1]  # 无新奇度轨迹: 恒一 d_t (预分配)
         lm_update_mask = ctx.learn_mask.to(torch.float16).unsqueeze(0).unsqueeze(-1)  # [1,S-1,1]
         bcm_term = torch.zeros_like(phi_wlm[:, :-1]) if net.cfg.lm_no_bcm else 0.1 * phi_wlm[:, :-1]
         dW_lm = (
@@ -220,7 +218,7 @@ class ReadoutMixin(_MixinBase):
         dW_lm_n = dW_lm.norm() + 1e-8
         dW_lm = dW_lm / dW_lm_n
         dW_lm = dW_lm + _elig_accum(net, "W_lm", dW_lm) * getattr(
-            net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16)
+            net, "_survival_signal", net._zero1
         )
         net.W_lm.data += dW_lm * (ctx.eta_lm * net.W_lm.norm() * LM_TRUST_REGION)
         # bias 硬复位: 范数锁定 target=10, 更新降 20× (去均值只学相对偏置)
@@ -229,13 +227,15 @@ class ReadoutMixin(_MixinBase):
         net.bias_lm.data += (bias_d - bias_d.mean()) * (ctx.eta_lm / 20.0)
         bn = net.bias_lm.norm()
         target_norm = 10.0
-        if bn > target_norm:
-            net.bias_lm.data.mul_(target_norm / bn)
+        net.bias_lm.data.mul_(
+            torch.minimum(torch.ones_like(bn), target_norm / (bn + 1e-6))  # 等比帽 (branchless min, 非 clamp)
+        )
         # W_lm 豁免 soft_norm (类间幅度差异 = 表达载体); 保留整体等比帽 10 防 fp16 溢出
         rn_lm = net.W_lm.data.norm(dim=1)
         mx_lm = rn_lm.max()
-        if mx_lm > 10.0:
-            net.W_lm.data.mul_((10.0 / (mx_lm + 1e-6)).to(torch.float16))
+        net.W_lm.data.mul_(
+            torch.minimum(torch.ones_like(mx_lm), 10.0 / (mx_lm + 1e-6)).to(torch.float16)  # 等比帽 (branchless min)
+        )
 
         # W1 混合层更新: 转置误差传播 (纯赫布); e_h = e @ W_lm.T · h_deriv
         e_h = (err_scaled @ net.W_lm.T) * lm.h_deriv[:, :-1]  # [N,S-1,d_h]
@@ -248,7 +248,7 @@ class ReadoutMixin(_MixinBase):
         dW1 = dW1 / (dW1.norm() + 1e-8)
         if not net.cfg.lm_freeze_w1:
             dW1 = dW1 + _elig_accum(net, "W1", dW1) * getattr(
-                net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16)
+                net, "_survival_signal", net._zero1
             )
             net.W1.data += dW1 * (ctx.eta_lm * net.W1.norm() * LM_TRUST_REGION)
             soft_norm_preserve(net.W1.data)
@@ -274,7 +274,7 @@ class ReadoutMixin(_MixinBase):
         dW_lm2_n = dW_lm2.norm() + 1e-8
         dW_lm2 = dW_lm2 / dW_lm2_n  # 单步更新幅度上界
         dW_lm2 = dW_lm2 + _elig_accum(net, "W_lm_2", dW_lm2) * getattr(
-            net, "_survival_signal", torch.tensor(0.0, device=dev, dtype=torch.float16)
+            net, "_survival_signal", net._zero1
         )
         net.W_lm_2.data += dW_lm2 * (ctx.eta_lm * net.W_lm_2.norm() * LM_TRUST_REGION)
         soft_norm_preserve(net.W_lm_2.data)
@@ -312,17 +312,17 @@ class ReadoutMixin(_MixinBase):
         net._mem_q.mul_(0.99).add_(0.01 * cos)
 
         # 2) 增益 (有界参数 clamp, 非梯度路径): q>0 上推, 乘性衰减让零贡献单元 g→0
-        net._mem_g.mul_(1.0 - cfg.mem_g_decay).clamp_(min=0.0)
+        net._mem_g.mul_(1.0 - cfg.mem_g_decay).clamp_(min=0.0)  # tensor-guard: bound (记忆增益界, 非梯度)
         net._mem_g.add_(cfg.mem_eta_g * net._mem_q)
-        net._mem_g.clamp_(max=cfg.mem_g_max)
+        net._mem_g.clamp_(max=cfg.mem_g_max)  # tensor-guard: bound (记忆增益界, 非梯度)
 
         # 3) 死亡: g 低 → 计数, 持续超限 → 删除; 索引 0 永不判死
         low = net._mem_g < cfg.mem_g_min
-        net._mem_death_cnt = torch.where(low, net._mem_death_cnt + 1, torch.zeros_like(net._mem_death_cnt))
+        net._mem_death_cnt.copy_(torch.where(low, net._mem_death_cnt + 1, torch.zeros_like(net._mem_death_cnt)))
         dead_mask = (net._mem_death_cnt >= cfg.mem_death_steps) & low
         dead_mask[0] = False
-        if dead_mask[1:].any():
-            net._mem_death_cnt = net._mem_death_cnt.where(~dead_mask, torch.zeros_like(net._mem_death_cnt))
+        if dead_mask[1:].any():  # tensor-guard: rare (死亡事件, 每 2000 步窗口至多一次)
+            net._mem_death_cnt.copy_(torch.where(~dead_mask, net._mem_death_cnt, torch.zeros_like(net._mem_death_cnt)))
             self._mem_resize(~dead_mask)
 
         # 4) 出生: 误差快 EMA 超阈值, 冷却期满, K<上限 → 增益最高单元二分
@@ -333,9 +333,9 @@ class ReadoutMixin(_MixinBase):
         if (
             net._mem_birth_cd >= cfg.mem_birth_cooldown
             and cfg.mem_k_max > K
-            and net._mem_err_ema > net._mem_err_long * cfg.mem_birth_thresh
+            and bool((net._mem_err_ema > net._mem_err_long * cfg.mem_birth_thresh).item())  # tensor-guard: rare (出生事件每冷却窗至多一次)
         ):
-            parent = int(torch.argmax(net._mem_g))  # 每步至多一次出生, 同步可接受
+            parent = int(torch.argmax(net._mem_g))  # tensor-guard: rare (出生事件同步)
             self._mem_birth(parent)
             net._mem_birth_cd = 0
 
@@ -373,6 +373,21 @@ class ReadoutMixin(_MixinBase):
             net.register_buffer("W1_elig", ne)
         net._lm_in = head + keep.shape[0] * dim_4
 
+    def _mem_famine_kill(self):
+        """饥荒击杀: 移除最低 _mem_g 的记忆单元 (索引 0 免疫, K_min=1 保底).
+
+        与 _update_mem_units 的 2000 步慢死亡不同: 这是代谢死亡回合的直接不可逆
+        损失，内容与身份永久消失, 后续 _mem_birth 只会从存活父克隆新单元.
+        """
+        net = self.net
+        K = net._mem_m.shape[0]
+        if K <= 1:
+            return
+        ix = int(torch.argmin(net._mem_g[1:])) + 1  # 与 _mem_birth 的 argmax 同款单次同步
+        keep = torch.ones(K, dtype=torch.bool, device=net._mem_g.device)  # tensor-guard: rare (饥荒击杀事件)
+        keep[ix] = False
+        self._mem_resize(keep)
+
     def _mem_birth(self, parent: int):
         """从父单元二分出生 (α×2 或 ÷2, _mem_alt 交替, 越界取另一侧)."""
         net = self.net
@@ -390,7 +405,7 @@ class ReadoutMixin(_MixinBase):
             a_child = a_par * 2.0
         a_child = max(cfg.mem_alpha_min, min(cfg.mem_alpha_max, a_child))
         # 子单元: m 继承父, g 小值起步 (需证明自己), q 零, α 二分
-        m_child = net._mem_m.data[parent : parent + 1].clone()
+        m_child = net._mem_m.data[parent : parent + 1].clone()  # tensor-guard: rare (出生事件)
         new_m = torch.cat([net._mem_m.data, m_child], dim=0).contiguous()
         new_a = torch.cat([net._mem_a.data, torch.tensor([a_child], dtype=torch.float16, device=net._mem_m.device)], dim=0).contiguous()
         new_g = torch.cat([net._mem_g.data, torch.full((1,), cfg.mem_g_min * 2.0, dtype=torch.float16, device=net._mem_m.device)], dim=0).contiguous()

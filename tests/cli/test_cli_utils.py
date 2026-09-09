@@ -1,5 +1,6 @@
 import os
 
+import pkg.cli.utils as u
 from pkg.cli.utils import PROJECT_ROOT, load_config, merge_config, resolve_path, save_config
 
 
@@ -40,3 +41,32 @@ class TestLoadSaveConfig:
         path = str(tmp_path / "cfg.json")
         save_config({"a": 1}, path)
         assert load_config(path) == {"a": 1}
+
+
+class TestRunDir:
+    def _pin(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(u, "PROJECT_ROOT", str(tmp_path))
+        monkeypatch.setattr(u, "_RUN_DIR", None)
+
+    def test_first_run_is_v1(self, tmp_path, monkeypatch):
+        self._pin(tmp_path, monkeypatch)
+        d = u.run_dir()
+        assert os.path.basename(d).startswith("v1-")
+        assert os.path.isdir(d)
+
+    def test_increments_past_existing_dirs(self, tmp_path, monkeypatch):
+        self._pin(tmp_path, monkeypatch)
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "v3-20260101-000000").mkdir()
+        (out / "v10-20260101-000000").mkdir()
+        (out / "prof").mkdir()
+        (out / "v99-not-a-dir.json").write_text("x", encoding="utf-8")
+        d = u.run_dir()
+        assert os.path.basename(d).startswith("v11-")
+        assert os.path.isdir(d)
+
+    def test_memoized_and_run_file_inside(self, tmp_path, monkeypatch):
+        self._pin(tmp_path, monkeypatch)
+        assert u.run_dir() == u.run_dir()
+        assert os.path.dirname(u.run_file("a.json")) == u.run_dir()
