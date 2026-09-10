@@ -109,7 +109,7 @@ def gen_at(net, snap, seeds, temp):
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="out/exp110c_world.pt")
+    ap.add_argument("--ckpt", default="out/exp110c_world.safetensors")
     ap.add_argument("--log", default="out/exp110c_world_stdout.log")
     ap.add_argument("--out", default=None)
     ap.add_argument("--temps", default="0.0,1.0,9.5",

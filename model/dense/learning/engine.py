@@ -237,7 +237,7 @@ class EngineCore(
 
         # 学习率恒基准值 (无全局调制); 前 50 步减半 (先稳后放)
         eta = net.cfg.lr_hebbian
-        if net._step_counter < 50:
+        if net._step_py < 50:
             eta = eta * 0.5
         eta_t = eta * net.cfg.temporal_lr_ratio
         # 速率自适应: W_lm 熵下降 (预测好) → 表示层放慢; 熵上升 → 放大重组. scale 每 100 步更新
@@ -278,7 +278,8 @@ class EngineCore(
         self._update_gate(ctx, sh)
 
         # 拓扑重塑: 修剪触发权由编排层经 net.maybe_prune(step) 显式交出
-        net._step_counter += 1
+        net._step_counter.add_(1)
+        net._step_py += 1
         net._life_cnt.add_(1)  # 机体年龄 (P2): 跨 load 持久化, warmup 判据
 
         stats = {

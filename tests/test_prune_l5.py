@@ -4,12 +4,10 @@ RED 测试 → shape 断言 + 一步 learn forward 不崩.
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 
-from model import DensePCNet, CyreneModel
+from model import CyreneModel, DensePCNet
 
 # 字节域默认 256 (与 CyreneModel.d_input 默认一致,动作域 d_act 同)
 D_INPUT = 256
@@ -21,23 +19,23 @@ torch.manual_seed(0)
 
 
 def _tiny_cfg(**over) -> CyreneModel:
-    kw = dict(
+    kw = {
         # 让 L4 精确等 l4_lower_bound → L4 不剪,专注观察 L5
-        d_l4=512,
-        d_l2=192,   # > bound 128 → 允许剪
-        d_l3=192,   # > bound 128
-        d_l5=192,   # > bound 128 ← 本轮主角
-        d_l6=128,   # = bound 128 (L6 不剪,测 L5→L6 列同步)
-        prune_warmup=0,
-        prune_fraction=0.6,  # 每步最多砍 60%
-        death_probation=1,   # 死缓 1 步直接过期 (本轮首步没 expired 就行)
-        active_size_lower_bound=128,
-        l4_lower_bound=512,
-        mem_k0=1,
-        mem_k_max=1,        # 禁用单元出生/死亡,避免 W1 形状非修剪因素干扰
-        input_history=True, # W_04 列=512 (默认)
-        max_seq_len=8,
-    )
+        "d_l4": 512,
+        "d_l2": 192,   # > bound 128 → 允许剪
+        "d_l3": 192,   # > bound 128
+        "d_l5": 192,   # > bound 128 ← 本轮主角
+        "d_l6": 128,   # = bound 128 (L6 不剪,测 L5→L6 列同步)
+        "prune_warmup": 0,
+        "prune_fraction": 0.6,  # 每步最多砍 60%
+        "death_probation": 1,   # 死缓 1 步直接过期 (本轮首步没 expired 就行)
+        "active_size_lower_bound": 128,
+        "l4_lower_bound": 512,
+        "mem_k0": 1,
+        "mem_k_max": 1,        # 禁用单元出生/死亡,避免 W1 形状非修剪因素干扰
+        "input_history": True, # W_04 列=512 (默认)
+        "max_seq_len": 8,
+    }
     kw.update(over)
     return CyreneModel(**kw)
 
@@ -97,7 +95,7 @@ def test_l5_prune_shapes_all_synced():
     byte_ids = torch.randint(0, D_INPUT, (1, 4), dtype=torch.long)
     # 不关心 loss — 只要 shape 对就好
     try:
-        stats = net.learn(byte_ids, closed_loop=False, free_run=False)
+        net.learn(byte_ids, closed_loop=False, free_run=False)
         net.pruner._prune()
     except Exception as e:
         pytest.fail(f"首步 learn 直接抛异常 {type(e).__name__}: {e}")
@@ -153,8 +151,8 @@ def test_l5_prune_shapes_all_synced():
         assert shape == exp_shape, f"{attr} shape {shape}≠{exp_shape}"
 
     # 8. 死亡行/死缓计数器
-    assert net._death_row["l5"].numel() == a5_new
-    assert net._probation_counter["l5"].numel() == a5_new
+    assert net._death_row_l5.numel() == a5_new
+    assert net._probation_counter_l5.numel() == a5_new
 
     # 9. 下游: L6 的 W_56 列 = a5_new (因为 L6 的 active_size_lower_bound=128=init,
     #    d_l6=128,L6 不剪,所以只要看列就行了)
@@ -179,7 +177,7 @@ def test_l5_prune_then_forward_no_crash():
     byte_ids_b = torch.randint(0, D_INPUT, (1, 4), dtype=torch.long)
 
     # Step1:修剪发生
-    s1 = net.learn(byte_ids_a, closed_loop=False, free_run=False)
+    net.learn(byte_ids_a, closed_loop=False, free_run=False)
     net.pruner._prune()
     # 断言修剪真的发生
     assert net.active_size["l5"] < cfg.d_l5, "L5 未剪,测试前提失效"
@@ -269,3 +267,17 @@ def test_l4_shrink_w1_markers_aligned():
     # z4 块不含 bind/单元标记
     z4 = e_w1[:a4]
     assert bool(((z4 < 768) | (z4 == 0)).all()), "z4 块混入 bind/单元标记"
+
+
+def test_l4_shrink_then_learn_no_shape_crash():
+    """L4 收缩后紧接 learn (感知+回声) 不崩 — 回归: 活性缓冲漏同步 (曾漏 _dw_slot 等)."""
+    cfg = _tiny_cfg(d_l4=576)  # > l4_lower_bound=512 → L4 真收缩
+    net = DensePCNet(cfg)
+    net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))
+    net.pruner._prune()
+    a4 = net.active_size["l4"]
+    assert a4 < net.cfg.d_l4
+    assert net._dw_slot.shape == (1, a4, a4)
+    assert net._z4_fut_buf.shape[-1] == a4
+    assert net._theta_w04.shape == (a4,)
+    net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))

@@ -5,16 +5,18 @@ metab_dip_margin=-10 → 阈值 = 11·base → f<11·base 恒真 → 恒清零.
 冷启动 (base==0): 登记基线, 该步按无下探计数 +1.
 """
 
+import pytest
 import torch
+from safetensors.torch import save_file
 
 from model import CyreneModel, DensePCNet
 
 
 def _tiny_cfg(**over) -> CyreneModel:
-    kw = dict(
-        d_l4=64, d_l2=32, d_l3=32, d_l5=64, d_l6=16,
-        max_seq_len=16, free_run_window=16, mem_k0=2, mem_k_max=2,
-    )
+    kw = {
+        "d_l4": 64, "d_l2": 32, "d_l3": 32, "d_l5": 64, "d_l6": 16,
+        "max_seq_len": 16, "free_run_window": 16, "mem_k0": 2, "mem_k_max": 2,
+    }
     kw.update(over)
     return CyreneModel(**kw)
 
@@ -26,7 +28,7 @@ def _learn(net, n: int = 1):
 
 def test_buffers_int32_persistent():
     net = DensePCNet(_tiny_cfg())
-    for name in ("_metab_starve_cnt", "_metab_death_round_cnt"):
+    for name in ("_metab_starve_cnt", "_metab_silence_cnt", "_metab_death_round_cnt"):
         buf = getattr(net, name)
         assert buf.dtype == torch.int32
         assert buf.shape == (1,)
@@ -131,7 +133,7 @@ def test_floor_round_noop_and_roundtrip(tmp_path):
     assert net.active_size == sz
     assert net._mem_m.shape[0] == 1
     assert net.W1.shape == w1_shape
-    p = tmp_path / "floor.pt"
+    p = tmp_path / "floor.safetensors"
     net.save(str(p))
     loaded = DensePCNet.load(str(p), cfg)
     assert int(loaded._metab_death_round_cnt.item()) == 1
@@ -139,27 +141,14 @@ def test_floor_round_noop_and_roundtrip(tmp_path):
     assert loaded._mem_m.shape[0] == 1
 
 
-def test_checkpoint_compat_without_new_keys(tmp_path):
-    """旧检查点 (无新键) → load 默认零+货币迁移, 回合正常."""
+def test_weights_only_checkpoint_refused(tmp_path):
+    """无 state_ver 的 weights-only 快照 → load 拒收 (不留「缺键即默认」的后门)."""
     cfg = _tiny_cfg(metab_dip_margin=1.0, metab_death_steps=1, prune_warmup=0)
     net = DensePCNet(cfg)
-    sd = dict(net.state_dict())
-    for k in ("_metab_starve_cnt", "_metab_death_round_cnt", "_metab_F_base", "_metab_ver"):
-        sd.pop(k)
-    p = tmp_path / "old.pt"
-    torch.save(sd, p)
-    loaded = DensePCNet.load(str(p), cfg)
-    assert int(loaded._metab_starve_cnt.item()) == 0
-    assert int(loaded._metab_death_round_cnt.item()) == 0
-    # P3-c/P3-b 货币迁移: 旧账本清零重臂 (F_prev 哨兵重置, 防首步伪死亡)
-    assert float(loaded._metab_F_prev_perc.item()) < 0.0
-    assert float(loaded._metab_F_prev_eco.item()) < 0.0
-    assert int(loaded._metab_ver.item()) == 3
-    assert float(loaded._metab_F_base.item()) == 0.0
-    _learn(loaded, 2)
-    loaded.maybe_prune(8)
-    assert int(loaded._metab_death_round_cnt.item()) == 1
-    assert loaded._mem_m.shape[0] == 1
+    p = tmp_path / "weights_only.safetensors"
+    save_file({k: v.contiguous() for k, v in net.state_dict().items()}, str(p))
+    with pytest.raises(ValueError, match="weights-only"):
+        DensePCNet.load(str(p), cfg)
 
 
 def test_mem_birth_rebound_after_famine():
@@ -174,3 +163,30 @@ def test_mem_birth_rebound_after_famine():
     head = 64 + net.bind_slot_dim
     assert net.W1.shape[0] == head + 2 * 64
     assert net._lm_in == net.W1.shape[0]
+
+
+# ---------- P3-b 对称牙: 长期只看不说 ----------
+
+
+def test_silence_tooth_mirrors_starve():
+    """强制感知 → 沉默计数累积 → 回合; 触发后归零 (dip_margin=-10 屏蔽 starve 干扰)."""
+    cfg = _tiny_cfg(metab_dip_margin=-10.0, metab_silence_steps=3, prune_warmup=0)
+    net = DensePCNet(cfg)
+    for _ in range(4):  # 首步哨兵不计数 → 4 步累积 3
+        net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long), force_perception=True)
+    assert float(net._metab_silence_cnt.item()) == 3.0
+    assert float(net._metab_starve_cnt.item()) == 0.0  # dip 恒真 → starve 未参与
+    assert net.maybe_prune(8) == "silence"
+    assert float(net._metab_death_round_cnt.item()) == 1.0
+    assert float(net._metab_silence_cnt.item()) == 0.0
+
+
+def test_silence_reset_by_echo():
+    """回声 = 表达发生 → 沉默计数清零 (镜像: 感知 dip 清零 starve)."""
+    net = DensePCNet(_tiny_cfg(metab_dip_margin=-10.0, metab_silence_steps=250))
+    for _ in range(3):
+        net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long), force_perception=True)
+    assert float(net._metab_silence_cnt.item()) == 2.0
+    net.learn(None, free_run=False)  # 回声
+    assert float(net._metab_silence_cnt.item()) == 0.0
+    assert float(net._metab_starve_cnt.item()) == 1.0  # 回声相 starve 恒 +1 (镜像证据)

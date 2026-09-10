@@ -18,21 +18,19 @@ app = click.Group(name="list", help="信息查询")
 @click.option("--detail", is_flag=True, default=False, help="显示详细信息 (加载检查点)")
 def checkpoints(directory, detail):
     """列出检查点文件."""
-    import torch
-
     ckpt_dir = resolve_path(directory or "out")
     if not os.path.exists(ckpt_dir):
         raise click.ClickException(f"目录不存在: {ckpt_dir}")
 
-    pt_files = sorted([f for f in os.listdir(ckpt_dir) if f.endswith((".pt", ".pth"))])
-    if not pt_files:
+    ck_files = sorted([f for f in os.listdir(ckpt_dir) if f.endswith(".safetensors")])
+    if not ck_files:
         print(f"没有检查点文件: {ckpt_dir}")
         return
 
     print(f"\n检查点: {ckpt_dir}")
     print(f"{'文件':40s} {'大小':>10s}  {'类型'}")
     print("-" * 70)
-    for fname in pt_files:
+    for fname in ck_files:
         fpath = os.path.join(ckpt_dir, fname)
         size = os.path.getsize(fpath)
         size_str = f"{size / 1024 / 1024:.1f} MB" if size > 1024 * 1024 else f"{size / 1024:.1f} KB"
@@ -40,12 +38,14 @@ def checkpoints(directory, detail):
         print(f"{fname:40s} {size_str:>10s}  {kind}")
 
     if detail:
-        for fname in pt_files:
+        from model.model_cyrene import read_checkpoint_metadata
+
+        for fname in ck_files:
             fpath = os.path.join(ckpt_dir, fname)
             try:
-                state = torch.load(fpath, map_location="cpu", weights_only=True)
-                if isinstance(state, dict) and "step" in state:
-                    print(f"  {fname}: step={state.get('step', '?')}  ce={state.get('ce_loss', '?')}")
+                meta = read_checkpoint_metadata(fpath)  # 只读 header, 不加载张量
+                if "step" in meta:
+                    print(f"  {fname}: step={meta.get('step', '?')}  ce={meta.get('ce_loss', '?')}")
             except Exception:  # noqa: S110
                 pass
 

@@ -1,7 +1,6 @@
 """P3-b 行为门测试: 门公式纯函数 + learn() 内部路由 + 每行为 F 分账 + 死亡时钟分相
-+ 行为账本 EMA + ver3 迁移 + sync_gate 镜像 (纯 CPU, 无 GPU)."""
++ 行为账本 EMA + ver4 迁移 + sync_gate 镜像 (纯 CPU, 无 GPU)."""
 
-import math
 
 import pytest
 import torch
@@ -11,11 +10,11 @@ from model.dense.learning.metabolism import gate_psay, rel_norm
 
 
 def _tiny(**over) -> CyreneModel:
-    kw = dict(
-        d_l4=64, d_l2=32, d_l3=32, d_l5=64, d_l6=16,
+    kw = {
+        "d_l4": 64, "d_l2": 32, "d_l3": 32, "d_l5": 64, "d_l6": 16,
         # 窗 32: 回声种子 (≤16) + 15 步续写 ≤ max_seq_len (mem 序列缓冲按它切)
-        max_seq_len=32, free_run_window=16, mem_k0=2, mem_k_max=2,
-    )
+        "max_seq_len": 32, "free_run_window": 16, "mem_k0": 2, "mem_k_max": 2,
+    }
     kw.update(over)
     return CyreneModel(**kw)
 
@@ -175,27 +174,7 @@ def test_gain_ledger_ema_only_running_behavior():
     assert float(net._metab_gain_perc.item()) == g_p  # 感知账本冻结
 
 
-# ---------- ver3 迁移 / sync_gate ----------
-
-
-def test_ver3_migration(tmp_path):
-    """伪造 v2 检查点 (旧 _metab_F_prev 键 + ver=2) → load 重臂: 双轨 F_prev=-1, ver=3."""
-    net = _make()
-    net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))  # 制造非零账本态
-    sd = dict(net.state_dict())
-    sd["_metab_F_prev"] = sd.pop("_metab_F_prev_perc").clone()  # 伪造 v2 键
-    sd.pop("_metab_F_prev_eco")
-    sd["_metab_ver"].fill_(2)
-    p = tmp_path / "v2.pt"
-    torch.save(sd, p)
-    loaded = DensePCNet.load(str(p), _tiny())
-    assert int(loaded._metab_ver.item()) == 3
-    assert float(loaded._metab_F_prev_perc.item()) < 0.0
-    assert float(loaded._metab_F_prev_eco.item()) < 0.0
-    assert float(loaded._metab_gain_perc.item()) == 0.0
-    assert float(loaded._metab_gain_eco.item()) == 0.0
-    assert float(loaded._metab_psay.item()) == 0.5
-    assert float(loaded._metab_E.item()) == 0.0
+# ---------- sync_gate 镜像 ----------
 
 
 def test_sync_gate_mirror():
@@ -207,12 +186,12 @@ def test_sync_gate_mirror():
     assert net._behavior_py == (hit > 0.0)
 
 
-def test_load_resets_behavior_mirror():
+def test_load_resets_behavior_mirror(tmp_path):
     """load 后 _behavior_py 默认 False (感知), 未调 sync_gate 前路由确定."""
     net = _echo_net()
     net._behavior_py = True
     net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))
-    p = "/tmp/_p3b_mirror.pt"
+    p = str(tmp_path / "_p3b_mirror.safetensors")
     net.save(p)
     loaded = DensePCNet.load(p, _tiny())
     assert loaded._behavior_py is False

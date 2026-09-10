@@ -106,10 +106,10 @@ class ReadoutMixin(_MixinBase):
         # 供 echo 相位带状 R 校准 (action.py); echo 相位冻结不更新
         if not ctx.echo_world_frozen:
             eps_lang = 1.0 - (probs_lm[:, :-1] * target_lm).sum(dim=-1).mean()
-            _lang_ema = getattr(net, "_lang_eps_ema", None)
-            if _lang_ema is None:
-                net._lang_eps_ema = eps_lang.detach().clone()  # tensor-guard: rare (EMA 一次性建立)
-                net._lang_eps_mad = torch.zeros_like(eps_lang.detach())
+            if net._lang_eps_cold:
+                net._lang_eps_ema.copy_(eps_lang.detach())  # 首次快照
+                net._lang_eps_mad.zero_()
+                net._lang_eps_cold = False
             else:
                 net._lang_eps_ema.mul_(0.995).add_(0.005 * eps_lang)
                 devi = (eps_lang - net._lang_eps_ema).abs()
@@ -329,15 +329,17 @@ class ReadoutMixin(_MixinBase):
         err_rms = lm.eps_total.square().mean().sqrt()
         net._mem_err_ema.mul_(0.99).add_(0.01 * err_rms)
         net._mem_err_long.mul_(0.999).add_(0.001 * err_rms)
-        net._mem_birth_cd += 1
+        net._mem_birth_cd.add_(1)
+        net._mem_birth_py += 1
         if (
-            net._mem_birth_cd >= cfg.mem_birth_cooldown
+            net._mem_birth_py >= cfg.mem_birth_cooldown
             and cfg.mem_k_max > K
             and bool((net._mem_err_ema > net._mem_err_long * cfg.mem_birth_thresh).item())  # tensor-guard: rare (出生事件每冷却窗至多一次)
         ):
             parent = int(torch.argmax(net._mem_g))  # tensor-guard: rare (出生事件同步)
             self._mem_birth(parent)
-            net._mem_birth_cd = 0
+            net._mem_birth_cd.zero_()
+            net._mem_birth_py = 0
 
     def _mem_resize(self, keep: torch.Tensor):
         """K 变化: 单元缓冲 + W1 行 + W1_elig 迹同步重注册."""

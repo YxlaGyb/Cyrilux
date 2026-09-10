@@ -10,32 +10,16 @@ PPA 模型评估
 """
 import time
 import torch
-from model import DensePCNet, CyreneModel
+from model import DensePCNet
 
 torch.set_grad_enabled(False)
 
 
 def load_model(path):
     t0 = time.perf_counter()
-    sd = torch.load(path, map_location="cpu", weights_only=True)
-    d_l4 = sd["W_04"].shape[0]
-    d_l2 = sd["W_42"].shape[0]
-    d_l3 = sd["W_23"].shape[0]
-    d_l5 = sd["W_35"].shape[0]
-    d_l6 = sd["W_56"].shape[0]
-    cfg = CyreneModel(d_l4=d_l4, d_l2=d_l2, d_l3=d_l3,
-                        d_l5=d_l5, d_l6=d_l6, max_seq_len=256)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = DensePCNet(cfg).to(dev)
-    net.load_state_dict(sd, strict=False)
-    net.active_size = {
-        "l4": net.W_04.shape[0], "l2": net.W_42.shape[0],
-        "l3": net.W_23.shape[0], "l5": net.W_35.shape[0], "l6": net.W_56.shape[0],
-    }
-    for k in ("l4", "l2", "l3", "l5", "l6"):
-        a = net.active_size[k]
-        net._death_row[k] = torch.zeros(a, dtype=torch.int8, device=dev)
-        net._probation_counter[k] = torch.zeros(a, dtype=torch.int16, device=dev)
+    net = DensePCNet.load(path).to(dev)
+    cfg = net.cfg
     elapsed = time.perf_counter() - t0
     d = cfg.dims()
     print(f"  {path}: L4={d['l4']} L2={d['l2']} L3={d['l3']} "

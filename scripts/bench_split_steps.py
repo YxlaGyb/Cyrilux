@@ -22,7 +22,7 @@ SEED_N = 16
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="out/exp115_p3c_ev.pt")
+    ap.add_argument("--ckpt", default="out/exp115_p3c_ev.safetensors")
     ap.add_argument("--data", default="dataset/pretrain_t2t_mini.jsonl")
     ap.add_argument("--max-length", type=int, default=256)
     ap.add_argument("--steps", type=int, default=4)

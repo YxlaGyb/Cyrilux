@@ -103,7 +103,7 @@ class FeedforwardMixin(_MixinBase):
             net.W_04[:dim_4].data += dW_04 * eta
             soft_norm_preserve(net.W_04[:dim_4].data)
             # 行去同质化: 斜坡渐进 (coef 200 步升到 1) + 范数信任域 (单步 ≤5%‖W‖_F) 防 z4 突变换层
-            ramp = min(1.0, net._step_counter / 200.0)
+            ramp = min(1.0, net._step_py / 200.0)
             _decorr_W(net.W_04[:dim_4].data, net.E_04[:dim_4, :dim_4], coef=ramp, max_delta_ratio=0.05, learn_boost=ctx.learn_boost)
 
             dW42 = (sh.errs.eps2_precise.transpose(-2, -1) @ rms_norm(z4)).mean(dim=0) * inv_s

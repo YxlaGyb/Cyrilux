@@ -14,6 +14,8 @@ class _StubNet:
     def __init__(self, ema_dim: int):
         self.cfg = type("C", (), {"oja_alpha": 0.05, "oja_elasticity": 0.05})()
         self._active_ema_init: set[str] = set()
+        self._active_ema_names = ("_active_ema_w35",)
+        self._active_ema_init_mask = torch.zeros(1, dtype=torch.int32)
         self._active_ema_w35 = torch.zeros(ema_dim, dtype=torch.float16)
 
 
@@ -28,6 +30,8 @@ def test_first_window_lazy_init_no_excess():
     assert torch.allclose(net._active_ema_w35, p2, atol=1e-3)
     assert torch.allclose(out, -(0.05 * p2).unsqueeze(1) * W, atol=1e-3)
     assert "_active_ema_w35" in net._active_ema_init
+    # 冷启动登记同时置 mask 位 (集合不持久化, mask 才是跨 load 的判据)
+    assert int(net._active_ema_init_mask.item()) == 1
 
 
 def test_excess_activates_only_above_ema():

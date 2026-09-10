@@ -24,6 +24,7 @@
       (续跑: ... --resume; 冒烟: ... --steps 100)
 """
 import argparse
+import codecs
 import json
 import math
 import os
@@ -446,7 +447,7 @@ def main():
     ap.add_argument("--steps", type=int, default=5000)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--tag", default="out/exp115_say")
-    ap.add_argument("--init-ckpt", default="out/exp114_say.pt",
+    ap.add_argument("--init-ckpt", default="out/exp114_say.safetensors",
                     help="起始检查点 (P3-b 主线: out/exp115_p3c_ev.pt)")
     ap.add_argument("--init-sidecar", default="out/exp114_world_state.json")
     ap.add_argument("--base-step", type=int, default=27500,
@@ -477,9 +478,9 @@ def main():
         with open(SIDECAR, encoding="utf-8") as f:
             st = json.load(f)
         step0, gt0 = world.load_state(st)
-        load_path = f"{args.tag}_step{step0}.pt"
+        load_path = f"{args.tag}_step{step0}.safetensors"
         if not os.path.exists(load_path):
-            load_path = args.tag + ".pt"
+            load_path = args.tag + ".safetensors"
         net = DensePCNet.load(load_path, cfg).to(dev)
         # P3-a: τ 是状态纯函数 (每回声步重算) — 侧车 τ 只打印不回填
         print(f"exp115_say: resume 权重={load_path} 侧车 step={step0} "
@@ -531,6 +532,8 @@ def main():
     last_q = 0.0
     last_sc = {"q": 0.0, "L": 0.0, "S": 0.0, "X": 0.0}  # 最近一次回声步的外部评分 (报告口径)
     last_gen = b""
+    gen_dec = codecs.getincrementaldecoder("utf-8")(errors="replace")  # 生成流跨步续接
+    gen_txt, gen_raw_hex = "", ""
     last_e, last_dm = 0.0, float("nan")
     last_death_rounds = 0
     step = step0
@@ -551,18 +554,25 @@ def main():
             # 遥测报告 (每 RPT=25 全局步一次; .item() 读数是同步排空主嫌 → 采样统计;
             # 事件行 (death/NaN) 另行, 不受此限)
             trace_norm = float(net.W_act_elig.norm().item())
-            r_v = float(net._metab_R.item())  # P3-b: 原语每步新鲜 (不依赖回声步刷新)
-            leg = trace_norm * abs(r_v) if exec_b else float("nan")  # leg 只在回声步定义
+            r_v = float(net._metab_R.item())  # 原语每步新鲜 (不依赖回声步刷新)
+            # leg 口径 = ‖迹‖·|生存信号| = |原语| (生存信号在消费端已除迹)
+            leg = (trace_norm * abs(float(net._survival_signal.item()))
+                   if exec_b else float("nan"))  # leg 只在回声步定义
             if exec_b and hasattr(net, "_gen_bytes"):
                 gen_bytes = bytes(int(v) for v in net._gen_bytes[0].tolist())
                 last_gen = gen_bytes
                 last_sc = world.score(gen_bytes)
                 last_q = last_sc["q"]
                 world.record(gen_bytes)
+                gen_txt = gen_dec.decode(gen_bytes)  # 增量 UTF-8 状态机 (多字节跨步续接)
+                gen_raw_hex = gen_bytes.hex()
             # 体内代谢遥测: E/R 账本已入体 (ΔF 型, P3-b 行为内分账), 训练路径零外部注入
             e_v = float(net._metab_E.item())
-            dm_v = float(net._metab_df_mad.item())
+            # 报告口径 = 本步执行行为的 MAD
+            dm_v = float((net._metab_df_mad_eco if exec_b else net._metab_df_mad_perc).item())
+            fam_v = float(net._metab_famine_prog.item())
             sc_v = float(net._metab_starve_cnt.item())
+            sl_v = float(net._metab_silence_cnt.item())
             dr_v = int(net._metab_death_round_cnt.item())
             st_v = float(getattr(net, "_metab_stress", torch.tensor(0.0)).item())
             cp_v = float(net._metab_cost_perc.item())
@@ -590,6 +600,9 @@ def main():
             q_hist.append(last_q)
             rec = {"step": step, "eps_lm": eps_now, "R": r_v,
                    "E": e_v, "df_mad": dm_v, "stress": st_v, "leg": leg,
+                   "df_mad_perc": float(net._metab_df_mad_perc.item()),
+                   "df_mad_eco": float(net._metab_df_mad_eco.item()),
+                   "famine_prog": fam_v,
                    "cost_perc": cp_v, "cost_learn": cl_v,
                    "cost_mem": cm_v, "cost_say": cs_v, "cost_tot": ct_v,
                    "trace_norm": trace_norm,
@@ -601,7 +614,9 @@ def main():
                    "L": last_sc["L"], "S": last_sc["S"], "X": last_sc["X"], "q": last_q,
                    "gen_temp": gt_v, "anchor": ema_v, "certified": int(certified),
                    "rep_frac": rep_v,
-                   "starve_cnt": sc_v, "death_rounds": dr_v,
+                   "gen": gen_txt if exec_b else None,
+                   "gen_raw": gen_raw_hex if exec_b else None,
+                   "starve_cnt": sc_v, "silence_cnt": sl_v, "death_rounds": dr_v,
                    "mem_k": net._mem_m.shape[0],
                    "active_size_l4": net.active_size["l4"],
                    "active_size_l5": net.active_size["l5"],
@@ -623,9 +638,10 @@ def main():
             wd_raw = getattr(net, "_dW_diff_absmax_raw", None)
             wd_raw_hist.append(float(wd_raw.item()) if wd_raw is not None else float("nan"))
 
-        # 代谢触发修剪 (P2): 墙钟已退役 — E < 死线连续 metab_death_steps 步 → 模型内
-        # 死亡回合 (mem 饥荒击杀 + 拓扑修剪). 轮询 8 步, 触发权完全在模型中.
-        net.maybe_prune(net._step_counter)
+        # 代谢触发修剪 (P2 下探缺失 + P3-b 对称牙): 墙钟已退役 — 连续饥饿 (F 无下探) 或
+        # 连续沉默 (只看不说) 达阈值 → 模型内死亡回合 (mem 饥荒击杀 + 拓扑修剪).
+        # 轮询 8 步, 触发权完全在模型中; 返回触发原因供事件行遥测.
+        death_cause = net.maybe_prune(net._step_counter)
 
         # 死亡事件遥测: 轮询点比较回合计数, 新回合追加 death_event 行 (被杀单元
         # 信息不可回读, 记当前态; active_size/mem_k 为 Python 侧零同步值).
@@ -636,8 +652,9 @@ def main():
                 last_death_rounds = dr
                 jsonf.write(json.dumps({
                     "event": "death", "step": step,
+                    "cause": death_cause,
                     "E": float(net._metab_E.item()),
-                    "de_mad": float(net._metab_df_mad.item()),
+                    "famine_prog": float(net._metab_famine_prog.item()),
                     "death_rounds": dr,
                     "mem_k": net._mem_m.shape[0],
                     "active_size_l4": net.active_size["l4"],
@@ -684,11 +701,11 @@ def main():
             print(msg, flush=True)
             logf.write(msg + "\n")
         if step % 500 == 0:
-            net.save(args.tag + f"_step{step}.pt")
+            net.save(args.tag + f"_step{step}.safetensors")
             _write_sidecar(world, step, net)
             # ── 仪表钩子: 独立评估实例 (零状态污染) + s 标定 + 名次 ──
             te = time.time()
-            g = eval_gauge(args.tag + f"_step{step}.pt", cfg, gauge, dev)
+            g = eval_gauge(args.tag + f"_step{step}.safetensors", cfg, gauge, dev)
             rec = {"step": step,
                    "bpb_tail": g["bpb_tail"], "bpb_trunc": g["bpb_trunc"],
                    "bpb_all": (g["bpb_tail"] * len(gauge["tail"]) * 255
@@ -713,11 +730,11 @@ def main():
                   f"median={g['eval']['rank_median']:.0f} ({rec['eval_s']}s)",
                   flush=True)
 
-    net.save(args.tag + ".pt")
+    net.save(args.tag + ".safetensors")
     _write_sidecar(world, step, net)
     if nan_at is None or step % 500 != 0:
         te = time.time()
-        g = eval_gauge(args.tag + ".pt", cfg, gauge, dev)
+        g = eval_gauge(args.tag + ".safetensors", cfg, gauge, dev)
         rec = {"step": step,
                "bpb_tail": g["bpb_tail"], "bpb_trunc": g["bpb_trunc"],
                "bpb_all": (g["bpb_tail"] * len(gauge["tail"]) * 255
@@ -739,7 +756,7 @@ def main():
               f"eval@best_s={g['eval']['bpb_at_best_s']:.3f} "
               f"top15={g['eval']['top15']:.4f} ({rec['eval_s']}s)", flush=True)
     for f in os.listdir("out"):
-        if f.startswith(os.path.basename(args.tag) + "_step") and f.endswith(".pt"):
+        if f.startswith(os.path.basename(args.tag) + "_step") and f.endswith(".safetensors"):
             os.remove(os.path.join("out", f))
 
     # frozen_moved 复测 (entrywise rel_frob, 阶段六口径)

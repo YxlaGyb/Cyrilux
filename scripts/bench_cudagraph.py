@@ -39,7 +39,7 @@ def _finite(out) -> bool:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="out/exp115_p3c_ev.pt")
+    ap.add_argument("--ckpt", default="out/exp115_p3c_ev.safetensors")
     ap.add_argument("--s-list", default="16,32,64")
     ap.add_argument("--reps", type=int, default=20)
     ap.add_argument("--out", default=None)

@@ -75,7 +75,7 @@ class ActionMixin(_MixinBase):
         # 范围由映射余域给出: 噪声区 (τ≈9.5-10 展平骗裁判) 与贪心区 (τ→0 单字符自锁)
         # 均物理不可达; 旧健康带 [1.0,1.54] 只是范围内一点, 不再是焊死的法律.
         # 符号: 应变差 _d = anchor − eps_now > 0 (回声流比感知锚容易) → τ 升温 (想表达的变异性).
-        _anchor = getattr(net, "_lang_eps_ema", None)
+        _anchor = None if net._lang_eps_cold else net._lang_eps_ema
         _gt = getattr(net, "_gen_temp", None)
         if not (torch.is_tensor(_gt) and _gt.shape == (1,) and _gt.device == dev):
             # 固定 buffer 就地覆写: echo 整段 continuation 罩 CUDA Graph 后地址不得漂移

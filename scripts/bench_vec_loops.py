@@ -132,7 +132,7 @@ def _mad(x, y) -> float:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="out/exp115_p3c_ev.pt")
+    ap.add_argument("--ckpt", default="out/exp115_p3c_ev.safetensors")
     ap.add_argument("--reps", type=int, default=10)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()

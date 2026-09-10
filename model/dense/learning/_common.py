@@ -18,6 +18,21 @@ class _MixinBase:
     net: DensePCNet
 
 
+def _mark_ema_init(net: DensePCNet, ema_name: str) -> None:
+    """冷启动登记: CPU 侧集合 + 持久化 mask 位 (每个名字至多置一次, 零同步).
+
+    集合本身不持久化 → 续跑后 17 个活动 EMA 会全部重新快照而非继续, 故 mask 记录谁曾初始化.
+    """
+    net._active_ema_init.add(ema_name)
+    net._active_ema_init_mask.add_(1 << net._active_ema_names.index(ema_name))
+
+
+def restore_active_ema_init(net: DensePCNet) -> set[str]:
+    """load 边界: 由 mask 重建 CPU 侧冷启动集合 (一次性同步)."""
+    mask = int(net._active_ema_init_mask.item())
+    return {n for i, n in enumerate(net._active_ema_names) if (mask >> i) & 1}
+
+
 def _activity_baseline(
     net: DensePCNet, post: torch.Tensor, ema_name: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -29,7 +44,7 @@ def _activity_baseline(
     ema = getattr(net, ema_name)[: p2.shape[0]]  # 修剪后 active 收缩: 只写头部切片
     if ema_name not in net._active_ema_init:
         ema.copy_(p2)
-        net._active_ema_init.add(ema_name)
+        _mark_ema_init(net, ema_name)
         excess = torch.zeros_like(p2)
     else:
         ema.mul_(0.99).add_(0.01 * p2)

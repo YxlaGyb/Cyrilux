@@ -13,25 +13,30 @@ class TestListCheckpoints:
         assert "没有检查点文件" in result.output
 
     def test_lists_files(self, tmp_path):
-        (tmp_path / "model.pt").write_bytes(b"\x00\x01")
+        (tmp_path / "model.safetensors").write_bytes(b"\x00\x01")
         (tmp_path / "ignore.txt").write_text("x", encoding="utf-8")
         runner = CliRunner()
         result = runner.invoke(app, ["list", "checkpoints", str(tmp_path)])
         assert result.exit_code == 0
-        assert "model.pt" in result.output
+        assert "model.safetensors" in result.output
         assert "ignore.txt" not in result.output
 
     def test_detail_with_dict_ckpt(self, tmp_path):
         import torch
+        from safetensors.torch import save_file
 
-        torch.save({"step": 100, "ce_loss": 0.5}, tmp_path / "model.pt")
+        save_file(
+            {"probe": torch.zeros(1)},
+            str(tmp_path / "model.safetensors"),
+            metadata={"step": "100", "ce_loss": "0.5"},
+        )
         runner = CliRunner()
         result = runner.invoke(app, ["list", "checkpoints", str(tmp_path), "--detail"])
         assert result.exit_code == 0
         assert "step=100" in result.output
 
     def test_detail_with_corrupt_file(self, tmp_path):
-        (tmp_path / "bad.pt").write_bytes(b"not a torch file")
+        (tmp_path / "bad.safetensors").write_bytes(b"not a torch file")
         runner = CliRunner()
         result = runner.invoke(app, ["list", "checkpoints", str(tmp_path), "--detail"])
         assert result.exit_code == 0  # 损坏文件被静默跳过

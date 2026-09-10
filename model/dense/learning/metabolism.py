@@ -131,15 +131,19 @@ class MetabolismMixin(_MixinBase):
         net._metab_starve_cnt.copy_(
             torch.where(dip, torch.zeros_like(net._metab_starve_cnt), net._metab_starve_cnt + 1)
         )
-        # 4) E_ref = E 慢 EMA (应激基线; P3-c 修正): 应激度量"E 低于自身近期水平"而非常数 0 —
-        # κ 标定误差只平移不放大. 应激 = tanh(relu(E_ref − E)·scale) ∈ [0,1), τ 恒温器与
-        # 行为门共用 (体内信号单一出处).
+        # 对称牙: 回声清零 / 感知 +1 (与 starve 镜像)
+        if ctx.echo_loop:
+            net._metab_silence_cnt.zero_()
+        else:
+            net._metab_silence_cnt.add_(1)
+        # 应激 = 饥荒契约进度 (starve_cnt/metab_death_steps): 尺度即机体自身死线, 零设计者增益
         net._metab_E_ref.mul_(1.0 - net.cfg.metab_eref_rate).add_(
             net.cfg.metab_eref_rate * net._metab_E
         )
-        net._metab_stress = torch.tanh(
-            torch.relu(net._metab_E_ref - net._metab_E) * net.cfg.metab_famine_scale
+        net._metab_famine_prog.copy_(net._metab_starve_cnt).mul_(
+            1.0 / float(net.cfg.metab_death_steps)
         )
+        net._metab_stress = net._metab_famine_prog
         # 6) P3-b 新奇度账本 (门控输入): 仅感知步刷新 — _novelty 由 _update_lm_head 末删除,
         # 而代谢在其前运行 (定点域序), 此处是 learn() 链内唯一安全读点. rel_n 自归一化:
         # 首感知步 ema=1e-3 → nov≈1 (世界全新 → 多看), 熟世界衰减 (看旧世界 → 想说的选项).
@@ -155,15 +159,20 @@ class MetabolismMixin(_MixinBase):
         #    使 MAD 比例同构 — div 预计免重标, 以标定探针为准.
         #    除 ‖迹‖ 在消费端 (_update_w_act 于迹更新后执行, 被乘的迹就是除的那个迹 —
         #    R1 精确形态, 且首步迹非零, 不会出现 /0 爆炸). 全 GPU fp16 零 .item().
-        net._metab_df_mad.mul_(net.cfg.metab_mad_alpha).add_(
+        # 每行为各一条 MAD (两行为 ΔF 尺度相差 ~15×; 共用会把 R_echo 压成 0)
+        if ctx.echo_loop:
+            mad, cold_flag = net._metab_df_mad_eco, "_metab_mad_cold_eco"
+        else:
+            mad, cold_flag = net._metab_df_mad_perc, "_metab_mad_cold_perc"
+        mad.mul_(net.cfg.metab_mad_alpha).add_(
             (1.0 - net.cfg.metab_mad_alpha) * df.abs()
         )
-        if net._metab_mad_cold:
-            # 冷启动 (world_lang 同款): MAD 首个样本 = |ΔF|, 下限防 0/0 (绝对货币下
+        if getattr(net, cold_flag):
+            # 冷启动 (world_lang 同款): 该行为首个样本 = |ΔF|, 下限防 0/0 (绝对货币下
             # 首结算步 ΔF 可精确为 0 → 0/0=nan); python 标志代替张量布尔 (免每步排空)
-            net._metab_df_mad.copy_(torch.maximum(df.abs(), torch.tensor(1e-5, dtype=torch.float16)))  # tensor-guard: rare (冷启动一次性)
-            net._metab_mad_cold = False
-        net._metab_R = torch.tanh(df / (net.cfg.metab_tanh_div * net._metab_df_mad))
+            mad.copy_(torch.maximum(df.abs(), torch.tensor(1e-5, dtype=torch.float16)))  # tensor-guard: rare (冷启动一次性)
+            setattr(net, cold_flag, False)
+        net._metab_R = torch.tanh(df / (net.cfg.metab_tanh_div * mad))
         # 7) P3-b 行为账本: 仅运行行为记账 (|R| EMA — 该行为最近收益体验); 非运行行为
         # 不更新不衰减 (留档记忆 — 衰减方向留作标定网格备选, 默认不实现)
         if ctx.echo_loop:

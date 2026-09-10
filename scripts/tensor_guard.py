@@ -37,7 +37,7 @@ MODEL_FILES = [
 ]
 SCRIPT_FILES = ["scripts/exp115_say.py"]
 EXEMPT_CTX = {"__init__", "_init_weights", "load", "save", "_migrate_mem",
-              "forward", "generate", "inject_world",
+              "forward", "generate",
               # 事件驱动函数 (非每步): 记忆生/死/修剪/拓扑重塑
               "_mem_birth", "_mem_resize", "_mem_famine_kill", "_prune",
               "maybe_prune", "_permute_weights", "_sync_l4_aux",

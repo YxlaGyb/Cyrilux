@@ -36,7 +36,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from model import DensePCNet
 
-CKPT = "out/exp115_say.pt"
+CKPT = "out/exp115_say.safetensors"
 BASELINE = "out/arch_guard_baseline.json"
 FIXED_PROMPT = "春"
 FIXED_N = 64

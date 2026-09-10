@@ -36,12 +36,11 @@ def test_tau_bounded_and_finite():
 
 
 def test_tau_forced_famine_near_floor():
-    """强制深度饥荒 (应激≈1) + 差分压底 → τ 逼近软带下限但不穿."""
+    """强制深度饥荒 (契约进度饱和) + 差分压底 → τ 逼近软带下限但不穿."""
     net = _make_net()
     net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))
     _echo(net)  # 建立锚/低通
-    net._metab_E.fill_(-5.0)
-    net._metab_E_ref.fill_(-0.05)
+    net._metab_starve_cnt.fill_(net.cfg.metab_death_steps)  # 饥荒契约进度 → 1
     net._metab_tau_d.fill_(-1.0)
     _echo(net)
     st = float(getattr(net, "_metab_stress", torch.tensor(0.0)).item())

@@ -20,8 +20,8 @@ def _make_net():
 def test_metab_buffers_fp16_persistent():
     net = _make_net()
     for name in (
-        "_metab_E", "_metab_E_ref", "_metab_df_mad",
-        "_metab_F_prev_perc", "_metab_F_prev_eco",
+        "_metab_E", "_metab_E_ref", "_metab_df_mad_perc", "_metab_df_mad_eco",
+        "_metab_famine_prog", "_metab_F_prev_perc", "_metab_F_prev_eco",
         "_metab_gain_perc", "_metab_gain_eco",
         "_metab_nov_ema", "_metab_nov", "_metab_psay", "_metab_gate_hit", "_gate_rand",
         "_metab_cost_perc", "_metab_cost_learn", "_metab_cost_mem",
@@ -31,7 +31,6 @@ def test_metab_buffers_fp16_persistent():
         assert buf.dtype == torch.float16
         assert buf.shape == (1,)
     assert float(net._metab_E_ref) == 0.0  # E_ref = E 慢 EMA 冷启 0
-    assert int(net._metab_ver) == 3  # P3-b 行为内 ΔF 货币版本
 
 
 def test_metabolism_first_step_register_then_settle():

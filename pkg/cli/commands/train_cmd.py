@@ -97,8 +97,8 @@ def _train_dense(
     if not out_dir:
         out_dir = run_dir()
     os.makedirs(out_dir, exist_ok=True)
-    net.save(os.path.join(out_dir, "final.pt"))
-    print(f"PPA model saved to {out_dir}/final.pt  final_free_energy_avg={fe_sum / max(step, 1):.4f}")
+    net.save(os.path.join(out_dir, "final.safetensors"))
+    print(f"PPA model saved to {out_dir}/final.safetensors  final_free_energy_avg={fe_sum / max(step, 1):.4f}")
 
 
 @click.command(name="train", help="直接训练模式 (dense PPA 闭环, 纯 Hebbian, 零反向传播)")
@@ -120,10 +120,10 @@ def _train_dense(
 @click.option("--dopamine-beta", default=0.5, type=float, help="多巴胺灵敏度 (dense 忽略)")
 @click.option("--dopamine-gamma", default=0.3, type=float, help="多巴胺衰减 (dense 忽略)")
 @click.option("--out-dir", "-o", default=None, help="输出目录 (默认 out/v{N}-时间戳/)")
-@click.option("--save-interval", default=10000, type=int, help="保存间隔 (dense 忽略, 结束时保存 final.pt)")
+@click.option("--save-interval", default=10000, type=int, help="保存间隔 (dense 忽略, 结束时保存 final.safetensors)")
 @click.option("--abstraction-bank/--no-abstraction-bank", default=False, help="抽象记忆库 (dense 忽略)")
 @click.option("--auto-phase2", is_flag=True, default=False, help="训练后自动进入 Phase 2 (dense 忽略)")
-@click.option("--resume", is_flag=True, default=False, help="从断点恢复 (out_dir/final.pt 或 -c 指定)")
+@click.option("--resume", is_flag=True, default=False, help="从断点恢复 (out_dir/final.safetensors 或 -c 指定)")
 @click.option("--backend", default="dense", help="dense=PPA 闭环 (默认) / sparse=已归档冻结")
 @click.option("--verbose", "-v", is_flag=True, default=False, help="verbose logging")
 def train(
@@ -178,12 +178,12 @@ def train(
         print(f"dense 后端: 忽略稀疏参数 {', '.join(ignored)}")
     if resume and checkpoint is None:
         if out_dir:
-            checkpoint = os.path.join(out_dir, "final.pt")
+            checkpoint = os.path.join(out_dir, "final.safetensors")
         else:
-            cands = glob.glob(os.path.join(resolve_path("out"), "v*", "final.pt"))
+            cands = glob.glob(os.path.join(resolve_path("out"), "v*", "final.safetensors"))
             checkpoint = max(cands, key=os.path.getmtime) if cands else ""
         if not checkpoint or not os.path.exists(checkpoint):
-            raise click.ClickException("--resume 但找不到可续的 final.pt, 请用 -c 指定检查点")
+            raise click.ClickException("--resume 但找不到可续的 final.safetensors, 请用 -c 指定检查点")
     data_files = [resolve_path(f.strip()) for f in data]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _train_dense(
@@ -244,6 +244,8 @@ def from_config(config, batch_size, lr, epochs, out_dir, verbose):
 @click.option("--verbose", "-v", is_flag=True, default=False, help="详细日志")
 def resume(checkpoint, data, batch_size, max_seq_len, epochs, lr, out_dir, verbose):
     """从检查点文件恢复训练 (dense PPA 闭环)."""
+    from dataclasses import replace
+
     from model import DensePCNet
 
     ckpt_path = resolve_path(checkpoint)
@@ -252,7 +254,9 @@ def resume(checkpoint, data, batch_size, max_seq_len, epochs, lr, out_dir, verbo
         raise click.ClickException(f"检查点不存在: {ckpt_path}")
 
     print(f"恢复训练 — 检查点: {ckpt_path}")
-    net = DensePCNet.load(ckpt_path)
+    # 缓冲按 max_seq_len 分配, 必须 ≥ 本命令的批次长度 (快照可能来自短序列实验)
+    base = DensePCNet.config_from_checkpoint(ckpt_path)
+    net = DensePCNet.load(ckpt_path, replace(base, max_seq_len=max(base.max_seq_len, max_seq_len)))
     if lr is not None:
         net.cfg.lr_hebbian = lr
     if not data:

@@ -17,8 +17,78 @@ if TYPE_CHECKING:
     from model.model_cyrene import DensePCNet
 
 
+# 行索引状态: 按神经元行索引的张量 → (层, 形态). 形态 vec=t[perm] / sq=t[perm][:,perm] / row=只排行.
+# 处理者 done = _permute_weights (压缩本体 + 死亡簿的语义更新), aux = _sync_layer_state.
+# 名录须完整: 漏项会让状态挂到别的神经元上 (test_prune_row_state_audit 校验覆盖度).
+_LAYERS = (  # (层, 主权重, 时间核, Foldiak, 时间核去相关) — l6 无 Foldiak
+    ("l4", "W_04", "W_t4", "E_04", "E_t4"),
+    ("l2", "W_42", "W_t2", "E_42", "E_t2"),
+    ("l3", "W_23", "W_t3", "E_23", "E_t3"),
+    ("l5", "W_35", "W_t5", "E_l5", "E_t5"),
+    ("l6", "W_56", "W_t6", "", "E_t6"),
+)
+_BY_LAYER = (  # (名字模板, 形态, 处理者)
+    ("{w}", "row", "done"),
+    ("{w}_elig", "row", "aux"),
+    ("bias_{l}", "vec", "done"),
+    ("{t}", "sq", "done"),
+    ("{t}_elig", "sq", "aux"),
+    ("{e}", "sq", "aux"),
+    ("{et}", "sq", "aux"),
+    ("_theta_{l}", "vec", "aux"),
+    ("_death_row_{l}", "vec", "done"),
+    ("_probation_counter_{l}", "vec", "done"),
+    ("_stp_r_{l}", "vec", "aux"),
+    ("_stp_tau_{l}", "vec", "aux"),
+    ("_stp_u_{l}", "vec", "aux"),
+    ("_stp_active_ema_{l}", "vec", "aux"),
+)
+_L4_ONLY = (  # 行 = L4
+    ("b_diff", "vec", "aux"),
+    ("E_bind", "sq", "aux"),
+    ("_theta_w", "vec", "aux"),
+    ("_theta_w04", "vec", "aux"),
+    ("_theta_wt4", "vec", "aux"),
+    ("W_diff", "sq", "done"),
+    ("W_diff_elig", "sq", "aux"),
+    ("W_state_pred", "sq", "done"),
+    ("W_state_pred_elig", "sq", "aux"),
+    ("W_pred_43", "row", "done"),
+    ("W_pred_43_elig", "row", "aux"),
+    ("W_bind", "row", "done"),
+    ("W_bind_elig", "row", "aux"),
+)
+_L5_ONLY = (
+    ("M_l5", "sq", "aux"),
+    ("W_pred_54", "row", "done"),
+    ("W_pred_54_elig", "row", "aux"),
+)
+_SPECIAL = ("W1", "W1_elig", "_dw_buf", "_mem_m", "_gain_mask", "_gain_l3")
+_EXEMPT = ("W_bind_self_elig", "W_act_elig", "W_lm_elig", "W_lm_2_elig")
+
+
+def _row_state() -> dict[str, tuple[str, str, str]]:
+    t: dict[str, tuple[str, str, str]] = {}
+    for lyr, w, wt, e, et in _LAYERS:
+        for tmpl, form, handler in _BY_LAYER:
+            name = tmpl.format(w=w, t=wt, e=e, et=et, l=lyr)
+            if name:
+                t[name] = (lyr, form, handler)
+    for lyr, spec in (("l4", _L4_ONLY), ("l5", _L5_ONLY)):
+        t.update({n: (lyr, f, h) for n, f, h in spec})
+    t.update(dict.fromkeys(_SPECIAL, ("l4", "special", "done")))
+    t.update(dict.fromkeys(_EXEMPT, ("-", "exempt", "exempt")))
+    from model.model_cyrene import _ACTIVE_EMA_LAYER
+
+    t.update({f"_active_ema_{a}": (lyr, "vec", "aux") for a, lyr in _ACTIVE_EMA_LAYER.items()})
+    return t
+
+
+ROW_STATE = _row_state()
+
+
 class PruningEngine:
-    """修剪引擎: 持 net 引用, 操作 net.active_size/_death_row/权重张量."""
+    """修剪引擎: 持 net 引用, 操作 net.active_size/_death_row_*/权重张量."""
 
     def __init__(self, net: DensePCNet):
         self.net = net
@@ -29,13 +99,8 @@ class PruningEngine:
         expired_flags: dict[str, torch.Tensor | None] = {}
         for layer in layers:
             active = net.active_size[layer]
-            dr = net._death_row.get(layer)
-            pc = net._probation_counter.get(layer)
-            if dr is None or pc is None:
-                expired_flags[layer] = None
-                continue
-            dr_a = dr[:active]
-            pc_a = pc[:active]
+            dr_a = getattr(net, f"_death_row_{layer}")[:active]
+            pc_a = getattr(net, f"_probation_counter_{layer}")[:active]
             in_death = dr_a.bool()
             expired = in_death & (pc_a >= dprob)
             W = getattr(net, self._W_attr[layer])
@@ -93,14 +158,8 @@ class PruningEngine:
             dead = torch.zeros(0, dtype=torch.long, device=rn.device)
         perm = torch.cat([keep, probation, dead])
 
-        dr = net._death_row.get(layer)
-        pc = net._probation_counter.get(layer)
-        new_dr = (
-            torch.zeros(active, dtype=torch.int8, device=rn.device) if dr is None else dr[:active].clone()
-        )
-        new_pc = (
-            torch.zeros(active, dtype=torch.int16, device=rn.device) if pc is None else pc[:active].clone()
-        )
+        new_dr = getattr(net, f"_death_row_{layer}")[:active].clone()
+        new_pc = getattr(net, f"_probation_counter_{layer}")[:active].clone()
 
         if expired is not None:
             new_dr[expired] = 0
@@ -111,31 +170,45 @@ class PruningEngine:
         W.data = W.data[perm].contiguous()
         W_t = getattr(net, self._t_attr[layer])
         W_t.data = W_t.data[perm][:, perm].contiguous()
-        # W_t* decorr 状态同 perm (Et 行列 = 该层神经元, 错位 → decorr 拆错方向)
-        et_attr = {"l4": "E_t4", "l5": "E_t5"}
-        if layer in et_attr:
-            Et = getattr(net, et_attr[layer])
-            Et.data = Et.data[perm][:, perm].contiguous()
         b = getattr(net, self._b_attr[layer])
         b.data = b.data[perm].contiguous()
 
         # L5 专属 perm: 方阵三张 + 行列向量
         if layer == "l5":
-            old_ml5 = net.M_l5.data
-            net.M_l5 = nn.Parameter(old_ml5[perm][:, perm].contiguous())  # [dim_5, dim_5]
-            del old_ml5
-            old_el5 = net.E_l5.data
-            net.E_l5 = nn.Parameter(old_el5[perm][:, perm].contiguous())  # [dim_5, dim_5]
-            del old_el5
             net.W_pred_54.data = net.W_pred_54.data[perm].contiguous()  # 行=L5 (列=L4 由 _sync_l4_aux)
             old_gm = net._gain_mask.data
             net.register_buffer("_gain_mask", old_gm[perm].contiguous())  # 行=L5 (列=L3 由 l3 分支)
             del old_gm
 
-        net._death_row[layer] = new_dr[perm]
-        net._probation_counter[layer] = new_pc[perm]
+        net.register_buffer(f"_death_row_{layer}", new_dr[perm])
+        net.register_buffer(f"_probation_counter_{layer}", new_pc[perm])
         perm_map[layer] = perm
         return perm, n_alive
+
+    def _sync_layer_state(self, layer: str, n_alive: int, perm: torch.Tensor | None) -> None:
+        """层内行索引状态同步: 按 ROW_STATE 逐项 perm 重排 + 收缩 (perm=None 时只收缩)."""
+        net = self.net
+        for name, (lyr, form, handler) in ROW_STATE.items():
+            if handler != "aux" or lyr != layer:
+                continue
+            buf = getattr(net, name, None)
+            if not isinstance(buf, torch.Tensor):
+                continue
+            new = buf
+            if perm is not None and buf.shape[0] == perm.numel():
+                new = buf[perm][:, perm] if form == "sq" else buf[perm]
+            if new.shape[0] != n_alive:
+                new = new[:n_alive, :n_alive] if form == "sq" else new[:n_alive]
+            if new is not buf:
+                if name in net._parameters:  # b_diff 等是 nn.Parameter
+                    setattr(net, name, nn.Parameter(new.contiguous()))
+                else:
+                    net.register_buffer(name, new.contiguous())
+        if layer in net._stp_r_end:  # STP 资源窗口写回 (dict, 非 buffer)
+            old_r = net._stp_r_end[layer]
+            if perm is not None and old_r.shape[0] == perm.numel():
+                old_r = old_r[perm]
+            net._stp_r_end[layer] = old_r[:n_alive].contiguous()
 
     def _sync_l4_aux(self, perm: torch.Tensor) -> None:
         """L4 行重排 → 同步重排所有 L4 行映射权重 (错位 → 修剪后首爆 NaN)."""
@@ -170,15 +243,6 @@ class PruningEngine:
         old_buf = net._dw_buf.data  # [4,L,L] 环形缓冲同 perm (缓冲与 W_diff 行错位 → 更新错乱)
         net.register_buffer("_dw_buf", old_buf[:, perm][:, :, perm].contiguous())
         del old_buf
-        old_thw = net._theta_w.data
-        net.register_buffer("_theta_w", old_thw[perm].contiguous())  # BCM 滑阈对齐 W_diff 行
-        del old_thw
-        old_eb = net.E_bind.data
-        net.E_bind = nn.Parameter(old_eb[perm][:, perm].contiguous())
-        del old_eb
-        old_e04 = net.E_04.data
-        net.E_04 = nn.Parameter(old_e04[perm][:, perm].contiguous())
-        del old_e04
 
     def _shrink_columns(
         self, layer: str, n_alive: int, src: str, src_n: int, perm_map: dict[str, torch.Tensor]
@@ -194,13 +258,13 @@ class PruningEngine:
             old = old[:, src_perm]
         setattr(net, self._W_attr[layer], nn.Parameter(old[:n_alive, :src_n].contiguous()))
         del old
-        # W_attr 同形 _elig 迹同步
+        # W_attr 同形 _elig 迹: 只同步列 (行由 _sync_layer_state 按 perm 处理)
         W_elig_name = f"{self._W_attr[layer]}_elig"
         if hasattr(net, W_elig_name):
             old_ew = getattr(net, W_elig_name).data
             if src_perm is not None and old_ew.shape[1] == src_perm.numel():
                 old_ew = old_ew[:, src_perm]
-            net.register_buffer(W_elig_name, old_ew[:n_alive, :src_n].contiguous())
+            net.register_buffer(W_elig_name, old_ew[:, :src_n].contiguous())
             del old_ew
         # _gain_l3 列 = L2 神经元, 用 L2 自己的 perm (非 src perm)
         l2_perm = perm_map.get("l2")
@@ -250,12 +314,6 @@ class PruningEngine:
         old_t = W_t.data
         setattr(net, self._t_attr[layer], nn.Parameter(old_t[:n_alive, :n_alive].contiguous()))
         del old_t
-        # t_attr 同形 _elig 迹同步 (方阵)
-        Wt_elig_name = f"{self._t_attr[layer]}_elig"
-        if hasattr(net, Wt_elig_name):
-            old_et = getattr(net, Wt_elig_name).data
-            net.register_buffer(Wt_elig_name, old_et[:n_alive, :n_alive].contiguous())
-            del old_et
 
         b = getattr(net, self._b_attr[layer])
         old_b = b.data
@@ -273,35 +331,16 @@ class PruningEngine:
             Wp54e_name = "W_pred_54_elig"
             if hasattr(net, Wp54e_name):
                 old_p54e = getattr(net, Wp54e_name).data
-                net.register_buffer(Wp54e_name, old_p54e[:n_alive, :a4_cur].contiguous())
+                net.register_buffer(Wp54e_name, old_p54e[:, :a4_cur].contiguous())
                 del old_p54e
             # _gain_mask 行=L5 裁 (列=L3 在上面 layer==l3 分支已裁到 a3_cur)
             old_gm = net._gain_mask.data
             net.register_buffer("_gain_mask", old_gm[:n_alive, :a3_cur].contiguous())
             del old_gm
-            # 方阵三张: M_l5 / E_l5 / E_t5
-            for attr in ("M_l5", "E_l5", "E_t5"):
-                old_x = getattr(net, attr).data
-                setattr(net, attr, nn.Parameter(old_x[:n_alive, :n_alive].contiguous()))
-                del old_x
-            # BCM 滑阈 _theta_l5
-            old_thl5 = net._theta_l5.data
-            net.register_buffer("_theta_l5", old_thl5[:n_alive].contiguous())
-            del old_thl5
-            # STP l5 四兄弟 (r / tau / u / act_ema)
-            for attr in ("_stp_r_l5", "_stp_tau_l5", "_stp_u_l5", "_stp_active_ema_l5"):
-                old_x = getattr(net, attr).data
-                net.register_buffer(attr, old_x[:n_alive].contiguous())
-                del old_x
-            # act_ema L5 四兄弟: w35 / wt5 / wp54 / b5
-            for attr in ("_active_ema_w35", "_active_ema_wt5", "_active_ema_wp54", "_active_ema_b5"):
-                old_x = getattr(net, attr).data
-                net.register_buffer(attr, old_x[:n_alive].contiguous())
-                del old_x
-
-        if net._death_row[layer] is not None:
-            net._death_row[layer] = net._death_row[layer][:n_alive]
-            net._probation_counter[layer] = net._probation_counter[layer][:n_alive]
+        self._sync_layer_state(layer, n_alive, perm_map.get(layer))
+        for _bn in (f"_death_row_{layer}", f"_probation_counter_{layer}"):
+            old_x = getattr(net, _bn).data
+            net.register_buffer(_bn, old_x[:n_alive].contiguous())
 
         net.active_size[layer] = n_alive
 
@@ -432,3 +471,14 @@ class PruningEngine:
             old_tht4 = net._theta_wt4.data
             net.register_buffer("_theta_wt4", old_tht4[: net.active_size["l4"]].contiguous())  # homeostatic 滑阈
             del old_tht4
+        # 缓冲随活性同步 (形状比较幂等): 既有清单曾漏这几条 — 死亡回合收缩后第一步 learn 即崩
+        # (temporal.py `_dw_slot.copy_(dW_diff_t)` shape 失配), 同类漏项在此一次收口.
+        a4, a5 = net.active_size["l4"], net.active_size["l5"]
+        for name, want in (("_dw_slot", (None, a4, a4)),
+                           ("_z4_fut_buf", (None, None, a4)),
+                           ("_z5_fut_buf", (None, None, a5)),
+                           ("_theta_w04", (a4,))):
+            buf = getattr(net, name)
+            target = tuple(s if s is not None else b for s, b in zip(want, buf.shape))
+            if buf.shape != target:
+                net.register_buffer(name, buf[tuple(slice(0, w) for w in target)].contiguous())
