@@ -37,7 +37,7 @@ import time
 import torch
 from world_lang import WorldLangPhysics
 
-from dataset import DualChannelDataset
+from dataset import ByteDataset
 from model import CyreneModel, DensePCNet
 from model.modulation import rms_norm
 from pkg.cli.utils import run_file
@@ -104,7 +104,7 @@ def build_gauge(data_path, dev):
 
     def extract(line_str):
         sample = json.loads(line_str)
-        return DualChannelDataset._extract_with_roles(sample)[0]
+        return ByteDataset._extract_with_roles(sample)[0]
 
     tail_bytes = bytearray()
     for l in tail_raw:
@@ -426,7 +426,7 @@ class _SamplePrefetch:
         pos = start
         while True:
             try:
-                b, _ = ds[idxs[pos % n]]
+                b = ds[idxs[pos % n]]
                 x = b.unsqueeze(0).pin_memory().to(dev, non_blocking=True)
             except Exception as e:  # 预取失败 → 主线程 get() 处重抛, 不静默挂死
                 self._q.put(e)
@@ -511,7 +511,7 @@ def main():
                    encoding="utf-8", buffering=1)
 
     lazy = args.max_samples > 100000
-    ds = DualChannelDataset(args.data, max_length=S_MAX,
+    ds = ByteDataset(args.data, max_length=S_MAX,
                             max_samples=args.max_samples or None, lazy=lazy)
     idxs = list(range(len(ds)))
     random.shuffle(idxs)

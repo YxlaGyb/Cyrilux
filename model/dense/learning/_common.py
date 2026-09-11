@@ -9,7 +9,7 @@ import torch
 if TYPE_CHECKING:
     from model.model_cyrene import DensePCNet
 
-from model.constants import ELIG_GAMMA, LM_TRUST_REGION
+from model.constants import ELIG_GAMMA
 
 
 class _MixinBase:

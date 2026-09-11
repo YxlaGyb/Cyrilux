@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import torch
 
-from ...modulation import soft_norm_preserve
 from model.modulation import rms_norm
+
+from ...modulation import soft_norm_preserve
 from ._common import _decorr_W, _elig_accum, _MixinBase
 
 
@@ -22,8 +23,11 @@ class BindMixin(_MixinBase):
         """Foldiak 反赫布侧抑制更新: dM = z_out 协方差 (白化本质), 零对角, 指数遗忘防爆炸.
 
         z_out 已逐行 RMS 归一化, 协方差元素 ∈[-1,1], 增量 fp16 直接可表示 (不做 Frobenius 归一化).
+        回声相位冻结 (C5 合约).
         """
         net = self.net
+        if ctx.echo_world_frozen:
+            return
         dev = ctx.dev
         dim_5 = ctx.dim_5
         z5 = net._z5
@@ -113,7 +117,7 @@ class BindMixin(_MixinBase):
                 zb = net._bind_vec
                 zb_pre = zb[:, :-1]  # [N,S-1,K]
                 zb_post = zb[:, 1:]  # [N,S-1,K] 对齐 learn_mask (t+1)
-                zb_post = zb_post * ctx.learn_mask.to(torch.float16).unsqueeze(0).unsqueeze(-1)
+                zb_post = zb_post * ctx.learn_mask.to(torch.float16).unsqueeze(-1)
                 # (振荡器 A/intr 已在上方推进 — P3-b 每步; 此处用同一本步相位)
                 dW_self = (
                     zb_pre.transpose(-2, -1) @ ((zb_post - zb_post.mean(dim=-1, keepdim=True)) * intr)

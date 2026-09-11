@@ -35,7 +35,6 @@ _BY_LAYER = (  # (名字模板, 形态, 处理者)
     ("{t}_elig", "sq", "aux"),
     ("{e}", "sq", "aux"),
     ("{et}", "sq", "aux"),
-    ("_theta_{l}", "vec", "aux"),
     ("_death_row_{l}", "vec", "done"),
     ("_probation_counter_{l}", "vec", "done"),
     ("_stp_r_{l}", "vec", "aux"),
@@ -60,6 +59,7 @@ _L4_ONLY = (  # 行 = L4
 )
 _L5_ONLY = (
     ("M_l5", "sq", "aux"),
+    ("_theta_l5", "vec", "aux"),
     ("W_pred_54", "row", "done"),
     ("W_pred_54_elig", "row", "aux"),
 )

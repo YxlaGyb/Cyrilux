@@ -12,7 +12,7 @@ Usage:
 import argparse, math, random, time, torch
 from torch.utils.data import DataLoader
 from model._archived_sparse import CyreneModel
-from dataset import DualChannelDataset
+from dataset import ByteDataset
 
 torch.set_grad_enabled(False)
 
@@ -40,7 +40,7 @@ def test_perplexity(model: CyreneModel, data_path: str, max_samples: int = 100):
     print(f"数据集: {data_path} ({max_samples} 样本)")
     print(f"{'=' * 60}")
 
-    ds = DualChannelDataset(data_path, max_length=128, max_samples=max_samples)
+    ds = ByteDataset(data_path, max_length=128, max_samples=max_samples)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
     total_loss = 0.0
@@ -218,21 +218,21 @@ def test_compare_ckpts(path_a: str, path_b: str, data_path: str):
     for path in [path_a, path_b]:
         m = CyreneModel.load(path)
         m.bridge.set_warmup(0)
-        ds = DualChannelDataset(data_path, max_length=64, max_samples=20)
+        ds = ByteDataset(data_path, max_length=64, max_samples=20)
         loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
         total_loss = 0.0
         n = 0
         t0 = time.perf_counter()
 
-        for byte_seq, labels in loader:
+        for byte_seq in loader:
             byte_seq = byte_seq.to(m.device)
             S = byte_seq.shape[-1]
             for pos in range(1, S):
-                target = labels[0, pos - 1].item()
-                if target == -100:
-                    continue
-                context = byte_seq[:, :, :pos].contiguous()
+                target = byte_seq[0, pos - 1].item()
+                if target < 32:
+                    continue  # _mask_print 输出域外 (pad 0x00 等) 不计
+                context = byte_seq[:, :pos].contiguous()
                 if context.shape[-1] < 13:
                     continue
                 m.step(context)

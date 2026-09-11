@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from _probe_meta import config_meta
 
-from dataset import DualChannelDataset  # noqa: E402
+from dataset import ByteDataset  # noqa: E402
 from model import DensePCNet  # noqa: E402
 from pkg.cli.utils import run_file  # noqa: E402
 
@@ -42,10 +42,10 @@ def main() -> None:
     torch.set_grad_enabled(False)
     dev = "cuda"
     net = DensePCNet.load(args.ckpt).to(dev)
-    ds = DualChannelDataset(args.data, max_length=args.max_length, max_samples=1270000, lazy=True)
+    ds = ByteDataset(args.data, max_length=args.max_length, max_samples=1270000, lazy=True)
 
     # 预热
-    b, _ = ds[1]
+    b = ds[1]
     x = b.unsqueeze(0).to(dev)
     for _ in range(2):
         net.learn(x)

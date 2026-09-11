@@ -9,12 +9,15 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from model import CyreneModel, DensePCNet
 from model.dense.pruning import ROW_STATE, PruningEngine
+from model.model_cyrene import read_checkpoint_metadata
 
 # 首维命中层尺寸但按槽位/位置索引的 (bind 维恰好等于 d_l2, 故需显式豁免)
 _AUDIT_ALLOWLIST = (
@@ -105,6 +108,45 @@ def test_weights_only_snapshot_refused(tmp_path):
     save_file({k: v.contiguous() for k, v in net.state_dict().items()}, str(p))
     with pytest.raises(ValueError, match="weights-only"):
         DensePCNet.load(str(p))
+
+
+def test_unknown_state_key_refused(tmp_path):
+    """未知 state 键 → raise (C9 fail-fast, 不静默丢弃); attr.* 豁免不触发.
+
+    正常检查点 sd 内本就含 attr.* 游离键 → load 成功即豁免的活证.
+    """
+    net = DensePCNet(_cfg())
+    for i in range(2):
+        _step(net, i)
+    p = tmp_path / "ck.safetensors"
+    net.save(str(p))
+    DensePCNet.load(str(p), _cfg())  # attr.* 在 sd → 不 raise (豁免)
+    # clone 脱离 load_file 的 mmap (Windows 下被 load 持有的视图未及释放, 同路径重存 1224)
+    blob = {k: v.clone() for k, v in load_file(str(p), device="cpu").items()}
+    blob["W_retired_fossil"] = blob["W_04"].clone()
+    p2 = tmp_path / "ck_fossil.safetensors"
+    save_file(blob, str(p2), metadata=dict(read_checkpoint_metadata(str(p))))
+    with pytest.raises(ValueError, match="未知 state 键"):
+        DensePCNet.load(str(p2), _cfg())
+
+
+def test_unknown_config_field_refused(tmp_path):
+    """config 快照含未知字段 → raise (C9: 化石口径错配不静默过滤)."""
+    net = DensePCNet(_cfg())
+    for i in range(2):
+        _step(net, i)
+    p = tmp_path / "ck.safetensors"
+    net.save(str(p))
+    # clone 脱离 load_file 的 mmap (Windows 下同路径重存会 os error 1224)
+    blob = {k: v.clone() for k, v in load_file(str(p), device="cpu").items()}
+    meta = dict(read_checkpoint_metadata(str(p)))
+    cfg_kv = json.loads(meta["config"])
+    cfg_kv["bind_dim"] = 4096  # 已退役字段 (批 5b)
+    meta["config"] = json.dumps(cfg_kv)
+    p2 = tmp_path / "ck_fossil_cfg.safetensors"
+    save_file(blob, str(p2), metadata=meta)
+    with pytest.raises(ValueError, match="未知字段"):
+        DensePCNet.load(str(p2), _cfg())
 
 
 def test_pruned_checkpoint_roundtrips(tmp_path):

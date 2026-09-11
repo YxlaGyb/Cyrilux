@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import torch
 
-from ...modulation import soft_norm_preserve
 from model.modulation import rms_norm
+
+from ...modulation import soft_norm_preserve
 from ._common import _elig_accum, _energy_constraint, _MixinBase, _rho_ctrl
 
 # 折扣多步预测目标 (未来引力): 目标 = 未来 K 步折扣和
@@ -24,7 +25,6 @@ class PredictMixin(_MixinBase):
     def _update_pred_engine(self, ctx, sh):
         """未来折扣目标 + W_pred_54/43 更新 + W_35/W_42 注入 + local_err 诊断."""
         net = self.net
-        dev = ctx.dev
         free_run = ctx.free_run
         dim_3, dim_4, dim_5 = ctx.dim_3, ctx.dim_4, ctx.dim_5
         z4, z3, z5 = net._z4, net._z3, net._z5
@@ -65,11 +65,13 @@ class PredictMixin(_MixinBase):
         err5_m = rms_norm(local_err_l5[:, mask5])  # [N,T5,dim_5]
         err4_m = rms_norm(local_err_l4[:, mask4])  # [N,T4,dim_4]
         z3_m = z3[:, mask5]
-        dW_pred35 = (err5_m.transpose(-2, -1) @ rms_norm(z3_m)).mean(dim=0) / max(1, int(mask5.sum()))
-        Wb.data += _rho_ctrl(dW_pred35 * ctx.eta * rpe * 1.5, Wb, "inj35", net)
-        # free_run+突触缩放时豁免 soft_norm (行范数 = 增益自由度归系统, 训练模式保持)
-        if not (free_run and net.cfg.wt_syn_scaling):
-            soft_norm_preserve(Wb.data)
+        # W_35 注入 + 软范数: 回声相位冻结 (C5 合约: W_35 全族)
+        if not ctx.echo_world_frozen:
+            dW_pred35 = (err5_m.transpose(-2, -1) @ rms_norm(z3_m)).mean(dim=0) / max(1, int(mask5.sum()))
+            Wb.data += _rho_ctrl(dW_pred35 * ctx.eta * rpe * 1.5, Wb, "inj35", net)
+            # free_run+突触缩放时豁免 soft_norm (行范数 = 增益自由度归系统, 训练模式保持)
+            if not (free_run and net.cfg.wt_syn_scaling):
+                soft_norm_preserve(Wb.data)
         if not free_run and not ctx.echo_world_frozen:
             # W_42 注入: local_err_L4 逆映射到 dim_2 (free_run/回声相位 W_42 冻结)
             z4_m = z4[:, mask4]

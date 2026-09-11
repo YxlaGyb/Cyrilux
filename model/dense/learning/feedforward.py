@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import torch
 
-from ...modulation import soft_norm_preserve
 from model.modulation import rms_norm
+
+from ...modulation import soft_norm_preserve
 from ._common import _activity_baseline, _decorr_W, _elig_accum, _energy_constraint, _MixinBase, _rho_ctrl
 
 
@@ -61,7 +62,7 @@ class FeedforwardMixin(_MixinBase):
     def _update_feed_ff(self, ctx, sh):
         """W_04/W_42/W_56/W_23 + eps_state 融合 + W_state_pred 自更新."""
         net = self.net
-        dev, N = ctx.dev, ctx.N
+        dev = ctx.dev
         free_run, echo_world_frozen = ctx.free_run, ctx.echo_world_frozen
         inv_s, eta = ctx.inv_s, ctx.eta
         dim_4, dim_2, dim_3, dim_6 = ctx.dim_4, ctx.dim_2, ctx.dim_3, ctx.dim_6
@@ -113,12 +114,13 @@ class FeedforwardMixin(_MixinBase):
             net.W_42[:dim_2].data += (dW42 * (~col_mask).to(torch.float16)) * eta
             _decorr_W(net.W_42[:dim_2].data, net.E_42[:dim_2, :dim_2], learn_boost=ctx.learn_boost)
         # 字节域块结束: free_run / echo_world_frozen 冻结 W_04/W_42 (感知链)
-        # W_56 (L5→L6 内部动力学) 在自由运行同样学习
-        dW_56 = (sh.errs.eps6_precise.transpose(-2, -1) @ rms_norm(z5)).mean(dim=0) * inv_s
-        dW_56 = _energy_constraint(net, net.W_56[:dim_6].data, dW_56, sh.errs.eps6_precise, "_active_ema_w56")
-        dW_56 = dW_56 + _elig_accum(net, "W_56", dW_56) * getattr(net, "_survival_signal", net._zero1)
-        col_mask = torch.rand(net.W_56[:dim_6].shape[0], 1, device=dev) < net.cfg.column_dropout
-        net.W_56[:dim_6].data += (dW_56 * (~col_mask).to(torch.float16)) * eta
+        # W_56 (L5→L6 内部动力学) 在自由运行同样学习; 回声冻结 (C5 合约)
+        if not echo_world_frozen:
+            dW_56 = (sh.errs.eps6_precise.transpose(-2, -1) @ rms_norm(z5)).mean(dim=0) * inv_s
+            dW_56 = _energy_constraint(net, net.W_56[:dim_6].data, dW_56, sh.errs.eps6_precise, "_active_ema_w56")
+            dW_56 = dW_56 + _elig_accum(net, "W_56", dW_56) * getattr(net, "_survival_signal", net._zero1)
+            col_mask = torch.rand(net.W_56[:dim_6].shape[0], 1, device=dev) < net.cfg.column_dropout
+            net.W_56[:dim_6].data += (dW_56 * (~col_mask).to(torch.float16)) * eta
 
         # 预测编码融合: eps_state = (z4 @ W_state_pred) - Δz4, 让表示层同时携带"未来往哪走"
         W_sp_a = net.W_state_pred[:dim_4, :dim_4]
@@ -134,16 +136,17 @@ class FeedforwardMixin(_MixinBase):
         # L3 种子: 随机增益 + 误差门控; _gain_l3 固定 [384,384], 修剪后按活性行切片
         dim_3 = ctx.dim_3
         gain_l3 = net._gain_l3[:dim_3, :dim_3] if dim_3 < 384 else net._gain_l3[:dim_3, :]
-        dW23 = (eps3_pc.transpose(-2, -1) @ rms_norm(z2)).mean(dim=0) * inv_s
-        dW23 = _energy_constraint(net, net.W_23[:dim_3].data, dW23, eps3_pc, "_active_ema_w23")
-        dW23 = dW23 + _elig_accum(net, "W_23", dW23) * getattr(net, "_survival_signal", net._zero1)
-        err3_norm = sh.errs.eps3.pow(2).mean(dim=(0, 1)).sqrt() + 1e-8  # [dim_3] 每神经元
-        gate3 = 0.1 + 0.9 * (err3_norm / err3_norm.max())
-        dW23 = dW23 * gain_l3 * gate3.unsqueeze(1)
-        c3_mask = torch.rand(dim_3, 1, device=dev) < net.cfg.column_dropout
-        net.W_23[:dim_3].data += (dW23 * (~c3_mask).to(torch.float16)) * eta
-        soft_norm_preserve(net.W_23[:dim_3].data)  # 0.8-1.2: 增益幅度保留, 权重有界
-        _decorr_W(net.W_23[:dim_3].data, net.E_23[:dim_3, :dim_3], learn_boost=ctx.learn_boost)
+        if not echo_world_frozen:  # W_23 世界模型, 回声冻结 (C5 合约, 含 soft_norm/decorr)
+            dW23 = (eps3_pc.transpose(-2, -1) @ rms_norm(z2)).mean(dim=0) * inv_s
+            dW23 = _energy_constraint(net, net.W_23[:dim_3].data, dW23, eps3_pc, "_active_ema_w23")
+            dW23 = dW23 + _elig_accum(net, "W_23", dW23) * getattr(net, "_survival_signal", net._zero1)
+            err3_norm = sh.errs.eps3.pow(2).mean(dim=(0, 1)).sqrt() + 1e-8  # [dim_3] 每神经元
+            gate3 = 0.1 + 0.9 * (err3_norm / err3_norm.max())
+            dW23 = dW23 * gain_l3 * gate3.unsqueeze(1)
+            c3_mask = torch.rand(dim_3, 1, device=dev) < net.cfg.column_dropout
+            net.W_23[:dim_3].data += (dW23 * (~c3_mask).to(torch.float16)) * eta
+            soft_norm_preserve(net.W_23[:dim_3].data)  # 0.8-1.2: 增益幅度保留, 权重有界
+            _decorr_W(net.W_23[:dim_3].data, net.E_23[:dim_3, :dim_3], learn_boost=ctx.learn_boost)
         # 状态预测矩阵自更新 (纯赫布): dW_sp = z4^T @ eps_state; echo_world_frozen 时冻结 (世界模型)
         if not echo_world_frozen:
             dW_sp = (net._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0)
@@ -153,13 +156,15 @@ class FeedforwardMixin(_MixinBase):
             soft_norm_preserve(W_sp_a.data)
 
     def _update_W35(self, ctx, sh):
-        """W_35 更新: 预测编码融合误差全量驱动."""
+        """W_35 更新: 预测编码融合误差全量驱动. 回声相位整族冻结 (C5 合约)."""
         net = self.net
+        if ctx.echo_world_frozen:
+            return  # W_35 全族 (Hebb+θ_l5+decorr+soft_norm) 世界模型, 回声零触碰
         dev, N, S = ctx.dev, ctx.N, ctx.S
-        free_run, echo_world_frozen = ctx.free_run, ctx.echo_world_frozen
+        free_run = ctx.free_run
         dim_3, dim_5 = ctx.dim_3, ctx.dim_5
         z3, z5 = net._z3, net._z5
-        if not free_run and not echo_world_frozen:
+        if not free_run:
             # 预测编码向下平移: W_lm 误差 → dim_3 (补零对齐 S, 经 W_42 逆映射)
             eps_lm_proj_pad = torch.cat(
                 [sh.lm.eps_lm_proj, net._padmax[:, :, :ctx.dim_4]], dim=1
@@ -170,7 +175,7 @@ class FeedforwardMixin(_MixinBase):
         eps_b = z5_b[:, 1:] - z5_b[:, :-1]  # 时序差分误差
         z3_b = z3[:, :-1]
         z3_bp = z3_b * (torch.rand_like(z3_b) > 0.3).to(torch.float16)
-        if not free_run and not echo_world_frozen:
+        if not free_run:
             # 融合: eps_b = 时序差分 + 0.5 × LM 误差投影回 L5
             eps_lm_b = eps_lm_3[:, :-1] @ net.W_35[:dim_5].T  # [N,S-1,dim_5]
             eps_lm_b = rms_norm(eps_lm_b)
@@ -250,12 +255,14 @@ class FeedforwardMixin(_MixinBase):
     def _final_softnorm(self, ctx, sh):
         """前馈权重软范数保持 (0.8-1.2): 无 BCM 约束的权重长训累积溢出 fp16.
 
-        free_run / echo_world_frozen 时 W_04/W_42/W_diff 冻结不触碰; W_56 恒保持.
+        echo_world_frozen 时全族冻结不触碰 (soft_norm 非幂等, 触碰即漏气); free_run 只保 W_56.
         """
         net = self.net
-        free_run, echo_world_frozen = ctx.free_run, ctx.echo_world_frozen
+        if ctx.echo_world_frozen:
+            return
+        free_run = ctx.free_run
         dim_4, dim_2, dim_6 = ctx.dim_4, ctx.dim_2, ctx.dim_6
-        if not free_run and not echo_world_frozen:
+        if not free_run:
             for W, a_sz in zip([net.W_04, net.W_42], [dim_4, dim_2]):
                 soft_norm_preserve(W[:a_sz].data)
             soft_norm_preserve(net.W_diff[:dim_4, :dim_4].data)

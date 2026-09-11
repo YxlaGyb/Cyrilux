@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import torch
 
-from ...modulation import soft_norm_preserve
 from model.constants import DIFF_TRUST_REGION
 from model.modulation import rms_norm
+
+from ...modulation import soft_norm_preserve
 from ._common import _decorr_W, _elig_accum, _energy_constraint, _MixinBase, _spectral_radius_guard
 
 
@@ -24,7 +25,7 @@ class TemporalMixin(_MixinBase):
         net = self.net
         if ctx.free_run or ctx.echo_world_frozen:
             return None
-        dev, N = ctx.dev, ctx.N
+        N = ctx.N
         dim_4 = ctx.dim_4
         W_diff_a = net.W_diff[:dim_4, :dim_4]
         dz4 = net._z4[:, 1:] - net._z4[:, :-1]
@@ -112,9 +113,13 @@ class TemporalMixin(_MixinBase):
         net.b_diff[:dim_4].data += future_e * ctx.eta
 
     def _update_wt_family(self, ctx, sh):
-        """时序 Hebbian (W_t 学习, 高确定性时增强 → 记忆巩固) + 谱守卫."""
+        """时序 Hebbian (W_t 学习, 高确定性时增强 → 记忆巩固) + 谱守卫.
+
+        回声相位整族冻结 (C5 合约): W_t 全族 + θ_wt4 + decorr + 谱守卫零触碰.
+        """
         net = self.net
-        dev = ctx.dev
+        if ctx.echo_world_frozen:
+            return
         free_run = ctx.free_run
         a_sizes = [ctx.dim_4, ctx.dim_2, ctx.dim_3, ctx.dim_5, ctx.dim_6]
         eta_t = ctx.eta_t

@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 from model._archived_sparse.continual.forgetting_sniffer import ForgettingSniffer
 from model._archived_sparse.continual.memory_bank import MemoryBank
-from dataset import DualChannelDataset
+from dataset import ByteDataset
 from model._archived_sparse import CyreneConfig, CyreneModel
 from pkg.utils.trainer_utils import setup_seed
 
@@ -45,28 +45,28 @@ def warmup(runner, batch_size=None, seq_len=None, device=None):
 @torch.no_grad()
 def evaluate(runner, data_path, max_seq_len, batch_size, max_samples, device):
     """评估 runner 在数据集上的 CE."""
-    ds = DualChannelDataset(data_path, max_length=max_seq_len, max_samples=max_samples)
+    ds = ByteDataset(data_path, max_length=max_seq_len, max_samples=max_samples)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
     total_ce, total_tokens = 0.0, 0
 
-    for bt, lt in loader:
-        bt, lt = bt.to(device), lt.to(device)
-        # bt: [bsz, 2, seq], lt: [bsz, seq]
-        seq_len = bt.size(2)
+    for bt in loader:
+        bt = bt.to(device)
+        # bt: [bsz, seq]
+        seq_len = bt.size(1)
 
         for i in range(bt.size(0)):
-            inp = bt[i:i+1]  # [1, 2, seq]
+            inp = bt[i:i+1]  # [1, seq]
             runner.step(inp)
 
         # 收集每个位置的 logits 计算 loss
         for i in range(bt.size(0)):
             for pos in range(1, seq_len):
-                target = lt[i, pos].item()
-                if target == -100:
-                    continue
+                target = bt[i, pos].item()
+                if target < 32:
+                    continue  # _mask_print 输出域外 (pad 0x00 等) 不计 CE
                 # 用 runner 当前状态预测下一个 byte
                 next_idx = pos - 1
-                runner.step(bt[i:i+1, :, next_idx:next_idx+1])
+                runner.step(bt[i:i+1, next_idx:next_idx+1])
                 logits_list = runner.lm_head.predict_logits(runner.pool, runner._top_layer)  # type: ignore[arg-type]
                 if logits_list is not None and len(logits_list) > 0:
                     logits = torch.as_tensor(logits_list, device=device)
@@ -101,7 +101,7 @@ def run_phase1(runner, task_paths, epochs, max_seq_len, batch_size,
     matrix = [[0.0] * n for _ in range(n)]
 
     for i, path in enumerate(task_paths):
-        ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
+        ds = ByteDataset(path, max_length=max_seq_len, max_samples=None)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
         total_steps = len(loader) * epochs
         gs = 0
@@ -110,7 +110,7 @@ def run_phase1(runner, task_paths, epochs, max_seq_len, batch_size,
 
         print(f'\n--- [P1-{name}] {os.path.basename(path)} ---')
         for _ in range(epochs):
-            for bt, lt in loader:
+            for bt in loader:
                 gs += 1
                 bt = bt.to(device)
                 loss, mod = run_step(runner, bt, device)
@@ -162,13 +162,13 @@ def run_phase2(runner, task_paths, epochs, max_seq_len, batch_size, max_samples,
         name = chr(65 + i)
 
         print(f'\n--- [P2-{name}] {os.path.basename(path)} ---')
-        ds = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
+        ds = ByteDataset(path, max_length=max_seq_len, max_samples=None)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
         total_steps = len(loader) * epochs
         gs = 0
 
         for _ in range(epochs):
-            for bt, lt in loader:
+            for bt in loader:
                 gs += 1
                 bt = bt.to(device)
                 run_step(runner, bt, device)
@@ -203,13 +203,15 @@ def run_phase2(runner, task_paths, epochs, max_seq_len, batch_size, max_samples,
 
         # 收集 exemplars → MemoryBank
         print(f'  [P2-{name}] 收集 exemplars → MemoryBank...')
-        ds_eval = DualChannelDataset(path, max_length=max_seq_len, max_samples=None)
+        ds_eval = ByteDataset(path, max_length=max_seq_len, max_samples=None)
         n_ex = min(n_exemplars, len(ds_eval))
         idx = torch.randperm(len(ds_eval))[:n_ex].tolist()
         samples_list = []
         for idx_i in idx:
-            bt, lt = ds_eval[idx_i]
-            samples_list.append((bt, lt))
+            bt = ds_eval[idx_i]
+            lbl = bt.clone()
+            lbl[bt == 0x00] = -100  # 归档 sparse Exemplar 契约仍要 label 通道 (归档代码不改)
+            samples_list.append((bt, lbl))
         memory_bank.add_samples(name, samples_list, dopamine_score=0.5, baseline_loss=0.0)
         print(f'  {n_ex} exemplars → bank (total={memory_bank.total})')
 

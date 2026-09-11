@@ -1,8 +1,5 @@
 """
-统一双通道数据集 — DualChannelDataset
-
-ch0 = 原始 UTF-8 字节值 (float32)
-ch1 = 角色编码: pad=0 / user=1 / assistant=2 / system=3
+统一字节数据集 — ByteDataset (单通道: 原始 UTF-8 字节值)
 
 支持格式:
   1. {"conversations": [{"role":..., "content":...}, ...]}  — 含角色
@@ -19,15 +16,14 @@ import torch
 from torch.utils.data import Dataset
 
 
-class DualChannelDataset(Dataset):
+class ByteDataset(Dataset):
     def __init__(self, data_path: str, max_length: int = 128, max_samples: int | None = None, lazy: bool = False):
         super().__init__()
         self.data_path = data_path
         self.max_length = max_length
         self.max_samples = max_samples
         self.lazy = lazy
-        self.dual_tensors: list[torch.Tensor] = []  # list of [max_length] long
-        self.label_tensors: list[torch.Tensor] = []  # list of [max_length] long
+        self.byte_tensors: list[torch.Tensor] = []  # list of [max_length] long
 
         if lazy:
             # 流式模式: 只记录每行的字节偏移 (二进制读, 字节偏移), 不加载内容
@@ -47,24 +43,16 @@ class DualChannelDataset(Dataset):
                 if max_samples and i >= max_samples:
                     break
                 sample = json.loads(line)
-                raw_text, roles = self._extract_with_roles(sample)
+                raw_text, _ = self._extract_with_roles(sample)
                 byte_seq = raw_text.encode("utf-8")[:max_length]
                 padded = byte_seq.ljust(max_length, b"\x00")
-                byte_raw = torch.frombuffer(bytearray(padded), dtype=torch.uint8).clone()
-
-                # 标签先从原始字节提取 [0,255], padding 位置设为 -100
-                lbl = byte_raw.clone().long()
-                lbl[byte_raw == 0x00] = -100
-                self.label_tensors.append(lbl)
-
-                # 字节 ID: [max_length] long (0-255), padding 处为 0
-                byte_ids = byte_raw.clone().long()
-                self.dual_tensors.append(byte_ids)
+                byte_ids = torch.frombuffer(bytearray(padded), dtype=torch.uint8).clone().long()
+                self.byte_tensors.append(byte_ids)
 
     def __len__(self):
         if self.lazy:
             return len(self._offsets)
-        return len(self.dual_tensors)
+        return len(self.byte_tensors)
 
     def __getitem__(self, index):
         if self.lazy:
@@ -76,13 +64,9 @@ class DualChannelDataset(Dataset):
             raw_text, _ = self._extract_with_roles(sample)
             byte_seq = raw_text.encode("utf-8")[: self.max_length]
             padded = byte_seq.ljust(self.max_length, b"\x00")
-            byte_raw = torch.frombuffer(bytearray(padded), dtype=torch.uint8).clone()
-            lbl = byte_raw.clone().long()
-            lbl[byte_raw == 0x00] = -100
-            byte_ids = byte_raw.clone().long()
-            return byte_ids, lbl
+            return torch.frombuffer(bytearray(padded), dtype=torch.uint8).clone().long()
         # 非 lazy: 张量在 DataLoader 中会被正确复制到 GPU，clone 是冗余的 CPU 开销
-        return self.dual_tensors[index], self.label_tensors[index]
+        return self.byte_tensors[index]
 
     @staticmethod
     def _extract_with_roles(sample: dict) -> tuple[str, list]:
@@ -177,11 +161,11 @@ def load_datasets(
         max_samples: 每个文件最大样本数 (0 = 全部)。
 
     Returns:
-        ConcatDataset 包装的 DualChannelDataset 列表。
+        ConcatDataset 包装的 ByteDataset 列表。
     """
     datasets = []
     for p in paths:
-        ds = DualChannelDataset(p, max_length=max_length, max_samples=max_samples or None)
+        ds = ByteDataset(p, max_length=max_length, max_samples=max_samples or None)
         if len(ds) > 0:
             datasets.append(ds)
     return torch.utils.data.ConcatDataset(datasets)

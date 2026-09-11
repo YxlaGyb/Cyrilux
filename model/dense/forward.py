@@ -56,7 +56,6 @@ class ForwardEngine:
         """
         net = self.net
         N, S = byte_ids.shape
-        dev = byte_ids.device
         # 预分配工作缓冲: cur (续写流, 定长预分配 + 长度游标), last_byte/expect_cont (UTF-8 状态)
         cur_buf = net._cont_cur[:, : S + n_gen]
         cur_buf[:, :S].copy_(byte_ids)
@@ -70,33 +69,32 @@ class ForwardEngine:
             bv = cur_buf[:, max(0, cur_len - 64) : cur_len]  # 上下文窗口 64 (任务语义, 前缀不足全取)
             _ = self._predict(bv, store_state=True, is_inference=True)
             # W_lm 读出为唯一声道; W_act 降格为意图调制器 (见下方注入)
-            if True:
-                dim_4 = net.active_size["l4"]
-                W_diff_a = net.W_diff[:dim_4, :dim_4]
-                z4_n = net._z4 / (net._z4.norm(dim=-1, keepdim=True) + 1e-3)
-                pred_delta = z4_n @ W_diff_a.T + net.b_diff[:dim_4].unsqueeze(0).unsqueeze(0)
-                z4_next = net._z4 + pred_delta
-                # 与训练头同款: 分流抑制 → RMS → 三阶 → 记忆单元+绑定拼接 → W1 混合层
-                z4_nl = z4_next / (1.0 + z4_next.abs())
-                z4_nl = rms_norm(z4_nl)
-                z4_nl = z4_nl * (1.0 - 0.5 * z4_nl.pow(2))
-                z4_nl = z4_nl / (1.0 + z4_nl.abs())  # 与训练端同款分流抑制
-                zh_next = torch.cat([z4_nl, net._bind_vec, net._mem_out], dim=-1)
-                zh_next = rms_norm(zh_next)  # 与训练端同口径 pre-norm
-                h_next = zh_next @ net.W1
-                h_next = h_next / (1.0 + h_next.abs())  # 分流抑制 (与训练同款)
-                h_next = h_next / (h_next.square().mean(dim=-1, keepdim=True).sqrt() * 1.01 + 1e-8)
-                h_next = h_next * (1.0 - 0.5 * h_next.pow(2))
-                inv_h = 1.0 / math.sqrt(net.d_h)
-                mu0_top = (h_next @ net.W_lm + net.bias_lm) * inv_h
-                logits_c = (mu0_top - mu0_top.mean(dim=-1, keepdim=True)) / (
-                    mu0_top.std(dim=-1, keepdim=True) + 1e-4
-                )
-                mu0_top = logits_c / logits_c.abs().max(dim=-1, keepdim=True).values * 60.0
-                mu0_top = mu0_top + (1.0 - net._mask_print) * -1e4  # tensor-guard: bound (打印屏蔽设计界)
-                last = mu0_top[:, -1]  # [N,256] fp16
-                # W_act 意图电位裸注入, 幅度归其自身稳态承载
-                last = last + (net._bind_vec[:, -1] @ net.W_act)
+            dim_4 = net.active_size["l4"]
+            W_diff_a = net.W_diff[:dim_4, :dim_4]
+            z4_n = net._z4 / (net._z4.norm(dim=-1, keepdim=True) + 1e-3)
+            pred_delta = z4_n @ W_diff_a.T + net.b_diff[:dim_4].unsqueeze(0).unsqueeze(0)
+            z4_next = net._z4 + pred_delta
+            # 与训练头同款: 分流抑制 → RMS → 三阶 → 记忆单元+绑定拼接 → W1 混合层
+            z4_nl = z4_next / (1.0 + z4_next.abs())
+            z4_nl = rms_norm(z4_nl)
+            z4_nl = z4_nl * (1.0 - 0.5 * z4_nl.pow(2))
+            z4_nl = z4_nl / (1.0 + z4_nl.abs())  # 与训练端同款分流抑制
+            zh_next = torch.cat([z4_nl, net._bind_vec, net._mem_out], dim=-1)
+            zh_next = rms_norm(zh_next)  # 与训练端同口径 pre-norm
+            h_next = zh_next @ net.W1
+            h_next = h_next / (1.0 + h_next.abs())  # 分流抑制 (与训练同款)
+            h_next = rms_norm(h_next)  # 与训练端同款共享 rms_norm (C6 口径统一)
+            h_next = h_next * (1.0 - 0.5 * h_next.pow(2))
+            inv_h = 1.0 / math.sqrt(net.d_h)
+            mu0_top = (h_next @ net.W_lm + net.bias_lm) * inv_h
+            logits_c = (mu0_top - mu0_top.mean(dim=-1, keepdim=True)) / (
+                mu0_top.std(dim=-1, keepdim=True) + 1e-4
+            )
+            mu0_top = logits_c / logits_c.abs().max(dim=-1, keepdim=True).values * 60.0
+            mu0_top = mu0_top + (1.0 - net._mask_print) * -1e4  # tensor-guard: bound (打印屏蔽设计界)
+            last = mu0_top[:, -1]  # [N,256] fp16
+            # W_act 意图电位裸注入, 幅度归其自身稳态承载
+            last = last + (net._bind_vec[:, -1] @ net.W_act)
             if temperature is not None and (not isinstance(temperature, float) or temperature > 0.0):
                 last = last / temperature  # Tensor 时 GPU 直除, 零 .item()
             stats["gen"] += N
@@ -142,7 +140,6 @@ class ForwardEngine:
             lead_len = torch.where(is_l2, 1, torch.where(is_l3, 2, torch.where(is_l4, 3, torch.zeros_like(b))))
             expect_cont.copy_(torch.where(expect_cont > 0, expect_cont - 1, lead_len))
         return cur_buf[:, :cur_len]
-        return cur
 
     def _recurrent(
         self,
@@ -338,12 +335,9 @@ class ForwardEngine:
             net._novelty = ((z4 - zslow).square().mean(dim=-1)).detach()  # [N,S] 逐帧新奇度
 
         # 稀疏绑定: 连续 z4 → W_bind → 槽内 top-k WTA; 推理也计算 (与训练同构)
-        if net.cfg.bind_mode != "none":
-            net._fr_vf = vf if free_run else None  # 快节律向量供 _bind 注入
-            self._bind(z4)
-            net._fr_vf = None
-        else:
-            net._fr_vf = None
+        net._fr_vf = vf if free_run else None  # 快节律向量供 _bind 注入
+        self._bind(z4)
+        net._fr_vf = None
 
         return {
             "mu_diff": mu_diff,
@@ -366,43 +360,40 @@ class ForwardEngine:
         dim_4 = net.active_size["l4"]
         z4_n = l2_norm(z4)
         raw = z4_n @ net.W_bind[:dim_4]  # [N,S,K] 自下而上投影
-        if getattr(net, "_bind_loop", True):
-            # 自由运行快节律注入: 加性电流 → z_bind 预激活
-            if getattr(net, "_fr_vf", None) is not None:
-                raw = raw + net.cfg.osc_amp_f * net._fr_vf
-            # STP 槽资源: 逐帧输出 ×r (资源耗尽 → 槽间歇切换)
-            stp_bind = None
-            if getattr(net, "_fr_vf", None) is not None:
-                stp_bind = (net._stp_r_bind, net._stp_tau_bind, net._stp_u_bind)
-            z_bind = self._bind_sparse(raw[:, :1] - net._theta_bind)  # t=0 无历史
-            z_binds = [z_bind]
-            r_bind = stp_bind[0].unsqueeze(0) if stp_bind else None
-            inv_tau_b = (1.0 / stp_bind[1]).unsqueeze(0) if stp_bind else None
-            u_bind_b = stp_bind[2].unsqueeze(0) if stp_bind else None
-            for t in range(1, raw.shape[1]):
-                raw_t = raw[:, t : t + 1] + 0.5 * (z_bind @ net.W_bind_self)
-                if stp_bind:
-                    raw_t = raw_t * r_bind  # 槽输入 × 可用资源
-                z_bind = self._bind_sparse(raw_t - net._theta_bind)
-                z_binds.append(z_bind)
-                if stp_bind:
-                    act = z_bind.abs().mean(dim=1)  # [1,K] (同递归层修正)
-                    ema_b = getattr(net, "_stp_active_ema_bind")[: r_bind.shape[1]]
-                    ema_b.mul_(0.99).add_(0.01 * act.squeeze(0))
-                    # 槽位局部 U 自适应 (同递归层, 纯局部负反馈)
-                    if self.net.cfg.stp_u_adapt:
-                        rel_b = (act - ema_b.unsqueeze(0)) / (ema_b.unsqueeze(0) + 1e-6)
-                        u_bind_b.add_(self.net.cfg.stp_u_adapt_rate * rel_b * u_bind_b)
-                        u_bind_b.clamp_(self.net.cfg.stp_u_min, self.net.cfg.stp_u_max)  # tensor-guard: bound (STP 动力学设计界)
+        # 递归绑定 (恒开): 自由运行快节律注入 → z_bind 预激活 + STP 槽资源
+        if getattr(net, "_fr_vf", None) is not None:
+            raw = raw + net.cfg.osc_amp_f * net._fr_vf
+        # STP 槽资源: 逐帧输出 ×r (资源耗尽 → 槽间歇切换)
+        stp_bind = None
+        if getattr(net, "_fr_vf", None) is not None:
+            stp_bind = (net._stp_r_bind, net._stp_tau_bind, net._stp_u_bind)
+        z_bind = self._bind_sparse(raw[:, :1] - net._theta_bind)  # t=0 无历史
+        z_binds = [z_bind]
+        r_bind = stp_bind[0].unsqueeze(0) if stp_bind else None
+        inv_tau_b = (1.0 / stp_bind[1]).unsqueeze(0) if stp_bind else None
+        u_bind_b = stp_bind[2].unsqueeze(0) if stp_bind else None
+        for t in range(1, raw.shape[1]):
+            raw_t = raw[:, t : t + 1] + 0.5 * (z_bind @ net.W_bind_self)
+            if stp_bind:
+                raw_t = raw_t * r_bind  # 槽输入 × 可用资源
+            z_bind = self._bind_sparse(raw_t - net._theta_bind)
+            z_binds.append(z_bind)
+            if stp_bind:
+                act = z_bind.abs().mean(dim=1)  # [1,K] (同递归层修正)
+                ema_b = getattr(net, "_stp_active_ema_bind")[: r_bind.shape[1]]
+                ema_b.mul_(0.99).add_(0.01 * act.squeeze(0))
+                # 槽位局部 U 自适应 (同递归层, 纯局部负反馈)
+                if self.net.cfg.stp_u_adapt:
+                    rel_b = (act - ema_b.unsqueeze(0)) / (ema_b.unsqueeze(0) + 1e-6)
+                    u_bind_b.add_(self.net.cfg.stp_u_adapt_rate * rel_b * u_bind_b)
+                    u_bind_b.clamp_(self.net.cfg.stp_u_min, self.net.cfg.stp_u_max)  # tensor-guard: bound (STP 动力学设计界)
 
-                    u_eff_b = u_bind_b * act / (act + ema_b + 1e-6)  # 自参照耗尽
-                    r_bind = r_bind + (1.0 - r_bind) * inv_tau_b - u_eff_b * r_bind * act
-                    r_bind = r_bind.clamp(0.01, 1.0)  # tensor-guard: bound (STP 资源界, 有界防发散)
-            if stp_bind and r_bind is not None:
-                net._stp_r_end["bind"] = r_bind.squeeze(0).clone()  # tensor-guard: rare (自由运行窗末写回)
-            z_bind = torch.cat(z_binds, dim=1)
-        else:
-            z_bind = self._bind_sparse(raw - net._theta_bind)
+                u_eff_b = u_bind_b * act / (act + ema_b + 1e-6)  # 自参照耗尽
+                r_bind = r_bind + (1.0 - r_bind) * inv_tau_b - u_eff_b * r_bind * act
+                r_bind = r_bind.clamp(0.01, 1.0)  # tensor-guard: bound (STP 资源界, 有界防发散)
+        if stp_bind and r_bind is not None:
+            net._stp_r_end["bind"] = r_bind.squeeze(0).clone()  # tensor-guard: rare (自由运行窗末写回)
+        z_bind = torch.cat(z_binds, dim=1)
         # 分流抑制: 上界 1.0, 范数保留为自由度
         th_b = net._theta_bind
         th_b.mul_(0.98).add_(0.02 * (z_bind * z_bind).mean(dim=(0, 1)))

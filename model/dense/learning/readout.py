@@ -11,9 +11,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...modulation import soft_norm_preserve
+from model.constants import LM_TRUST_REGION
 from model.modulation import l2_norm, rms_norm
-from ._common import LM_TRUST_REGION, _elig_accum, _MixinBase
+
+from ...modulation import soft_norm_preserve
+from ._common import _elig_accum, _MixinBase
 
 
 class ReadoutMixin(_MixinBase):
@@ -27,7 +29,6 @@ class ReadoutMixin(_MixinBase):
         net = self.net
         if ctx.free_run:
             return None
-        dev, N = ctx.dev, ctx.N
         net = net
         dim_4 = ctx.dim_4
         z4 = net._z4
@@ -63,12 +64,6 @@ class ReadoutMixin(_MixinBase):
         )
         logits_lm = logits_c / logits_c.abs().max(dim=-1, keepdim=True).values * 60.0
         # 可打印物理掩码: 0x00-0x1F 强制 -1e4 (fp16 安全极弱值)
-        if ctx.closed_loop:
-            target_oh = F.one_hot(ctx.byte_ids[:, 1:], num_classes=256).to(torch.float16).mean(dim=(0, 1))
-        else:
-            target_oh = F.one_hot(ctx.byte_ids, num_classes=256).to(torch.float16).mean(dim=(0, 1))
-        if not ctx.echo_world_frozen:
-            net._freq.mul_(0.99).add_(0.01 * target_oh.detach())  # 回声相位冻结频率统计
         logits_lm = logits_lm + (1.0 - net._mask_print) * -1e4  # tensor-guard: bound (打印屏蔽设计界)
 
         # 多步预测: W_lm 专责 t+1, W_lm_2 独立子预测器专责 t+2 (共享 h, 各自更新)
@@ -79,6 +74,7 @@ class ReadoutMixin(_MixinBase):
         h2 = rms_norm(h2)
         h2 = h2 * (1.0 - 0.5 * h2.pow(2))
         logits_t2 = (h2 @ net.W_lm_2 + net.bias_lm) * inv_h  # [N,S-2,256]
+        logits_t2 = logits_t2 + (1.0 - net._mask_print) * -1e4  # 与 logits_lm 同款打印掩码 (C3: probs 双域统一)
         target_lm = F.one_hot(ctx.byte_ids[:, 1:], num_classes=256).to(torch.float16)
         target_lm2 = F.one_hot(ctx.byte_ids[:, 2:], num_classes=256).to(torch.float16)
         # 赫布版 softmax 误差: eps = target - softmax(logits); logits 已归一化 [-60,60] 无溢出
@@ -92,28 +88,26 @@ class ReadoutMixin(_MixinBase):
         target_l1 = target_lm  # [N,S-1,256]
         target_l2 = target_lm2  # [N,S-2,256]
         diff2 = (target_l2 - target_l1[:, :-1]) - (probs_l2 - probs_l1[:, :-1])  # [N,S-2,256]
+        # 行掩码: t+1 与 t+2 目标均 ≥32 的行才保留 (C3: 幻影目标行整行清零)
+        diff2 = diff2 * (ctx.learn_mask[:, :-1] & ctx.learn_mask[:, 1:]).to(torch.float16).unsqueeze(-1)
         diff2 = torch.cat([diff2, net._padmax[:, :, :256]], dim=1)  # S-1 对齐
-        if ctx.closed_loop:
-            lm_mask = ctx.learn_mask.unsqueeze(0).unsqueeze(-1)
-            eps_lm = eps_lm * lm_mask
-            eps_t2 = eps_t2 * ctx.learn_mask[1:].unsqueeze(0).unsqueeze(-1)
-            diff2 = diff2 * lm_mask
+        # 学习位置掩码 (engine 端从目标字节推导): t+1 位 [N,S-1,1], t+2 位 [N,S-2,1]
+        lm_mask = ctx.learn_mask.to(torch.float16).unsqueeze(-1)
+        eps_lm = eps_lm * lm_mask
+        eps_t2 = eps_t2 * ctx.learn_mask[:, 1:].to(torch.float16).unsqueeze(-1)
         # 0.2 权重: diff2 能量占比 ~22%, 保留为辅助结构信号
         eps_total = (eps_lm + 0.2 * diff2).detach()  # W_lm: t+1 + 差分 (S-1 对齐)
         eps_t2_total = (eps_t2 + 0.2 * diff2[:, :-1]).detach()  # W_lm_2: t+2 + 差分 (S-2)
 
-        # 语言带自校准: 感知相位记录真实语言 ε 中心 (EMA) 与弥散 (窗间 MAD EMA),
-        # 供 echo 相位带状 R 校准 (action.py); echo 相位冻结不更新
+        # 语言带自校准锚: 感知相位记录 ε 中心 EMA (恒温器输入, action.py 读 _lang_eps_ema);
+        # echo 相位冻结不更新
         if not ctx.echo_world_frozen:
             eps_lang = 1.0 - (probs_lm[:, :-1] * target_lm).sum(dim=-1).mean()
             if net._lang_eps_cold:
                 net._lang_eps_ema.copy_(eps_lang.detach())  # 首次快照
-                net._lang_eps_mad.zero_()
                 net._lang_eps_cold = False
             else:
                 net._lang_eps_ema.mul_(0.995).add_(0.005 * eps_lang)
-                devi = (eps_lang - net._lang_eps_ema).abs()
-                net._lang_eps_mad.mul_(0.95).add_(0.05 * devi)
 
         # 动态稳态竞争: 熵 20 步窗口最小二乘斜率 → traction_scale ∈ (0,2) 有界无 clamp;
         # 熵降放慢表示层保护成果, 熵升放大强迫重组
@@ -130,19 +124,18 @@ class ReadoutMixin(_MixinBase):
                 net._traction_scale.copy_(2.0 / (1.0 + torch.exp(-slope20 / sigma)))
         # 显著性反馈: 回传误差 × 时间突变范数, 状态剧变且预测失误时大幅改写表示层.
         # 投影用全量 W_lm 取 z4 维, 不受池门控排挤, 防表示层收不到误差而漂移 NaN.
-        if getattr(net, "_q1_enabled", True):
-            dz4_sig = (z4[:, 1:] - z4[:, :-1]).norm(dim=-1, keepdim=True)  # [N,S-1,1]
-            dz4_sig = dz4_sig / (dz4_sig.max() + 1e-3)
-            # soft 饱和增益: gain = x/(0.5·mean+0.5·x) ∈ (0,2)
-            err_mag = eps_total.norm(dim=-1, keepdim=True)  # [N,S-1,1]
-            err_ref = err_mag.mean() + 1e-3
-            gain = err_mag / (0.5 * err_ref + 0.5 * err_mag)
-            # 混合层转置投影: e → W_lm.T → W1.T → z4 段; RMS 归一化防 W_04 更新爆
-            eps_lm_proj = (eps_total @ net.W_lm.T @ W1_a.T)[:, :, :dim_4] * dz4_sig * gain  # [N,S-1,dim_4]
-            eps_lm_proj = rms_norm(eps_lm_proj)
-        else:
-            eps_lm_proj = (eps_total @ net.W_lm.T @ W1_a.T)[:, :, :dim_4]  # 均匀回传
-            eps_lm_proj = rms_norm(eps_lm_proj)
+        dz4_sig = (z4[:, 1:] - z4[:, :-1]).norm(dim=-1, keepdim=True)  # [N,S-1,1]
+        dz4_sig = dz4_sig / (dz4_sig.max() + 1e-3)
+        # soft 饱和增益: gain = x/(0.5·mean+0.5·x) ∈ (0,2)
+        err_mag = eps_total.norm(dim=-1, keepdim=True)  # [N,S-1,1]
+        err_ref = err_mag.mean() + 1e-3
+        gain = err_mag / (0.5 * err_ref + 0.5 * err_mag)
+        # 混合层转置投影: e → W_lm.T → W1.T → z4 段; RMS 归一化防 W_04 更新爆
+        # 结构化预缩放 (A1): 矩阵乘在 d_h 维累加可冲 fp16 上限, 溢出发生在 rms_norm
+        # 之前 (后置归一化救不了); ÷64 = 指数移位, rms_norm 尺度不变 → 下游语义零变
+        eps_in = eps_total / 64.0
+        eps_lm_proj = (eps_in @ net.W_lm.T @ W1_a.T)[:, :, :dim_4] * dz4_sig * gain  # [N,S-1,dim_4]
+        eps_lm_proj = rms_norm(eps_lm_proj)
         eps_lm_pad = torch.cat(
             [eps_lm_proj, net._padmax[:, :, :dim_4]], dim=1
         )
@@ -156,7 +149,6 @@ class ReadoutMixin(_MixinBase):
             eps_lm_proj=eps_lm_proj,
             eps_lm_pad=eps_lm_pad,
             logits_lm=logits_lm,
-            logits_t2=logits_t2,
             probs_lm=probs_lm,
             h=h,
             h2=h2,
@@ -169,7 +161,6 @@ class ReadoutMixin(_MixinBase):
         net = self.net
         if ctx.free_run or ctx.echo_world_frozen:
             return net._one_s[: ctx.N, : ctx.S - 1]  # tensor-guard: bound (冻结步恒一 d_t, 预分配)
-        dev = ctx.dev
         d_h = net.d_h
         inv_h = 1.0 / math.sqrt(d_h)
         byte_ids = ctx.byte_ids
@@ -182,12 +173,6 @@ class ReadoutMixin(_MixinBase):
         denom = torch.where(alive > 0, err_norm, torch.ones_like(err_norm))
         err_scaled = lm.eps_total * alive / denom  # 单位能量, 方向保留
 
-        # W_lm 专属 BCM 滑阈 (防输出过冲); logits 先 RMS 归一化防平方溢出
-        logits_n = rms_norm(lm.logits_lm.detach())
-        th_wlm = net._theta_wlm
-        th_wlm.mul_(0.01).add_(0.99 * (logits_n * logits_n).mean(dim=(0, 1)))
-        phi_wlm = logits_n * (logits_n - th_wlm)
-        phi_wlm = rms_norm(phi_wlm)
         # 结构对比度惩罚: 非目标列按"与目标列 logits 距离"加权, 区分差的错误列放大排斥
         target_oh = F.one_hot(byte_ids[:, 1:], num_classes=256).to(torch.float16)  # [N,S-1,256]
         logits_d = (lm.h[:, :-1] @ net.W_lm) * inv_h  # 未去偏 logits (对比度基准)
@@ -209,10 +194,9 @@ class ReadoutMixin(_MixinBase):
             d_t = d_t[:, :-1]  # 对齐 S-1 (t+1 目标)
         else:
             d_t = net._one_s[:ctx.N, : ctx.S - 1]  # 无新奇度轨迹: 恒一 d_t (预分配)
-        lm_update_mask = ctx.learn_mask.to(torch.float16).unsqueeze(0).unsqueeze(-1)  # [1,S-1,1]
-        bcm_term = torch.zeros_like(phi_wlm[:, :-1]) if net.cfg.lm_no_bcm else 0.1 * phi_wlm[:, :-1]
+        lm_update_mask = ctx.learn_mask.to(torch.float16).unsqueeze(-1)  # [N,S-1,1]
         dW_lm = (
-            rms_norm(lm.h[:, :-1]).transpose(-2, -1) @ ((err_contrast - bcm_term) * lm_update_mask * d_t)
+            rms_norm(lm.h[:, :-1]).transpose(-2, -1) @ (err_contrast * lm_update_mask * d_t)
         ).mean(dim=0) * math.sqrt(d_h)  # [d_h,256] (补偿输出缩放)
         # 单位向量 (单步更新幅度上界), 信任域防从零初始化时信号被噪声淹没
         dW_lm_n = dW_lm.norm() + 1e-8
@@ -258,16 +242,11 @@ class ReadoutMixin(_MixinBase):
         alive2 = (err_norm2 > 1e-8).to(lm.eps_t2_total.dtype)
         denom2 = torch.where(alive2 > 0, err_norm2, torch.ones_like(err_norm2))
         err_scaled2 = lm.eps_t2_total * alive2 / denom2
-        logits_n2 = rms_norm(lm.logits_t2.detach())
-        th_wlm2 = net._theta_wlm2
-        th_wlm2.mul_(0.01).add_(0.99 * (logits_n2 * logits_n2).mean(dim=(0, 1)))
-        phi_wlm2 = logits_n2 * (logits_n2 - th_wlm2)
-        phi_wlm2 = rms_norm(phi_wlm2)
         dW_lm2 = (
             rms_norm(lm.h2).transpose(-2, -1)
             @ (
-                (err_scaled2 - 0.1 * phi_wlm2)
-                * ctx.learn_mask[1:].to(torch.float16).unsqueeze(0).unsqueeze(-1)
+                err_scaled2
+                * ctx.learn_mask[:, 1:].to(torch.float16).unsqueeze(-1)
                 * d_t[:, :-1]
             )
         ).mean(dim=0) * math.sqrt(d_h)

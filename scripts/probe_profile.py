@@ -21,7 +21,7 @@ import torch
 import torch.profiler as profiler
 from _probe_meta import config_meta
 
-from dataset import DualChannelDataset  # noqa: E402
+from dataset import ByteDataset  # noqa: E402
 from model import DensePCNet  # noqa: E402
 from pkg.cli.utils import run_dir, run_file  # noqa: E402
 
@@ -31,7 +31,7 @@ LAUNCH_KEYS = ("cudaLaunchKernel", "cudaLaunchKernelExC", "cudaMemcpyAsync", "cu
 
 def _one_step(net, ds, dev, i: int, last_tail: torch.Tensor) -> torch.Tensor:
     if i % 2 == 1:
-        b, _ = ds[i]
+        b = ds[i]
         x = b.unsqueeze(0).to(dev)
         net.learn(x)
         return x[0, -SEED_N:]
@@ -57,7 +57,7 @@ def main() -> None:
     torch.set_grad_enabled(False)
     dev = "cuda"
     net = DensePCNet.load(args.ckpt).to(dev)
-    ds = DualChannelDataset(args.data, max_length=args.max_length, max_samples=1270000, lazy=True)
+    ds = ByteDataset(args.data, max_length=args.max_length, max_samples=1270000, lazy=True)
     if args.frw:
         try:
             net.cfg.free_run_window = args.frw

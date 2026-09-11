@@ -37,7 +37,7 @@ class LearnCtx:
     free_run: bool
     echo_loop: bool
     echo_world_frozen: bool
-    learn_mask: torch.Tensor
+    learn_mask: torch.Tensor  # [N,S-1] 目标位掩码 (目标字节 <32 → False, free_run 全一)
     dim_4: int
     dim_2: int
     dim_3: int
@@ -70,7 +70,6 @@ class LmSignal:
     eps_lm_proj: torch.Tensor
     eps_lm_pad: torch.Tensor
     logits_lm: torch.Tensor
-    logits_t2: torch.Tensor
     probs_lm: torch.Tensor
     h: torch.Tensor
     h2: torch.Tensor
@@ -198,18 +197,26 @@ class EngineCore(
         N, S = inp.shape if inp is not None else (1, net.cfg.free_run_window)
         dev = next(net.parameters()).device
         k = S // 2 if closed_loop else 0
-        # 自回声激活字节域学习; 回声相位冻结世界模型 (W_04/W_42/W_diff/W_lm 等),
-        # 仅更新表达端 W_act, 避免在乱码回声上学习污染感知.
+        # 自回声: 目标 = 自身生成流 (他者响应). 回声相位冻结世界模型, 避免在乱码回声上
+        # 学习污染感知 — C5 冻结合约 (单一出处, 各域守卫以此为准):
+        #   冻结 {W_04, W_42+inj42, W_23, W_state_pred, W_pred_54/43, W_diff+b_diff,
+        #     W_35 全族(Hebb+inj35+θ_l5+decorr+soft_norm), W_56, W_t 全族(+θ_wt4+谱守卫),
+        #     M_l5, LM 头(W_lm/W_lm_2/W1/bias_lm), 偏置家族, 记忆单元群, W_bind/W_bind_self}
+        #   仍推进 {W_act, 行为统计, 代谢账本 E/R, 节律 _intr_*, 行为门, 恒温器}
+        #   边界: forward 侧状态 (θ_bind EMA/_mem_m/STP) 每步照走, 不属冻结域
         echo_loop = (not free_run) and route_echo
         if echo_loop:
-            byte_ids = inp  # 自回声: 目标 = 自身生成流 (他者响应), 下游同普通训练
+            byte_ids = inp
         echo_world_frozen = echo_loop
-        # 生成段掩码 (closed_loop 时只有后半参与误差, 前半锚定只看不学):
+        # 学习位置掩码: 目标字节 <32 = 模型自身 _mask_print 输出域不可达 (0x00 管道填充、
+        # \n 行分隔等同段), 这些位置的误差信号不得进赫布驱动 — 学习端与自身输出域自洽.
         # 对齐 S-1 (t+1 目标), 位置 i 对应目标 byte_ids[:, i+1]
-        learn_mask = net._learn_mask_all[: S - 1]
+        if byte_ids is not None:
+            learn_mask = byte_ids[:, 1:] >= 32
+        else:
+            learn_mask = torch.ones(N, S - 1, dtype=torch.bool, device=dev)  # free_run: 内生动力学全位放行
         if closed_loop:
-            learn_mask = torch.ones(S - 1, dtype=torch.bool, device=dev)  # tensor-guard: rare (闭环暴露路径)
-            learn_mask[: k - 1] = False
+            learn_mask[:, : k - 1] = False  # 前半锚定只看不学
         dim_4, dim_2, dim_3, dim_5, dim_6 = (
             net.active_size[k] for k in ("l4", "l2", "l3", "l5", "l6")
         )

@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from _probe_meta import config_meta
 
-from dataset import DualChannelDataset  # noqa: E402
+from dataset import ByteDataset  # noqa: E402
 from model import DensePCNet  # noqa: E402
 from pkg.cli.utils import run_file  # noqa: E402
 
@@ -72,9 +72,9 @@ def main() -> None:
     torch.set_grad_enabled(False)
     dev = "cuda"
     net = DensePCNet.load(args.ckpt).to(dev)
-    ds = DualChannelDataset(args.data, max_length=args.max_length, max_samples=1270000, lazy=True)
+    ds = ByteDataset(args.data, max_length=args.max_length, max_samples=1270000, lazy=True)
 
-    seed_t = ds[101][0][-SEED_N:].unsqueeze(0).to(dev).contiguous()
+    seed_t = ds[101][-SEED_N:].unsqueeze(0).to(dev).contiguous()
     n_gen = net.cfg.free_run_window - 1  # 63
 
     def cont():
@@ -88,7 +88,7 @@ def main() -> None:
 
     # 真实预热 (同 bench_split_steps 口径)
     for i in (101, 103, 105, 107):
-        net._echo_seed = ds[i][0][-SEED_N:].unsqueeze(0).to(dev)
+        net._echo_seed = ds[i][-SEED_N:].unsqueeze(0).to(dev)
         net.learn(None, free_run=False)
 
     rep: dict[str, object] = {
@@ -238,7 +238,7 @@ def main() -> None:
         rep["replay_s"] = round(replay_s, 4)
         rep["speedup_vs_eager"] = round(eager_s / replay_s, 2)
         # 活性: 换 seed 原地覆写后回放, 输出必须变化且有限
-        seed_t.copy_(ds[137][0][-SEED_N:].unsqueeze(0).to(dev))
+        seed_t.copy_(ds[137][-SEED_N:].unsqueeze(0).to(dev))
         g.replay()
         torch.cuda.synchronize()
         after = _snap(out)

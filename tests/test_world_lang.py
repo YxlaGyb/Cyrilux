@@ -27,8 +27,7 @@ LINES = [
 def world(tmp_path):
     p = tmp_path / "mini.jsonl"
     with open(p, "w", encoding="utf-8") as f:
-        for t in LINES:
-            f.write(json.dumps({"text": t}) + "\n")
+        f.writelines(json.dumps({"text": t}) + "\n" for t in LINES)
     w = WorldLangPhysics(str(p), n_char_lines=10, n_trigram_lines=None, top_n=100)
     w.q_ref = 0.5  # 手动覆盖 (mini 语料 heldout 空 → 自校准 q_base=0)
     return w
@@ -36,10 +35,10 @@ def world(tmp_path):
 
 def test_L_coverage_common_chars(world):
     # 全部常用字 (语料内) → L = 1.0
-    s = world.score("你好天气很好我们".encode("utf-8"))
+    s = world.score("你好天气很好我们".encode())
     assert s["L"] == 1.0
     # 全生僻字 (不在 top-100) → L = 0.0
-    s2 = world.score("龘靐齉爩鱻".encode("utf-8"))
+    s2 = world.score("龘靐齉爩鱻".encode())
     assert s2["L"] == 0.0
 
 
@@ -54,8 +53,8 @@ def test_S_structure_hit(world):
 
 
 def test_X_novelty_tax(world):
-    a = "你好天气很好我们出去散步".encode("utf-8")
-    b = "abcdEFGH1234!@#$".encode("utf-8")  # 与 A 无共同字节 3-gram
+    a = "你好天气很好我们出去散步".encode()
+    b = b"abcdEFGH1234!@#$"  # 与 A 无共同字节 3-gram
     world._hist.clear()
     world.record(a)
     # 复读同一发声 → 与最近历史并集完全重叠 → X → 1
@@ -68,11 +67,11 @@ def test_E_metabolism_monotone(world):
     e0 = world.E
     # 高 q → E 上升
     world.step_E(0.9, trace_norm=12.0)
-    assert world.E > e0
+    assert e0 < world.E
     # 零 q → E 单调衰减 (只消耗)
     for _ in range(20):
         world.step_E(0.0, trace_norm=12.0)
-    assert world.E < e0
+    assert e0 > world.E
 
 
 def test_R1_gain_two_sided_calibration(world):
@@ -128,8 +127,8 @@ def test_state_roundtrip(tmp_path, world):
     world.step_E(0.5, trace_norm=11.8)
     for v in (0.50, 0.52):
         world.certify(0.6, v)
-    world.record("你好天气很好我们".encode("utf-8"))
-    world.record("学习知识需要耐心".encode("utf-8"))
+    world.record("你好天气很好我们".encode())
+    world.record("学习知识需要耐心".encode())
     assert world.de_mad is not None
 
     st = world.save_state(step=1500, gen_temp=1.0)
@@ -150,7 +149,7 @@ def test_state_roundtrip(tmp_path, world):
     assert w2._hist == world._hist  # deque[frozenset] 深等价
 
     # 恢复后行为连续: 同一发声的新颖税 = 恢复前 (历史已接续)
-    dup = "你好天气很好我们".encode("utf-8")
+    dup = "你好天气很好我们".encode()
     assert w2.score(dup)["X"] == world.score(dup)["X"] > 0.9
 
 

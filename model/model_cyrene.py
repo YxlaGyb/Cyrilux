@@ -34,7 +34,6 @@ class CyreneModel:
     temporal_lr_ratio: float = 5.0
     oja_alpha: float = 0.05
     column_dropout: float = 0.25
-    inertia_alpha: float = 0.3
 
     # 修剪
     prune_warmup: int = 5000
@@ -68,19 +67,10 @@ class CyreneModel:
     spectral_guard_bound: float = 1.5
     bias_leak_rate: float = 1e-4
     oja_elasticity: float = 0.05
-    probation_decay: float = 0.5
-
-    # 生成 / 绑定
-    gen_precision: float = 1.0
-    bind_dim: int = 4096
-    bind_k: int = 10
-    bind_mode: str = "hard"
-    bind_orth: bool = False
 
     # 读出端诊断开关
     lm_freeze_w1: bool = False
     lm_no_contrast: bool = False
-    lm_no_bcm: bool = False
 
     # 竞争性记忆单元群
     mem_k0: int = 6
@@ -177,7 +167,8 @@ def read_checkpoint_metadata(path: str) -> dict[str, str]:
 
 
 # 检查点契约: state_ver 存在 = 完整检查点. 游离状态命名空间 attr./py.
-_STATE_VER = "1"
+# "2" = P5 轮口径 (BCM 删除 + pad 掩码 + 孤儿缓冲退役; load 只查存在性, 版本号为文档)
+_STATE_VER = "2"
 _ATTR_PREFIX = "attr."
 _PY_PREFIX = "py."
 _CFG_FIELDS = frozenset(f.name for f in fields(CyreneModel))
@@ -190,6 +181,17 @@ _ACTIVE_EMA_LAYER = {
     "wsp": "l4", "wp54": "l5", "wp43": "l4", "w42": "l2",
     "b4": "l4", "b2": "l2", "b3": "l3", "b5": "l5", "b6": "l6",
 }
+
+
+def _cfg_from_snapshot(path: str, snap: str) -> CyreneModel:
+    """config 快照 → CyreneModel (C9 fail-fast: 未知字段 = 化石口径错配, raise)."""
+    raw = json.loads(snap)
+    unknown = [k for k in raw if k not in _CFG_FIELDS]
+    if unknown:
+        raise ValueError(
+            f"{path} config 快照含未知字段 {unknown} — 检查点与当前模型口径错配 (化石 → 重迁)"
+        )
+    return CyreneModel(**raw)
 
 
 class DensePCNet(nn.Module):
@@ -335,13 +337,9 @@ class DensePCNet(nn.Module):
         # 否则续跑后锚归零需 ~200 步重建. NaN = 冷启动哨兵 (ε ∈ [0,1) 永不 NaN);
         # _lang_eps_cold 为其 CPU 镜像 — 热路径判 NaN 是一次隐式 .item() 同步, 故镜像在 load 一次性恢复
         self.register_buffer("_lang_eps_ema", torch.full((), float("nan"), dtype=torch.float16))
-        self.register_buffer("_lang_eps_mad", torch.zeros((), dtype=torch.float16))
         self._lang_eps_cold = True
         # 生命计数 (P2): 跨 load 持久化的机体年龄, warmup 判据用它 (旧检查点缺键 → 0 = P2 机制幼年期)
         self.register_buffer("_life_cnt", torch.zeros(1, dtype=torch.int32))
-
-        # 内部 EMA 频率 (纯模型内部累计 target 分布)
-        self.register_buffer("_freq", torch.full((self.cfg.d_input,), 1.0 / 256.0, dtype=torch.float16))
 
         # 张量规范共享缓冲 (热路径零新建): 零/壹标量、pad 段 (cat 前后缀按 active 切视图)、
         # 打印掩码、序列掩码 — 全部随 state_dict 持久化, 每步复用
@@ -355,7 +353,6 @@ class DensePCNet(nn.Module):
         _mp = torch.zeros(256, dtype=torch.float16)
         _mp[32:] = 1.0
         self.register_buffer("_mask_print", _mp)
-        self.register_buffer("_learn_mask_all", torch.ones(self.cfg.max_seq_len - 1, dtype=torch.bool))
         # continuation/_predict 工作缓冲: 续写流 (定长预分配+长度游标)、UTF-8 状态、L0 one-hot、
         # 记忆序列、ACh 噪声 — 全部就地覆写, 零热路径新建
         self.register_buffer(
@@ -445,17 +442,13 @@ class DensePCNet(nn.Module):
             )
 
         # 神经调制与竞争机制
-        self.register_buffer("_ent_ema", torch.tensor(5.5, dtype=torch.float16))
         self.register_buffer("_ent_buf", torch.zeros(20, dtype=torch.float16))
         self.register_buffer("_t_center", torch.arange(20, dtype=torch.float16) - 9.5)
         self.register_buffer("_t_denom", (torch.arange(20, dtype=torch.float16) - 9.5).square().sum())
         self._ent_i = 0
         self.register_buffer("_traction_scale", torch.tensor(1.0, dtype=torch.float16))
         self.register_buffer("_theta_novelty", torch.full((1,), 0.001, dtype=torch.float16))
-        for ln, dim in (("l4", d["l4"]), ("l2", d["l2"]), ("l3", d["l3"]), ("l5", d["l5"]), ("l6", d["l6"])):
-            self.register_buffer(f"_theta_{ln}", torch.full((dim,), 0.01, dtype=torch.float16))
-        self.register_buffer("_theta_wlm", torch.full((self.cfg.d_input,), 0.01, dtype=torch.float16))
-        self.register_buffer("_theta_wlm2", torch.full((self.cfg.d_input,), 0.01, dtype=torch.float16))
+        self.register_buffer("_theta_l5", torch.full((d["l5"],), 0.01, dtype=torch.float16))
 
         # Foldiak 反赫布去同质化矩阵 (零起步 = 无抑制)
         self.E_l5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
@@ -650,8 +643,7 @@ class DensePCNet(nn.Module):
         meta = read_checkpoint_metadata(path)
         if "config" not in meta:
             raise ValueError(f"{path} 缺 config 快照 (有 state_ver 就必须有)")
-        kv = {k: v for k, v in json.loads(meta["config"]).items() if k in _CFG_FIELDS}
-        return CyreneModel(**kv)
+        return _cfg_from_snapshot(path, meta["config"])
 
     @classmethod
     def load(cls, path: str, config: CyreneModel | None = None) -> DensePCNet:
@@ -676,12 +668,12 @@ class DensePCNet(nn.Module):
             "d_l6": sd["W_56"].shape[0],
             "input_history": sd["W_04"].shape[1] != 256,
         }
+        snap = meta.get("config")
+        if snap is None:
+            raise ValueError(f"{path} 缺 config 快照 (有 state_ver 就必须有)")
+        _cfg_from_snapshot(path, snap)  # C9: 快照含未知字段一律 raise (显式 cfg 只管值, 不管口径校验)
         if config is None:
-            snap = meta.get("config")
-            if snap is None:
-                raise ValueError(f"{path} 缺 config 快照 (有 state_ver 就必须有)")
-            kv = {k: v for k, v in json.loads(snap).items() if k in _CFG_FIELDS}
-            config = replace(CyreneModel(**kv), **dims)
+            config = replace(_cfg_from_snapshot(path, snap), **dims)
         else:
             config = replace(config, **dims)
         net = cls(config)
@@ -694,6 +686,14 @@ class DensePCNet(nn.Module):
             net.register_buffer("W1_elig", torch.zeros_like(sd["W1"], dtype=torch.float16))
             net._lm_in = sd["W1"].shape[0]
         nsd = net.state_dict()
+        # C9 fail-fast: 未知 state 键 = 检查点与当前模型口径错配 (退役键), 静默丢弃会让
+        # 续跑在旧口径上静默漂移; attr.* 豁免 (游离张量, 下方第二循环消费)
+        unknown = [k for k in sd if k not in nsd and not k.startswith(_ATTR_PREFIX)]
+        if unknown:
+            raise ValueError(
+                f"{path} 含 {len(unknown)} 个未知 state 键 (退役键 → 用 scripts/migrate_ckpt.py 重迁): "
+                f"{unknown[:8]}{'…' if len(unknown) > 8 else ''}"
+            )
         for k, v in sd.items():
             if k not in nsd:
                 continue

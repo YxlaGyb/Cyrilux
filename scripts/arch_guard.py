@@ -26,18 +26,45 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime
+from pathlib import Path
 
 import torch
+
+from model import DensePCNet
 
 torch.set_grad_enabled(False)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from model import DensePCNet
+OUT = Path(__file__).resolve().parent.parent / "out"
 
-CKPT = "out/exp115_say.safetensors"
-BASELINE = "out/arch_guard_baseline.json"
+
+def _latest(pattern: str) -> Path | None:
+    """out/ 运行目录 (v3-<ts>) 内按 glob 取最新 — 零硬编码路径."""
+    hits = sorted(OUT.glob(pattern), key=lambda p: p.stat().st_mtime)
+    return hits[-1] if hits else None
+
+
+def _resolve_ckpt() -> str:
+    p = _latest("*/migrated/exp115_say.safetensors")
+    if p is None:
+        raise FileNotFoundError("out/*/migrated/exp115_say.safetensors 不存在 — 先跑 scripts/migrate_ckpt.py")
+    return str(p)
+
+
+def _resolve_baseline() -> str:
+    p = _latest("*/arch_guard_baseline.json")
+    if p is None:  # 首跑锚定: 按 v3-<ts> 运行目录规范新开
+        d = OUT / f"v3-{datetime.now():%Y%m%d-%H%M%S}"
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d / "arch_guard_baseline.json")
+    return str(p)
+
+
+CKPT = _resolve_ckpt()
+BASELINE = _resolve_baseline()
 FIXED_PROMPT = "春"
 FIXED_N = 64
 SEED = 117
@@ -84,7 +111,10 @@ def _learn_signature(net, steps: int, dev) -> dict:
     """
     torch.manual_seed(SEED)
     net = net.to(dev)
-    wget = lambda n: getattr(net, n).data  # 权重是 nn.Parameter/Buffer, 走 getattr 而非 __dict__
+
+    def wget(n):
+        return getattr(net, n).data  # 权重是 nn.Parameter/Buffer, 走 getattr 而非 __dict__
+
     base = {w: wget(w).float().detach().cpu().clone() for w in LEARN_W}
     for _ in range(steps):
         x = torch.randint(0, 256, (1, 8), dtype=torch.long, device=dev)
