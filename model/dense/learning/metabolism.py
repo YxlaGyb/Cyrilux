@@ -48,7 +48,7 @@ class MetabolismMixin(_MixinBase):
         if ctx.free_run or sh.lm is None:
             # free_run 无 lm 信号 (_build_lm_signal 返回 None), 代谢不结算
             return
-        # 1) F := 绝对误差能量 (P2 货币修正): 归一化误差平方是尺度无关的 — 饥荒
+        # 1) F := 绝对误差能量: 归一化误差平方是尺度无关的 — 饥荒
         # (预测相对变差) 会被误差自身标准差吸收, E 对饥荒零判别力 (术前探针实证:
         # 随机字节/分布漂移/W_t 渐进病理下 E min 都停在 -0.008 平台噪声带内).
         # 绝对货币: 乱码输入 → 原始误差能量暴涨 → E 深潜 → 死亡线可达.
@@ -107,14 +107,14 @@ class MetabolismMixin(_MixinBase):
         net._metab_E.mul_(1.0 - net.cfg.metab_d).add_(net.cfg.metab_c * df).sub_(
             net._metab_cost_tot
         )
-        # 死亡判据计数 (P2 终裁, 下探缺失; P3-b 分相): 平台期 F 规律性下探 (低能耗时刻),
+        # 死亡判据计数: 平台期 F 规律性下探 (低能耗时刻),
         # 饥荒 = F 钉高位零下探 (v3 实测: 平台 q25-q95 = 0.975-0.986 ≈ 天花板, 但每 ~14 步
         # 一下探; famine_rand 400 步零下探). dip = f_now < base·(1−metab_dip_margin); 每次
         # dip 清零, 无 dip 连续 metab_death_steps 步 → 死亡回合. (v1/v2/v3 三次证伪:
         # E 域/绝对域/高域余量均无判别力 — 平台均值已钉天花板, κ 阈值落在信号域之外.)
         # 分相: 只有感知相能下探清零 (F_base 慢基线也只在感知相更新 — 回声相 F 是
         # 自生成流, 尺度/语义不同轨); 回声相无条件 +1 — 纯回声锁 250 步即死
-        # ("长时间不看世界 = 病态", P2 死亡语义在此保留).
+        # ("长时间不看世界 = 病态", 死亡语义在此保留).
         if ctx.echo_loop:
             dip = torch.zeros_like(net._metab_F_base, dtype=torch.bool)  # 回声相无下探判据 (恒 +1)
         else:

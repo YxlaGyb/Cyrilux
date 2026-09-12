@@ -85,14 +85,18 @@ class CyreneModel:
     mem_birth_cooldown: int = 2000
     mem_death_steps: int = 2000
 
-    # 体内代谢 (P1): E ← E·(1−metab_d) + metab_c·ΔF; MAD EMA 新息权 = 1−metab_mad_alpha.
-    # metab_mad_alpha=0.90 + metab_tanh_div=1.5 为 R1 契约标定值 (2026-09-01 P1 段标定:
+    # 体内代谢:
+    # E ← E·(1−metab_d) + metab_c·ΔF;
+    # MAD EMA 新息权 = 1−metab_mad_alpha.
+    # metab_mad_alpha=0.90 + metab_tanh_div=1.5 为 R1 契约标定值
     # 0.95/2.0 下 median(leg)=0.26 低于 [0.3,1] 带; 标定后 0.38 复现 R1 历史值 0.39).
     metab_d: float = 0.05
     metab_c: float = 0.1
     metab_mad_alpha: float = 0.90
     metab_tanh_div: float = 2.5
-    # 死亡契约 (P2 终裁, 下探缺失): f < base·(1−metab_dip_margin) 每次清零计数器,
+
+    # 死亡契约:
+    # f < base·(1−metab_dip_margin) 每次清零计数器,
     # 无下探连续 metab_death_steps 步 → 死亡回合 (修剪 5% 最弱 + 记忆单元饥荒击杀).
     # 基线 = F 慢 EMA (metab_base_rate); 平台期 F 规律性下探不触发, 饥荒 (F 钉高位
     # 零下探) 触发. 术前探针标定: δ=0.10, N=250 (平台 max_run 93 → 2.7× 裕度;
@@ -102,26 +106,30 @@ class CyreneModel:
     metab_death_steps: int = 250
     # 连续感知步 (无发声) 上限, 与 metab_death_steps 镜像 (留校准钮)
     metab_silence_steps: int = 250
-    # P3-c 全行为计价 (判词 §2.4): 看/学/记/说全耗能, 成本只进 E 账本 (资本/应激/门控货币),
+
+    # 全行为计价:
+    # 看/学/记/说全耗能, 成本只进 E 账本 (资本/应激/门控货币),
     # R 吃纯 ΔF (条件二逐点: F 下降 → R > 0). κ 为 CPU 重放标定值 (docs/es/p3c_handoff.md).
     # cost_看 = κ_p·f_now (感知步输入处理 F 水平); cost_学 = κ_l·sqrt(f_now) (ΔW 幅度结构代理);
-    # cost_记 = κ_m·W1 行数 (生存质量费 — P2 死亡回合直接降此费); cost_说 = κ_s (每次发声 ATP).
+    # cost_记 = κ_m·W1 行数 (生存质量费,死亡回合直接降此费); cost_说 = κ_s (每次发声 ATP).
     metab_cost_perc: float = 1.0e-3
     metab_cost_learn: float = 1.0e-3
     metab_cost_mem: float = 3.0e-7
     metab_cost_say: float = 2.0e-3
     # E_ref = E 慢 EMA; 应激 = 饥荒契约进度 (starve_cnt/metab_death_steps), 零设计者增益
     metab_eref_rate: float = 0.002
-    # P3-a τ 有界状态映射 (拆硬夹, 判词 §2.5 案一): τ = τ_lo + (τ_hi−τ_lo)·(0.5+0.5·tanh(g)).
-    # 无乘性累加无 clamp — 范围由映射余域给出: 噪声区 (τ≈9.5 展平骗裁判) 与贪心区 (τ→0
-    # 单字符自锁) 均物理不可达; 旧健康带 [1.0,1.54] 只是范围内一点. β_d 标定: 健康 ε
-    # 差分 (+0.1~0.3) → τ≈1.8-2.2 (历史"粘 2.00"操作点回归, 目的已兑现).
+
+    # τ 有界状态映射: τ = τ_lo + (τ_hi−τ_lo)·(0.5+0.5·tanh(g)).
+    # 无乘性累加无 clamp
+    # 范围由映射余域给出: 噪声区 (τ≈9.5 展平骗裁判) 与贪心区 (τ→0单字符自锁) 均物理不可达;
+    # 旧健康带 [1.0,1.54] 只是范围内一点. β_d 标定: 健康 ε差分 (+0.1~0.3) → τ≈1.8-2.2
     metab_tau_lo: float = 0.9
     metab_tau_hi: float = 2.5
     metab_tau_beta_d: float = 4.0
     metab_tau_beta_s: float = 1.5
     metab_tau_smooth: float = 0.3
-    # P3-b 行为门 (节律内生, 判词 §2.2): p_say = σ(κ_g·(g_eco−g_perc) − κ_s·stress
+
+    # 行为门: p_say = σ(κ_g·(g_eco−g_perc) − κ_s·stress
     # + κ_A·(A−0.5) − κ_n·(nov_n−0.5)); 行为账本 (g_* = |R| EMA, metab_gain_rate);
     # 新奇度自归一化 (metab_nov_rate)。κ/α_g/div 为标定定稿值 (probe_p3b_calib:
     # out/v2-20260910-193044/probe_p3b_calib.json, 204/750 存活; div 取 leg 最接近 0.6)
@@ -132,6 +140,7 @@ class CyreneModel:
     metab_gain_rate: float = 0.02
     metab_nov_rate: float = 0.05
     echo_seed_n: int = 16  # 回声种子字节数 (脚本 SEED_N 迁移)
+
 
     def dims(self) -> dict[str, int]:
         return {
@@ -184,7 +193,7 @@ _ACTIVE_EMA_LAYER = {
 
 
 def _cfg_from_snapshot(path: str, snap: str) -> CyreneModel:
-    """config 快照 → CyreneModel (C9 fail-fast: 未知字段 = 化石口径错配, raise)."""
+    """config 快照 → CyreneModel"""
     raw = json.loads(snap)
     unknown = [k for k in raw if k not in _CFG_FIELDS]
     if unknown:
@@ -195,7 +204,10 @@ def _cfg_from_snapshot(path: str, snap: str) -> CyreneModel:
 
 
 class DensePCNet(nn.Module):
-    """PPA 闭环网络 (门面: 权重声明 + 引擎委托)."""
+    """
+    PPA 闭环网络
+    权重声明 + 引擎委托
+    """
 
     def __init__(self, config: CyreneModel | None = None):
         super().__init__()
@@ -249,9 +261,10 @@ class DensePCNet(nn.Module):
                 (1.0 - 2.0 * torch.arange(osc_n, dtype=torch.float16) / osc_n),
             )
 
-        # 内建能量约束活动基线 (每可塑性矩阵一个 EMA)
+        # 内建能量约束活动基线，每可塑性矩阵一个 EMA
         for aen, lyr in _ACTIVE_EMA_LAYER.items():
             self.register_buffer(f"_active_ema_{aen}", torch.zeros(d[lyr], dtype=torch.float16))
+
         # 冷启动登记: 集合给热路径 (免费成员判定), mask 给持久化. 缺 mask 键的旧检查点
         # 解码为 0 → 集合空 → 首次用即快照, 与旧行为一致. 名称表与 buffer 同源, 不会漂移
         self._active_ema_names = tuple(f"_active_ema_{aen}" for aen in _ACTIVE_EMA_LAYER)
@@ -289,6 +302,7 @@ class DensePCNet(nn.Module):
         )
         self.register_buffer("_mem_g", torch.full((self.cfg.mem_k0,), self.cfg.mem_g_max / 2.0, dtype=torch.float16))
         self.register_buffer("_mem_q", torch.zeros(self.cfg.mem_k0, dtype=torch.float16))
+
         # 出生冷却: int32 buffer 为持久化载体, _mem_birth_py 为热路径 CPU 镜像
         # (对 GPU 张量做步级阈值比较是隐式 .item() 同步排空). 两者同步递增, load 回填镜像
         self.register_buffer("_mem_birth_cd", torch.zeros(1, dtype=torch.int32))
@@ -300,17 +314,19 @@ class DensePCNet(nn.Module):
         if self.cfg.mem_k0 > 6:
             raise ValueError("mem_k0 > 6 需要补充初始 α 谱")
 
-        # 体内代谢账本: 随 state_dict 持久化 (P2 死亡契约消费);
+        # 体内代谢账本: 随 state_dict 持久化;
         # _metab_F_prev_* < 0 = 行为首跑哨兵; _metab_df_mad_* == 0 = 该行为冷启动哨兵
-        # P3-b: ΔF 按行为分账 (感知/回声各一轨 F_prev) — 行为内差分同构可比
+        # ΔF 按行为分账 (感知/回声各一轨 F_prev) 行为内差分同构可比
         self.register_buffer("_metab_E", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_metab_E_ref", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_metab_df_mad_perc", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_metab_df_mad_eco", torch.zeros(1, dtype=torch.float16))
+
         # 饥荒契约进度 fp16 镜像 (应激出处: starve_cnt/metab_death_steps)
         self.register_buffer("_metab_famine_prog", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_metab_F_prev_perc", torch.full((1,), -1.0, dtype=torch.float16))
         self.register_buffer("_metab_F_prev_eco", torch.full((1,), -1.0, dtype=torch.float16))
+
         # P3-b 行为账本 (g_* = |R| EMA, 仅运行行为记账) + 行为门状态
         self.register_buffer("_metab_gain_perc", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_metab_gain_eco", torch.zeros(1, dtype=torch.float16))
@@ -319,26 +335,35 @@ class DensePCNet(nn.Module):
         self.register_buffer("_metab_psay", torch.full((1,), 0.5, dtype=torch.float16))
         self.register_buffer("_metab_gate_hit", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_gate_rand", torch.full((1,), 0.5, dtype=torch.float16))
+        # RPE 预期基线 — EMA(R), rpe = R − 预期; W_act 学"比预期好/差"
+        # 而非绝对进度. 速率复用 metab_gain_rate (行为账本同款时间尺度).
+        self.register_buffer("_metab_rpe_ema", torch.zeros(1, dtype=torch.float16))
+
         # 死亡契约计数器: 连续饥饿 / 连续沉默 / 死亡回合计数, 随 state_dict 持久化
         self.register_buffer("_metab_starve_cnt", torch.zeros(1, dtype=torch.int32))
         self.register_buffer("_metab_silence_cnt", torch.zeros(1, dtype=torch.int32))
         self.register_buffer("_metab_death_round_cnt", torch.zeros(1, dtype=torch.int32))
-        # F 慢基线 (P2 基线锚): high = f_now > base·(1+κ); base==0 = 冷启动哨兵
+
+        # F 慢基线: high = f_now > base·(1+κ); base==0 = 冷启动哨兵
         self.register_buffer("_metab_F_base", torch.zeros(1, dtype=torch.float16))
-        # P3-c 成本遥测 (每步覆写, 报告/验证用): 看/学/记/说分量 + 总支出
+
+        # 成本遥测 (每步覆写, 报告/验证用): 看/学/记/说分量 + 总支出
         self.register_buffer("_metab_cost_perc", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_metab_cost_learn", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_metab_cost_mem", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_metab_cost_say", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_metab_cost_tot", torch.zeros(1, dtype=torch.float16))
-        # P3-a: τ 低通信号滤波器 (ε 差分 EMA, 语义同 de_mad 家族; 持久化保续跑一致)
+
+        # τ 低通信号滤波器 (ε 差分 EMA, 语义同 de_mad 家族; 持久化保续跑一致)
         self.register_buffer("_metab_tau_d", torch.zeros(1, dtype=torch.float16))
+
         # 语言带自校准锚 (感知相位 ε 中心/弥散 EMA, 恒温器输入): 跨 load 持久化,
         # 否则续跑后锚归零需 ~200 步重建. NaN = 冷启动哨兵 (ε ∈ [0,1) 永不 NaN);
         # _lang_eps_cold 为其 CPU 镜像 — 热路径判 NaN 是一次隐式 .item() 同步, 故镜像在 load 一次性恢复
         self.register_buffer("_lang_eps_ema", torch.full((), float("nan"), dtype=torch.float16))
         self._lang_eps_cold = True
-        # 生命计数 (P2): 跨 load 持久化的机体年龄, warmup 判据用它 (旧检查点缺键 → 0 = P2 机制幼年期)
+
+        # 生命计数: 跨 load 持久化的机体年龄, warmup 判据用它
         self.register_buffer("_life_cnt", torch.zeros(1, dtype=torch.int32))
 
         # 张量规范共享缓冲 (热路径零新建): 零/壹标量、pad 段 (cat 前后缀按 active 切视图)、
@@ -353,8 +378,9 @@ class DensePCNet(nn.Module):
         _mp = torch.zeros(256, dtype=torch.float16)
         _mp[32:] = 1.0
         self.register_buffer("_mask_print", _mp)
+
         # continuation/_predict 工作缓冲: 续写流 (定长预分配+长度游标)、UTF-8 状态、L0 one-hot、
-        # 记忆序列、ACh 噪声 — 全部就地覆写, 零热路径新建
+        # 记忆序列、ACh 噪声 全部就地覆写, 零热路径新建
         self.register_buffer(
             "_cont_cur",
             torch.zeros(1, self.cfg.max_seq_len + self.cfg.free_run_window + 64, dtype=torch.long),
@@ -364,6 +390,7 @@ class DensePCNet(nn.Module):
             "_mem_m_seq",
             torch.zeros(1, self.cfg.max_seq_len, max(self.cfg.mem_k0, self.cfg.mem_k_max), d["l4"], dtype=torch.float16),
         )
+
         # 未来折扣目标/序列掩码 (predict 域): 预分配就地清零/置位, 零热路径新建
         self.register_buffer("_z4_fut_buf", torch.zeros(1, self.cfg.max_seq_len, d["l4"], dtype=torch.float16))
         self.register_buffer("_z5_fut_buf", torch.zeros(1, self.cfg.max_seq_len, d["l5"], dtype=torch.float16))
@@ -381,6 +408,7 @@ class DensePCNet(nn.Module):
 
         # 多尺度软加权时间窗
         self.register_buffer("_w_soft", torch.tensor([0.1, 0.8, 0.1], dtype=torch.float16))
+
         # UTF-8 语法阻断掩码 (生成路径逐字节向量化: 原逐字节 .item() 布尔分支 =
         # 每回声步 ~120 次同步排空, GPU 利用率主嫌; 禁止集/值与逐位分支逐位等价).
         # block_cnt = 字符中途禁字节集 {0x00-0x7F}∪{0xC0-0xFF}; block_start = 边界禁
@@ -395,6 +423,7 @@ class DensePCNet(nn.Module):
         self.register_buffer("_e_ema_2", torch.tensor(0.05, dtype=torch.float16))
         self.register_buffer("_e_ema_4", torch.tensor(0.05, dtype=torch.float16))
         self.register_buffer("_e_ema_8", torch.tensor(0.05, dtype=torch.float16))
+
         # 多尺度差分窗环形缓冲 (GPU 索引 [4,L,L] + 槽位 [1,L,L] — 图捕获兼容, 零热路径新建;
         # 旧四缓冲+python 索引迁移见 load)
         self.register_buffer("_dw_buf", torch.zeros(4, d["l4"], d["l4"], dtype=torch.float16))
@@ -420,19 +449,21 @@ class DensePCNet(nn.Module):
 
         # 动态生长状态
         self.active_size = {"l4": d["l4"], "l2": d["l2"], "l3": d["l3"], "l5": d["l5"], "l6": d["l6"]}
+
         # 全局步计数: int32 buffer 为持久化载体, _step_py 为热路径 CPU 镜像 (同 _behavior_py)
         self.register_buffer("_step_counter", torch.zeros(1, dtype=torch.int32))
         self._step_py = 0
+
         # 代谢哨兵 python 标志 (代替对 GPU 张量的 `if _metab_F_prev < 0:` — 那是每步
         # 一次隐式 .item() 同步排空; 标志由 load 从 F_prev 一次性恢复)
-        # P3-b: 每行为独立哨兵 (_settled_perc/_settled_eco), _metab_settled = 全局首步
+        # 每行为独立哨兵 (_settled_perc/_settled_eco), _metab_settled = 全局首步
         self._metab_settled = False
         self._metab_mad_cold_perc = True
         self._metab_mad_cold_eco = True
         self._settled_perc = False
         self._settled_eco = False
-        # P3-b: 行为门 CPU 路由镜像 (load 后未调 sync_gate 前默认 False = 感知)
-        self._behavior_py = False
+        self._behavior_py = False # 行为门 CPU 路由镜像，load 后未调 sync_gate 前默认 False = 感知
+
         # 死缓簿: 每层行状态 (int8 是否死缓 / int16 死缓龄), 随 state_dict 持久化.
         # 零值 = 从未进入死缓, 与旧检查点缺键同义 (修剪引擎原以 None 表达此态)
         for _sln in ("l4", "l2", "l3", "l5", "l6"):
@@ -461,7 +492,8 @@ class DensePCNet(nn.Module):
         self.E_t6 = nn.Parameter(torch.zeros(d["l6"], d["l6"], dtype=torch.float16))
         self.E_bind = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
         self.E_04 = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
-        # 侧抑制矩阵 (L5 激活去相关)
+
+        # 侧抑制矩阵 L5 激活去相关
         self.M_l5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
         self.register_buffer("_gain_mask", (0.5 + torch.rand(d["l5"], d["l3"])).to(torch.float16))
         self.register_buffer("_gain_l3", (0.5 + torch.rand(d["l3"], d["l2"])).to(torch.float16))
@@ -505,7 +537,6 @@ class DensePCNet(nn.Module):
             else:
                 nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(p.shape[-1]))
 
-    # 门面: 一行委托
 
     def forward(self, byte_ids: torch.Tensor) -> dict:
         """推理前馈: 返回未来预测偏差."""
@@ -541,7 +572,7 @@ class DensePCNet(nn.Module):
         self._behavior_py = bool(self._metab_gate_hit.item())
 
     def maybe_prune(self, step: int) -> str | None:
-        """代谢触发修剪接缝 (P2 下探缺失 + P3-b 对称牙): 连续饥饿或连续沉默达阈值 → 死亡回合.
+        """代谢触发修剪接缝: 连续饥饿或连续沉默达阈值 → 死亡回合.
 
         墙钟已退役. 轮询周期 8 步 (触发延迟 ≤8 步, 相对 N=250 的滞回可忽略);
         warmup 期计数器继续积累但回合被挡 (发育期免回合, 不免登记).

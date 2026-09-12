@@ -72,7 +72,14 @@ class FeedforwardMixin(_MixinBase):
         if not free_run and not echo_world_frozen:
             # W_04 主辅误差: 预测误差为主 + 0.2×重建误差 (重建不需要词序, 只稳定信号);
             # F 由 _update_metabolism 同式计算 (单一出处, 保证驱动 W_04 与代谢账本同 F)
-            final_error = sh.metab_f
+            # explain-away — 高层 (z2) 经 W_42 无转置生成 z4 预测 (生成方向),
+            # 未能解释部分占比 pw ∈ (0,1] 作为精度权重: 高层已解释的成分不再驱动
+            # 低层学习 (Rao-Ballard explain-away; 判词 §8 缺陷一). 只乘本函数局部副本,
+            # sh.metab_f (代谢 F 单一出处) 原样不动.
+            td_hat = z2 @ net.W_42[:dim_2, :dim_4]  # 生成方向: 高层生成低层预测
+            res_td = (z4 - td_hat).norm(dim=-1)  # [N,S] 未解释范数
+            pw = res_td / (z4.norm(dim=-1) + res_td + 1e-3)  # 未解释占比 ∈ (0,1)
+            final_error = sh.metab_f * pw.unsqueeze(-1)
 
             # 幅度-方向解耦: dW 归一化单位向量, 显著性只选方向不放大幅度
             # → 单步最大幅度 = lr, 防极端样本单步爆 NaN

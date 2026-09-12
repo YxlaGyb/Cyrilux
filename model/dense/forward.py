@@ -265,7 +265,10 @@ class ForwardEngine:
         if free_run:
             mu3 = mu3 + net.cfg.osc_amp_s * vs  # 慢节律 → L3
         if not is_inference:
-            mu3 = mu3 + torch.sign(2.0 * (torch.rand_like(mu3) - 0.5)) * 0.03  # ACh 噪声
+            # ACh 噪声: 幅度由内生新奇度调制 (0.5+nov ∈ [0.5,1.5]) —
+            # 机体越觉得新鲜越探索, 不再是固定 0.03 的设计者常数底噪
+            _nov = net._metab_nov if hasattr(net, "_metab_nov") else net._zero1
+            mu3 = mu3 + torch.sign(2.0 * (torch.rand_like(mu3) - 0.5)) * (0.03 * (0.5 + _nov))
         z3 = self._recurrent(
             mu3, dev, net.W_t3[:dim_3, :dim_3],
             stp=(net._stp_r_l3[:dim_3], net._stp_tau_l3[:dim_3], net._stp_u_l3[:dim_3]) if free_run else None,
@@ -325,7 +328,14 @@ class ForwardEngine:
                 zt = z4[:, t : t + 1].unsqueeze(2)  # [N,1,1,dim_4]
                 mt = (1 - net._mem_a)[None, None, :, None] * m_seq[:, t - 1 : t] + net._mem_a[None, None, :, None] * zt
                 m_seq[:, t : t + 1] = mt
-            net._mem_out = m_seq.reshape(N, S, K * a4_)  # [N,S,K·dim_4] 展平供 zh 拼接
+            # 内容寻址检索 — 记忆单元按与当前输入的余弦相似度做 softmax
+            # 竞争上岗 (gate 以单元数 K 自标定, Σgate=K: 全相似 → 均匀 1 = 中性;
+            # 单元独配 → ~K 独占 = 检索). 记忆本体 _mem_m 写回不受门控影响,
+            # 门控只作用于读出通道 _mem_out (检索是读出行为, 不是记忆改写).
+            num = (z4.unsqueeze(2) * m_seq).sum(dim=-1)  # [N,S,K] 内容匹配度
+            den = z4.norm(dim=-1, keepdim=True) * (m_seq.norm(dim=-1) + 1e-3)  # [N,S,1]×[N,S,K] → [N,S,K]
+            attn = torch.softmax((num / den) * float(K), dim=-1) * float(K)
+            net._mem_out = (m_seq * attn.unsqueeze(-1)).reshape(N, S, K * a4_)
             net._mem_m = m_seq[:, -1].mean(dim=0).detach()  # [K,dim_4] 批均值写回
             # 新奇度 (快慢散度): 死循环→N→0 (LTD); 正常推进→N 正 (LTP). 保留循环版 (张量化 fp16 下溢)
             zslow = torch.zeros_like(z4)

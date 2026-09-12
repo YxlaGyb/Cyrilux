@@ -7,8 +7,8 @@ from __future__ import annotations
 from pathlib import Path
 
 REDLINE_TOKENS = (
-    "step_E",        # 体外代谢账本 (P1 已删, 不得复生)
-    "inject_world",  # 体外注入接口 (P1 已拆)
+    "step_E",        # 体外代谢账本
+    "inject_world",  # 体外注入接口
     "_world_R",      # 体外生存信号字段
     "_world_E",      # 体外能量账本字段 (含 _world_E_ref 等家族)
     "world_lang",    # 报告仪表禁止被核心库 import (分层解耦 + 红线)

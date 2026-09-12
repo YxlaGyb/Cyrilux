@@ -287,7 +287,7 @@ class EngineCore(
         # 拓扑重塑: 修剪触发权由编排层经 net.maybe_prune(step) 显式交出
         net._step_counter.add_(1)
         net._step_py += 1
-        net._life_cnt.add_(1)  # 机体年龄 (P2): 跨 load 持久化, warmup 判据
+        net._life_cnt.add_(1)  # 机体年龄: 跨 load 持久化, warmup 判据
 
         stats = {
             "free_energy": (

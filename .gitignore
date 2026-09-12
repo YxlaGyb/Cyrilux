@@ -9,7 +9,7 @@ py_models
 
 # data
 /dataset
-/docs
+
 *.pt
 *.jsonl
 *.egg-info
@@ -28,3 +28,5 @@ py_models
 # AI
 /.claude
 /.code-review-graph
+
+tmp/

@@ -98,10 +98,16 @@ class ActionMixin(_MixinBase):
         dW_elig = (zbg_ac.transpose(-2, -1) @ oh_g).mean(dim=0)
         E_act = _elig_accum(net, "W_act", dW_elig)
         _wr = getattr(net, "_metab_R", None)
-        net._survival_signal = (
-            _wr / (E_act.norm() + 1e-6) if _wr is not None
-            else net._zero1  # tensor-guard: rare (代谢未结算冷启动)
-        )
+        if _wr is not None:
+            # RPE — W_act 学"比预期好/差"而非绝对进度 (判词 §8 缺陷二:
+            # R 是进度量非预期差). rpe = R − EMA(R), EMA 速率复用 metab_gain_rate
+            # (行为账本同款时间尺度). 冷启动 EMA=0 → rpe=R (从原始进度平滑过渡).
+            _g_rpe = net.cfg.metab_gain_rate
+            _rpe = _wr - net._metab_rpe_ema
+            net._metab_rpe_ema.mul_(1.0 - _g_rpe).add_(_g_rpe * _wr)
+            net._survival_signal = _rpe / (E_act.norm() + 1e-6)
+        else:
+            net._survival_signal = net._zero1  # tensor-guard: rare (代谢未结算冷启动)
         dW_act = dW_act + E_act * net._survival_signal
         net.W_act.data += dW_act * (net.cfg.lm_lr_boost * 0.2) * (0.5 + intr_d) * col_norm * 5.0
         # 复读检测跟踪 (随机扰动已升级为 forward.py 内部状态错误配对, 此处仅跟踪供诊断)

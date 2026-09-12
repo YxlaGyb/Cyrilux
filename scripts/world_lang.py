@@ -14,7 +14,7 @@
   q         (0.8·L + 0.2·S)·(1 - X)
 
 认证门 certify: q ≥ q_ref → 记一次认证并更新 ε 遥测 EMA — 仅报告统计;
-恒温器设定点已改走体内 _lang_eps_ema (P1/P3-a), 本模块不发任何锚.
+恒温器设定点已改走体内 _lang_eps_ema, 本模块不发任何锚.
 
 全部统计 CPU Python (非张量热路径).
 常用字统计口径与 audit_char_coverage 一致 (前 2 万行字符 Counter).
@@ -182,7 +182,7 @@ class WorldLangPhysics:
         """世界仪表动态状态 + 恒温器温度 → 可 JSON 侧车 (断点续跑连续性).
 
         net.save() 只存权重; 认证遥测/_hist 是仪表运行时状态 — 分段续跑
-        必须靠此侧车保持连续. 体外 E/de_mad 已随 step_E 删除 (P1 断链),
+        必须靠此侧车保持连续. 体外 E/de_mad 已随 step_E 删除,
         旧侧车中的残留键在 load_state 被忽略.
         """
         return {

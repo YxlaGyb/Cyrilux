@@ -81,7 +81,7 @@ def test_certify_anchor_ema(world):
 
 
 def test_step_E_retired(world):
-    # 红线卫生锁: 体外代谢账本已删除 (P1 断链), 不得复生
+    # 红线卫生锁: 体外代谢账本已删除, 不得复生
     assert not hasattr(world, "step_E")
     assert not hasattr(world, "E")
     assert not hasattr(world, "de_mad")
@@ -115,7 +115,7 @@ def test_state_roundtrip(tmp_path, world):
 
 
 def test_load_state_tolerates_legacy_keys(tmp_path, world):
-    # 旧侧车 (P1 前) 含体外 E/de_mad 残留键 → 恢复忽略之, 仪表不复活死状态
+    # 旧侧车含体外 E/de_mad 残留键 → 恢复忽略之, 仪表不复活死状态
     st = world.save_state(step=1500, gen_temp=1.0)
     st["E"] = 0.7
     st["de_mad"] = 0.004

@@ -36,7 +36,7 @@ def restore_active_ema_init(net: DensePCNet) -> set[str]:
 def _activity_baseline(
     net: DensePCNet, post: torch.Tensor, ema_name: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """返回 (p2, excess): 窗内活动² 与相对慢基线 EMA (0.99/0.01) 的超额部分.
+    """窗内活动² 与相对慢基线 EMA (0.99/0.01) 的超额部分.
 
     首窗延迟初始化 ema ← post² (excess 从零起步), 纯局部.
     """

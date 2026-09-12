@@ -90,8 +90,7 @@ def test_l5_prune_shapes_all_synced():
             p = getattr(net, name).data
             p.copy_((p / (p.norm(dim=1, keepdim=True) + 1e-6) * 1.0).to(torch.float16))
 
-    # 用极短的字节序列跑 learn,推进内部状态后直调 _prune (白盒: 测剪裁机制,
-    # 不依赖 P2 后的代谢触发接缝 — maybe_prune 已由代谢门控)
+    # 用极短的字节序列跑 learn,推进内部状态后直调 _prune
     byte_ids = torch.randint(0, D_INPUT, (1, 4), dtype=torch.long)
     # 不关心 loss — 只要 shape 对就好
     try:
