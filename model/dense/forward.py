@@ -378,9 +378,9 @@ class ForwardEngine:
                 raw_t = raw_t * r_bind  # 槽输入 × 可用资源
             z_bind = self._bind_sparse(raw_t - net._theta_bind)
             z_binds.append(z_bind)
-            if stp_bind:
+            if r_bind is not None and u_bind_b is not None and inv_tau_b is not None:
                 act = z_bind.abs().mean(dim=1)  # [1,K] (同递归层修正)
-                ema_b = getattr(net, "_stp_active_ema_bind")[: r_bind.shape[1]]
+                ema_b = net._stp_active_ema_bind[: r_bind.shape[1]]
                 ema_b.mul_(0.99).add_(0.01 * act.squeeze(0))
                 # 槽位局部 U 自适应 (同递归层, 纯局部负反馈)
                 if self.net.cfg.stp_u_adapt:

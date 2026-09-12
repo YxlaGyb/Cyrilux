@@ -1,4 +1,5 @@
-"""方案 A 实测: 把真实 echo 步 (continuation 63 次 _predict + learn) 罩进 CUDA Graph.
+"""
+把真实 echo 步 (continuation 63 次 _predict + learn) 罩进 CUDA Graph.
 
 两档, 分开跑 (各自独立进程, 避免状态互相污染):
   --which cont : 整段 continuation(seed=16, n_gen=63) 捕获成一张图
@@ -20,9 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from _probe_meta import config_meta
 
-from dataset import ByteDataset  # noqa: E402
-from model import DensePCNet  # noqa: E402
-from pkg.cli.utils import run_file  # noqa: E402
+from dataset import ByteDataset
+from model import DensePCNet
+from pkg.cli.utils import run_file
 
 SEED_N = 16
 

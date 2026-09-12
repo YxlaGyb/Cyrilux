@@ -1,8 +1,5 @@
 """
-多任务灾难性遗忘压力测试 StreamRunner.  — DEPRECATED sparse 管线
-
-DEPRECATED (117 轮 Round 1): 本脚本测稀疏 CyreneModel 灾难性遗忘, 已脱离活动主线。
-活跃主线 = model.dense.DensePCNet。保留可跑: 依赖指向 model/_archived_sparse.
+多任务灾难性遗忘压力测试 StreamRunner.DEPRECATED sparse 管线
 
 Phase 1: 无回放 (A→B→C→D 灾难性遗忘基线)
 Phase 2: MemoryBank + Sniffer 保护 (A→B→C→D 持续学习)
@@ -16,12 +13,11 @@ import time
 import torch
 from torch.utils.data import DataLoader
 
-from model._archived_sparse.continual.forgetting_sniffer import ForgettingSniffer
-from model._archived_sparse.continual.memory_bank import MemoryBank
 from dataset import ByteDataset
 from model._archived_sparse import CyreneConfig, CyreneModel
+from model._archived_sparse.continual.forgetting_sniffer import ForgettingSniffer
+from model._archived_sparse.continual.memory_bank import MemoryBank
 from pkg.utils.trainer_utils import setup_seed
-
 
 # ═══════════════════════════════════════════════════════════════════
 # 工具函数
@@ -362,7 +358,7 @@ def main():
         print('错误: 至少需要 2 个任务')
         sys.exit(1)
 
-    task_names = args.task_names if args.task_names else [chr(65 + i) for i in range(n_tasks)]
+    task_names = args.task_names or [chr(65 + i) for i in range(n_tasks)]
     if len(task_names) != n_tasks:
         print(f'错误: --task-names 数量 ({len(task_names)}) 与 --tasks ({n_tasks}) 不匹配')
         sys.exit(1)

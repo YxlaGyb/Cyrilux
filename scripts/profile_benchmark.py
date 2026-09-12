@@ -1,7 +1,5 @@
-"""CyreneModel 性能基准测试 — 字节级指标.  — DEPRECATED sparse 管线
-
-DEPRECATED (117 轮 Round 1): 本脚本基准稀疏 CyreneModel, 已脱离活动主线。
-活跃主线 = model.dense.DensePCNet。保留可跑: 依赖指向 model/_archived_sparse.
+"""
+CyreneModel 性能基准测试 — 字节级指标. DEPRECATED sparse 管线
 
 指标:
   - steps/s  (step 吞吐)
@@ -72,7 +70,7 @@ def benchmark_latency(model: CyreneModel, seq: torch.Tensor, n_steps: int = 200)
 
 
 def benchmark_memory(
-    hidden_sizes: list[int] = None, seq_len: int = 128
+    hidden_sizes: list[int] | None = None, seq_len: int = 128
 ) -> list[dict]:
     """测不同规模下的 CPU/GPU 内存."""
     hidden_sizes = hidden_sizes or [64, 128, 256]

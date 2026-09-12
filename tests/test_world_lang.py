@@ -1,6 +1,6 @@
 """
-world_lang 世界语言物理单元测试
-评分 / 新颖税 / E 代谢 / 认证门.
+world_lang 世界语言物理仪表单元测试
+评分 / 新颖税 / 认证遥测 / 侧车 round-trip / 旧键兼容.
 """
 import importlib.util
 import json
@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 _spec = importlib.util.spec_from_file_location("world_lang", "scripts/world_lang.py")
+assert _spec is not None and _spec.loader is not None
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 WorldLangPhysics = _mod.WorldLangPhysics
@@ -63,48 +64,6 @@ def test_X_novelty_tax(world):
     assert world.score(b)["X"] == 0.0
 
 
-def test_E_metabolism_monotone(world):
-    e0 = world.E
-    # 高 q → E 上升
-    world.step_E(0.9, trace_norm=12.0)
-    assert e0 < world.E
-    # 零 q → E 单调衰减 (只消耗)
-    for _ in range(20):
-        world.step_E(0.0, trace_norm=12.0)
-    assert e0 > world.E
-
-
-def test_R1_gain_two_sided_calibration(world):
-    # R = tanh(ΔE/(2·MAD))/‖迹‖ (113 R1). 消费侧: 同流水, 迹范数翻倍
-    # → R 精确减半 (写入 = 单位方向 × 幅度, 音量随系统自己的行为尺度).
-    world.E = 1.0
-    world.de_mad = None
-    r_a = world.step_E(0.9, trace_norm=10.0)
-    world.E = 1.0
-    world.de_mad = None
-    r_b = world.step_E(0.9, trace_norm=20.0)
-    assert r_a == pytest.approx(2.0 * r_b)
-    # tanh 界: |R| ≤ 1/‖迹‖ (迹 ≥ 1 时 ≤ 1, 契约 0-1 级)
-    assert abs(r_a) <= 0.1 + 1e-12
-    assert abs(r_a) > 0.0
-    # 信号侧: 同流水, 世界噪声地板 (MAD) 更大 → |R| 更小
-    world.E = 1.0
-    world.de_mad = 0.5
-    r_noisy = world.step_E(0.9, trace_norm=10.0)
-    assert abs(r_noisy) < abs(r_a)
-    # de_mad EMA 收敛: 多步后为正有限
-    assert 0.0 < world.de_mad < float("inf")
-
-
-def test_R1_mad_cold_start(world):
-    # 冷启动首笔: de_mad = |ΔE| → |tanh| = tanh(0.5) ≈ 0.462 (平滑入契约区)
-    world.E = 1.0
-    world.de_mad = None
-    world.step_E(0.9, trace_norm=1.0)
-    de = 1.0 * (1 - 0.05) + 0.1 * 0.9 - 1.0
-    assert world.de_mad == pytest.approx(abs(de))
-
-
 def test_certify_gate(world):
     assert not world.certify(0.1, 0.9)  # 低于 q_ref → 不认证
     assert world.n_certified == 0
@@ -121,18 +80,22 @@ def test_certify_anchor_ema(world):
     assert world.world_eps_mad >= 0.0
 
 
+def test_step_E_retired(world):
+    # 红线卫生锁: 体外代谢账本已删除 (P1 断链), 不得复生
+    assert not hasattr(world, "step_E")
+    assert not hasattr(world, "E")
+    assert not hasattr(world, "de_mad")
+
+
 def test_state_roundtrip(tmp_path, world):
-    # 演化出非平凡动态状态: E 代谢 + 认证锚 + 新颖度历史 + de_mad
-    world.step_E(0.7, trace_norm=12.0)
-    world.step_E(0.5, trace_norm=11.8)
+    # 演化出非平凡动态状态: 认证锚 + 新颖度历史
     for v in (0.50, 0.52):
         world.certify(0.6, v)
     world.record("你好天气很好我们".encode())
     world.record("学习知识需要耐心".encode())
-    assert world.de_mad is not None
 
     st = world.save_state(step=1500, gen_temp=1.0)
-    # JSON 侧车可序列化 (exp113 断点续跑的存储形态)
+    # JSON 侧车可序列化 (断点续跑的存储形态)
     p = tmp_path / "sidecar.json"
     p.write_text(json.dumps(st), encoding="utf-8")
 
@@ -141,8 +104,6 @@ def test_state_roundtrip(tmp_path, world):
     w2 = WorldLangPhysics(str(p2), n_char_lines=10, n_trigram_lines=None, top_n=100)
     step, gt = w2.load_state(json.loads(p.read_text(encoding="utf-8")))
     assert (step, gt) == (1500, 1.0)
-    assert w2.E == world.E
-    assert w2.de_mad == world.de_mad
     assert w2.world_eps_ema == world.world_eps_ema
     assert w2.world_eps_mad == world.world_eps_mad
     assert w2.n_certified == world.n_certified
@@ -153,17 +114,20 @@ def test_state_roundtrip(tmp_path, world):
     assert w2.score(dup)["X"] == world.score(dup)["X"] > 0.9
 
 
-def test_state_roundtrip_old_sidecar_no_de_mad(tmp_path, world):
-    # 旧侧车 (111/112 轮, 无 de_mad 键) → 恢复为 None → R1 冷启动
-    world.step_E(0.7, trace_norm=12.0)
+def test_load_state_tolerates_legacy_keys(tmp_path, world):
+    # 旧侧车 (P1 前) 含体外 E/de_mad 残留键 → 恢复忽略之, 仪表不复活死状态
     st = world.save_state(step=1500, gen_temp=1.0)
-    del st["de_mad"]
-    p = tmp_path / "sidecar_old.json"
+    st["E"] = 0.7
+    st["de_mad"] = 0.004
+    p = tmp_path / "sidecar_legacy.json"
     p.write_text(json.dumps(st), encoding="utf-8")
     p2 = tmp_path / "mini.jsonl"
     w2 = WorldLangPhysics(str(p2), n_char_lines=10, n_trigram_lines=None, top_n=100)
-    w2.load_state(json.loads(p.read_text(encoding="utf-8")))
-    assert w2.de_mad is None
+    step, gt = w2.load_state(json.loads(p.read_text(encoding="utf-8")))
+    assert (step, gt) == (1500, 1.0)
+    assert not hasattr(w2, "E")
+    assert not hasattr(w2, "de_mad")
+    assert w2._hist == world._hist
 
 
 def test_state_roundtrip_null_anchor(tmp_path, world):

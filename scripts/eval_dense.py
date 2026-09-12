@@ -9,7 +9,9 @@ PPA 模型评估
 - Memory: 重复喂同输入, 自由能是否逐轮下降 (世界模型记住模式)
 """
 import time
+
 import torch
+
 from model import DensePCNet
 
 torch.set_grad_enabled(False)

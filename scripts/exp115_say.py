@@ -1,27 +1,5 @@
-"""第 115 轮短跑: W1 解冻验证 + 仪表升级 (round-115 阶段四/五).
-
-阶段五 (本轮唯一训练跑):
-1. 114 终态 init (exp114_say.pt + 侧车 step=27500), lm_freeze_w1=False
-   — 预缩放修复 (readout.py) 在位, τ 硬夹 [1,2] (action.py 结构继承),
-   语料/世界物理/感知-回声交替循环与 114 逐行同款, ≤5000 步
-2. ‖dW1‖ 每步两口径: 缩放前 |dW1| 条目绝对最大 (readout.py 遥测
-   net._dW1_absmax_raw, fp16 max 归约无求和溢出; inf 即首溢出诊断)
-   + 落盘后 ‖ΔW1‖_F (步前后快照差, 含 soft_norm_preserve)
-3. NaN 全程监控: 步数 + 第一个异常量 (参数名 + _dW1_absmax_raw +
-   ‖W1_elig‖ + h_in_max)
-4. 前后梯级对照 (probe115_ladder.py --ckpt): 跑前 114 终态 / 跑后
-   115 终态 — W1 解冻是否移动梯级位置
-
-阶段四 (仪表升级, 挂进 checkpoint 钩子; 今后"变没变好"主读数):
-- 增报: 真字节中位名次 / top-1 / top-15 命中率 (en eval = tail 窗
-  [0:200], 模型未见) + 最优温度标定 bpb
-- s 标定硬约束: s* 仅由标定切片 (tail 窗 [200:1000], 模型未见, 与
-  eval 严格分离) 的 bpb 网格扫描决定 — 标量无梯度无裁判无 R 无任何
-  局部学习信号; 评估用独立实例, s* 不回灌训练
-- 保留 s=60 旧口径 bpb (tail/trunc 全量) — 与 114 曲线连续可比
-
-用法: .venv/Scripts/python.exe scripts/exp115_say.py --steps 5000
-      (续跑: ... --resume; 冒烟: ... --steps 100)
+"""
+W1 解冻验证 + 仪表升级
 """
 import argparse
 import codecs
@@ -40,7 +18,8 @@ from world_lang import WorldLangPhysics
 from dataset import ByteDataset
 from model import CyreneModel, DensePCNet
 from model.modulation import rms_norm
-from pkg.cli.utils import run_file
+from pkg.cli.utils import pin_run_dir, resolve_path, run_dir, run_file
+from pkg.outver import latest_run_dir_with
 
 torch.set_grad_enabled(False)
 
@@ -51,7 +30,24 @@ S_MAX = 256
 # SEED_N 已退役: 回声种子长度入模型 cfg.echo_seed_n (P3-b 内部路由)
 RPT = 25  # 遥测报告周期 (步): .item() 读数是同步排空主嫌 — 报告降频到 1/RPT,
 #          统计口径改为采样统计; 事件行 (death/NaN) 不受此限
-SIDECAR = "out/exp115_world_state.json"
+SIDECAR_NAME = "exp115_world_state.json"  # 侧车文件名 (位于本次训练的版本目录内)
+LEGACY_SIDECAR = "out/exp115_world_state.json"  # 旧固定路径 (时间戳方案时代, 只读兼容)
+LEGACY_TAG = "out/exp115_say"  # 旧权重固定路径前缀 (只读兼容)
+
+
+def _resolve_resume(tag_base: str = "exp115_say") -> tuple[str, str]:
+    """续跑定位: 含本训练线侧车的最大 N 版本目录 → (权重 tag 路径, 侧车路径).
+
+    版本目录 (v{N}-{YYYYMMDD}-{HHMMSS}) 优先; 无则回退旧固定路径 (只读兼容).
+    续跑沿用原版本目录 (pin_run_dir) — 训练线与版本目录一一对应.
+    """
+    d = latest_run_dir_with(resolve_path("out"), SIDECAR_NAME)
+    if d is not None:
+        pin_run_dir(d)
+        return os.path.join(d, tag_base), os.path.join(d, SIDECAR_NAME)
+    return LEGACY_TAG, LEGACY_SIDECAR
+
+
 TRAIN_LINES = 1270000
 GAUGE_TOTAL = 1048576  # 1MB
 S_GRID = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 8.0, 10.0, 12.0)
@@ -59,7 +55,9 @@ N_EVAL_WIN = 200   # en eval = tail[0:200] (tmp_rank_probe / ladder 同臂)
 N_CAL_WIN = 800    # 标定切片 = tail[200:1000] (与 eval 严格分离)
 
 
-def _write_sidecar(world, step, net, path=SIDECAR):
+def _write_sidecar(world, step, net, path=None):
+    if path is None:
+        path = run_file(SIDECAR_NAME)
     gt = getattr(net, "_gen_temp", None)
     st = world.save_state(step, float(gt.item()) if gt is not None else 4.0)
     tmp = path + ".tmp"
@@ -446,7 +444,8 @@ def main():
     ap.add_argument("--data", default="dataset/pretrain_t2t_mini.jsonl")
     ap.add_argument("--steps", type=int, default=5000)
     ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--tag", default="out/exp115_say")
+    ap.add_argument("--tag", default="exp115_say",
+                    help="产物名前缀 (位于本次训练的版本目录 out/v{N}-{YYYYMMDD}-{HHMMSS}/ 内)")
     ap.add_argument("--init-ckpt", default="out/exp114_say.safetensors",
                     help="起始检查点 (P3-b 主线: out/exp115_p3c_ev.pt)")
     ap.add_argument("--init-sidecar", default="out/exp114_world_state.json")
@@ -475,18 +474,20 @@ def main():
           flush=True)
 
     if args.resume:
-        with open(SIDECAR, encoding="utf-8") as f:
+        tag, sidecar = _resolve_resume(tag_name)
+        with open(sidecar, encoding="utf-8") as f:
             st = json.load(f)
         step0, gt0 = world.load_state(st)
-        load_path = f"{args.tag}_step{step0}.safetensors"
+        load_path = f"{tag}_step{step0}.safetensors"
         if not os.path.exists(load_path):
-            load_path = args.tag + ".safetensors"
+            load_path = tag + ".safetensors"
         net = DensePCNet.load(load_path, cfg).to(dev)
         # P3-a: τ 是状态纯函数 (每回声步重算) — 侧车 τ 只打印不回填
-        print(f"exp115_say: resume 权重={load_path} 侧车 step={step0} "
+        print(f"exp115_say: resume 权重={load_path} 侧车={sidecar} step={step0} "
               f"E(体内,来自检查点)= {float(net._metab_E.item()):.4f} τ(侧车,参考)={gt0:.3f} "
               f"cert={world.n_certified}", flush=True)
     else:
+        tag = run_file(args.tag)  # 本次训练全部产物 → 新版本目录 out/v{N}-{YYYYMMDD}-{HHMMSS}/
         with open(args.init_sidecar, encoding="utf-8") as f:
             st = json.load(f)
         _, gt0 = world.load_state(st)
@@ -701,11 +702,11 @@ def main():
             print(msg, flush=True)
             logf.write(msg + "\n")
         if step % 500 == 0:
-            net.save(args.tag + f"_step{step}.safetensors")
+            net.save(tag + f"_step{step}.safetensors")
             _write_sidecar(world, step, net)
             # ── 仪表钩子: 独立评估实例 (零状态污染) + s 标定 + 名次 ──
             te = time.time()
-            g = eval_gauge(args.tag + f"_step{step}.safetensors", cfg, gauge, dev)
+            g = eval_gauge(tag + f"_step{step}.safetensors", cfg, gauge, dev)
             rec = {"step": step,
                    "bpb_tail": g["bpb_tail"], "bpb_trunc": g["bpb_trunc"],
                    "bpb_all": (g["bpb_tail"] * len(gauge["tail"]) * 255
@@ -730,11 +731,11 @@ def main():
                   f"median={g['eval']['rank_median']:.0f} ({rec['eval_s']}s)",
                   flush=True)
 
-    net.save(args.tag + ".safetensors")
+    net.save(tag + ".safetensors")
     _write_sidecar(world, step, net)
     if nan_at is None or step % 500 != 0:
         te = time.time()
-        g = eval_gauge(args.tag + ".safetensors", cfg, gauge, dev)
+        g = eval_gauge(tag + ".safetensors", cfg, gauge, dev)
         rec = {"step": step,
                "bpb_tail": g["bpb_tail"], "bpb_trunc": g["bpb_trunc"],
                "bpb_all": (g["bpb_tail"] * len(gauge["tail"]) * 255
@@ -755,9 +756,9 @@ def main():
               f"trunc={g['bpb_trunc']:.4f} | s*={g['best_s_on_cal']} "
               f"eval@best_s={g['eval']['bpb_at_best_s']:.3f} "
               f"top15={g['eval']['top15']:.4f} ({rec['eval_s']}s)", flush=True)
-    for f in os.listdir("out"):
-        if f.startswith(os.path.basename(args.tag) + "_step") and f.endswith(".safetensors"):
-            os.remove(os.path.join("out", f))
+    for f in os.listdir(run_dir()):
+        if f.startswith(tag_name + "_step") and f.endswith(".safetensors"):
+            os.remove(os.path.join(run_dir(), f))
 
     # frozen_moved 复测 (entrywise rel_frob, 阶段六口径)
     fin_w = {n: getattr(net, n).detach().float().cpu() for n in tracked}  # tensor-guard: report (摘要快照口径)

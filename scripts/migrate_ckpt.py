@@ -10,24 +10,20 @@ W_04/W_42/W_23/W_56/W1 形状反推 dims/mem_k0 建模 → 形状过滤载入存
 """
 
 import json
-import os
 import sys
 from dataclasses import replace
-from datetime import datetime
 from pathlib import Path
 
 import torch
+from safetensors.torch import load_file
+
+from dataset import ByteDataset
+from model import CyreneModel, DensePCNet
+from pkg.outver import ensure_run_dir
 
 torch.set_grad_enabled(False)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
-from safetensors.torch import load_file  # noqa: E402
-
-from dataset import ByteDataset  # noqa: E402
-from model import CyreneModel, DensePCNet  # noqa: E402
 
 NAMES = [
     "chat107_pool_fixed",
@@ -38,7 +34,7 @@ NAMES = [
     "exp115_p3c_ev",
     "exp115_p3b_ev",
 ]
-OUT_DIR = Path("out") / f"v3-{datetime.now():%Y%m%d-%H%M%S}" / "migrated"  # v3-<ts> 运行目录规范
+OUT_DIR = Path(ensure_run_dir(Path("out"))) / "migrated"  # 版本目录规范 out/v{N}-{时间戳} (pkg/outver)
 DATA = "dataset/pretrain_t2t_mini.jsonl"
 S_MAX = 256
 PARITY_WINDOWS = 2

@@ -4,10 +4,9 @@ CLI 共享工具: 路径处理 & 配置加载.
 
 import json
 import os
-import re
-from datetime import datetime
 
-# 项目根目录 — 相对于 pkg/cli/utils.py 向上 3 层
+from pkg.outver import ensure_run_dir
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -22,22 +21,21 @@ _RUN_DIR: str | None = None
 
 
 def run_dir() -> str:
-    """本次运行的输出目录 out/v{N}-YYYYMMDD-HHMMSS/ — 每进程一个, 首次调用时创建.
+    """本次训练的输出版本目录 out/v{N}-{YYYYMMDD}-{HHMMSS}/ — 每进程一个, 首次调用时创建.
 
-    N = out/ 下已有 v{N}-* 目录的最大值 + 1, 从 v1 起. 只认目录, out/*.pt / out/prof 不受影响.
+    N = out/ 下已有版本目录最大值 + 1, 全自动自增 (pkg/outver 单一事实源).
+    续跑延续既有训练线时不调用本函数, 用 pin_run_dir 锚定原目录.
     """
     global _RUN_DIR
     if _RUN_DIR is None:
-        out = resolve_path("out")
-        os.makedirs(out, exist_ok=True)
-        nums = [
-            int(m.group(1))
-            for d in os.listdir(out)
-            if os.path.isdir(os.path.join(out, d)) and (m := re.match(r"v(\d+)-", d))
-        ]
-        n = 1 + max(nums, default=0)
-        _RUN_DIR = os.path.join(out, f"v{n}-{datetime.now():%Y%m%d-%H%M%S}")
-        os.makedirs(_RUN_DIR, exist_ok=True)
+        _RUN_DIR = ensure_run_dir(resolve_path("out"))
+    return _RUN_DIR
+
+
+def pin_run_dir(path: str) -> str:
+    """续跑: 把本次进程的产物目录锚定到既有训练线的版本目录."""
+    global _RUN_DIR
+    _RUN_DIR = path
     return _RUN_DIR
 
 
@@ -69,10 +67,6 @@ def merge_config(config: dict, cli_overrides: dict) -> dict:
             merged[k] = v
     return merged
 
-
-# ═══════════════════════════════════════════════════════════════════
-# 通用配置模板
-# ═══════════════════════════════════════════════════════════════════
 
 TRAIN_CONFIG_TEMPLATE = {
     "model": {

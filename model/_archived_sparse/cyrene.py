@@ -18,9 +18,9 @@ from dataclasses import dataclass, fields
 
 import torch
 
+from model._archived_sparse.sparse import TensorNeuronPool, compute_precision_scales
 from model.constants import F_Z
 from model.modulation import combine_modulation, compute_ach, compute_dopamine, compute_uncertainty
-from model._archived_sparse.sparse import TensorNeuronPool, compute_precision_scales
 from pkg.device.cuda import setup_cuda_device
 
 

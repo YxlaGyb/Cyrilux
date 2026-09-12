@@ -5,7 +5,10 @@ Usage:
     python scripts/migrate_checkpoint.py out/model7/final.pt -o out/model7/final_v2.pt
 """
 
-import argparse, os, torch
+import argparse
+import os
+
+import torch
 
 
 def migrate(src: str, dst: str):
@@ -23,7 +26,7 @@ def migrate(src: str, dst: str):
     new_state[:, 7] = 4.0  # F_BCM_SLOPE
     new_state[:, 8] = 0.25  # F_BCM_ZERO
     pool["state"] = new_state
-    print(f"  state: [N, 7] → [N, 9], BCM默认 slope=4.0 zero=0.25")
+    print("  state: [N, 7] → [N, 9], BCM默认 slope=4.0 zero=0.25")
 
     # 2. conn_type: 所有旧突触标记为前馈 (0)
     if "syn_alive" in pool:
@@ -41,7 +44,7 @@ def migrate(src: str, dst: str):
         new_layer[old_layer == 7] = 10
         pool["layer"] = new_layer
         ckpt["top_layer"] = 10
-        print(f"  layer: 7 → 10 (L4)")
+        print("  layer: 7 → 10 (L4)")
 
     ckpt["pool"] = pool
     ckpt["_migrated"] = True

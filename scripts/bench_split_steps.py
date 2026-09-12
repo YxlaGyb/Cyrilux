@@ -1,4 +1,8 @@
-"""分步型计时: 学习步 (learn(x)) vs 自回归步 (learn(None)) —— 不开 profiler."""
+"""
+分步型计时
+
+学习步 (learn(x)) vs 自回归步 (learn(None)) 不开 profiler
+"""
 
 from __future__ import annotations
 
@@ -13,9 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from _probe_meta import config_meta
 
-from dataset import ByteDataset  # noqa: E402
-from model import DensePCNet  # noqa: E402
-from pkg.cli.utils import run_file  # noqa: E402
+from dataset import ByteDataset
+from model import DensePCNet
+from pkg.cli.utils import run_file
 
 SEED_N = 16
 

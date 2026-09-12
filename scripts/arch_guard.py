@@ -1,23 +1,12 @@
-"""arch_guard — 架构回归闸 (117 轮 Round 0).
-
-结构移动 (无 git, 不可逆) 之前的"行为逐位等价"门禁:
-  1. pytest 全量, 记录 pass/fail 基线;
-  2. 加载主线终态检查点, 在 CPU (确定性, 逐位可比) 上对固定 prompt 做
-     temperature=0 贪心 generate, 记录解码文本 + 字节数 + 结构签名;
-  3. (117 轮 Round 3 增强) 在同一检查点跑固定步纯感知 learn,
-     哈希关键 W 矩阵增量 — 给 learn() 数值面也立逐位锚 (改名核的守卫).
-     首跑锚定 baseline, 之后每轮结束重跑, 非逐位相同则该轮失败.
+"""
+arch_guard 架构回归闸
 
 为何用 CPU: 贪心 generate 与 learn 都是纯计算 (零采样随机), fp16 CPU
 matmul 逐位可复现; CUDA 归约还原序不确定, 不足以作逐位闸.
 为何不对照 exp115_say.log: 日志生成走 τ=1.0 随机采样 + 训练中演化状态,
 没有可复现的 oracle. 因此锚定本闸自己的确定性输出.
-
-用法:
-  .venv/Scripts/python.exe scripts/arch_guard.py              # 首跑锚定, 并跑 pytest
-  .venv/Scripts/python.exe scripts/arch_guard.py --steps 64   # 重跑, 与锚定逐位比
-  .venv/Scripts/python.exe scripts/arch_guard.py --no-pytest  # 仅 generate 闸
 """
+
 from __future__ import annotations
 
 import argparse
@@ -26,12 +15,13 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import torch
+from redline import scan_model_sources
 
 from model import DensePCNet
+from pkg.outver import ensure_run_dir
 
 torch.set_grad_enabled(False)
 
@@ -42,7 +32,7 @@ OUT = Path(__file__).resolve().parent.parent / "out"
 
 
 def _latest(pattern: str) -> Path | None:
-    """out/ 运行目录 (v3-<ts>) 内按 glob 取最新 — 零硬编码路径."""
+    """out/ 版本目录 (v{N}-{YYYYMMDD}-{HHMMSS}) 内按 glob 取最新 — 零硬编码路径."""
     hits = sorted(OUT.glob(pattern), key=lambda p: p.stat().st_mtime)
     return hits[-1] if hits else None
 
@@ -56,10 +46,9 @@ def _resolve_ckpt() -> str:
 
 def _resolve_baseline() -> str:
     p = _latest("*/arch_guard_baseline.json")
-    if p is None:  # 首跑锚定: 按 v3-<ts> 运行目录规范新开
-        d = OUT / f"v3-{datetime.now():%Y%m%d-%H%M%S}"
-        d.mkdir(parents=True, exist_ok=True)
-        return str(d / "arch_guard_baseline.json")
+    if p is None:  # 首跑锚定: 按版本目录规范新开 (pkg/outver)
+        d = ensure_run_dir(OUT)
+        return str(Path(d) / "arch_guard_baseline.json")
     return str(p)
 
 
@@ -76,7 +65,9 @@ def _run_pytest() -> dict:
     """跑 tests/ 全量, 返回 pass/fail 计数."""
     r = subprocess.run(
         [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--no-cov", "-q"],
-        capture_output=True, text=True, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        capture_output=True,
+        text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     )
     tail = (r.stdout or r.stderr).strip().splitlines()
     summary = tail[-1] if tail else ""
@@ -126,6 +117,16 @@ def _learn_signature(net, steps: int, dev) -> dict:
     return {"learn_steps": steps, "sha256": h.hexdigest()}
 
 
+def _redline_scan() -> dict:
+    """静态红线扫描 (R0 红线固化轮): model/ 活动源码红线 token 必须零命中.
+
+    数值锚 (generate/learn) 只能抓行为漂移, 抓不住"不碰锚定路径"的语义
+    违规 (如 L 回灌复辟) — 本面补语义级守卫. 命中即 FAIL.
+    """
+    hits = scan_model_sources()
+    return {"hits": hits}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=CKPT)
@@ -142,6 +143,7 @@ def main() -> int:
     net = DensePCNet.load(args.ckpt).to(dev)
     sig = _gen_signature(net, args.prompt, args.n, dev)
     lsig = None if args.no_learn else _learn_signature(net, args.learn_steps, dev)
+    rsig = _redline_scan()
 
     pytest_out = {"skipped": True}
     if not args.no_pytest:
@@ -150,12 +152,16 @@ def main() -> int:
     if not os.path.exists(args.baseline):
         doc = {
             "anchored_at": {
-                "ckpt": args.ckpt, "prompt": args.prompt, "n": args.n,
-                "learn_steps": args.learn_steps, "device": args.device,
+                "ckpt": args.ckpt,
+                "prompt": args.prompt,
+                "n": args.n,
+                "learn_steps": args.learn_steps,
+                "device": args.device,
             },
             "pytest": pytest_out,
             "golden": sig,
             "learn_golden": lsig,
+            "redline": rsig,
         }
         with open(args.baseline, "w", encoding="utf-8") as f:
             json.dump(doc, f, ensure_ascii=False, indent=2)
@@ -166,6 +172,7 @@ def main() -> int:
             print(f"  learn: steps={lsig['learn_steps']} sha256={lsig['sha256']}")
         if pytest_out.get("summary") is not None:
             print(f"  pytest: {pytest_out['summary']}")
+        print(f"  redline: {'CLEAN' if not rsig['hits'] else rsig['hits']}")
         print("[arch_guard] 锚定成功 (本闸首跑). 后续每轮重跑本闸做逐位对照.")
         return 0
 
@@ -178,25 +185,34 @@ def main() -> int:
         and sig["W1_shape"] == g["W1_shape"]
         and sig["param_count"] == g["param_count"]
     )
-    print(f"[arch_guard] 对照: n_bytes {sig['n_bytes']} vs {g['n_bytes']} | "
-          f"sha256 {sig['sha256']} vs {g['sha256']}")
+    print(
+        f"[arch_guard] 对照: n_bytes {sig['n_bytes']} vs {g['n_bytes']} | "
+        f"sha256 {sig['sha256']} vs {g['sha256']}"
+    )
     print(f"  decoded={sig['decoded']!r}")
     lg = doc.get("learn_golden")
     learn_ok = True
     if lsig is not None and lg is not None:
         learn_ok = lsig["sha256"] == lg["sha256"]
-        print(f"  learn: sha256 {lsig['sha256']} vs {lg['sha256']} "
-              f"({'PASS' if learn_ok else 'FAIL'})")
+        print(f"  learn: sha256 {lsig['sha256']} vs {lg['sha256']} ({'PASS' if learn_ok else 'FAIL'})")
     elif lsig is not None:
         print(f"  learn: sha256 {lsig['sha256']} (anchor 无 learn 锚 — 需重锚定)")
         learn_ok = False
+    rl = doc.get("redline")
+    redline_ok = not rsig["hits"]
+    print(
+        f"  redline: {'CLEAN' if redline_ok else rsig['hits']}"
+        + ("" if rl is not None else " (anchor 无 redline 面 — 差异留档后建议重锚)")
+    )
+    if rl is not None and rl.get("hits"):
+        redline_ok = False  # 锚定时就已命中 → 持续违规
     pv = pytest_out.get("summary", "skipped")
     pav = doc["pytest"].get("summary", "skipped")
     print(f"  pytest: {pv} (anchor: {pav})")
-    if ok and learn_ok:
-        print("[arch_guard] PASS — generate 与 learn 逐位与锚定一致, 结构签名不变.")
+    if ok and learn_ok and redline_ok:
+        print("[arch_guard] PASS — generate 与 learn 逐位与锚定一致, 结构签名不变, 红线干净.")
         return 0
-    print("[arch_guard] FAIL — 与锚定逐位不一致 (结构移动破坏了行为).", file=sys.stderr)
+    print("[arch_guard] FAIL — 与锚定逐位不一致 (结构移动破坏了行为) 或红线命中.", file=sys.stderr)
     return 1
 
 

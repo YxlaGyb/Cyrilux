@@ -1,4 +1,5 @@
-"""单步训练 profiler: 只看两个指标.
+"""
+单步训练 profiler: 只看两个指标.
 
 1) cudaLaunchKernel 的 CPU 耗时  → host 提交 GPU 任务的开销
 2) aten:: 系列算子的 CPU 耗时   → 算子本身的开销
@@ -21,9 +22,9 @@ import torch
 import torch.profiler as profiler
 from _probe_meta import config_meta
 
-from dataset import ByteDataset  # noqa: E402
-from model import DensePCNet  # noqa: E402
-from pkg.cli.utils import run_dir, run_file  # noqa: E402
+from dataset import ByteDataset
+from model import DensePCNet
+from pkg.cli.utils import run_dir, run_file
 
 SEED_N = 16
 LAUNCH_KEYS = ("cudaLaunchKernel", "cudaLaunchKernelExC", "cudaMemcpyAsync", "cudaStreamSynchronize")

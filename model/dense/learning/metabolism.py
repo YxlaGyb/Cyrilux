@@ -168,7 +168,7 @@ class MetabolismMixin(_MixinBase):
             (1.0 - net.cfg.metab_mad_alpha) * df.abs()
         )
         if getattr(net, cold_flag):
-            # 冷启动 (world_lang 同款): 该行为首个样本 = |ΔF|, 下限防 0/0 (绝对货币下
+            # 冷启动: 该行为首个样本 = |ΔF|, 下限防 0/0 (绝对货币下
             # 首结算步 ΔF 可精确为 0 → 0/0=nan); python 标志代替张量布尔 (免每步排空)
             mad.copy_(torch.maximum(df.abs(), torch.tensor(1e-5, dtype=torch.float16)))  # tensor-guard: rare (冷启动一次性)
             setattr(net, cold_flag, False)

@@ -28,6 +28,7 @@ from model.constants import (
     PAGE_TD,
     TOP_LAYER,
 )
+
 from .learning import compute_precision_scales
 from .tensor_pool import TensorNeuronPool
 

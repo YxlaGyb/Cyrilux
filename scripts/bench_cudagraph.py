@@ -1,4 +1,5 @@
-"""CUDA Graph 实测: _predict 能否被图捕获, 捕获代价, 回放多快.
+"""
+CUDA Graph 实测: _predict 能否被图捕获, 捕获代价, 回放多快.
 
 逐档 S 各建一张图 (真实 continuation 的 S 是 1..64 递增的).
 计时口径: 同一静态输入, eager 单次调用 vs graph.replay().
@@ -18,8 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from _probe_meta import config_meta
 
-from model import DensePCNet  # noqa: E402
-from pkg.cli.utils import run_file  # noqa: E402
+from model import DensePCNet
+from pkg.cli.utils import run_file
 
 
 def _timeit(fn, reps: int) -> float:

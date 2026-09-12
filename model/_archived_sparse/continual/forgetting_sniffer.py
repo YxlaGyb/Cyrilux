@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import torch
 
-from model._archived_sparse.continual.memory_bank import MemoryBank
 from model._archived_sparse import CyreneModel
+from model._archived_sparse.continual.memory_bank import MemoryBank
 
 
 class ForgettingSniffer:

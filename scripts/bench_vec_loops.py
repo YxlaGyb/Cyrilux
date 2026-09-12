@@ -1,4 +1,5 @@
-"""两个线性递推循环: 原 Python 循环 vs 前缀扫描 (fp32).
+"""
+两个线性递推循环: 原 Python 循环 vs 前缀扫描 (fp32).
 
 实测: 耗时 / 派发数 / 相对 fp64 真值的 max|Δ|.
 m[t]     = (1-α)·m[t-1] + α·z4[t]        α = net._mem_a
@@ -14,7 +15,6 @@ import argparse
 import json
 import sys
 import time
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +24,8 @@ import torch
 from _probe_meta import config_meta
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from model import DensePCNet  # noqa: E402
-from pkg.cli.utils import run_file  # noqa: E402
+from model import DensePCNet
+from pkg.cli.utils import run_file
 
 CHUNK = 32
 
@@ -85,7 +85,7 @@ def mem_scan(z4, m0, a, out_dtype, chunk: int = CHUNK):
 
 # ---------- zslow ----------
 def zslow_loop(z4, dtype=None):
-    N, S = z4.shape[0], z4.shape[1]
+    S = z4.shape[1]
     if dtype is not None:
         z4 = z4.to(dtype)
     out = torch.zeros_like(z4)
@@ -164,7 +164,7 @@ def main() -> None:
         loop_z = zslow_loop(z4).float()
         scan_z = zslow_scan(z4, z4.dtype).float()
 
-        rep[f"S{S}"] = {
+        section = {
             "mem_loop_ms": round(_timeit(lambda: mem_loop(z4, m0, a, buf), args.reps), 3),
             "mem_scan_ms": round(_timeit(lambda: mem_scan(z4, m0, a, buf.dtype), args.reps), 3),
             "zslow_loop_ms": round(_timeit(lambda: zslow_loop(z4), args.reps), 3),
@@ -176,8 +176,9 @@ def main() -> None:
             "mem_scale": round(float(truth_m.abs().max()), 5),
             "zslow_scale": round(float(truth_z.abs().max()), 5),
         }
+        rep[f"S{S}"] = section
 
-        c = {}
+        c: dict = {}
         for name, fn in (
             ("mem_loop", lambda: mem_loop(z4, m0, a, buf)),
             ("mem_scan", lambda: mem_scan(z4, m0, a, buf.dtype)),
@@ -188,7 +189,7 @@ def main() -> None:
             with cc:
                 fn()
             c[f"{name}_dispatch"] = cc.n
-        rep[f"S{S}"].update(c)
+        section.update(c)
 
     rep["config"] = config_meta(probe="bench_vec_loops.py", args=vars(args))
     Path(args.out).write_text(json.dumps(rep, indent=2, ensure_ascii=False), encoding="utf-8")

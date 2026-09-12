@@ -8,8 +8,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from model.constants import F_EPS, F_Z
 from model._archived_sparse import CyreneModel
+from model.constants import F_EPS, F_Z
 
 
 @torch.no_grad()

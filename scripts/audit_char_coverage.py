@@ -6,7 +6,6 @@ audit_char_coverage 字符覆盖率质证审计
 113 起传实际末段 τ — 标签随参数自描述).
 """
 import ast
-import importlib.util
 import json
 import random
 import re
@@ -15,13 +14,12 @@ from collections import Counter
 
 import torch
 
+from model import DensePCNet
 from pkg.cli.utils import run_file
 
 torch.set_grad_enabled(False)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-from model import CyreneModel, DensePCNet
 
 # 原 import probe110_langnoise (110 波已删): 内联等价小工具 (功能不变)
 DATA = "dataset/pretrain_t2t_mini.jsonl"
@@ -121,9 +119,9 @@ def main():
 
     cnt = corpus_char_stats()
     top_sets = {
-        "top100": set(c for c, _ in cnt.most_common(100)),
-        "top1000": set(c for c, _ in cnt.most_common(1000)),
-        "top3000": set(c for c, _ in cnt.most_common(3000)),
+        "top100": {c for c, _ in cnt.most_common(100)},
+        "top1000": {c for c, _ in cnt.most_common(1000)},
+        "top3000": {c for c, _ in cnt.most_common(3000)},
     }
 
     conds = {}
@@ -162,7 +160,7 @@ def main():
     # D. 纯物理下限
     conds["D 纯物理(零学习)"] = (physics_null(), None)
 
-    # ── 统计表 ──
+    # 统计表
     print(f"{'条件':<20} {'字符数':>6} {'CJK':>6} {'top100':>8} {'top1000':>8} "
           f"{'top3000':>8} {'ASCII%':>7} {'词命中':>5}", flush=True)
     audit.write(f"{'条件':<20} {'字符数':>6} {'CJK':>6} {'top100':>8} {'top1000':>8} "
@@ -180,8 +178,7 @@ def main():
     for name, (text, streams) in conds.items():
         audit.write(f"\n──── {name} ────\n")
         if streams:
-            for i, s in enumerate(streams):
-                audit.write(f"[{i:02d}] {s.decode('utf-8', errors='replace')!r}\n")
+            audit.writelines(f"[{i:02d}] {s.decode('utf-8', errors='replace')!r}\n" for i, s in enumerate(streams))
         else:
             audit.write(text[:600] + " …\n")
 

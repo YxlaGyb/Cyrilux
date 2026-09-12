@@ -1,4 +1,5 @@
-"""D1 发射开销测量 + torch.compile 评估 (P3-2).
+"""
+D1 发射开销测量 + torch.compile 评估 (P3-2).
 
 先量准每步 learn 的 Python→算子派发次数, 再判断 compile / CUDA graph 是否可行.
 所有失败都记录到产物, 不静默.
@@ -20,9 +21,9 @@ import torch
 from _probe_meta import config_meta
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from dataset import ByteDataset  # noqa: E402
-from model import DensePCNet  # noqa: E402
-from pkg.cli.utils import run_file  # noqa: E402
+from dataset import ByteDataset
+from model import DensePCNet
+from pkg.cli.utils import run_file
 
 SEED_N = 16
 

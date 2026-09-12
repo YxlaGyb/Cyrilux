@@ -1,4 +1,5 @@
-"""单点编译基准: _predict 单次调用 eager vs torch.compile(mode=reduce-overhead).
+"""
+单点编译基准: _predict 单次调用 eager vs torch.compile(mode=reduce-overhead).
 
 continuation 每步调用 _predict 63 次 (free_run_window=64), 故本单点值 × 63 = 自回归段实测换算.
 产物增量写入, 超时也能取到已完成阶段.
@@ -20,8 +21,8 @@ import torch
 from _probe_meta import config_meta
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from model import DensePCNet  # noqa: E402
-from pkg.cli.utils import run_file  # noqa: E402
+from model import DensePCNet
+from pkg.cli.utils import run_file
 
 
 def _opname(func: Any) -> str:

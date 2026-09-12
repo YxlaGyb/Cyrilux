@@ -1,4 +1,5 @@
 import os
+import re
 
 import pkg.cli.utils as u
 from pkg.cli.utils import PROJECT_ROOT, load_config, merge_config, resolve_path, save_config
@@ -48,10 +49,10 @@ class TestRunDir:
         monkeypatch.setattr(u, "PROJECT_ROOT", str(tmp_path))
         monkeypatch.setattr(u, "_RUN_DIR", None)
 
-    def test_first_run_is_v1(self, tmp_path, monkeypatch):
+    def test_first_run_is_v1_with_timestamp(self, tmp_path, monkeypatch):
         self._pin(tmp_path, monkeypatch)
         d = u.run_dir()
-        assert os.path.basename(d).startswith("v1-")
+        assert re.match(r"^v1-\d{8}-\d{6}$", os.path.basename(d))
         assert os.path.isdir(d)
 
     def test_increments_past_existing_dirs(self, tmp_path, monkeypatch):
@@ -61,12 +62,20 @@ class TestRunDir:
         (out / "v3-20260101-000000").mkdir()
         (out / "v10-20260101-000000").mkdir()
         (out / "prof").mkdir()
-        (out / "v99-not-a-dir.json").write_text("x", encoding="utf-8")
+        (out / "v99-not-a-dir").write_text("x", encoding="utf-8")  # 只认目录
         d = u.run_dir()
         assert os.path.basename(d).startswith("v11-")
-        assert os.path.isdir(d)
 
     def test_memoized_and_run_file_inside(self, tmp_path, monkeypatch):
         self._pin(tmp_path, monkeypatch)
         assert u.run_dir() == u.run_dir()
         assert os.path.dirname(u.run_file("a.json")) == u.run_dir()
+
+    def test_pin_run_dir_resume_reuses_line_dir(self, tmp_path, monkeypatch):
+        # 续跑锚定: pin 后 run_file 落进既有训练线目录, 不新开版本
+        self._pin(tmp_path, monkeypatch)
+        out = tmp_path / "out"
+        (out / "v3-20260911-115631").mkdir(parents=True)
+        u.pin_run_dir(str(out / "v3-20260911-115631"))
+        assert u.run_dir() == str(out / "v3-20260911-115631")
+        assert os.path.dirname(u.run_file("w.safetensors")) == str(out / "v3-20260911-115631")

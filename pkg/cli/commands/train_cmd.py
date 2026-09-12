@@ -119,7 +119,7 @@ def _train_dense(
 @click.option("--dopamine-eta", default=1.0, type=float, help="多巴胺学习率 (dense 忽略)")
 @click.option("--dopamine-beta", default=0.5, type=float, help="多巴胺灵敏度 (dense 忽略)")
 @click.option("--dopamine-gamma", default=0.3, type=float, help="多巴胺衰减 (dense 忽略)")
-@click.option("--out-dir", "-o", default=None, help="输出目录 (默认 out/v{N}-时间戳/)")
+@click.option("--out-dir", "-o", default=None, help="输出目录 (默认自动分配版本目录 out/v{N}-{YYYYMMDD}-{HHMMSS}/)")
 @click.option("--save-interval", default=10000, type=int, help="保存间隔 (dense 忽略, 结束时保存 final.safetensors)")
 @click.option("--abstraction-bank/--no-abstraction-bank", default=False, help="抽象记忆库 (dense 忽略)")
 @click.option("--auto-phase2", is_flag=True, default=False, help="训练后自动进入 Phase 2 (dense 忽略)")

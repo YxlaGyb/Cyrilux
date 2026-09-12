@@ -1,18 +1,17 @@
-"""综合模型评估: 语言能力 + 记忆能力.  — DEPRECATED sparse 管线
-
-DEPRECATED (117 轮 Round 1): 本脚本评估稀疏 CyreneModel, 已脱离活动主线。
-活跃主线 = model.dense.DensePCNet; dense 评估见 scripts/eval_dense.py。
-保留可跑: 依赖指向 model/_archived_sparse.
-
-Usage:
-    python scripts/eval_model.py                    # 评估 final.pt
-    python scripts/eval_model.py --ckpt ckpt_s20000.pt  # 评估特定 checkpoint
+"""
+综合模型评估: 语言能力 + 记忆能力.
+DEPRECATED sparse 管线
 """
 
-import argparse, math, random, time, torch
+import argparse
+import math
+import time
+
+import torch
 from torch.utils.data import DataLoader
-from model._archived_sparse import CyreneModel
+
 from dataset import ByteDataset
+from model._archived_sparse import CyreneModel
 
 torch.set_grad_enabled(False)
 
@@ -223,7 +222,6 @@ def test_compare_ckpts(path_a: str, path_b: str, data_path: str):
 
         total_loss = 0.0
         n = 0
-        t0 = time.perf_counter()
 
         for byte_seq in loader:
             byte_seq = byte_seq.to(m.device)

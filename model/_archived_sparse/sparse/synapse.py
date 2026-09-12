@@ -11,6 +11,7 @@ import random
 import torch
 
 from model.constants import CONN_FEEDBACK, CONN_FEEDFORWARD, LAYER_L4, LAYER_SENSORY
+
 from .page_storage import MemoryBudgetError
 
 

@@ -1,6 +1,7 @@
-"""A/B 基准: eager vs torch.compile(mode=reduce-overhead) 全步耗时 + host 派发数.
+"""
+A/B 基准: eager vs torch.compile(mode=reduce-overhead) 全步耗时 + host 派发数
 
-只记录实测值; 任何失败都写进产物, 不静默.
+只记录实测值
 """
 
 from __future__ import annotations
@@ -19,9 +20,9 @@ import torch
 from _probe_meta import config_meta
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from dataset import ByteDataset  # noqa: E402
-from model import DensePCNet  # noqa: E402
-from pkg.cli.utils import run_file  # noqa: E402
+from dataset import ByteDataset
+from model import DensePCNet
+from pkg.cli.utils import run_file
 
 SEED_N = 16
 
