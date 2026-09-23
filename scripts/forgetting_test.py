@@ -14,10 +14,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import ByteDataset
-from model._archived_sparse import CyreneConfig, CyreneModel
-from model._archived_sparse.continual.forgetting_sniffer import ForgettingSniffer
-from model._archived_sparse.continual.memory_bank import MemoryBank
-from pkg.utils.trainer_utils import setup_seed
+from crates.model._archived_sparse import CyreneConfig, CyreneModel
+from crates.model._archived_sparse.continual.forgetting_sniffer import ForgettingSniffer
+from crates.model._archived_sparse.continual.memory_bank import MemoryBank
+from crates.utils.trainer_utils import setup_seed
 
 # ═══════════════════════════════════════════════════════════════════
 # 工具函数

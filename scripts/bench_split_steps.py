@@ -18,8 +18,8 @@ import torch
 from _probe_meta import config_meta
 
 from dataset import ByteDataset
-from model import DensePCNet
-from pkg.cli.utils import run_file
+from crates.model import DensePCNet
+from crates.cli.utils import run_file
 
 SEED_N = 16
 

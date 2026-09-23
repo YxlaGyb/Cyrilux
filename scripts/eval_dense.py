@@ -12,7 +12,7 @@ import time
 
 import torch
 
-from model import DensePCNet
+from crates.model import DensePCNet
 
 torch.set_grad_enabled(False)
 

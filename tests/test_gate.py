@@ -5,8 +5,8 @@
 import pytest
 import torch
 
-from model import CyreneModel, DensePCNet
-from model.dense.learning.metabolism import gate_psay, rel_norm
+from crates.model import CyreneModel, DensePCNet
+from crates.dense.learning.metabolism import gate_psay, rel_norm
 
 
 def _tiny(**over) -> CyreneModel:

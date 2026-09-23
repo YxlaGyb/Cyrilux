@@ -16,6 +16,7 @@ dependencies = [
     "click>=8.4.2",
     "rich>=15.0.0",
     "safetensors>=0.7.0",
+    "jieba>=0.42.1",
 ]
 
 [dependency-groups]
@@ -28,19 +29,20 @@ dev = [
 ]
 
 [project.scripts]
-cyrilux = "pkg.cli:app"
+cyrilux = "crates.cli:app"
 
 [tool.setuptools.packages.find]
 include = [
-    "pkg","pkg.*","pkg.device","pkg.device.*",
-    "model","model.*",
+    "crates","crates.*",
     "dataset","dataset.*",
-    "pkg.cli","pkg.cli.*",
+]
+exclude = [
+    "crates._archived_sparse","crates._archived_sparse.*",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=pkg"
+addopts = "--cov=crates"
 
 [tool.coverage.run]
 exclude_also = [
@@ -91,7 +93,7 @@ per-file-ignores = { "__init__.py" = ["F401"] }
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["model", "scripts", "pkg"]
+known-first-party = ["crates", "scripts", "dataset"]
 
 [tool.ruff.format]
 # Like Black, use double quotes for strings.

@@ -10,7 +10,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from model import CyreneModel, DensePCNet
+from crates.model import CyreneModel, DensePCNet
 
 
 def _tiny_cfg(**over) -> CyreneModel:

@@ -15,9 +15,9 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from model import CyreneModel, DensePCNet
-from model.dense.pruning import ROW_STATE, PruningEngine
-from model.model_cyrene import read_checkpoint_metadata
+from crates.model import CyreneModel, DensePCNet
+from crates.dense.pruning import ROW_STATE, PruningEngine
+from crates.model.model_cyrene import read_checkpoint_metadata
 
 # 首维命中层尺寸但按槽位/位置索引的 (bind 维恰好等于 d_l2, 故需显式豁免)
 _AUDIT_ALLOWLIST = (

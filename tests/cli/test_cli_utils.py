@@ -1,8 +1,8 @@
 import os
 import re
 
-import pkg.cli.utils as u
-from pkg.cli.utils import PROJECT_ROOT, load_config, merge_config, resolve_path, save_config
+import crates.cli.utils as u
+from crates.cli.utils import PROJECT_ROOT, load_config, merge_config, resolve_path, save_config
 
 
 class TestResolvePath:

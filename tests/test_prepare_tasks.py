@@ -1,6 +1,6 @@
 import json
 
-from pkg.utils.prepare_tasks import (
+from crates.utils.prepare_tasks import (
     HETERO_TASKS,
     conv_to_text,
     extract_conversations,

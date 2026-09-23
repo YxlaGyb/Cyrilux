@@ -9,6 +9,7 @@ py_models
 
 # data
 /dataset
+/docs
 
 *.pt
 *.jsonl
@@ -28,5 +29,7 @@ py_models
 # AI
 /.claude
 /.code-review-graph
+/.agents
+/.codex
 
 tmp/

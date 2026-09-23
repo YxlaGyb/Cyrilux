@@ -1,12 +1,12 @@
-"""
-两个线性递推循环: 原 Python 循环 vs 前缀扫描 (fp32).
+"""两个线性递推循环: 原 Python 循环 vs 分块前缀扫描 — 全 fp16 (FP16 死令, 无 fp32/fp64 对照路).
 
-实测: 耗时 / 派发数 / 相对 fp64 真值的 max|Δ|.
+实测: 耗时 / 派发数 / 两 fp16 实现间 max|Δ| 与非有限计数 (互为参照).
 m[t]     = (1-α)·m[t-1] + α·z4[t]        α = net._mem_a
 zslow[t] = 0.99·zslow[t-1] + 0.01·z4[t]
 
-闭式 (逐块, 块长 C): x[t] = d^u·s + c·Σ_v d^{u-v}·u_v,  d=1-c, u=t-t0
-分块原因: α=0.5 时 d^-S 在 fp32 溢出 (S=256 → Inf), 块内指数 ≤ C 即可。
+分块前缀扫描: x[t] = d^u·s + c·Σ_v d^{u-v}·u_v, d=1-c, u=t-t0.
+块内 d^{-u} (u<C) 须落在 fp16 值域: α=0.5 时 C=8 → d^-8=256 安全; α 越大 d 越小,
+d^-C 越易溢出 — 扫描路出现 Inf/NaN 时基准如实报告非有限计数, 那是 fp16 的真读数.
 """
 
 from __future__ import annotations
@@ -24,10 +24,10 @@ import torch
 from _probe_meta import config_meta
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from model import DensePCNet
-from pkg.cli.utils import run_file
+from crates.model import DensePCNet
+from crates.cli.utils import run_file
 
-CHUNK = 32
+CHUNK = 8  # 块长: d^{-C} 须落在 fp16 值域 (α=0.5 → 256; α=0.75 → 65536 临界)
 
 
 def _opname(func: Any) -> str:
@@ -47,11 +47,10 @@ class OpCounter(TorchDispatchMode):
 
 
 # ---------- m_seq ----------
-def mem_loop(z4, m0, a, buf, dtype=None):
+def mem_loop(z4, m0, a, buf):
+    """原 Python 循环 (fp16): buf[:, t] = (1-α)·buf[:, t-1] + α·z4[:, t]."""
     N, S = z4.shape[0], z4.shape[1]
     K, a4 = m0.shape
-    if dtype is not None:
-        z4, m0, a, buf = z4.to(dtype), m0.to(dtype), a.to(dtype), buf.to(dtype)
     buf[:, :1] = m0.unsqueeze(0).unsqueeze(0).expand(N, 1, K, a4)
     for t in range(1, S):
         zt = z4[:, t : t + 1].unsqueeze(2)
@@ -59,35 +58,36 @@ def mem_loop(z4, m0, a, buf, dtype=None):
     return buf
 
 
-def mem_scan(z4, m0, a, out_dtype, chunk: int = CHUNK):
+def mem_scan(z4, m0, a, chunk: int = CHUNK):
+    """分块前缀扫描 (fp16): 块内 d^{-u} 闭式, 跨块串行传状态."""
     N, S = z4.shape[0], z4.shape[1]
     K, a4 = m0.shape
-    c = a.float()
+    c = a
     d = 1.0 - c
     pad = (-S) % chunk
     Sp = S + pad
-    z = z4.float().unsqueeze(2)                                   # [N,S,1,a4]
+    z = z4.unsqueeze(2)  # [N,S,1,a4] fp16
     if pad:
-        z = torch.cat([z, torch.zeros(N, pad, 1, a4, device=z.device)], dim=1)
+        z = torch.cat([z, torch.zeros(N, pad, 1, a4, device=z.device, dtype=z.dtype)], dim=1)
     zc = z.reshape(N, Sp // chunk, chunk, 1, a4)
-    w = torch.cumprod(d.unsqueeze(0).expand(chunk, K), dim=0)     # d^u  [C,K]
-    inv = c.unsqueeze(0) / w                                      # c/d^u
-    acc = torch.cumsum(zc * inv[None, None, :, :, None], dim=2)   # [N,nb,C,1,a4]
-    loc = w[None, None, :, :, None] * acc                         # 局部 (state=0)
-    dec = w[None, None, :, :, None]                                # d^u
-    out = torch.empty(N, Sp // chunk, chunk, K, a4, device=z.device, dtype=torch.float32)
-    state = m0.float().unsqueeze(0).expand(N, K, a4)              # [N,K,a4]
-    for b in range(Sp // chunk):                                  # 跨块串行: S/C 次
-        out[:, b] = loc[:, b] + dec[:, b] * state.unsqueeze(1)
+    w = torch.cumprod(d.unsqueeze(0).expand(chunk, K), dim=0)  # d^u [C,K] fp16
+    inv = c.unsqueeze(0) / w  # c/d^u [C,K] fp16 — u<C, α 小则安全, 溢出如实呈现
+    acc = torch.cumsum(zc * inv[None, None, :, :, None], dim=2)  # [N,nb,C,1,a4]
+    loc = w[None, None, :, :, None] * acc  # [N,nb,C,K,a4] 局部 (state=0)
+    out = torch.empty(N, Sp // chunk, chunk, K, a4, device=z.device, dtype=torch.float16)
+    state = m0.unsqueeze(0).expand(N, K, a4)  # [N,K,a4] fp16
+    nb = Sp // chunk
+    for b in range(nb):  # 跨块串行: S/C 次
+        # x[t0+v] = d^v·s + c·Σ_{j≤v} d^{v-j} z_j = w[v]·s + loc[:, b, v] (v = 块内位置)
+        out[:, b] = loc[:, b] + w.unsqueeze(-1) * state.unsqueeze(1)
         state = out[:, b, chunk - 1]
-    return out.reshape(N, Sp, K, a4)[:, :S].to(out_dtype)
+    return out.reshape(N, Sp, K, a4)[:, :S]
 
 
 # ---------- zslow ----------
-def zslow_loop(z4, dtype=None):
+def zslow_loop(z4):
+    """原 Python 循环 (fp16)."""
     S = z4.shape[1]
-    if dtype is not None:
-        z4 = z4.to(dtype)
     out = torch.zeros_like(z4)
     out[:, 0] = z4[:, 0]
     for t in range(1, S):
@@ -95,26 +95,27 @@ def zslow_loop(z4, dtype=None):
     return out
 
 
-def zslow_scan(z4, out_dtype, chunk: int = CHUNK):
+def zslow_scan(z4, chunk: int = CHUNK):
+    """分块前缀扫描 (fp16): d=0.99, d^-C ≈ 1.086 (C=8), fp16 全程安全."""
     N, S = z4.shape[0], z4.shape[1]
-    d = torch.tensor(0.99, dtype=torch.float32, device=z4.device)
+    d = 0.99
     pad = (-S) % chunk
     Sp = S + pad
-    z = z4.float()
+    z = z4
     if pad:
-        z = torch.cat([z, torch.zeros(N, pad, z.shape[2], device=z.device)], dim=1)
+        z = torch.cat([z, torch.zeros(N, pad, z.shape[2], device=z.device, dtype=z.dtype)], dim=1)
     zc = z.reshape(N, Sp // chunk, chunk, z.shape[2])
-    w = torch.cumprod(d.expand(chunk), dim=0)                     # [C]
-    inv = 0.01 / w
+    w = torch.cumprod(torch.full((chunk,), d, device=z.device, dtype=torch.float16), dim=0)  # [C]
+    inv = 0.01 / w  # [C] fp16
     acc = torch.cumsum(zc * inv[None, None, :, None], dim=2)
-    loc = w[None, None, :, None] * acc
-    dec = w[None, None, :, None]
-    out = torch.empty(N, Sp // chunk, chunk, z.shape[2], device=z.device, dtype=torch.float32)
-    state = torch.zeros(N, z.shape[2], device=z.device, dtype=torch.float32)
-    for b in range(Sp // chunk):
-        out[:, b] = loc[:, b] + dec[:, b] * state.unsqueeze(1)
+    loc = w[None, None, :, None] * acc  # [N,nb,C,d_z]
+    out = torch.empty(N, Sp // chunk, chunk, z.shape[2], device=z.device, dtype=torch.float16)
+    state = torch.zeros(N, z.shape[2], device=z.device, dtype=torch.float16)
+    nb = Sp // chunk
+    for b in range(nb):
+        out[:, b] = loc[:, b] + w[None, :, None] * state.unsqueeze(1)
         state = out[:, b, chunk - 1]
-    return out.reshape(N, Sp, z.shape[2])[:, :S].to(out_dtype)
+    return out.reshape(N, Sp, z.shape[2])[:, :S]
 
 
 def _timeit(fn, reps: int) -> float:
@@ -126,14 +127,20 @@ def _timeit(fn, reps: int) -> float:
     return (time.perf_counter() - t0) / reps * 1000.0
 
 
-def _mad(x, y) -> float:
-    return round(float((x.float() - y.float()).abs().max()), 7)
+def _mad(x, y):
+    """max|Δ| 与非有限计数 (标量落盘: 单次 .cpu() 传输, 不用 .item())."""
+    diff = (x - y).abs()
+    bad = int(torch.isnan(diff).sum() + torch.isinf(diff).sum())
+    finite = diff[~torch.isnan(diff) & ~torch.isinf(diff)]
+    mx = float(finite.max().cpu()) if finite.numel() else float("inf")
+    return round(mx, 6), bad
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="out/exp115_p3c_ev.safetensors")
     ap.add_argument("--reps", type=int, default=10)
+    ap.add_argument("--chunk", type=int, default=CHUNK)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     args.out = args.out or run_file("bench_vec_loops.json")
@@ -146,8 +153,8 @@ def main() -> None:
     a = net._mem_a
     K, a4 = net._mem_m.shape
     rep: dict[str, object] = {
-        "K": int(K), "a4": int(a4), "alpha": round(float(a.mean()), 4),
-        "dtype_path": "z4/m_seq fp16", "chunk": CHUNK,
+        "K": int(K), "a4": int(a4), "alpha": round(float(a.mean().cpu()), 4),
+        "dtype_path": "all fp16 (FP16 死令)", "chunk": args.chunk,
     }
 
     for S in (64, 256):
@@ -155,35 +162,33 @@ def main() -> None:
         N = z4.shape[0]
         m0 = net._mem_m
         buf = torch.empty(N, S, K, a4, device="cuda", dtype=net._mem_m_seq.dtype)
-        buf64 = torch.empty(N, S, K, a4, device="cuda", dtype=torch.float64)
 
-        truth_m = mem_loop(z4, m0, a, buf64, dtype=torch.float64).float()
-        truth_z = zslow_loop(z4, dtype=torch.float64).float()
-        loop_m = mem_loop(z4, m0, a, buf.clone()).float()
-        scan_m = mem_scan(z4, m0, a, buf.dtype).float()
-        loop_z = zslow_loop(z4).float()
-        scan_z = zslow_scan(z4, z4.dtype).float()
+        loop_m = mem_loop(z4, m0, a, buf.clone())
+        scan_m = mem_scan(z4, m0, a, args.chunk)
+        loop_z = zslow_loop(z4)
+        scan_z = zslow_scan(z4, args.chunk)
+
+        mad_m, bad_m = _mad(scan_m, loop_m)
+        mad_z, bad_z = _mad(scan_z, loop_z)
 
         section = {
             "mem_loop_ms": round(_timeit(lambda: mem_loop(z4, m0, a, buf), args.reps), 3),
-            "mem_scan_ms": round(_timeit(lambda: mem_scan(z4, m0, a, buf.dtype), args.reps), 3),
+            "mem_scan_ms": round(_timeit(lambda: mem_scan(z4, m0, a, args.chunk), args.reps), 3),
             "zslow_loop_ms": round(_timeit(lambda: zslow_loop(z4), args.reps), 3),
-            "zslow_scan_ms": round(_timeit(lambda: zslow_scan(z4, z4.dtype), args.reps), 3),
-            "mem_err_loop_vs_fp64": _mad(loop_m, truth_m),
-            "mem_err_scan_vs_fp64": _mad(scan_m, truth_m),
-            "zslow_err_loop_vs_fp64": _mad(loop_z, truth_z),
-            "zslow_err_scan_vs_fp64": _mad(scan_z, truth_z),
-            "mem_scale": round(float(truth_m.abs().max()), 5),
-            "zslow_scale": round(float(truth_z.abs().max()), 5),
+            "zslow_scan_ms": round(_timeit(lambda: zslow_scan(z4, args.chunk), args.reps), 3),
+            "mem_mad_scan_vs_loop": mad_m, "mem_nonfinite_scan": bad_m,
+            "zslow_mad_scan_vs_loop": mad_z, "zslow_nonfinite_scan": bad_z,
+            "mem_scale": round(float(loop_m.abs().max().cpu()), 5),
+            "zslow_scale": round(float(loop_z.abs().max().cpu()), 5),
         }
         rep[f"S{S}"] = section
 
         c: dict = {}
         for name, fn in (
             ("mem_loop", lambda: mem_loop(z4, m0, a, buf)),
-            ("mem_scan", lambda: mem_scan(z4, m0, a, buf.dtype)),
+            ("mem_scan", lambda: mem_scan(z4, m0, a, args.chunk)),
             ("zslow_loop", lambda: zslow_loop(z4)),
-            ("zslow_scan", lambda: zslow_scan(z4, z4.dtype)),
+            ("zslow_scan", lambda: zslow_scan(z4, args.chunk)),
         ):
             cc = OpCounter()
             with cc:

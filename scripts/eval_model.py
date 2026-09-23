@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import ByteDataset
-from model._archived_sparse import CyreneModel
+from crates.model._archived_sparse import CyreneModel
 
 torch.set_grad_enabled(False)
 

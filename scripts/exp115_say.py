@@ -15,11 +15,11 @@ import time
 import torch
 from world_lang import WorldLangPhysics
 
+from crates.cli.utils import pin_run_dir, resolve_path, run_dir, run_file
+from crates.model import CyreneModel, DensePCNet
+from crates.model.modulation import rms_norm
+from crates.utils.outver import latest_run_dir_with
 from dataset import ByteDataset
-from model import CyreneModel, DensePCNet
-from model.modulation import rms_norm
-from pkg.cli.utils import pin_run_dir, resolve_path, run_dir, run_file
-from pkg.outver import latest_run_dir_with
 
 torch.set_grad_enabled(False)
 
@@ -53,6 +53,8 @@ GAUGE_TOTAL = 1048576  # 1MB
 S_GRID = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 8.0, 10.0, 12.0)
 N_EVAL_WIN = 200   # en eval = tail[0:200] (tmp_rank_probe / ladder 同臂)
 N_CAL_WIN = 800    # 标定切片 = tail[200:1000] (与 eval 严格分离)
+GAUGE_MIN_TAIL_WIN = N_EVAL_WIN + N_CAL_WIN + 200  # 尾部窗数下限 (rest 切片 tail[1000:] 须非空)
+GAUGE_MAX_TAIL_LINES = 20000                       # 行数放大上限 (防病态语料死循环)
 
 
 def _write_sidecar(world, step, net, path=None):
@@ -97,16 +99,30 @@ def _tail_lines_bin(data_path, n_tail, n_before, total_lines):
 
 
 def build_gauge(data_path, dev):
-    """held-out 仪表集: 尾部全未见表 + 训练行 256B 截断尾 (行内不可见)."""
-    tail_raw, before_raw = _tail_lines_bin(data_path, 238, 4000, None)
+    """held-out 仪表集: 尾部全未见表 + 训练行 256B 截断尾 (行内不可见).
 
-    def extract(line_str):
-        sample = json.loads(line_str)
-        return ByteDataset._extract_with_roles(sample)[0]
+    尾部行数按**字节量**迭代放大: 评估切片要求 tail 窗数 ≥ N_EVAL_WIN + N_CAL_WIN + 余量,
+    而行数→字节量随语料平均行长变化 (旧楼 238 行 ≈ 3.3k 窗; 维基 238 行仅 631 窗 → 除零).
+    """
+    n_tail = 238
+    tail_bytes, before_raw, tail_raw = bytearray(), [], []
+    while True:
+        tail_raw, before_raw = _tail_lines_bin(data_path, n_tail, max(4000, n_tail), None)
 
-    tail_bytes = bytearray()
-    for l in tail_raw:
-        tail_bytes += extract(l).encode("utf-8")
+        def extract(line_str):
+            sample = json.loads(line_str)
+            return ByteDataset._extract_with_roles(sample)[0]
+
+        tail_bytes = bytearray()
+        for l in tail_raw:
+            tail_bytes += extract(l).encode("utf-8")
+        if len(tail_bytes) // S_MAX >= GAUGE_MIN_TAIL_WIN or n_tail >= GAUGE_MAX_TAIL_LINES:
+            break
+        n_tail *= 2
+    assert len(tail_bytes) // S_MAX >= N_EVAL_WIN + N_CAL_WIN, (
+        f"仪表集尾部窗数不足: {len(tail_bytes) // S_MAX} < {N_EVAL_WIN + N_CAL_WIN} "
+        f"(n_tail={n_tail}, 语料平均行长过短)"
+    )
     trunc_bytes = bytearray()
     for l in before_raw:
         if len(trunc_bytes) >= GAUGE_TOTAL - len(tail_bytes):
@@ -117,7 +133,7 @@ def build_gauge(data_path, dev):
     gauge = {}
     for name, buf in (("tail", tail_bytes), ("trunc", trunc_bytes)):
         n_win = len(buf) // S_MAX
-        arr = torch.frombuffer(bytes(buf[: n_win * S_MAX]), dtype=torch.uint8)
+        arr = torch.frombuffer(bytearray(buf[: n_win * S_MAX]), dtype=torch.uint8)
         arr = arr.reshape(n_win, S_MAX).long()
         gauge[name] = [arr[i] for i in range(n_win)]
     return gauge, len(tail_bytes), len(trunc_bytes)
@@ -153,6 +169,7 @@ def _score_windows(net, wins, dev, want_ranks=False, want_sgrid=False):
     """一次前向多口径: s=60 旧口径 nll + (可选) s 网格 nll + 名次统计."""
     n = 0
     leg_nll = 0.0
+    assert len(wins) > 0, "_score_windows 收到空窗集 (仪表集切片为空 → 除零来源; 见 build_gauge 窗数断言)"
     grid_nll = dict.fromkeys(S_GRID, 0.0) if want_sgrid else None
     top1 = top15 = 0
     ranks: list[torch.Tensor] = []
@@ -411,32 +428,84 @@ class _SamplePrefetch:
 
     与旧内联口径同序同值 (idxs[(step-1) % n] 从 start 起); 队列有界, 预取深度 2;
     预取异常经队列在主循环 get() 处重抛, 不静默挂死.
+    need_mask=True 时线程内 CPU 侧算 jieba 词首掩码 (零 GPU 同步, jieba 不进主循环).
     """
 
-    def __init__(self, ds, idxs, dev, start=0, depth=2):
-        self._q: queue.Queue[torch.Tensor | BaseException] = queue.Queue(maxsize=depth)
+    def __init__(self, ds, idxs, dev, start=0, depth=2, need_mask=False):
+        self.zero_win_skipped = 0  # 审计计数: 零窗跳过 (空文本行 → ljust 全零窗)
+        self._q: queue.Queue = queue.Queue(maxsize=depth)
         self._th = threading.Thread(
-            target=self._loop, args=(ds, idxs, dev, start), daemon=True)
+            target=self._loop, args=(ds, idxs, dev, start, need_mask), daemon=True)
         self._th.start()
 
-    def _loop(self, ds, idxs, dev, start):
+    def _loop(self, ds, idxs, dev, start, need_mask):
         n = len(idxs)
         pos = start
         while True:
             try:
                 b = ds[idxs[pos % n]]
+                # 零窗显式跳过 (批令 A): 空文本窗无学习信号, 且代谢会把"看不见"记成
+                # "看见全零" → F 基线/starve_cnt 被伪造. 跳过 = 训练流不被空窗污染.
+                skips = 0
+                while bool((b == 0).all()):
+                    self.zero_win_skipped += 1
+                    pos += 1
+                    skips += 1
+                    if skips >= n:
+                        raise RuntimeError("zero-window skip: 全语料均为零窗")
+                    b = ds[idxs[pos % n]]
                 x = b.unsqueeze(0).pin_memory().to(dev, non_blocking=True)
+                wsm = word_start_mask_cpu(b).pin_memory().to(dev, non_blocking=True) if need_mask else None
             except Exception as e:  # 预取失败 → 主线程 get() 处重抛, 不静默挂死
                 self._q.put(e)
                 return
-            self._q.put(x)
+            self._q.put((x, wsm))
             pos += 1
 
-    def get(self) -> torch.Tensor:
-        x = self._q.get()
-        if isinstance(x, BaseException):
-            raise x
-        return x
+    def get(self):
+        item = self._q.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item  # (x, wsm|None)
+
+
+def word_start_mask_cpu(b):
+    """jieba 词首掩码 (CPU 侧, prefetch 线程调用): [S-1] fp16, 行 p=1 当且仅当目标字节 b[p+1] 是词首字符的 UTF-8 首字节."""
+    import jieba
+
+    raw = bytes(int(v) for v in b.tolist())
+    txt = raw.decode("utf-8", errors="ignore")
+    mask = torch.zeros(b.shape[0] - 1, dtype=torch.float16)
+    offs, pos = [], 0
+    for ch in txt:
+        offs.append(pos)
+        pos += len(ch.encode("utf-8"))
+    starts, j = set(), 0
+    for w in jieba.cut(txt):
+        if j < len(offs):
+            starts.add(offs[j])
+        j += len(w)
+    for off in offs:
+        if off in starts and 1 <= off <= b.shape[0] - 1:
+            mask[off - 1] = 1.0
+    return mask
+
+
+def _expand_h(net, new_d_h: int):
+    """扩 h 臂 (h_expand_prereg.md §1): d_h 扩到 new_d_h, W1/W_lm/W_lm_2 冷启动 (小随机), bias_lm 零, elig 迹同步 resize."""
+    _lm_in = net._lm_in
+    _din = net.cfg.d_input
+    _dev = net.W1.device  # 跟随模型 device (load 后已 .to(dev))
+    _std = 1.0 / math.sqrt(new_d_h)
+    net.d_h = new_d_h
+    net.W1 = torch.nn.Parameter(torch.randn(_lm_in, new_d_h, dtype=torch.float16, device=_dev) * _std)
+    net.W_lm = torch.nn.Parameter(torch.randn(new_d_h, _din, dtype=torch.float16, device=_dev) * _std)
+    net.W_lm_2 = torch.nn.Parameter(torch.randn(new_d_h, _din, dtype=torch.float16, device=_dev) * _std)
+    net.bias_lm = torch.nn.Parameter(torch.zeros(_din, dtype=torch.float16, device=_dev))
+    net.register_buffer("W1_elig", torch.zeros(_lm_in, new_d_h, dtype=torch.float16, device=_dev))
+    net.register_buffer("W_lm_elig", torch.zeros(new_d_h, _din, dtype=torch.float16, device=_dev))
+    net.register_buffer("W_lm_2_elig", torch.zeros(new_d_h, _din, dtype=torch.float16, device=_dev))
+    return net
 
 
 def main():
@@ -456,6 +525,42 @@ def main():
     ap.add_argument("--max-samples", type=int, default=1270000)
     ap.add_argument("--trigram-lines", type=int, default=None)
     ap.add_argument("--eager", action="store_true")
+    ap.add_argument("--f5-whiten", action="store_true",
+                    help="F5 突触前白化 (wlm_head_f5_train_prereg.md): 前 100 步纯积累 C, 此后每 100 步重估注入")
+    ap.add_argument("--boundary-weight", type=float, default=0.0,
+                    help="scaffold A 路: 目标字节为 UTF-8 首字节的 eps 行 ×W (0=关闭; scaffold_prereg.md)")
+    ap.add_argument("--char-agg", action="store_true",
+                    help="2a 载体: 字符级 eps 聚合 (pre_2a_step2_prereg.md) — 同字符内字节共享字符平均误差")
+    ap.add_argument("--word-start-add", type=float, default=0.0,
+                    help="词首加法位 (wordstart_add_prereg.md): 词首行在 A 的 ×W 之上额外 +δ; 掩码由 prefetch 线程 CPU 侧计算")
+    ap.add_argument("--self-state-pred", action="store_true",
+                    help="self-state 分层臂 (self_state_layered_prereg.md): 状态头赫布通道 + 字节头降权")
+    ap.add_argument("--byte-head-w", type=float, default=1.0,
+                    help="字节头更新幅度权重 (仅在 --self-state-pred 时生效; 预锁 0.1)")
+    ap.add_argument("--wire-state-pred", action="store_true",
+                    help="接线臂 (w1_state_pred_wire_prereg.md): eps_state 前向投影通道更新 W1 的 z4 切片")
+    ap.add_argument("--echo-learn", action="store_true",
+                    help="echo 相位不冻结 (multi_step_commit_b_prereg.md): 回声段全权重更新")
+    ap.add_argument("--bind-commit", action="store_true",
+                    help="echo 段多步承诺 (multi_step_commit_b_prereg.md): 字符 K 字节冻结 bind 末位")
+    ap.add_argument("--keep-steps", action="store_true",
+                    help="保留中间检查点 *_step*.safetensors (默认跑完即删, L813 原设计)")
+    ap.add_argument("--expand-h", type=int, default=None,
+                    help="扩 h 臂 (h_expand_prereg.md): 加载后把 d_h 扩到该值, W1/W_lm/W_lm_2 冷启动 (小随机), 默认 None 零变更")
+    ap.add_argument("--freeze-below", action="store_true",
+                    help="路 A 臂 (layerA_prereg.md): 冻结 zh 及以下, 只更新 W1/W_lm/W_lm_2/bias_lm")
+    ap.add_argument("--ckpt-every", type=int, default=500,
+                    help="轨迹版路 A (layerA_trajectory_prereg.md): 每 N 步存中间检查点, 默认 500 零变更")
+    ap.add_argument("--w1v2", action="store_true",
+                    help="w1v2 第一步 (w1v2_prereg.md): 4 头 × 48 + 残差 64 替换 W1, A_i/B_i 纯重建驱动, 默认关零变更")
+    ap.add_argument("--w1v2-wzh", type=str, default=None,
+                    help="w1v2b 加权重建 (w1v2b_prereg.md): 组合方向 w_zh 文件 (.pt, v100 重拟合), 加载到 net._w1v2_wzh")
+    ap.add_argument("--migrate-expand", action="store_true",
+                    help="迁移扩 h (migrate_expand_prereg.md): W1_old/W_lm_old 冻结 + W1_new/W_lm_new 小随机, 双信号, 默认关零变更")
+    ap.add_argument("--single-recon", action="store_true",
+                    help="单通道迁移 (single_recon_prereg.md): W1/W_lm 继承 v100 训练 + B_recon 加权重建辅信号, 默认关零变更")
+    ap.add_argument("--merge", action="store_true",
+                    help="合并 (merge_prereg.md): W1/W_lm 回退 v100 冻结 + W1_new/W_lm_new=single_recon 残差训练, 默认关零变更")
     args = ap.parse_args()
     tag_name = os.path.basename(args.tag)
 
@@ -463,7 +568,8 @@ def main():
     random.seed(args.seed)
     dev = torch.device(args.device)
     cfg = CyreneModel(d_input=256, d_act=256, max_seq_len=S_MAX,
-                        lm_freeze_w1=False)  # 115 唯一训练臂差异: W1 解冻
+                        lm_freeze_w1=False,  # 115 唯一训练臂差异: W1 解冻
+                        lm_presyn_whiten=args.f5_whiten)  # F5-B 白化 (预锁 wlm_head_f5_train_prereg.md)
 
     t0 = time.time()
     print("exp115: 构建世界语言物理 (常用字 2 万行 + 3-gram 位图)...", flush=True)
@@ -492,12 +598,26 @@ def main():
             st = json.load(f)
         _, gt0 = world.load_state(st)
         net = DensePCNet.load(args.init_ckpt, cfg).to(dev)
+        if args.expand_h is not None:
+            net = _expand_h(net, args.expand_h)
+        if args.w1v2:
+            net.init_w1v2()
+        if args.migrate_expand:
+            net.init_migrate_expand()
+        if args.single_recon:
+            net.init_single_recon()
+        if args.merge:
+            net_v100 = DensePCNet.load("out/Archive/v100-20260916-161644/signal_amplify.safetensors", cfg).to(dev)
+            net.init_merge(net_v100.W1.data, net_v100.W_lm.data)  # 残差初始化 (single_recon − v100)
+        if args.w1v2_wzh is not None:
+            net._w1v2_wzh = torch.load(args.w1v2_wzh).to(dev)  # 组合方向 (单位范数)
         step0 = args.base_step
         print(f"exp115_say: init={args.init_ckpt} 114 终态侧车 step={st['step']} "
               f"τ={gt0:.3f} 锚={world.world_eps_ema} "
               f"cert={world.n_certified} (累计步 {args.base_step} 起) "
               f"lm_freeze_w1=False", flush=True)
     net._echo_entropy = False
+    net._freeze_below = args.freeze_below  # 路 A: 冻结 zh 及以下, 只更新 W1/W_lm
     if not args.eager and dev.type == "cuda":
         net.forward_engine.continuation = GraphedContinuation(net.forward_engine, net)
         print("exp115_say: CUDA graph 快路径 ON (整段 echo continuation 一张图)", flush=True)
@@ -517,7 +637,8 @@ def main():
     idxs = list(range(len(ds)))
     random.shuffle(idxs)
     print(f"exp115_say: data n={len(ds)} lazy={lazy} (感知/echo 交替)", flush=True)
-    prefetch = _SamplePrefetch(ds, idxs, dev, start=step0)  # P3-1: 取样+H2D 移出主循环
+    prefetch = _SamplePrefetch(ds, idxs, dev, start=step0,  # P3-1: 取样+H2D 移出主循环
+                               need_mask=(args.word_start_add > 0.0))
 
     tracked = ("W_lm", "W_lm_2", "W_04", "W_42", "W_diff", "W_bind",
                "W_t4", "W_t2", "W_t3", "W_t5", "W_t6", "W1")
@@ -540,15 +661,36 @@ def main():
     step = step0
     nan_at = None
     first_abnormal = None
+    f5_rejects = 0  # 连续白化拒绝计数 (预锁 v3 §5: 达 3 停机)
 
     for i in range(1, args.steps + 1):
         step = step0 + i
         do_report = step % RPT == 0
+        # W1 resize 守卫 (mem 增单元使 W1 变形, 冻结快照重置, 位移从 resize 起算)
+        if w1_start.shape != net.W1.data.shape:
+            old = tuple(w1_start.shape)
+            w1_start = net.W1.data.float().clone()
+            init_w["W1"] = net.W1.detach().float().cpu().clone()
+            print(f"[W1] step {step}: shape {old} -> {tuple(net.W1.data.shape)} "
+                  f"(mem 增单元 resize) 冻结快照重置, 位移从 resize 起算", flush=True)
         w1_ref = net.W1.data.clone() if do_report else None  # 报告步起点快照 (区间位移口径)
         # P3-b 节律内生: 每步喂世界流, 看/说由模型内部门控决定 (step%2 节拍器已拆除,
         # 判词 §2.2); 首步 force_perception (开机先看); sync_gate 取路由镜像
-        x = prefetch.get()  # 预取样本 (与旧内联口径同序同值, 已在 dev 上)
+        x, wsm = prefetch.get()  # (预取样本, 词首掩码|None) — 掩码在线程内 CPU 侧算好
         exec_b = net._behavior_py  # 本步执行的决策 (上一步末门算)
+        # ── scaffold 写参 (wordstart_add_prereg.md; 默认全 0 零变更) ──
+        net._boundary_w = args.boundary_weight
+        net._word_start_add = args.word_start_add
+        net._char_agg = args.char_agg
+        # ── self-state 写参 (self_state_layered_prereg.md; 默认关零变更) ──
+        net._self_state_pred = args.self_state_pred
+        net._byte_head_w = args.byte_head_w if args.self_state_pred else 1.0
+        # ── 接线写参 (w1_state_pred_wire_prereg.md; 默认关零变更) ──
+        net._wire_state_pred = args.wire_state_pred
+        # ── echo 不冻结 + 承诺写参 (multi_step_commit_b_prereg.md; 默认关零变更) ──
+        net._echo_learn = args.echo_learn
+        net._bind_commit = args.bind_commit
+        net._word_start_mask = None if exec_b else wsm  # 回声步输入=自生成流, 喂入窗掩码不适用
         net.learn(x, force_perception=(i == 1))
         net.sync_gate()
         if do_report:
@@ -593,6 +735,18 @@ def main():
             ema_v = float(ema.item()) if ema is not None else float("nan")
             rep = getattr(net, "_rep_frac", None)
             rep_v = float(rep.item()) if rep is not None else 0.0
+            # self-state 遥测 (self_state_layered_prereg.md §5; 仅报告步同步, 主循环零 .item())
+            ssp_w_v, ssp_mse_v = None, None
+            if args.self_state_pred:
+                _eng = net.learning_engine
+                if getattr(_eng, "_ssp_w", None) is not None:
+                    ssp_w_v = float(_eng._ssp_w.norm().item())
+                    if getattr(_eng, "_ssp_mse", None) is not None:
+                        ssp_mse_v = float(_eng._ssp_mse.item())
+            # 接线遥测 (w1_state_pred_wire_prereg.md §5 旁证; 只记录不入判据)
+            wire_w1_v = None
+            if args.wire_state_pred:
+                wire_w1_v = float(net.W1.data[: net.active_size["l4"], :].norm().item())
 
             temp_hist.append(gt_v)
             r_hist.append(r_v)
@@ -615,6 +769,9 @@ def main():
                    "L": last_sc["L"], "S": last_sc["S"], "X": last_sc["X"], "q": last_q,
                    "gen_temp": gt_v, "anchor": ema_v, "certified": int(certified),
                    "rep_frac": rep_v,
+                   "ssp_w_norm": ssp_w_v, "ssp_mse": ssp_mse_v,
+                   "wire_w1_slice_norm": wire_w1_v,
+                   "byte_head_w": net._byte_head_w if args.self_state_pred else None,
                    "gen": gen_txt if exec_b else None,
                    "gen_raw": gen_raw_hex if exec_b else None,
                    "starve_cnt": sc_v, "silence_cnt": sl_v, "death_rounds": dr_v,
@@ -623,7 +780,8 @@ def main():
                    "active_size_l5": net.active_size["l5"],
                    "w1_absmax_raw": w1_raw_hist[-1] if w1_raw_hist else None,
                    "w1_disk": w1_disk_hist[-1] if w1_disk_hist else None,
-                   "w_diff_absmax_raw": wd_raw_hist[-1] if wd_raw_hist else None}
+                   "w_diff_absmax_raw": wd_raw_hist[-1] if wd_raw_hist else None,
+                   "zero_win_skipped": int(prefetch.zero_win_skipped)}
             jsonf.write(json.dumps(rec) + "\n")
 
         if do_report:
@@ -638,6 +796,27 @@ def main():
                 w1_disk_hist.append(float("nan"))
             wd_raw = getattr(net, "_dW_diff_absmax_raw", None)
             wd_raw_hist.append(float(wd_raw.item()) if wd_raw is not None else float("nan"))
+
+        if args.f5_whiten and step % 100 == 0:
+            # F5-B 白化器重估 (预锁 v3 §2: 每 100 学习步; step 30600 首次 = 第 100 个学习步, 之前纯积累)
+            st_w = net.learning_engine.rebuild_wlm_whiten()
+            if st_w is None:
+                msg_f5 = f"[f5] step {step}: C 未积累 (异常, 不应发生)"
+            else:
+                msg_f5 = (f"[f5] step {step}: C 重估 status={st_w['status']} cond={st_w['cond']:.4g} "
+                          f"eig_min={st_w['eig_min']:.4f}"
+                          + (" → Wh(fp16) 注入 ON" if st_w["status"] == "ok" else " → 拒绝注入, 保留上一 Wh"))
+                if st_w["status"] == "reject":
+                    f5_rejects = f5_rejects + 1
+                    if f5_rejects >= 3:
+                        msg_f5 += " | 连续 3 次拒绝 → 按预锁 v3 §5 停机判读"
+                        print(msg_f5, flush=True)
+                        logf.write(msg_f5 + "\n")
+                        raise RuntimeError("f5 whiten: 连续 3 次病态重估 (预锁 v3 §5)")
+                else:
+                    f5_rejects = 0
+            print(msg_f5, flush=True)
+            logf.write(msg_f5 + "\n")
 
         # 代谢触发修剪 (P2 下探缺失 + P3-b 对称牙): 墙钟已退役 — 连续饥饿 (F 无下探) 或
         # 连续沉默 (只看不说) 达阈值 → 模型内死亡回合 (mem 饥荒击杀 + 拓扑修剪).
@@ -697,11 +876,15 @@ def main():
                    f"W1: raw_max={max(r50) if r50 else float('nan'):.1f} "
                    f"disk̄={sum(w50)/len(w50):.4f} "
                    f"disp={float((net.W1.data.float()-w1_start).norm().item()):.2f}")  # tensor-guard: report (摘要位移口径)
+            if (args.w1v2 or args.migrate_expand or args.single_recon or args.merge) and hasattr(net, "_w1v2_recon_err"):
+                msg += f" | recon={float(net._w1v2_recon_err.item()):.4f}"  # 重建 MSE 遥测
             if exec_b:
                 msg += f" gen={last_gen[:24].decode('utf-8', errors='replace')!r} ({len(last_gen)}B)"
+            if args.self_state_pred and ssp_w_v is not None:
+                msg += f" | ssp: |W_z4|={ssp_w_v:.4f} mse={ssp_mse_v:.4f}"
             print(msg, flush=True)
             logf.write(msg + "\n")
-        if step % 500 == 0:
+        if step % args.ckpt_every == 0:
             net.save(tag + f"_step{step}.safetensors")
             _write_sidecar(world, step, net)
             # ── 仪表钩子: 独立评估实例 (零状态污染) + s 标定 + 名次 ──
@@ -733,7 +916,7 @@ def main():
 
     net.save(tag + ".safetensors")
     _write_sidecar(world, step, net)
-    if nan_at is None or step % 500 != 0:
+    if nan_at is None or step % args.ckpt_every != 0:
         te = time.time()
         g = eval_gauge(tag + ".safetensors", cfg, gauge, dev)
         rec = {"step": step,
@@ -756,16 +939,20 @@ def main():
               f"trunc={g['bpb_trunc']:.4f} | s*={g['best_s_on_cal']} "
               f"eval@best_s={g['eval']['bpb_at_best_s']:.3f} "
               f"top15={g['eval']['top15']:.4f} ({rec['eval_s']}s)", flush=True)
-    for f in os.listdir(run_dir()):
-        if f.startswith(tag_name + "_step") and f.endswith(".safetensors"):
-            os.remove(os.path.join(run_dir(), f))
+    if not args.keep_steps:
+        for f in os.listdir(run_dir()):
+            if f.startswith(tag_name + "_step") and f.endswith(".safetensors"):
+                os.remove(os.path.join(run_dir(), f))
 
     # frozen_moved 复测 (entrywise rel_frob, 阶段六口径)
     fin_w = {n: getattr(net, n).detach().float().cpu() for n in tracked}  # tensor-guard: report (摘要快照口径)
     moved = {}
     for n in tracked:
         w0, w1 = init_w[n], fin_w[n]
-        moved[n] = ((w1 - w0).norm() / (w0.norm() + 1e-12)).item()
+        if w0.shape != w1.shape:
+            moved[n] = float("nan")  # 运行中 resize (mem 增单元), 与初态不可比
+        else:
+            moved[n] = ((w1 - w0).norm() / (w0.norm() + 1e-12)).item()
     n_echo = len(e_hist)  # 遥测样本数 (每 RPT 全局步一次; P3-b 后不再按回声步)
     half = n_echo // 2
     last100 = slice(max(0, n_echo - 100), n_echo)

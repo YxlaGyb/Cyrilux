@@ -20,7 +20,7 @@ from argparse import ArgumentParser
 
 import torch
 
-from model._archived_sparse import CyreneConfig, CyreneModel, create_cyrene
+from crates.model._archived_sparse import CyreneConfig, CyreneModel, create_cyrene
 
 
 def _make_seq(n_bytes: int = 512) -> torch.Tensor:

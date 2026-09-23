@@ -2,7 +2,7 @@ import json
 
 from click.testing import CliRunner
 
-from pkg.cli import app
+from crates.cli import app
 
 
 class TestListCheckpoints:

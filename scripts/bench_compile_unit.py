@@ -21,8 +21,8 @@ import torch
 from _probe_meta import config_meta
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from model import DensePCNet
-from pkg.cli.utils import run_file
+from crates.model import DensePCNet
+from crates.cli.utils import run_file
 
 
 def _opname(func: Any) -> str:

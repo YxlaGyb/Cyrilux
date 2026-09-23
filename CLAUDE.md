@@ -1,1 +1,1 @@
-E:/SystemShare/Documents/Cyrilux/.github/CLAUDE.md
+@AGENTS.md

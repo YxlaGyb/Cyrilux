@@ -1,6 +1,6 @@
 import json
 
-from pkg.utils.data_splitter import split_directory, split_file
+from crates.utils.data_splitter import split_directory, split_file
 
 
 class TestSplitFile:

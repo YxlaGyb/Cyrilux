@@ -7,7 +7,7 @@ dW ← dW − (α·post² + β·relu(post²−ema)) ⊙ W.
 
 import torch
 
-from model.dense.learning import _energy_constraint
+from crates.dense.learning import _energy_constraint
 
 
 class _StubNet:

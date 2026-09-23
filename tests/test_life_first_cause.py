@@ -2,7 +2,7 @@
 生命第一因落地配置检查.
 """
 
-from model import CyreneModel
+from crates.model import CyreneModel
 
 
 def test_stp_u_adapt_default_on():

@@ -2,8 +2,8 @@
 
 import torch
 
-from model import CyreneModel, DensePCNet
-from model.modulation import rms_norm
+from crates.model import CyreneModel, DensePCNet
+from crates.model.modulation import rms_norm
 
 
 def _make_net():

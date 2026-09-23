@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import torch
 
-from pkg.utils.trainer_utils import Logger, effective_capacity, effective_params, get_lr, setup_seed
+from crates.utils.trainer_utils import Logger, effective_capacity, effective_params, get_lr, setup_seed
 
 
 class TestGetLr:

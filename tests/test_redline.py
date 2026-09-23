@@ -31,7 +31,7 @@ def test_redline_tokens_nonempty():
 
 def test_action_survival_source_is_internal():
     # 资格迹 R 来源只允许体内 _metab_R; 注入通道源码级零容忍
-    from model.dense.learning.action import ActionMixin
+    from crates.dense.learning.action import ActionMixin
 
     src = inspect.getsource(ActionMixin._update_w_act)
     assert "_metab_R" in src, "资格迹信号源未走体内 _metab_R"

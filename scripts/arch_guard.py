@@ -20,8 +20,8 @@ from pathlib import Path
 import torch
 from redline import scan_model_sources
 
-from model import DensePCNet
-from pkg.outver import ensure_run_dir
+from crates.model import DensePCNet
+from crates.utils.outver import ensure_run_dir
 
 torch.set_grad_enabled(False)
 

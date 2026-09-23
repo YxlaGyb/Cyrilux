@@ -5,7 +5,7 @@ pkg/outver 版本目录管理单元测试
 import os
 import re
 
-from pkg.outver import ensure_run_dir, latest_run_dir_with, next_run_num, scan_run_nums
+from crates.utils.outver import ensure_run_dir, latest_run_dir_with, next_run_num, scan_run_nums
 
 RUN_DIR_RE = re.compile(r"^v(\d+)-\d{8}-\d{6}$")
 

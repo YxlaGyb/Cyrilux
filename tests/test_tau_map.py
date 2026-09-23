@@ -4,8 +4,8 @@ import inspect
 
 import torch
 
-from model import CyreneModel, DensePCNet
-from model.dense.learning.action import ActionMixin
+from crates.model import CyreneModel, DensePCNet
+from crates.dense.learning.action import ActionMixin
 
 TAU_LO = 0.9
 TAU_HI = 2.5

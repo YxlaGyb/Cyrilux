@@ -1,0 +1,4 @@
+description: crates.cli exposes the click entrypoints to train, resume, configure, inspect, and prepare data for the dense PPA backend.
+
+README.md: e8f3955a6c7fc188178f757c791cd91058f77673
+README.zh.md: 967586089823ff8fa7a7f45b488c1ecdaf834e88

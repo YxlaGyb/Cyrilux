@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from model import CyreneModel, DensePCNet
+from crates.model import CyreneModel, DensePCNet
 
 # 字节域默认 256 (与 CyreneModel.d_input 默认一致,动作域 d_act 同)
 D_INPUT = 256

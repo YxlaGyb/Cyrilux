@@ -9,7 +9,7 @@
 """
 import torch
 
-from model import CyreneModel, DensePCNet
+from crates.model import CyreneModel, DensePCNet
 
 
 def _make_net():

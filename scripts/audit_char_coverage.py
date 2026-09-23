@@ -14,8 +14,8 @@ from collections import Counter
 
 import torch
 
-from model import DensePCNet
-from pkg.cli.utils import run_file
+from crates.model import DensePCNet
+from crates.cli.utils import run_file
 
 torch.set_grad_enabled(False)
 if hasattr(sys.stdout, "reconfigure"):

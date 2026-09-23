@@ -1,6 +1,6 @@
 import json
 
-from pkg.utils.data_converter import (
+from crates.utils.data_converter import (
     ROLE_MARKERS,
     conversations_to_text,
     convert_file,

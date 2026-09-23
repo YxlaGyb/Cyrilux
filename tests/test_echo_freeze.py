@@ -7,7 +7,7 @@ echo 步冻结集逐位不变 + 表达端 W_act 推进; free_run 内生动力学
 
 import torch
 
-from model import CyreneModel, DensePCNet
+from crates.model import CyreneModel, DensePCNet
 
 _FROZEN_WEIGHTS = (
     "W_04", "W_42", "W_23", "W_35", "W_56", "W_state_pred", "W_pred_54", "W_pred_43",

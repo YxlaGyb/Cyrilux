@@ -23,8 +23,8 @@ import torch.profiler as profiler
 from _probe_meta import config_meta
 
 from dataset import ByteDataset
-from model import DensePCNet
-from pkg.cli.utils import run_dir, run_file
+from crates.model import DensePCNet
+from crates.cli.utils import run_dir, run_file
 
 SEED_N = 16
 LAUNCH_KEYS = ("cudaLaunchKernel", "cudaLaunchKernelExC", "cudaMemcpyAsync", "cudaStreamSynchronize")

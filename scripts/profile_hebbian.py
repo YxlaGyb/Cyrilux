@@ -5,7 +5,7 @@ import time
 
 import torch
 
-from model._archived_sparse import CyreneConfig, CyreneModel
+from crates.model._archived_sparse import CyreneConfig, CyreneModel
 
 # 接近生产环境的配置
 cfg = CyreneConfig(
