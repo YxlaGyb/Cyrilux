@@ -130,13 +130,13 @@ package = true
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchvision = [
-    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu132"
-url = "https://mirrors.nju.edu.cn/pytorch/whl/cu132"
+name = "pytorch-cu126"
+url = "https://mirrors.nju.edu.cn/pytorch/whl/cu126"
 explicit = true
