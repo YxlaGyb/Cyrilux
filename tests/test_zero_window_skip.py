@@ -44,7 +44,7 @@ def test_prefetch_skips_zero_windows_and_counts():
     windows = [_win([65, 66]), _win([]), _win([67, 68]), _win([]), _win([]), _win([69])]
     pf = _SamplePrefetch(_StubDS(windows), list(range(len(windows))), torch.device("cpu"),
                          start=0, depth=1)
-    out = [pf.get() for _ in range(8)]
+    out = [pf.get()[0] for _ in range(8)]
     assert all(int(x.sum()) > 0 for x in out), "零窗进入了训练流"
     n_skipped = pf.zero_win_skipped
     assert 7 <= n_skipped <= 10, f"zero_win_skipped={n_skipped} 越界 (期望 7..10)"
@@ -55,7 +55,7 @@ def test_prefetch_counter_zero_when_no_zero_window():
     windows = [_win([65]), _win([66]), _win([67])]
     pf = _SamplePrefetch(_StubDS(windows), list(range(len(windows))), torch.device("cpu"),
                          start=0, depth=1)
-    out = [int(pf.get()[0, 0]) for _ in range(4)]
+    out = [int(pf.get()[0][0, 0]) for _ in range(4)]
     assert out == [65, 66, 67, 65]
     assert pf.zero_win_skipped == 0
 

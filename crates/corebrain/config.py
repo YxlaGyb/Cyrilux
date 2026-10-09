@@ -19,3 +19,7 @@ class CoreBrainConfig:
     std_floor: float = 0.05
 
     delta_scale: float = 0.05
+
+    attention_ema_tau: float = 0.95
+    attention_temperature: float = 1.0
+    attention_floor: float = 0.05

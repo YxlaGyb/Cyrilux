@@ -23,6 +23,7 @@ from crates.model.model_cyrene import read_checkpoint_metadata
 _AUDIT_ALLOWLIST = (
     "E_bind_col", "E_bind_self", "W_act", "W_bind_self", "_osc_f_tab", "_seq_arange",
     "_stp_active_ema_bind", "_stp_r_bind", "_stp_tau_bind", "_stp_u_bind", "_theta_bind",
+    "_ms_mask_k8", "_ms_mask_k32",
 )
 
 

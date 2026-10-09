@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`crates.corebrain` 承载中心脑：密集 PPA 网络旁边的一层平行结构。它读原生的 `z4` 状态，池化出两个视图（窗口的后四分之一与整个窗口），把两者投影到同一组槽位空间，并在每个视图内部各跑一次 top-k 胜者全取。一个小预测器负责把短视图激活映射到由长视图构成的慢速目标上，这份预测误差是该层唯一的学习信号。前向输出是一个窗级修正量，在 L2 归一化之前叠加到 L4 状态上。该层默认关闭。
+`crates.corebrain` 承载中心脑：密集 PPA 网络旁边的一层平行结构。它读原生的 `z4` 状态，池化出两个视图（窗口的后四分之一与整个窗口），把两者投影到同一组槽位空间，并在每个视图内部各跑一次 top-k 胜者全取。一个小预测器负责把短视图激活映射到由长视图构成的慢速目标上，这份预测误差是该层唯一的学习信号。前向输出是一个窗级修正量，在 L2 归一化之前叠加到 L4 状态上
 
 ## 目录
 
@@ -26,9 +26,9 @@ kind: "package-reference"
 
 | 导出 | 形状 | 含义 |
 |---|---|---|
-| `CoreBrainConfig` | dataclass | 参数级默认值：槽位数、top-k、学习率、EMA 速率、信任域、正则权重、离差下限、修正幅度。 |
-| `CoreBrain(cfg)` | 模块 | 该层本身。持有两组视图投影、槽位预测器与慢速目标缓冲。 |
-| `DensePCNet.enable_core_brain(**overrides)` | 模块 | 构造该层、挂到网络上并返回。开关未开时不调用，因此默认跑不增加参数、不增加 buffer。 |
+| `CoreBrainConfig` | dataclass | 参数级默认值：槽位数、top-k、学习率、EMA 速率、信任域、正则权重、离差下限、修正幅度、注意力 EMA 速率、温度与下界。 |
+| `CoreBrain(cfg)` | 模块 | 该层本身。持有两组视图投影、槽位预测器、慢速目标缓冲与强制的注意力调制器。 |
+| `DensePCNet._core_brain` | 模块 | 由 `DensePCNet` 自动构造，始终存在。 |
 
 调用该层。
 
@@ -62,6 +62,8 @@ kind: "package-reference"
 
 该层位于前向链旁边，不进入链内。在 `ForwardEngine._predict` 里，L4 递归产出 `z4` 之后，该层读取这个原生张量，为每个批元素返回一个修正量，修正量在 `l2_norm` 送入 L2 之前叠加。`z4` 的其他消费者（世界模型差分、绑定层、记忆单元）仍然读原生张量，因此修正只触及一条边。
 
+CoreBrain 的跨视图预测误差在更新 `Q`、`P_short` 与 `P_long` 之前，必须经过强制的 `crates.attention` 调制层。注意力层持有自己的慢速激活状态，不改变 CoreBrain 的 JEPA 目标。
+
 两个视图取自同一个窗口。`crates/corebrain/center.py::_views` 取序列位置的后四分之一作为短视图、取全部位置作为长视图，因此短视图不携带更早的历史，而长视图携带。两者都只在位置上池化，不引入新参数，也不需要新数据。
 
 每个视图各有自己的投影，落到同一组槽位空间。`crates/corebrain/project.py` 持有 `P_short` 与 `P_long`，用局部 delta 规则学习，配信任域与软行范数界。`P_long_ema` 是 `P_long` 的慢速副本，以指数滑动平均跟随，且不直接接收误差，这使得目标不会像在线侧那样快速移动。
@@ -80,4 +82,5 @@ kind: "package-reference"
 ## 进一步探索
 
 - [dense](../dense/README.md)：前向链，以及修正量叠加的位置。
-- [model](../model/README.md)：网络声明，以及构造该层的开关。
+- [attention](../attention/README.zh.md)：强制的误差精度调制器。
+- [model](../model/README.zh.md)：网络声明与生命周期。

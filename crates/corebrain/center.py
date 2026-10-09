@@ -10,6 +10,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from crates.attention import AttentionConfig, ErrorAttention
 from crates.corebrain.compete import topk_wta
 from crates.corebrain.config import CoreBrainConfig
 from crates.corebrain.predict import SlotPredictor
@@ -29,6 +30,15 @@ class CoreBrain(nn.Module):
         self.cfg = cfg or CoreBrainConfig()
         self.projector = ViewProjector(self.cfg)
         self.predictor = SlotPredictor(self.cfg)
+        self.attention = ErrorAttention(
+            self.cfg.n_slots,
+            AttentionConfig(
+                ema_tau=self.cfg.attention_ema_tau,
+                temperature=self.cfg.attention_temperature,
+                floor=self.cfg.attention_floor,
+                top_k=self.cfg.top_k,
+            ),
+        )
         k = self.cfg.n_slots
         self.register_buffer("_cov_s", torch.zeros(k, k, dtype=torch.float16))
         self.register_buffer("_cov_l", torch.zeros(k, k, dtype=torch.float16))
@@ -81,8 +91,11 @@ class CoreBrain(nn.Module):
         if st is None:
             return dict(self._stats)
         e = st["pred"] - st["target"]
-        self.predictor.learn(st["a_short"], e)
-        self.projector.learn(st["short"], st["long"], e, st["win_short"], st["win_long"])
+        attn = self.attention(st["a_short"], st["a_long"], e)
+        delta_eff = attn.effective_error
+        e_p = delta_eff @ self.predictor.Q.T
+        self.predictor.learn(st["a_short"], delta_eff)
+        self.projector.learn(st["short"], st["long"], e_p, st["win_short"], st["win_long"])
         self.projector.ema()
         shuffled = self.predictor(st["a_short"].roll(1, dims=0))
         self._win_ema[0].mul_(0.99).add_(0.01 * st["win_short"].to(torch.float16).mean(dim=0))
@@ -92,11 +105,17 @@ class CoreBrain(nn.Module):
         self._delta_prev.copy_(delta_mean)
         self._stats = {
             "xv_energy": e.square().mean(),
+            "xv_energy_effective": delta_eff.square().mean(),
             "xv_energy_shuffled": (shuffled - st["target"]).square().mean(),
             "effective_rank": participation_ratio(st["a_long"]),
             "slot_overlap": (st["win_short"] & st["win_long"]).to(torch.float16).mean(),
             "delta_cos": delta_cos,
             "delta_absmax": st["delta"].abs().max(),
+            "attention_gain_mean": attn.gain.mean(),
+            "attention_gain_min": attn.gain.min(),
+            "attention_gain_var": attn.gain.var(unbiased=False),
+            "attention_salience_norm": attn.salience.norm(dim=-1).mean(),
+            "attention_top_down_norm": attn.top_down.norm(),
         }
         self._state = None
         return dict(self._stats)

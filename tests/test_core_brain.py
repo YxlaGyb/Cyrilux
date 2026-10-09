@@ -44,8 +44,8 @@ def test_ste_delta_zeroes_non_winner_columns():
 
 
 def test_cross_view_error_decreases_on_structured_input():
-    cb = CoreBrain(CoreBrainConfig(d_in=32, n_slots=16, top_k=8, eta_proj=0.05, eta_q=0.05))
     torch.manual_seed(0)
+    cb = CoreBrain(CoreBrainConfig(d_in=32, n_slots=16, top_k=8, eta_proj=0.05, eta_q=0.05))
     base = torch.randn(8, 1, 32, dtype=torch.float16) * 2.0
 
     def batch() -> torch.Tensor:
@@ -58,18 +58,18 @@ def test_cross_view_error_decreases_on_structured_input():
     assert float(last) < float(first)
 
 
-def test_default_off_adds_no_parameters():
+def test_core_brain_and_attention_are_mandatory():
     from crates.model import CyreneModel, DensePCNet
 
     cfg = CyreneModel(d_l4=64, d_l2=32, d_l3=32, d_l5=32, d_l6=32, max_seq_len=16)
     net = DensePCNet(cfg)
-    assert not any(key.startswith("_core_brain") for key in net.state_dict())
-    before = sum(p.numel() for p in net.parameters())
-    net.enable_core_brain(n_slots=8, top_k=2)
     assert any(key.startswith("_core_brain.") for key in net.state_dict())
-    assert sum(p.numel() for p in net.parameters()) > before
+    assert any(key.startswith("_core_brain.attention.") for key in net.state_dict())
+    assert net._core_brain.attention is not None
     stats = net.learn(torch.randint(0, 256, (1, 16), dtype=torch.long))
     assert torch.isfinite(stats["core_xv_energy"]).all()
+    assert torch.isfinite(stats["attention_gain_mean"]).all()
+    assert torch.isfinite(stats["attention_gain_min"]).all()
 
 
 def test_source_carries_no_reference_marker():
