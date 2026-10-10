@@ -68,11 +68,11 @@ Two views come from one window. `crates/corebrain/center.py::_views` takes the r
 
 Each view has its own projection into the shared slot space. `crates/corebrain/project.py` holds `P_short` and `P_long`, learned by a local delta rule with a trust region and a soft row-norm bound. `P_long_ema` is a slow copy of `P_long` that follows it by exponential moving average and receives no error directly, which keeps the target from moving as fast as the online side.
 
-Competition is hard and stays inside each view. `crates/corebrain/compete.py::topk_wta` keeps the largest `top_k` entries per row and zeroes the rest, returning the winner mask alongside the activation. Both views draw on the same slot indices, so a slot can be won by either view.
+Competition is hard and stays inside each view. `crates.kernels.topk_wta` (in `crates/kernels/sparse.py`) keeps the largest `top_k` entries per row and zeroes the rest, returning the winner mask alongside the activation. Both views draw on the same slot indices, so a slot can be won by either view.
 
 The predictor is trained by the error; the projections are trained through the winner mask. `crates/corebrain/predict.py` holds `Q`, a square slot-to-slot map updated by a local delta rule. Because the winner-take-all is not differentiable, the error reaches the projections through a straight-through rule: `crates/corebrain/project.py::learn` multiplies the error by the winner mask, so only the columns that produced a winning slot receive an update.
 
-Collapse is held off without gradients. `crates/corebrain/regularize.py` applies two direct rules to the slot activations, not to the weights: an anti-Hebbian de-correlation that removes the off-diagonal of the slot covariance, and a per-slot gain that rescales any slot whose spread falls below the floor. The gain is bounded to the interval `[1, 2]`, so no clamp is needed.
+Collapse is held off without gradients. `crates.kernels` (`foldiak_decorrelate` and `variance_floor`) applies two direct rules to the slot activations, not to the weights: an anti-Hebbian de-correlation that removes the off-diagonal of the slot covariance, and a per-slot gain that rescales any slot whose spread falls below the floor. The gain is bounded to the interval `[1, 2]`, so no clamp is needed.
 
 The correction is the predicted long-view code read back into L4 space. `CoreBrain.forward` maps the short-view activation through `Q`, then through the transpose of `P_long`, and scales the result. The layer never decodes to bytes.
 

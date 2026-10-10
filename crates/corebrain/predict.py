@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from crates.model.modulation import soft_norm_preserve
+from crates.kernels import soft_norm_preserve
 
 
 class SlotPredictor(nn.Module):

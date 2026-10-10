@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 
 from crates.corebrain import CoreBrain, CoreBrainConfig
-from crates.corebrain.project import ste_delta
+from crates.kernels import ste_delta
 
 torch.set_grad_enabled(False)
 

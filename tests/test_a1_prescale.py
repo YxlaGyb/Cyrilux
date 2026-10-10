@@ -2,15 +2,21 @@
 
 import torch
 
+from crates.kernels import rms_norm
 from crates.model import CyreneModel, DensePCNet
-from crates.model.modulation import rms_norm
 
 
 def _make_net():
     torch.manual_seed(0)
     cfg = CyreneModel(
-        d_l4=64, d_l2=32, d_l3=32, d_l5=64, d_l6=16,
-        max_seq_len=16, free_run_window=16, mem_k0=2,
+        d_l4=64,
+        d_l2=32,
+        d_l3=32,
+        d_l5=64,
+        d_l6=16,
+        max_seq_len=16,
+        free_run_window=16,
+        mem_k0=2,
     )
     return DensePCNet(cfg)
 

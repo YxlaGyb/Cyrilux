@@ -58,6 +58,8 @@ def main() -> None:
     ap.add_argument("--s", type=int, default=64)
     ap.add_argument("--reps", type=int, default=20)
     ap.add_argument("--mode", default="reduce-overhead")
+    ap.add_argument("--backend", default=None,
+                    help="显式指定 dynamo 后端 (免 Triton: cudagraphs / aot_eager); 缺省走 --mode")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     args.out = args.out or run_file("bench_compile_unit.json")
@@ -85,7 +87,12 @@ def main() -> None:
 
     # --- compiled ---
     try:
-        cf = torch.compile(f, mode=args.mode, fullgraph=False)
+        cf = (
+            torch.compile(f, backend=args.backend, fullgraph=False)
+            if args.backend
+            else torch.compile(f, mode=args.mode, fullgraph=False)
+        )
+        rep["backend"] = args.backend or f"mode:{args.mode}"
         t0 = time.perf_counter()
         cf(x)
         cf(x)

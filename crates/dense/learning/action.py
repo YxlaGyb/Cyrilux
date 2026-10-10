@@ -5,7 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from ...model.modulation import soft_norm_preserve
+from crates.kernels import soft_norm_preserve
+
 from ._common import _elig_accum, _MixinBase
 
 

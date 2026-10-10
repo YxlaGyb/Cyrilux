@@ -17,7 +17,7 @@ import torch.nn.functional as F
 if TYPE_CHECKING:
     from crates.model.model_cyrene import DensePCNet
 
-from crates.model.modulation import l2_norm, rms_norm
+from crates.kernels import cubic, l2_norm, rms_norm, saturate
 
 
 class ForwardEngine:
@@ -82,10 +82,10 @@ class ForwardEngine:
             pred_delta = z4_n @ W_diff_a.T + net.b_diff[:dim_4].unsqueeze(0).unsqueeze(0)
             z4_next = net._z4 + pred_delta
             # 与训练头同款: 分流抑制 → RMS → 三阶 → 记忆单元+绑定拼接 → W1 混合层
-            z4_nl = z4_next / (1.0 + z4_next.abs())
+            z4_nl = saturate(z4_next)
             z4_nl = rms_norm(z4_nl)
-            z4_nl = z4_nl * (1.0 - 0.5 * z4_nl.pow(2))
-            z4_nl = z4_nl / (1.0 + z4_nl.abs())  # 与训练端同款分流抑制
+            z4_nl = cubic(z4_nl)
+            z4_nl = saturate(z4_nl)  # 与训练端同款分流抑制
             # 多步承诺: 字符中途 (expect_cont>0) 时, zh 组装用 held bind 覆盖末位 (只覆盖 zh, 不动 W_act)
             if _commit and bool((expect_cont > 0).any()):
                 _zh_bind = net._bind_vec.clone()
@@ -94,12 +94,30 @@ class ForwardEngine:
                 _zh_bind = net._bind_vec
             zh_next = torch.cat([z4_nl, _zh_bind, net._mem_out], dim=-1)
             zh_next = rms_norm(zh_next)  # 与训练端同口径 pre-norm
-            h_next = zh_next @ net.W1
-            h_next = h_next / (1.0 + h_next.abs())  # 分流抑制 (与训练同款)
-            h_next = rms_norm(h_next)  # 与训练端同款共享 rms_norm (C6 口径统一)
-            h_next = h_next * (1.0 - 0.5 * h_next.pow(2))
+            # 生成通道选择 (诊断用; 默认 "old" = 冻结旧通道, 不改既有 continuation 行为):
+            #   old -> h_old@W_lm_old            (migrate/merge 当前 continuation 实际路径, = v100 冻结)
+            #   new -> h_new@W_lm_new            (仅残差新通道, 验证 h_new 能否独立生成)
+            #   cat -> h_old@W_lm_old + h_new@W_lm_new  (merge 设计意图, 与训练 _build_lm_signal 同款)
+            _gen_mode = getattr(net, "_gen_logit_mode", "old")
+            h_old = zh_next @ net.W1  # [N,S,d_h] 冻结旧通道 (merge: W1=v100.W1)
+            h_old = saturate(h_old)  # 分流抑制 (与训练同款)
+            h_old = rms_norm(h_old)  # 与训练端同款共享 rms_norm (C6 口径统一)
+            h_old = cubic(h_old)
+            h_new = None
+            if _gen_mode in ("new", "cat") and getattr(net, "_migrate_expand", False):
+                h_new = zh_next @ net.W1_new  # [N,S,256]
+                h_new = saturate(h_new)
+                h_new = rms_norm(h_new)
+                h_new = cubic(h_new)
             inv_h = 1.0 / math.sqrt(net.d_h)
-            mu0_top = (h_next @ net.W_lm + net.bias_lm) * inv_h
+            _gen_alpha = getattr(net, "_gen_logit_alpha", None)  # 诊断: cat 模式 h_new 项系数 (None=1.0)
+            if _gen_mode == "new" and h_new is not None:
+                mu0_top = h_new @ net.W_lm_new  # 仅残差新通道 (无 inv_h, 与训练 _build_lm_signal 同款)
+            elif _gen_mode == "cat" and h_new is not None:
+                _alpha = 1.0 if _gen_alpha is None else float(_gen_alpha)
+                mu0_top = (h_old @ net.W_lm + net.bias_lm) * inv_h + h_new @ net.W_lm_new * _alpha
+            else:
+                mu0_top = (h_old @ net.W_lm + net.bias_lm) * inv_h
             logits_c = (mu0_top - mu0_top.mean(dim=-1, keepdim=True)) / (
                 mu0_top.std(dim=-1, keepdim=True) + 1e-4
             )
@@ -110,9 +128,9 @@ class ForwardEngine:
             if _commit and bool((expect_cont > 0).any()):
                 _zh_evo_last = torch.cat([z4_nl[:, -1:], net._bind_vec[:, -1:], net._mem_out[:, -1:]], dim=-1)
                 _h_evo = _zh_evo_last @ net.W1
-                _h_evo = _h_evo / (1.0 + _h_evo.abs())
+                _h_evo = saturate(_h_evo)
                 _h_evo = rms_norm(_h_evo)
-                _h_evo = _h_evo * (1.0 - 0.5 * _h_evo.pow(2))
+                _h_evo = cubic(_h_evo)
                 _lg_evo = ((_h_evo @ net.W_lm + net.bias_lm) * inv_h)[:, -1]  # [N,256] live-bind logits
                 _diff = (last.argmax(-1) != _lg_evo.argmax(-1))  # [N] bool
                 net._commit_changed += int(_diff.sum().item())
@@ -279,7 +297,8 @@ class ForwardEngine:
         else:
             stp4 = None
         z4 = self._recurrent(mu4, dev, net.W_t4[:dim_4, :dim_4], stp=stp4, stp_tag="l4" if free_run else None)
-        z4_n = l2_norm(z4)
+        z4_used = z4 if free_run else z4 + net._core_brain.forward(z4).unsqueeze(1)
+        z4_n = l2_norm(z4_used)
         mu2 = z4_n @ W_42_a.T + net.bias_l2[:dim_2]
         if free_run:
             mu2 = mu2 + net.cfg.osc_amp_m * vm  # 中节律 → L2
@@ -303,7 +322,7 @@ class ForwardEngine:
             stp_tag="l3" if free_run else None,
         )
         if free_run:
-            z3 = z3 / (1.0 + z3.abs())  # 分流抑制: 断 z3 下游尖峰链, 仅自由运行
+            z3 = saturate(z3)  # 分流抑制: 断 z3 下游尖峰链, 仅自由运行
         z3_n = l2_norm(z3)
         # L5 统一单矩阵
         z5 = z3_n @ net.W_35[:dim_5].T + net.bias_l5[:dim_5]
@@ -435,7 +454,7 @@ class ForwardEngine:
         # 分流抑制: 上界 1.0, 范数保留为自由度
         th_b = net._theta_bind
         th_b.mul_(0.98).add_(0.02 * (z_bind * z_bind).mean(dim=(0, 1)))
-        z_bind = z_bind / (1.0 + z_bind.abs())
+        z_bind = saturate(z_bind)
         net._bind_pre = raw
         net._bind_vec = z_bind  # [N,S,K] 连续值稀疏向量
         if getattr(net, "_fr_vf", None) is not None:

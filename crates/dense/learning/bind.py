@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import torch
 
-from crates.model.modulation import rms_norm
+from crates.kernels import decorr_W as _decorr_W
+from crates.kernels import rms_norm, soft_norm_preserve
 
-from ...model.modulation import soft_norm_preserve
-from ._common import _decorr_W, _elig_accum, _MixinBase
+from ._common import _elig_accum, _MixinBase
 
 
 class BindMixin(_MixinBase):

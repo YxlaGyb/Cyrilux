@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import torch
 
-from crates.model.modulation import rms_norm
+from crates.kernels import rms_norm, soft_norm_preserve
 
-from ...model.modulation import soft_norm_preserve
 from ._common import _elig_accum, _energy_constraint, _MixinBase, _rho_ctrl
 
 # 折扣多步预测目标 (未来引力): 目标 = 未来 K 步折扣和

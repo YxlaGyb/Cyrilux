@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from crates.attention.config import AttentionConfig
-from crates.attention.ops import topk_wta
+from crates.kernels import topk_wta
 
 
 @dataclass

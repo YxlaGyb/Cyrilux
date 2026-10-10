@@ -88,6 +88,8 @@ def main() -> None:
     ap.add_argument("--out", default=None)
     ap.add_argument("--tag", default="eager")
     ap.add_argument("--no-compile", action="store_true")
+    ap.add_argument("--backend", default=None,
+                    help="显式指定 dynamo 后端 (免 Triton: cudagraphs / aot_eager); 缺省走 mode=reduce-overhead")
     args = ap.parse_args()
     args.out = args.out or run_file("bench_step.json")
 
@@ -116,7 +118,12 @@ def main() -> None:
         rep["compile_ok"] = None
     else:
       try:
-        cf = torch.compile(_one_step, mode="reduce-overhead", fullgraph=False)
+        cf = (
+            torch.compile(_one_step, backend=args.backend, fullgraph=False)
+            if args.backend
+            else torch.compile(_one_step, mode="reduce-overhead", fullgraph=False)
+        )
+        rep["backend"] = args.backend or "mode:reduce-overhead"
         tail = fresh()
         _run(cf, net, ds, dev, 3, 1, tail)  # 触发编译 + 预热
         tail = fresh()

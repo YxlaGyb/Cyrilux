@@ -11,13 +11,13 @@ import torch
 from torch import nn
 
 from crates.attention import AttentionConfig, ErrorAttention
-from crates.corebrain.compete import topk_wta
 from crates.corebrain.config import CoreBrainConfig
 from crates.corebrain.predict import SlotPredictor
 from crates.corebrain.project import ViewProjector
-from crates.corebrain.regularize import (
+from crates.kernels import (
     foldiak_decorrelate,
     participation_ratio,
+    topk_wta,
     variance_floor,
 )
 

@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import torch
 
+from crates.kernels import decorr_W as _decorr_W
+from crates.kernels import rms_norm, soft_norm_preserve
+from crates.kernels import spectral_radius_guard as _spectral_radius_guard
 from crates.model.constants import DIFF_TRUST_REGION
-from crates.model.modulation import rms_norm
 
-from ...model.modulation import soft_norm_preserve
-from ._common import _decorr_W, _elig_accum, _energy_constraint, _MixinBase, _spectral_radius_guard
+from ._common import _elig_accum, _energy_constraint, _MixinBase
 
 
 class TemporalMixin(_MixinBase):

@@ -16,8 +16,8 @@ import torch
 from world_lang import WorldLangPhysics
 
 from crates.cli.utils import pin_run_dir, resolve_path, run_dir, run_file
+from crates.kernels import cubic, rms_norm, saturate
 from crates.model import CyreneModel, DensePCNet
-from crates.model.modulation import rms_norm
 from crates.utils.outver import latest_run_dir_with
 from dataset import ByteDataset
 
@@ -149,16 +149,16 @@ def _readout_lc(net, x, dev):
     pred_delta = (z4_n_ @ net.W_diff[:a4, :a4].T
                   + net.b_diff[:a4].unsqueeze(0).unsqueeze(0))
     z4r = z4 + pred_delta
-    z4_lm = z4r / (1.0 + z4r.abs())
+    z4_lm = saturate(z4r)
     z4_lm = rms_norm(z4_lm)
-    z4_lm = z4_lm * (1.0 - 0.5 * z4_lm.pow(2))
-    z4_lm = z4_lm / (1.0 + z4_lm.abs())
+    z4_lm = cubic(z4_lm)
+    z4_lm = saturate(z4_lm)
     zh = torch.cat([z4_lm, net._bind_vec, net._mem_out], dim=-1)
     zh = rms_norm(zh)
     h = zh @ net.W1
-    h = h / (1.0 + h.abs())
+    h = saturate(h)
     h = rms_norm(h)
-    h = h * (1.0 - 0.5 * h.pow(2))
+    h = cubic(h)
     logits = (h @ net.W_lm + net.bias_lm) * inv_h
     lc = ((logits - logits.mean(dim=-1, keepdim=True))
           / (logits.std(dim=-1, keepdim=True) + 1e-4))
@@ -508,6 +508,30 @@ def _expand_h(net, new_d_h: int):
     return net
 
 
+def _sample_dump(net, tag, cfg, dev, step, n, nbytes, temp, logf):
+    """输出优先 (E9f): 从当前检查点快照加载独立实例采样生成, 零状态污染, 追加人工可读样本."""
+    snap = tag + f"_sample{step}.safetensors"
+    net.save(snap)
+    fresh = DensePCNet.load(snap, cfg).to(dev)
+    lines = []
+    for k in range(n):
+        torch.manual_seed(step * 1000 + k)
+        out = fresh.generate("春", n_tokens=nbytes, temperature=temp, dev=dev)
+        lines.append(bytes(out).decode("utf-8", errors="replace"))
+    try:
+        os.remove(snap)
+    except OSError:
+        pass
+    head = f"[sample] step {step} T={temp} n={n} {nbytes}B:"
+    print(head, flush=True)
+    logf.write(head + "\n")
+    for j, txt in enumerate(lines):
+        row = f"  #{j + 1}: {txt!r}"
+        print(row, flush=True)
+        logf.write(row + "\n")
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="dataset/pretrain_t2t_mini.jsonl")
@@ -561,6 +585,25 @@ def main():
                     help="单通道迁移 (single_recon_prereg.md): W1/W_lm 继承 v100 训练 + B_recon 加权重建辅信号, 默认关零变更")
     ap.add_argument("--merge", action="store_true",
                     help="合并 (merge_prereg.md): W1/W_lm 回退 v100 冻结 + W1_new/W_lm_new=single_recon 残差训练, 默认关零变更")
+    ap.add_argument("--readout-realign", action="store_true",
+                    help="E8a (e8a_preregistration.md): 覆写 _mig 冻结门, 解冻 W_lm/W1 读出重对齐, 默认关零变更")
+    ap.add_argument("--readout-freeze", action="store_true",
+                    help="E8 (e8_preregistration.md): 读出侧全冻结 (W_lm/W1/bias_lm/W_lm_2/W1_new/W_lm_new/B_new/B_recon), 感知侧可训, 默认关零变更")
+    ap.add_argument("--migrate-freeze", action="store_true", default=None,
+                    help="E9f (e9f_preregistration.md): migrate 新通道 (W1_new/W_lm_new/B_new) 独立冻结门; "
+                         "默认 None = 跟随 --readout-freeze (零变更)")
+    ap.add_argument("--sample-every", type=int, default=0,
+                    help="输出优先 (E9f): 每 N 步从检查点快照采样生成人工可读样本, 默认 0 = 关 (零变更)")
+    ap.add_argument("--sample-temp", type=float, default=0.8, help="样本采样温度 (默认 0.8)")
+    ap.add_argument("--sample-bytes", type=int, default=240, help="样本生成长度 (字节, 默认 240)")
+    ap.add_argument("--sample-n", type=int, default=3, help="样本条数 (默认 3)")
+    ap.add_argument("--multi-scale-f", action="store_true",
+                    help="E9 (e9_preregistration.md): F 加多尺度状态聚合预测误差项 (双出处同改); 默认关零变更")
+    ap.add_argument("--multi-scale-theta-abs", type=float, default=None,
+                    help="E9 降级阶梯 θ_abs (§4.5/§5.4): 默认 None → 机体占位 1e4; 标定后设 10×A0")
+    ap.add_argument("--e9b0-audit", "--ms-audit", action="store_true", dest="e9b0_audit",
+                    help="E9b-0 (e9b0_audit_preregistration.md): 剂量/路径审计插桩 (默认关零变更; "
+                         "仅诊断 buffer, 不入 state_dict, 不参与权重更新)")
     args = ap.parse_args()
     tag_name = os.path.basename(args.tag)
 
@@ -618,6 +661,14 @@ def main():
               f"lm_freeze_w1=False", flush=True)
     net._echo_entropy = False
     net._freeze_below = args.freeze_below  # 路 A: 冻结 zh 及以下, 只更新 W1/W_lm
+    net._readout_realign = args.readout_realign  # E8a: 覆写 _mig 门 (默认 False)
+    net._readout_freeze = args.readout_freeze  # E8: 读出侧全冻结 (默认 False)
+    # E9f 拆门: 未显式给 --migrate-freeze 时跟随 _readout_freeze (E8/E9/默认路径零变更)
+    net._migrate_freeze = args.migrate_freeze if args.migrate_freeze is not None else args.readout_freeze
+    net._f_multiscale = args.multi_scale_f  # E9: 多尺度 F (默认 False = 短路零变更)
+    net._f_ms_audit = args.e9b0_audit  # E9b-0: 剂量/路径审计插桩 (默认 False = 零变更)
+    if args.multi_scale_theta_abs is not None:
+        net._f_ms_theta_abs = args.multi_scale_theta_abs  # E9: 缺省由 metabolism 机体占位 1e4
     if not args.eager and dev.type == "cuda":
         net.forward_engine.continuation = GraphedContinuation(net.forward_engine, net)
         print("exp115_say: CUDA graph 快路径 ON (整段 echo continuation 一张图)", flush=True)
@@ -748,6 +799,43 @@ def main():
             if args.wire_state_pred:
                 wire_w1_v = float(net.W1.data[: net.active_size["l4"], :].norm().item())
 
+            # E9 多尺度 F 遥测 (§8 #11/#12): 仅报告步同步; flag 关为 None (零变更)
+            f_ms = None
+            if args.multi_scale_f:
+                theta_abs = float(getattr(net, "_f_ms_theta_abs", 1e4))
+                f_ms = {
+                    "rung": int(net._f_ms_rung.item()),
+                    "nonfinite": int(net._f_ms_nonfinite.item()),
+                    "absmax": float(net._f_ms_absmax.item()),
+                    "eps_k8_sq": float(net._eps_k_sq[0].item()),
+                    "eps_k32_sq": float(net._eps_k_sq[1].item()),
+                    "eps_k8_ema": float(net._eps_k_ema[0].item()),
+                    "eps_k32_ema": float(net._eps_k_ema[1].item()),
+                    "theta_abs": theta_abs,
+                }
+
+            # E9b-0 剂量/路径审计遥测 (默认关 = None 零变更): 仅报告步同步读, 不写权重
+            ms_audit = None
+            if args.e9b0_audit:
+                ms_audit = {
+                    "eps_lm_sq": float(net._audit_eps_lm_sq.item()),
+                    "eps4_sq": float(net._audit_eps4_sq.item()),
+                    "f_total": float(net._audit_f_total.item()),
+                    "ms_scalar": float(net._audit_ms_scalar.item()),
+                    "ems_rms": float(net._audit_ems_rms.item()),
+                    "ems_norm_rms": float(net._audit_ems_norm_rms.item()),
+                    "vec_base_rms": float(net._audit_vec_base_rms.item()),
+                    "vec_ms_rms": float(net._audit_vec_ms_rms.item()),
+                    "dw04_base": float(net._audit_dw04_base.item()),
+                    "dw04_ms": float(net._audit_dw04_ms.item()),
+                    "f_perc_ema": float(net._audit_f_perc_ema.item()),
+                    "f_echo_ema": float(net._audit_f_echo_ema.item()),
+                    "perc_steps": int(net._audit_perc_steps.item()),
+                    "echo_steps": int(net._audit_echo_steps.item()),
+                    "priced_steps": int(net._audit_priced_steps.item()),
+                    "priced_now": int(net._audit_priced.item()),
+                }
+
             temp_hist.append(gt_v)
             r_hist.append(r_v)
             e_hist.append(e_v)
@@ -771,6 +859,8 @@ def main():
                    "rep_frac": rep_v,
                    "ssp_w_norm": ssp_w_v, "ssp_mse": ssp_mse_v,
                    "wire_w1_slice_norm": wire_w1_v,
+                   "f_multiscale": f_ms,
+                   "ms_audit": ms_audit,
                    "byte_head_w": net._byte_head_w if args.self_state_pred else None,
                    "gen": gen_txt if exec_b else None,
                    "gen_raw": gen_raw_hex if exec_b else None,
@@ -884,6 +974,9 @@ def main():
                 msg += f" | ssp: |W_z4|={ssp_w_v:.4f} mse={ssp_mse_v:.4f}"
             print(msg, flush=True)
             logf.write(msg + "\n")
+        if args.sample_every and step % args.sample_every == 0:
+            _sample_dump(net, tag, cfg, dev, step, args.sample_n,
+                         args.sample_bytes, args.sample_temp, logf)
         if step % args.ckpt_every == 0:
             net.save(tag + f"_step{step}.safetensors")
             _write_sidecar(world, step, net)

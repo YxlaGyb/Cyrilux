@@ -64,7 +64,20 @@ _L5_ONLY = (
     ("W_pred_54_elig", "row", "aux"),
 )
 _SPECIAL = ("W1", "W1_elig", "_dw_buf", "_mem_m", "_gain_mask", "_gain_l3")
-_EXEMPT = ("W_bind_self_elig", "W_act_elig", "W_lm_elig", "W_lm_2_elig")
+_EXEMPT = (
+    "W_bind_self_elig",
+    "W_act_elig",
+    "W_lm_elig",
+    "W_lm_2_elig",
+    "_core_brain.projector.P_short",
+    "_core_brain.projector.P_long",
+    "_core_brain.projector.P_long_ema",
+    "_core_brain._delta_prev",
+    "_core_brain.predictor.Q",
+    "_core_brain._cov_s",
+    "_core_brain._cov_l",
+    "_core_brain.attention._a_long_ema",
+)
 
 
 def _row_state() -> dict[str, tuple[str, str, str]]:
@@ -235,6 +248,14 @@ class PruningEngine:
         old_m2 = net._mem_m.data
         net.register_buffer("_mem_m", old_m2[:, perm].contiguous())  # 单元状态列 = L4 神经元
         del old_m2
+        core = net._core_brain
+        core.projector.P_short.data = core.projector.P_short.data[perm].contiguous()
+        core.projector.P_long.data = core.projector.P_long.data[perm].contiguous()
+        core.projector.register_buffer(
+            "P_long_ema", core.projector.P_long_ema[perm].contiguous()
+        )
+        core.register_buffer("_delta_prev", core._delta_prev[perm].contiguous())
+        core._state = None
         net.W_diff.data = net.W_diff.data[perm][:, perm].contiguous()
         net.W_state_pred.data = net.W_state_pred.data[perm][:, perm].contiguous()
         net.W_pred_54.data = net.W_pred_54.data[:, perm].contiguous()  # 列 = L4
@@ -447,6 +468,16 @@ class PruningEngine:
             old_mm = net._mem_m.data
             net.register_buffer("_mem_m", old_mm[:, : net.active_size["l4"]].contiguous())  # 单元状态列
             del old_mm
+            core = net._core_brain
+            a4_new = net.active_size["l4"]
+            core.projector.P_short.data = core.projector.P_short.data[:a4_new].contiguous()
+            core.projector.P_long.data = core.projector.P_long.data[:a4_new].contiguous()
+            core.projector.register_buffer(
+                "P_long_ema", core.projector.P_long_ema[:a4_new].contiguous()
+            )
+            core.register_buffer("_delta_prev", core._delta_prev[:a4_new].contiguous())
+            core.cfg.d_in = a4_new
+            core._state = None
             old_bind = net.W_bind.data
             net.W_bind = nn.Parameter(old_bind[: net.active_size["l4"], :].contiguous())  # 列 = 槽位固定
             del old_bind

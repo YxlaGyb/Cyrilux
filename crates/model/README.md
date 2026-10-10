@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`crates.model` owns the configuration and weight-declaration surface of the dense perception-prediction-action (PPA) closed loop. It exposes `CyreneModel`, a dataclass that enumerates every learning, pruning, metabolism, and oscillator hyperparameter, and `DensePCNet`, the `nn.Module` that declares the full weight and buffer layout and delegates the forward, learning, and pruning engines. The crate also carries the shared neuro-modulation functions (dopamine, ACh, free energy, norm-preservation) and the numeric constants that define layer roles and trust regions. It holds no training loop; all dynamics live in `crates.dense`.
+`crates.model` owns the configuration and weight-declaration surface of the dense perception-prediction-action (PPA) closed loop. It exposes `CyreneModel`, a dataclass that enumerates every learning, pruning, metabolism, and oscillator hyperparameter, and `DensePCNet`, the `nn.Module` that declares the full weight and buffer layout and delegates the forward, learning, and pruning engines. The crate also carries the numeric constants that define layer roles and trust regions. It holds no training loop; all dynamics live in `crates.dense`.
 
 ## Table of Contents
 
@@ -58,7 +58,7 @@ Run the model. These are thin delegations to the dense engines.
 
 `save` writes a `state_ver` anchor, a `config` snapshot, and the free runtime tensors under an `attr.` namespace plus CPU counters under a `py.` namespace. `load` refuses a snapshot that lacks `state_ver`; dimension fields follow the checkpoint shapes (pruning physically slices matrices); any unknown persistent key raises instead of being silently dropped.
 
-The modulation helpers in `modulation.py` are pure and device-agnostic: `compute_dopamine` is a sigmoid of signed free-energy change, `compute_ach` responds to uncertainty, `soft_norm_preserve` bounds row norms in a structured, non-clamping way, and `rms_norm` and `l2_norm` guard against the zero-vector case with masked denominators so fp16 never divides by zero.
+The pure operators that were once split across this crate and the learning path now live in `crates.kernels`: activations, normalizations, neuromodulation and regularization. This crate keeps the numeric `constants.py` and the weight and buffer layout, so the learning path no longer reaches back to the orchestrator for math.
 
 `constants.py` defines the neuron state-column indices, the six-layer cortex roles, the per-layer configuration (neuron count, inertia, k-WTA fraction), connection kinds, and the trust regions and eligibility discount that the learning domain consumes.
 

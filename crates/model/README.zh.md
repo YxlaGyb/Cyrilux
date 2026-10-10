@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`crates.model` 承担密集感知-预测-行动（PPA）闭环的配置与权重声明面。它导出 `CyreneModel`，一个列举全部学习、修剪、代谢和振荡器超参数的 dataclass，以及 `DensePCNet`，一个声明完整权重与 buffer 布局并把前馈、学习、修剪引擎委托出去的 `nn.Module`。该 crate 还承载共享神经调制函数（多巴胺、乙酰胆碱、自由能、范数保持）以及定义层角色和信任域的数值常量。它不含训练循环，所有动力学都放在 `crates.dense`。
+`crates.model` 承担密集感知-预测-行动（PPA）闭环的配置与权重声明面。它导出 `CyreneModel`，一个列举全部学习、修剪、代谢和振荡器超参数的 dataclass，以及 `DensePCNet`，一个声明完整权重与 buffer 布局并把前馈、学习、修剪引擎委托出去的 `nn.Module`。该 crate 还承载定义层角色和信任域的数值常量。它不含训练循环，所有动力学都放在 `crates.dense`。
 
 ## 目录
 
@@ -58,7 +58,7 @@ kind: "package-reference"
 
 `save` 写入 `state_ver` 锚点、`config` 快照，并把游离运行时张量放到 `attr.` 命名空间、CPU 计数器放到 `py.` 命名空间。`load` 拒绝缺少 `state_ver` 的快照；维度字段一律跟随检查点形状（修剪会物理切片矩阵）；未知持久化键一律抛错而不是静默丢弃。
 
-`modulation.py` 中的调制辅助函数是纯函数且与设备无关：`compute_dopamine` 是带符号自由能变化的 sigmoid，`compute_ach` 响应不确定性，`soft_norm_preserve` 以结构化、非 clamp 的方式约束行范数，`rms_norm` 与 `l2_norm` 用掩码式分母保护零向量情形，避免 fp16 除以零。
+原先分散在本 crate 与学习路径中的纯算子现已归入 `crates.kernels`：激活、归一化、神经调制与正则化。本 crate 只保留数值 `constants.py` 与权重及 buffer 布局，因此学习路径不再为数学而反指编排层。
 
 `constants.py` 定义神经元状态列索引、六层皮层角色、每层配置（神经元数、惯性、k-WTA 比例）、连接类型，以及学习域消费的信任域与资格迹折扣。
 

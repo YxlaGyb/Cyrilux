@@ -1,6 +1,7 @@
 """
-共享神经调制
-神经调制 (参数化) + 自由能 + 软范数保持.
+神经调制纯算子
+
+标量调制 (多巴胺/ACh/不确定度) + 自由能 + 行为门
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ def compute_uncertainty(F_hist: list[float], window: int = 10) -> float:
 
 
 def compute_dopamine(F_curr: float, F_prev: float, beta: float = 0.5) -> float:
-    """多巴胺 RPE: D = sigmoid(beta * (F_prev - F_curr))."""
+    """多巴胺 RPE: D = sigmoid(beta * (F_curr - F_prev))."""
     if not (math.isfinite(F_curr) and math.isfinite(F_prev)):
         return 0.5
     x = -beta * (F_prev - F_curr)
@@ -54,29 +55,14 @@ def compute_free_energy(eps_list: list[torch.Tensor]) -> torch.Tensor:
     return sum(eps.square().mean() for eps in eps_list)
 
 
-def soft_norm_preserve(W: torch.Tensor) -> None:
-    """行范数保持 0.8-1.2, 结构化非 clamp: 幅度差异保留, 权重有界防 fp16 溢出.
+def gate_psay(g_eco: float, g_perc: float, stress: float, A: float, nov: float,
+              k_g: float, k_s: float, k_a: float, k_n: float) -> float:
+    """行为门纯函数 (测试锚; GPU 版 _update_gate 与之公式一一对应).
 
-    范数归一化收缩 + 软缩放: 行范数归一到 1 后乘 soft 缩放因子,
-    超范数行强收缩 (≥1.2 收缩), 弱行微放大 (≤0.8 放大), 中段近恒等.
-    原实现 rn/(rn+1e-4) 在范数 2 时饱和到 1, 收缩近零 (装饰性), 已修复.
+    p_say = σ(κ_g·(g_eco−g_perc) − κ_s·stress + κ_A·(A−0.5) − κ_n·(nov−0.5)).
+    符号: 账本差 >0 (说比看近期更赚) → 想说; 应激高 (能量紧) → 省着少说;
+    振荡器 A 高相位 → 说 (节律基因); 新奇高 → 多看少说. σ 软饱和 = 结构性有界.
     """
-    rn = W.norm(dim=1, keepdim=True)
-    soft = 0.8 + 0.4 * (rn / (rn + 1.0))  # [0.8, 1.2), 范数大时趋向 1.2 但乘上归一化强收缩
-    W.mul_(soft / (rn + 1e-4))
-
-
-def rms_norm(x: torch.Tensor) -> torch.Tensor:
-    """零向量保护 RMS 归一化 (fp16 下 1e-8 舍为 0, 需掩码保护分母)."""
-    rms = x.square().mean(dim=-1, keepdim=True)
-    alive = (rms > 1e-8).to(x.dtype)
-    denom = torch.where(alive > 0, (rms * 1.01).sqrt(), torch.ones_like(rms))
-    return x * alive / denom
-
-
-def l2_norm(x: torch.Tensor) -> torch.Tensor:
-    """零向量保护 L2 归一化 (与 rms_norm 量纲不同: 分母为范数非均方根)."""
-    nrm = x.norm(dim=-1, keepdim=True)
-    alive = (nrm > 1e-8).to(x.dtype)
-    denom = torch.where(alive > 0, nrm * 1.01, torch.ones_like(nrm))
-    return x * alive / denom
+    logit = (k_g * (g_eco - g_perc) - k_s * stress
+             + k_a * (A - 0.5) - k_n * (nov - 0.5))
+    return 1.0 / (1.0 + math.exp(-logit))

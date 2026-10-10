@@ -68,11 +68,11 @@ CoreBrain 的跨视图预测误差在更新 `Q`、`P_short` 与 `P_long` 之前�
 
 每个视图各有自己的投影，落到同一组槽位空间。`crates/corebrain/project.py` 持有 `P_short` 与 `P_long`，用局部 delta 规则学习，配信任域与软行范数界。`P_long_ema` 是 `P_long` 的慢速副本，以指数滑动平均跟随，且不直接接收误差，这使得目标不会像在线侧那样快速移动。
 
-竞争是硬的，且发生在每个视图内部。`crates/corebrain/compete.py::topk_wta` 每行保留数值最大的 `top_k` 项并置零其余，同时返回胜出掩码。两个视图共用同一组槽位索引，因此一个槽位可以被任一视图赢下。
+竞争是硬的，且发生在每个视图内部。`crates.kernels.topk_wta`（位于 `crates/kernels/sparse.py`）每行保留数值最大的 `top_k` 项并置零其余，同时返回胜出掩码。两个视图共用同一组槽位索引，因此一个槽位可以被任一视图赢下。
 
 预测器由误差训练，投影经由胜出掩码训练。`crates/corebrain/predict.py` 持有 `Q`，一个槽位到槽位的方阵，用局部 delta 规则更新。由于胜者全取不可导，误差以直通规则到达投影：`crates/corebrain/project.py::learn` 把误差乘以胜出掩码，只有产生胜出槽位的那几列收到更新。
 
-防坍缩不依赖梯度。`crates/corebrain/regularize.py` 对槽位激活而非权重施加两条直接规则：一条反希伯去相关，去掉槽位协方差的非对角项；一条逐槽增益，把离差低于下限的槽整列重标。增益被限制在 `[1, 2]` 区间，因此不需要 clamp。
+防坍缩不依赖梯度。`crates.kernels`（`foldiak_decorrelate` 与 `variance_floor`）对槽位激活而非权重施加两条直接规则：一条反希伯去相关，去掉槽位协方差的非对角项；一条逐槽增益，把离差低于下限的槽整列重标。增益被限制在 `[1, 2]` 区间，因此不需要 clamp。
 
 修正是把预测出的长视图编码读回 L4 空间。`CoreBrain.forward` 先把短视图激活经 `Q` 映射，再经 `P_long` 的转置，最后缩放。该层从不解码回字节。
 
