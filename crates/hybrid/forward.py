@@ -15,15 +15,24 @@ import torch
 import torch.nn.functional as F
 
 if TYPE_CHECKING:
-    from crates.model.model_cyrene import DensePCNet
+    from crates.model.model_cyrene import HybridPCNet
 
 from crates.kernels import cubic, l2_norm, rms_norm, saturate
+from crates.model.constants import KWTA_RATIO
+from crates.neuron import survival_mask
+
+from .mask import bind, compete
+
+
+def _k(layer: str, width: int) -> int:
+    """k-WTA 胜者数: 由 LAYER_CONFIG 比例导出, 不新增常数."""
+    return max(1, int(KWTA_RATIO[layer] * width))
 
 
 class ForwardEngine:
     """前馈引擎: 持 net 引用, 状态经 net._z*/net.active_size 传递."""
 
-    def __init__(self, net: DensePCNet):
+    def __init__(self, net: HybridPCNet):
         self.net = net
 
     def forward(self, byte_ids: torch.Tensor) -> dict:
@@ -297,6 +306,8 @@ class ForwardEngine:
         else:
             stp4 = None
         z4 = self._recurrent(mu4, dev, net.W_t4[:dim_4, :dim_4], stp=stp4, stp_tag="l4" if free_run else None)
+        z4, C4 = compete(z4, survival_mask(net, "l4"), _k("l4", dim_4))
+        net._P_l4 = bind(C4, survival_mask(net, "l4"))
         z4_used = z4 if free_run else z4 + net._core_brain.forward(z4).unsqueeze(1)
         z4_n = l2_norm(z4_used)
         mu2 = z4_n @ W_42_a.T + net.bias_l2[:dim_2]
@@ -307,6 +318,8 @@ class ForwardEngine:
             stp=(net._stp_r_l2[:dim_2], net._stp_tau_l2[:dim_2], net._stp_u_l2[:dim_2]) if free_run else None,
             stp_tag="l2" if free_run else None,
         )
+        z2, C2 = compete(z2, survival_mask(net, "l2"), _k("l2", dim_2))
+        net._P_l2 = bind(C2, survival_mask(net, "l2"))
         z2_n = l2_norm(z2)  # 只归一化输入, 保方向压尖峰
         mu3 = z2_n @ W_23_a.T + net.bias_l3[:dim_3]
         if free_run:
@@ -323,6 +336,8 @@ class ForwardEngine:
         )
         if free_run:
             z3 = saturate(z3)  # 分流抑制: 断 z3 下游尖峰链, 仅自由运行
+        z3, C3 = compete(z3, survival_mask(net, "l3"), _k("l3", dim_3))
+        net._P_l3 = bind(C3, survival_mask(net, "l3"))
         z3_n = l2_norm(z3)
         # L5 统一单矩阵
         z5 = z3_n @ net.W_35[:dim_5].T + net.bias_l5[:dim_5]
@@ -332,7 +347,8 @@ class ForwardEngine:
         # Foldiak 反赫布侧抑制: M 学协方差 → 白化去相关 (零起步 = 恒等).
         # z5 不做三阶: 稀疏尖峰经三阶翻转放大 → W_diff 差分 NaN, 非线性由 z3 承载
         z5_fd = z5 - 0.2 * (net.M_l5[:dim_5, :dim_5] @ z5.transpose(-2, -1)).transpose(-2, -1)
-        z5_raw = z5_fd
+        z5_raw, C5 = compete(z5_fd, survival_mask(net, "l5"), _k("l5", dim_5))
+        net._P_l5 = bind(C5, survival_mask(net, "l5"))
         z5 = z5_raw - z5_raw.mean(dim=-1, keepdim=True)
         mu6 = z5 @ W_56_a.T + net.bias_l6[:dim_6]
         if free_run:
@@ -342,6 +358,8 @@ class ForwardEngine:
             stp=(net._stp_r_l6[:dim_6], net._stp_tau_l6[:dim_6], net._stp_u_l6[:dim_6]) if free_run else None,
             stp_tag="l6" if free_run else None,
         )
+        z6, C6 = compete(z6, survival_mask(net, "l6"), _k("l6", dim_6))
+        net._P_l6 = bind(C6, survival_mask(net, "l6"))
 
         # W_diff 在 L4 空间预测 Δz4, eps_diff 驱动 W_diff 学习动力学
         dz4_pred = z4[:, 1:] - z4[:, :-1]

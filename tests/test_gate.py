@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from crates.kernels import gate_psay, rel_norm
-from crates.model import CyreneModel, DensePCNet
+from crates.model import CyreneModel, HybridPCNet
 
 
 def _tiny(**over) -> CyreneModel:
@@ -21,7 +21,7 @@ def _tiny(**over) -> CyreneModel:
 
 def _make(**over):
     torch.manual_seed(0)
-    return DensePCNet(_tiny(**over))
+    return HybridPCNet(_tiny(**over))
 
 
 def _echo_net(**over):
@@ -132,7 +132,7 @@ def test_per_behavior_f_prev():
 def test_echo_starve_unconditional_plus_one():
     """回声相无 dip 判据恒 +1; 感知相 dip 清零只有感知步 (dip_margin=-10 恒 dip 技巧).
     注意冷启动步 (base==0 → 登记基线) 按无下探计数 +1 — P2 语义, 与 margin 无关."""
-    net = DensePCNet(_tiny(metab_dip_margin=-10.0))
+    net = HybridPCNet(_tiny(metab_dip_margin=-10.0))
     net._echo_seed = torch.zeros(1, 1, dtype=torch.long)
     net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))  # 哨兵 (不计数)
     net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))  # 感知冷启动: +1
@@ -146,7 +146,7 @@ def test_echo_starve_unconditional_plus_one():
 
 def test_perception_dip_resets_irrespective_of_echo_runs():
     """感知下探中断回声累计: 回声 +2 后感知 dip → 回 0 (冷启动步先行)."""
-    net = DensePCNet(_tiny(metab_dip_margin=-10.0))
+    net = HybridPCNet(_tiny(metab_dip_margin=-10.0))
     net._echo_seed = torch.zeros(1, 1, dtype=torch.long)
     net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))  # 哨兵
     net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))  # 感知冷启动: +1
@@ -193,5 +193,5 @@ def test_load_resets_behavior_mirror(tmp_path):
     net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))
     p = str(tmp_path / "_p3b_mirror.safetensors")
     net.save(p)
-    loaded = DensePCNet.load(p, _tiny())
+    loaded = HybridPCNet.load(p, _tiny())
     assert loaded._behavior_py is False

@@ -1,6 +1,6 @@
-from crates.model.model_cyrene import CyreneModel, DensePCNet
+from crates.model.model_cyrene import CyreneModel, HybridPCNet
 
 __all__ = [
-    "DensePCNet",
+    "HybridPCNet",
     "CyreneModel",
 ]

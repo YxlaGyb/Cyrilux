@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from crates.model import CyreneModel, DensePCNet
+from crates.model import CyreneModel, HybridPCNet
 
 # 字节域默认 256 (与 CyreneModel.d_input 默认一致,动作域 d_act 同)
 D_INPUT = 256
@@ -43,7 +43,7 @@ def _tiny_cfg(**over) -> CyreneModel:
 def test_l5_enters_layers_list():
     """RED-1:layers 列表现在含 l5,且顺序保证依赖链 l3→l5→l6."""
     cfg = _tiny_cfg()
-    net = DensePCNet(cfg)
+    net = HybridPCNet(cfg)
     pruner = net.pruner
     # 触发一次以填充内部字典
     pruner._W_attr = None  # 强制重置状态
@@ -70,7 +70,7 @@ def test_l5_prune_shapes_all_synced():
     随机 (保证不触发它们剪或剪也不影响 L5 观测).
     """
     cfg = _tiny_cfg()
-    net = DensePCNet(cfg)
+    net = HybridPCNet(cfg)
     # 初始形状
     assert net.active_size["l5"] == cfg.d_l5 == 192, f"init bad a5={net.active_size['l5']}"
 
@@ -164,7 +164,7 @@ def test_l5_prune_shapes_all_synced():
 def test_l5_prune_then_forward_no_crash():
     """RED-3:修剪后再跑一次 forward + learn,确保 matmul 形状全对齐,无 NaN/shape 崩。"""
     cfg = _tiny_cfg()
-    net = DensePCNet(cfg)
+    net = HybridPCNet(cfg)
     # 准备 L5 低活
     with torch.no_grad():
         a5 = net.W_35.shape[0]
@@ -219,7 +219,7 @@ def test_l4_shrink_w1_markers_aligned():
         active_size_lower_bound=128, l4_lower_bound=512,
         mem_k0=3, mem_k_max=3, max_seq_len=8,
     )
-    net = DensePCNet(cfg)
+    net = HybridPCNet(cfg)
     n_bind = net.bind_slot_dim  # 32
     K = 3
     head = 768 + n_bind
@@ -235,13 +235,13 @@ def test_l4_shrink_w1_markers_aligned():
                 w1[head + k * 768 + i, 0] = 2000 + k * 1000 + i  # 单元块 k
         net.W1_elig.copy_(net.W1.data)
         # W_04 行范数严格递减 → 最弱 = 尾行 (topk 稳定; 断言本身不依赖具体 keep 集)
-        r = (torch.arange(768, dtype=torch.float32).flip(0) + 1).unsqueeze(1) / 768.0
+        r = (torch.arange(768, dtype=torch.float16).flip(0) + 1).unsqueeze(1) / 768.0
         net.W_04.data.copy_(
             r.expand(-1, net.W_04.shape[1]).to(torch.float16)
         )
     # 死亡回合同序: mem 饥荒击杀 (K 3→2) → 拓扑修剪
     net._mem_g.copy_(torch.tensor([0.9, 0.5, 0.1], dtype=torch.float16))
-    net.learning_engine._mem_famine_kill()
+    net.mem_pool.famine_kill()
     assert net._mem_m.shape[0] == K - 1
     net.pruner._prune()
     a4 = net.active_size["l4"]
@@ -271,7 +271,7 @@ def test_l4_shrink_w1_markers_aligned():
 def test_l4_shrink_then_learn_no_shape_crash():
     """L4 收缩后紧接 learn (感知+回声) 不崩 — 回归: 活性缓冲漏同步 (曾漏 _dw_slot 等)."""
     cfg = _tiny_cfg(d_l4=576)  # > l4_lower_bound=512 → L4 真收缩
-    net = DensePCNet(cfg)
+    net = HybridPCNet(cfg)
     net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))
     net.pruner._prune()
     a4 = net.active_size["l4"]

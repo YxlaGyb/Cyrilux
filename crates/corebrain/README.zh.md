@@ -28,7 +28,7 @@ kind: "package-reference"
 |---|---|---|
 | `CoreBrainConfig` | dataclass | 参数级默认值：槽位数、top-k、学习率、EMA 速率、信任域、正则权重、离差下限、修正幅度、注意力 EMA 速率、温度与下界。 |
 | `CoreBrain(cfg)` | 模块 | 该层本身。持有两组视图投影、槽位预测器、慢速目标缓冲与强制的注意力调制器。 |
-| `DensePCNet._core_brain` | 模块 | 由 `DensePCNet` 自动构造，始终存在。 |
+| `HybridPCNet._core_brain` | 模块 | 由 `HybridPCNet` 自动构造，始终存在。 |
 
 调用该层。
 
@@ -81,6 +81,6 @@ CoreBrain 的跨视图预测误差在更新 `Q`、`P_short` 与 `P_long` 之前�
 <a id="further-exploration"></a>
 ## 进一步探索
 
-- [dense](../dense/README.md)：前向链，以及修正量叠加的位置。
+- [hybrid](../hybrid/README.zh.md)：前向链，以及修正量叠加的位置。
 - [attention](../attention/README.zh.md)：强制的误差精度调制器。
 - [model](../model/README.zh.md)：网络声明与生命周期。

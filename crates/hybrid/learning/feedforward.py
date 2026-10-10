@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import torch
 
-from crates.model.modulation import rms_norm
+from crates.kernels import decorr_W as _decorr_W
+from crates.kernels import rms_norm, soft_norm_preserve
 
-from ...model.modulation import soft_norm_preserve
-from ._common import _activity_baseline, _decorr_W, _elig_accum, _energy_constraint, _MixinBase, _rho_ctrl
+from ._common import _activity_baseline, _elig_accum, _energy_constraint, _MixinBase, _plastic, _rho_ctrl
 
 
 class FeedforwardMixin(_MixinBase):
@@ -79,12 +79,19 @@ class FeedforwardMixin(_MixinBase):
             td_hat = z2 @ net.W_42[:dim_2, :dim_4]  # 生成方向: 高层生成低层预测
             res_td = (z4 - td_hat).norm(dim=-1)  # [N,S] 未解释范数
             pw = res_td / (z4.norm(dim=-1) + res_td + 1e-3)  # 未解释占比 ∈ (0,1)
-            final_error = sh.metab_f * pw.unsqueeze(-1)
+            final_error = _plastic(sh.metab_f * pw.unsqueeze(-1), net, "l4")
 
             # 幅度-方向解耦: dW 归一化单位向量, 显著性只选方向不放大幅度
             # → 单步最大幅度 = lr, 防极端样本单步爆 NaN
             z0_n = rms_norm(z0)
             dW_04n = torch.bmm(final_error.transpose(-2, -1), z0_n)  # [N,dim_4,in]
+            # E9b-0 路径审计: 拆分向量路径的基线/多尺度贡献 (外积范数, 归一化前). 默认关零变更.
+            if (getattr(net, "_f_ms_audit", False)
+                    and sh.metab_f_base is not None and sh.metab_f_ms is not None):
+                base_fe = sh.metab_f_base * pw.unsqueeze(-1)
+                ms_fe = sh.metab_f_ms * pw.unsqueeze(-1)
+                net._audit_dw04_base.copy_(torch.bmm(base_fe.transpose(-2, -1), z0_n).norm())
+                net._audit_dw04_ms.copy_(torch.bmm(ms_fe.transpose(-2, -1), z0_n).norm())
             nrm_04 = dW_04n.norm(dim=(-2, -1), keepdim=True)
             # 零范数行分母=1 (预测完美 → dW=0 → 0/0=NaN)
             alive_04 = (nrm_04 > 1e-8).to(dW_04n.dtype)
@@ -134,6 +141,7 @@ class FeedforwardMixin(_MixinBase):
         dz4_full = net._z4[:, 1:] - net._z4[:, :-1]
         eps_state = (net._z4[:, :-1] @ W_sp_a.T) - dz4_full  # [N,S-1,dim_4]
         eps_state = rms_norm(eps_state)
+        eps_state = _plastic(eps_state, net, "l4", pos=slice(None, -1))  # 可塑码门控: 死/不活跃神经元不进 W_state_pred
         eps_state_3 = eps_state @ net.W_42[:dim_2].T[:, :dim_3]  # dim_4 → dim_3 (经 W_42 逆映射)
         eps3_pc = sh.errs.eps3 + 0.3 * torch.cat(
             [eps_state_3, net._padmax[:, :, :dim_3]], dim=1
@@ -179,7 +187,7 @@ class FeedforwardMixin(_MixinBase):
             eps_lm_3 = eps_lm_proj_pad @ net.W_42[:ctx.dim_2].T[:, :dim_3]
             eps_lm_3 = rms_norm(eps_lm_3)
         z5_b = z5
-        eps_b = z5_b[:, 1:] - z5_b[:, :-1]  # 时序差分误差
+        eps_b = _plastic(z5_b[:, 1:] - z5_b[:, :-1], net, "l5", pos=slice(1, None))  # 时序差分误差 (可塑码门控)
         z3_b = z3[:, :-1]
         z3_bp = z3_b * (torch.rand_like(z3_b) > 0.3).to(torch.float16)
         if not free_run:

@@ -35,7 +35,7 @@ kind: "package-reference"
 
 | 导出 | 形状 | 含义 |
 |---|---|---|
-| `setup_cuda_device()` | 设备选择 | 返回 `torch.device`（有 CUDA 用 CUDA，否则 CPU），在 CUDA 上把 float32 matmul 精度设为 medium，并启用 cuDNN benchmark 与 tf32。 |
+| `setup_cuda_device()` | 设备选择 | 返回 `torch.device`（有 CUDA 用 CUDA，否则 CPU），在 CUDA 上启用 cuDNN benchmark。 |
 
 -----
 
@@ -55,5 +55,5 @@ kind: "package-reference"
 <a id="further-exploration"></a>
 ## 进一步探索
 
-- [dense](../dense/README.zh.md)：设备桥把事件批馈入密集感知管线。
+- [hybrid](../hybrid/README.zh.md)：设备桥把事件批馈入密集感知管线。
 - [architecture](../../docs/architecture.md)：top-k 与稀疏、事件驱动传输设计。

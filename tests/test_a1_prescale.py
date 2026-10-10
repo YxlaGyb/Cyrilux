@@ -3,7 +3,7 @@
 import torch
 
 from crates.kernels import rms_norm
-from crates.model import CyreneModel, DensePCNet
+from crates.model import CyreneModel, HybridPCNet
 
 
 def _make_net():
@@ -18,7 +18,7 @@ def _make_net():
         free_run_window=16,
         mem_k0=2,
     )
-    return DensePCNet(cfg)
+    return HybridPCNet(cfg)
 
 
 def test_rms_norm_scale_invariance_fp16():

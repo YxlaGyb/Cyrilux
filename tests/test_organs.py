@@ -9,7 +9,7 @@
 """
 import torch
 
-from crates.model import CyreneModel, DensePCNet
+from crates.model import CyreneModel, HybridPCNet
 
 
 def _make_net():
@@ -18,7 +18,7 @@ def _make_net():
         d_l4=64, d_l2=32, d_l3=32, d_l5=64, d_l6=16,
         max_seq_len=16, free_run_window=16, mem_k0=2,
     )
-    return DensePCNet(cfg)
+    return HybridPCNet(cfg)
 
 
 class TestOrgan1Retrieval:

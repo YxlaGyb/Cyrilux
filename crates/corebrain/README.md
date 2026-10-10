@@ -28,7 +28,7 @@ Construct the layer through the network so it stays a registered submodule.
 |---|---|---|
 | `CoreBrainConfig` | dataclass | Parameter-level defaults: slot count, top-k, learning rates, EMA rate, trust region, regulariser weights, deviation floor, correction scale, attention EMA rate, attention temperature and attention floor. |
 | `CoreBrain(cfg)` | module | The layer itself. Holds the two view projections, the slot predictor, the slow target buffer and the mandatory attention modulator. |
-| `DensePCNet._core_brain` | module | Constructed automatically by `DensePCNet` and always present. |
+| `HybridPCNet._core_brain` | module | Constructed automatically by `HybridPCNet` and always present. |
 
 Call the layer.
 
@@ -81,6 +81,6 @@ The layer learns only from its own error. `LearningEngine.learn` calls `CoreBrai
 <a id="further-exploration"></a>
 ## Further exploration
 
-- [dense](../dense/README.md): the forward chain and the point where the correction is added.
+- [hybrid](../hybrid/README.md): the forward chain and the point where the correction is added.
 - [attention](../attention/README.md): the mandatory error-precision modulator.
 - [model](../model/README.md): the network declaration and lifecycle.

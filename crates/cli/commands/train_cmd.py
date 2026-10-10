@@ -13,7 +13,7 @@ from crates.cli.utils import load_config, resolve_path, run_dir
 
 def _build_net(hidden_size: int, lr: float, max_seq_len: int, checkpoint: str | None = None):
     """dense 网络构建: 按 hidden_size 比例缩放各层; 有 checkpoint 则载入加权."""
-    from crates.model import CyreneModel, DensePCNet
+    from crates.model import CyreneModel, HybridPCNet
 
     ratio = hidden_size / 1024.0
     d_cfg = CyreneModel(
@@ -26,8 +26,8 @@ def _build_net(hidden_size: int, lr: float, max_seq_len: int, checkpoint: str | 
         max_seq_len=max_seq_len,
     )
     if checkpoint is not None:
-        return DensePCNet.load(resolve_path(checkpoint), d_cfg), d_cfg
-    return DensePCNet(d_cfg), d_cfg
+        return HybridPCNet.load(resolve_path(checkpoint), d_cfg), d_cfg
+    return HybridPCNet(d_cfg), d_cfg
 
 
 def extract_window_text(sample: dict) -> str:
@@ -156,7 +156,6 @@ def _train_dense(
 @click.option("--abstraction-bank/--no-abstraction-bank", default=False, help="抽象记忆库 (dense 忽略)")
 @click.option("--auto-phase2", is_flag=True, default=False, help="训练后自动进入 Phase 2 (dense 忽略)")
 @click.option("--resume", is_flag=True, default=False, help="从断点恢复 (out_dir/final.safetensors 或 -c 指定)")
-@click.option("--backend", default="dense", help="dense=PPA 闭环 (默认) / sparse=已归档冻结")
 @click.option("--verbose", "-v", is_flag=True, default=False, help="verbose logging")
 def train(
     model_type,
@@ -181,12 +180,9 @@ def train(
     abstraction_bank,
     auto_phase2,
     resume,
-    backend,
     verbose,
 ):
 
-    if backend == "sparse":
-        raise click.ClickException("sparse 管线已随 117 轮归档冻结 (model/_archived_sparse), 请用 dense")
     if not data:
         raise click.ClickException("请用 -d 指定数据文件 (可多个)")
     ignored = []
@@ -207,7 +203,7 @@ def train(
     if save_interval != 10000:
         ignored.append("--save-interval")
     if ignored:
-        print(f"dense 后端: 忽略稀疏参数 {', '.join(ignored)}")
+        print(f"hybrid 后端: 忽略废弃参数 {', '.join(ignored)}")
     if resume and checkpoint is None:
         if out_dir:
             checkpoint = os.path.join(out_dir, "final.safetensors")
@@ -278,7 +274,7 @@ def resume(checkpoint, data, batch_size, max_seq_len, epochs, lr, out_dir, verbo
     """从检查点文件恢复训练 (dense PPA 闭环)."""
     from dataclasses import replace
 
-    from crates.model import DensePCNet
+    from crates.model import HybridPCNet
 
     ckpt_path = resolve_path(checkpoint)
     if not os.path.exists(ckpt_path):
@@ -287,8 +283,8 @@ def resume(checkpoint, data, batch_size, max_seq_len, epochs, lr, out_dir, verbo
 
     print(f"恢复训练 — 检查点: {ckpt_path}")
     # 缓冲按 max_seq_len 分配, 必须 ≥ 本命令的批次长度 (快照可能来自短序列实验)
-    base = DensePCNet.config_from_checkpoint(ckpt_path)
-    net = DensePCNet.load(ckpt_path, replace(base, max_seq_len=max(base.max_seq_len, max_seq_len)))
+    base = HybridPCNet.config_from_checkpoint(ckpt_path)
+    net = HybridPCNet.load(ckpt_path, replace(base, max_seq_len=max(base.max_seq_len, max_seq_len)))
     if lr is not None:
         net.cfg.lr_hebbian = lr
     if not data:

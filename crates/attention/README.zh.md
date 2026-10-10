@@ -55,7 +55,7 @@ g = (1 - floor) * K * softmax(g_raw / temperature) + floor
 
 在不使用 clamp 的前提下保持均值为 1、下界为 `floor`。
 
-CoreBrain 继续使用现有 JEPA 目标 `topk_wta(long @ P_long_ema)`。注意力不替换该目标，只计算 `delta_eff = g * delta`，并把有效误差同时送入预测器与投影器更新。投影更新先经 `Q.T` 映射，再应用现有 WTA 掩码。
+CoreBrain 继续使用现有目标 `topk_wta(long @ P_long_ema)`。注意力不替换该目标，只计算 `delta_eff = g * delta`，并把有效误差同时送入预测器与投影器更新。投影更新先经 `Q.T` 映射，再应用现有 WTA 掩码。
 
 该层只在感知学习阶段运行。自由运行与回声冻结阶段不更新 `a_long_ema`。
 

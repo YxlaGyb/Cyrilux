@@ -1,15 +1,15 @@
 ---
-description: "dense：密集感知-预测-行动闭环的引擎，前馈、推理、生成与动态修剪。"
+description: "hybrid：密集感知-预测-行动闭环的引擎，前馈、推理、生成与引擎委托。"
 kind: "package-reference"
 ---
 
-# dense
+# hybrid
 
 [English](README.md) | 中文
 
 ## 概述
 
-`crates.dense` 实现密集 PPA（感知-预测-行动）闭环的运行时引擎。`forward.py` 拥有 `ForwardEngine`，它从字节输入沿 L0 到 L6 逐层走过激活路径，应用时间递归核，绑定稀疏概念槽，并执行自回归续写与生成。`pruning.py` 拥有 `PruningEngine`，它通过淘汰不再有贡献的神经元来重塑拓扑。逐域学习更新放在同级子 crate `crates.dense.learning`。这些引擎共同消费 `crates.model` 声明的网络与配置，并以纯希伯、无反向传播的方式驱动它。
+`crates.hybrid` 实现密集 PPA（感知-预测-行动）闭环的运行时引擎。`forward.py` 拥有 `ForwardEngine`，它从字节输入沿 L0 到 L6 逐层走过激活路径，应用时间递归核，绑定稀疏概念槽，并执行自回归续写与生成。动态神经元机制（拓扑修剪与记忆单元群的生死）放在同级 crate `crates.neuron`。逐域学习更新放在同级子 crate `crates.hybrid.learning`。这些引擎共同消费 `crates.model` 声明的网络与配置，并以纯希伯、无反向传播的方式驱动它。
 
 ## 目录
 
@@ -26,8 +26,7 @@ kind: "package-reference"
 
 | 导出 | 形状 | 含义 |
 |---|---|---|
-| `ForwardEngine(net)` | 引擎 | 持有网络并驱动感知、推理、绑定与生成。由 `DensePCNet.__init__` 自动构造，暴露为 `net.forward_engine`。 |
-| `PruningEngine(net)` | 引擎 | 持有网络并驱动拓扑重塑。自动构造为 `net.pruner`。 |
+| `ForwardEngine(net)` | 引擎 | 持有网络并驱动感知、推理、绑定与生成。由 `HybridPCNet.__init__` 自动构造，暴露为 `net.forward_engine`。 |
 
 前馈与生成。
 
@@ -38,12 +37,6 @@ kind: "package-reference"
 | `engine.generate(prompt, n_tokens, temperature, dev)` | 生成 | 让模型在提示字符串上前进并返回生成的字节。 |
 | `engine.continuation(byte_ids, n_gen, temperature, rep_backstop)` | 自回归续写 | 训练 rollout 与验证共用。对输入前缀批量处理并返回追加的 token。 |
 
-修剪。
-
-| 导出 | 形状 | 含义 |
-|---|---|---|
-| `engine._prune()` | 拓扑重塑 | 执行一次：发育期守卫、死缓二级判决、相对排名淘汰。 |
-
 -----
 
 <a id="understand-the-implementation"></a>
@@ -53,7 +46,7 @@ kind: "package-reference"
 
 `continuation` 为训练与评估复用同一条 logits 管线。温度可以传张量从而在 GPU 上直除、零标量同步，还带可选的重复问题兜底（屏蔽周期性字节），并用预建掩码屏蔽非法续字节以强制 UTF-8 合法性。多步承诺遥测由一个可选开关控制。
 
-`PruningEngine` 以严格顺序用一个置换重塑，使某层的行映射权重与其下游列保持对齐。每层的前馈权重、时间核、偏置、资格迹、死亡簿与 STP 资源都被置换并按存活宽度收缩，L4 专属辅助量（`W1`、`W_diff`、`W_state_pred`、记忆单元）也按同一置换 gather。淘汰先经死缓二级判决，再按行范数相对排名（L4 额外计入 W1 贡献），一直降到配置的下限尺寸。
+`crates.neuron` 拥有拓扑重塑与记忆单元生命周期：一个重塑回合如何把某层的行映射权重与其下游列用同一置换一起重塑，以及记忆单元如何出生与死亡。本包不含任何重塑逻辑：编排层轮询 `net.maybe_prune(step)`，网络再委托给 `net.pruner.decide()` 与 `net.pruner.compact()`。
 
 -----
 
@@ -62,3 +55,4 @@ kind: "package-reference"
 
 - [model](../model/README.zh.md)：这些引擎操作的权重与配置声明。
 - [learning](learning/README.zh.md)：逐域学习更新。
+- [neuron](../neuron/README.zh.md)：动态神经元机制，主链修剪与记忆单元群生死。

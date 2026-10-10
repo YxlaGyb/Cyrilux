@@ -13,7 +13,7 @@ import torch
 from crates.kernels import decorr_W as _decorr_W
 from crates.kernels import rms_norm, soft_norm_preserve
 
-from ._common import _elig_accum, _MixinBase
+from ._common import _elig_accum, _MixinBase, _plastic
 
 
 class BindMixin(_MixinBase):
@@ -31,6 +31,7 @@ class BindMixin(_MixinBase):
         dev = ctx.dev
         dim_5 = ctx.dim_5
         z5 = net._z5
+        z5 = _plastic(z5, net, "l5")  # 可塑码门控: M_l5 是 L5 表示侧耦合, 死/不活跃神经元不进协方差
         z5_flat = z5.reshape(-1, dim_5).to(torch.float16)
         z5_flat = z5_flat / (z5_flat.norm(dim=-1, keepdim=True) + 1e-3)
         cov = z5_flat.transpose(0, 1) @ z5_flat / z5_flat.shape[0]
@@ -83,7 +84,7 @@ class BindMixin(_MixinBase):
                 gain_n = (rel_n * 5.0).clamp(0.3, 5.0)  # tensor-guard: bound (惊喜增益设计界)
                 net._s_ema_n[:N].mul_(0.95).add_(0.05 * s_n)
             net._gain_n = gain_n  # 诊断: 逐样本增益分布
-            z4n_w = z4n[:, :-1] * gain_n[:, None, None]  # [N, S-1, dim_4]
+            z4n_w = _plastic(z4n[:, :-1], net, "l4", pos=slice(None, -1)) * gain_n[:, None, None]  # [N, S-1, dim_4]
             dW_bind = (
                 torch.einsum("nsd,nsq->dq", z4n_w, bind_t[:, :-1]) / (gain_n.sum() + 1e-8) * (1.0 / (S - 1))
             )

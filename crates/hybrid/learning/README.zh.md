@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`crates.dense.learning` 实现密集 PPA 循环的希伯学习：一次前馈、逐域误差、然后进行无反向传播、无教师目标的局部权重更新。`LearningEngine` 由 `EngineCore` 组合七个 mixin 构成。`engine.py` 持有 `learn()` 编排与共享的逐步上下文；`_common.py` 持有各域共用的逐网络状态适配层，把纯算子委托给 `crates.kernels`（资格迹、能量约束、去相关、谱守卫）；`action.py`、`bind.py`、`feedforward.py`、`metabolism.py`、`predict.py`、`readout.py` 与 `temporal.py` 各自拥有一个更新域。所有状态都流经引擎所持有的网络。
+`crates.hybrid.learning` 实现密集 PPA 循环的希伯学习：一次前馈、逐域误差、然后进行无反向传播、无教师目标的局部权重更新。`LearningEngine` 由 `EngineCore` 组合七个 mixin 构成。`engine.py` 持有 `learn()` 编排与共享的逐步上下文；`_common.py` 持有各域共用的逐网络状态适配层，把纯算子委托给 `crates.kernels`（资格迹、能量约束、去相关、谱守卫）；`action.py`、`bind.py`、`feedforward.py`、`metabolism.py`、`predict.py`、`readout.py` 与 `temporal.py` 各自拥有一个更新域。所有状态都流经引擎所持有的网络。
 
 ## 目录
 

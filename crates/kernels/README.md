@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`crates.kernels` is the leaf operator library. It holds every gradient-free, device-agnostic function the learning and forward paths share: activations, normalizations, sparse competition, neuromodulation, regularization, straight-through estimators, plasticity rules and spectral guards. It depends only on `torch` and holds no state and no network reference, so `crates.model`, `crates.dense`, `crates.corebrain` and `crates.attention` can all depend on it without creating a cycle.
+`crates.kernels` is the leaf operator library. It holds every gradient-free, device-agnostic function the learning and forward paths share: activations, normalizations, sparse competition, neuromodulation, regularization, straight-through estimators, plasticity rules and spectral guards. It depends only on `torch` and holds no state and no network reference, so `crates.model`, `crates.hybrid`, `crates.corebrain` and `crates.attention` can all depend on it without creating a cycle.
 
 ## Table of Contents
 
@@ -59,9 +59,9 @@ from crates.kernels import rms_norm, saturate, topk_wta
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
 
-The crate is the single home for operators that were previously duplicated across `crates.model`, `crates.dense`, `crates.corebrain` and `crates.attention`. Moving them here breaks the reverse dependency from the learning path back to `crates.model`, since pure math never needs the orchestrator.
+The crate is the single home for operators that were previously duplicated across `crates.model`, `crates.hybrid`, `crates.corebrain` and `crates.attention`. Moving them here breaks the reverse dependency from the learning path back to `crates.model`, since pure math never needs the orchestrator.
 
-Every function is pure: it reads its arguments and returns its result, except the in-place regularizers (`soft_norm_preserve`, `foldiak_decorrelate`, `variance_floor`, `decorr_W`, `spectral_radius_guard`) which mutate the tensor they are handed. No function holds a network reference. When an operator needs network state (the slow EMA buffers, the cold-start flags, the `cfg` coefficients), the caller in `crates.dense.learning._common` reads that state and passes it in, so the kernel stays testable in isolation.
+Every function is pure: it reads its arguments and returns its result, except the in-place regularizers (`soft_norm_preserve`, `foldiak_decorrelate`, `variance_floor`, `decorr_W`, `spectral_radius_guard`) which mutate the tensor they are handed. No function holds a network reference. When an operator needs network state (the slow EMA buffers, the cold-start flags, the `cfg` coefficients), the caller in `crates.hybrid.learning._common` reads that state and passes it in, so the kernel stays testable in isolation.
 
 The sparse and modulation paths keep the fp16 contract. `rms_norm` and `l2_norm` guard the zero-vector case with a masked denominator instead of a clamp, and `saturate` and `cubic` bound their tails structurally, so no operator relies on a gradient-breaking clamp. Two module-level caches inside `spectral` (`_PROBE_CACHE` and `_EYE_CACHE`) reuse a probe vector and an identity mask per `(device, dtype, size)`, which keeps the hot path free of new allocations.
 
@@ -71,5 +71,5 @@ The sparse and modulation paths keep the fp16 contract. `rms_norm` and `l2_norm`
 ## Further exploration
 
 - [model](../model/README.md): configuration and the numeric constants the kernels consume.
-- [dense](../../crates/dense/README.md): the forward and learning paths that call these operators.
-- [learning](../dense/learning/README.md): the state adapters that delegate to this crate.
+- [dense](../../crates/hybrid/README.md): the forward and learning paths that call these operators.
+- [learning](../hybrid/learning/README.md): the state adapters that delegate to this crate.

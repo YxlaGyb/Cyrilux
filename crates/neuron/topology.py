@@ -1,9 +1,14 @@
 """
 PruningEngine
-动态神经元修剪 (慢速循环).
+动态神经元生死 (判决侧) 与拓扑压实 (滞后侧).
 
-拓扑重塑三段: 发育期内不剪 → 死缓二级判决 → 相对排名淘汰.
-修剪同步: 同 perm 重排所有 L4 行映射权重与下游列 (错位是历史 NaN 根因).
+两段分离是生死的根本口径:
+  判决 decide()  —— 每轮写 S_l 与死缓簿, 只关位, 不动任何张量形状,
+                     active_size 保持为物理宽度 (切片长度).
+  压实 compact() —— 滞后执行, 把 S_l=0 的行与下游列真正裁掉并回收显存,
+                     只有到此步 active_size 才会变小.
+
+压实同步: 同 perm 重排所有 L4 行映射权重与下游列 (错位是历史 NaN 根因).
 """
 
 from __future__ import annotations
@@ -13,188 +18,136 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from .registry import ROW_STATE
+from .survival import LAYERS
+
 if TYPE_CHECKING:
-    from crates.model.model_cyrene import DensePCNet
-
-
-# 行索引状态: 按神经元行索引的张量 → (层, 形态). 形态 vec=t[perm] / sq=t[perm][:,perm] / row=只排行.
-# 处理者 done = _permute_weights (压缩本体 + 死亡簿的语义更新), aux = _sync_layer_state.
-# 名录须完整: 漏项会让状态挂到别的神经元上 (test_prune_row_state_audit 校验覆盖度).
-_LAYERS = (  # (层, 主权重, 时间核, Foldiak, 时间核去相关) — l6 无 Foldiak
-    ("l4", "W_04", "W_t4", "E_04", "E_t4"),
-    ("l2", "W_42", "W_t2", "E_42", "E_t2"),
-    ("l3", "W_23", "W_t3", "E_23", "E_t3"),
-    ("l5", "W_35", "W_t5", "E_l5", "E_t5"),
-    ("l6", "W_56", "W_t6", "", "E_t6"),
-)
-_BY_LAYER = (  # (名字模板, 形态, 处理者)
-    ("{w}", "row", "done"),
-    ("{w}_elig", "row", "aux"),
-    ("bias_{l}", "vec", "done"),
-    ("{t}", "sq", "done"),
-    ("{t}_elig", "sq", "aux"),
-    ("{e}", "sq", "aux"),
-    ("{et}", "sq", "aux"),
-    ("_death_row_{l}", "vec", "done"),
-    ("_probation_counter_{l}", "vec", "done"),
-    ("_stp_r_{l}", "vec", "aux"),
-    ("_stp_tau_{l}", "vec", "aux"),
-    ("_stp_u_{l}", "vec", "aux"),
-    ("_stp_active_ema_{l}", "vec", "aux"),
-)
-_L4_ONLY = (  # 行 = L4
-    ("b_diff", "vec", "aux"),
-    ("E_bind", "sq", "aux"),
-    ("_theta_w", "vec", "aux"),
-    ("_theta_w04", "vec", "aux"),
-    ("_theta_wt4", "vec", "aux"),
-    ("W_diff", "sq", "done"),
-    ("W_diff_elig", "sq", "aux"),
-    ("W_state_pred", "sq", "done"),
-    ("W_state_pred_elig", "sq", "aux"),
-    ("W_pred_43", "row", "done"),
-    ("W_pred_43_elig", "row", "aux"),
-    ("W_bind", "row", "done"),
-    ("W_bind_elig", "row", "aux"),
-)
-_L5_ONLY = (
-    ("M_l5", "sq", "aux"),
-    ("_theta_l5", "vec", "aux"),
-    ("W_pred_54", "row", "done"),
-    ("W_pred_54_elig", "row", "aux"),
-)
-_SPECIAL = ("W1", "W1_elig", "_dw_buf", "_mem_m", "_gain_mask", "_gain_l3")
-_EXEMPT = (
-    "W_bind_self_elig",
-    "W_act_elig",
-    "W_lm_elig",
-    "W_lm_2_elig",
-    "_core_brain.projector.P_short",
-    "_core_brain.projector.P_long",
-    "_core_brain.projector.P_long_ema",
-    "_core_brain._delta_prev",
-    "_core_brain.predictor.Q",
-    "_core_brain._cov_s",
-    "_core_brain._cov_l",
-    "_core_brain.attention._a_long_ema",
-)
-
-
-def _row_state() -> dict[str, tuple[str, str, str]]:
-    t: dict[str, tuple[str, str, str]] = {}
-    for lyr, w, wt, e, et in _LAYERS:
-        for tmpl, form, handler in _BY_LAYER:
-            name = tmpl.format(w=w, t=wt, e=e, et=et, l=lyr)
-            if name:
-                t[name] = (lyr, form, handler)
-    for lyr, spec in (("l4", _L4_ONLY), ("l5", _L5_ONLY)):
-        t.update({n: (lyr, f, h) for n, f, h in spec})
-    t.update(dict.fromkeys(_SPECIAL, ("l4", "special", "done")))
-    t.update(dict.fromkeys(_EXEMPT, ("-", "exempt", "exempt")))
-    from crates.model.model_cyrene import _ACTIVE_EMA_LAYER
-
-    t.update({f"_active_ema_{a}": (lyr, "vec", "aux") for a, lyr in _ACTIVE_EMA_LAYER.items()})
-    return t
-
-
-ROW_STATE = _row_state()
+    from crates.model.model_cyrene import HybridPCNet
 
 
 class PruningEngine:
-    """修剪引擎: 持 net 引用, 操作 net.active_size/_death_row_*/权重张量."""
+    """修剪引擎: 持 net 引用, 操作 net.active_size/_S_l/_death_row_*/权重张量."""
 
-    def __init__(self, net: DensePCNet):
+    def __init__(self, net: HybridPCNet):
         self.net = net
 
-    def _expire_flags(self, layers: list[str], dprob: int) -> dict[str, torch.Tensor | None]:
-        """死缓二级判决: 过期标记 (死缓期满且未复活) → 强制淘汰."""
+    def _attrs(self) -> None:
+        """登记表 + 各层下限. 判决与压实共用, 避免两处字面量漂移."""
         net = self.net
-        expired_flags: dict[str, torch.Tensor | None] = {}
-        for layer in layers:
+        self._W_attr = {"l4": "W_04", "l2": "W_42", "l3": "W_23", "l5": "W_35", "l6": "W_56"}
+        self._t_attr = {"l4": "W_t4", "l2": "W_t2", "l3": "W_t3", "l5": "W_t5", "l6": "W_t6"}
+        self._b_attr = {"l4": "bias_l4", "l2": "bias_l2", "l3": "bias_l3", "l5": "bias_l5", "l6": "bias_l6"}
+        bound = net.cfg.active_size_lower_bound
+        self._bounds = {
+            "l4": net.cfg.l4_lower_bound, "l2": bound, "l3": bound, "l5": bound, "l6": bound,
+        }
+
+    def decide(self) -> None:
+        """判决: 行范数相对排名 → 死缓登记; 死缓期满未复活 → S_l 关位.
+
+        本方法不改变 active_size 与任何张量形状 — 被关位的神经元只是不再点火,
+        它的行/列仍占物理宽度直到压实点. 所有关位都受下限约束, 不会把活体数
+        压到 active_size_lower_bound (L4 另用 l4_lower_bound) 之下.
+        """
+        net = self.net
+        self._attrs()
+        frac = net.cfg.prune_fraction
+        dprob = net.cfg.death_probation
+        for layer in LAYERS:
             active = net.active_size[layer]
-            dr_a = getattr(net, f"_death_row_{layer}")[:active]
-            pc_a = getattr(net, f"_probation_counter_{layer}")[:active]
-            in_death = dr_a.bool()
-            expired = in_death & (pc_a >= dprob)
+            S = getattr(net, f"_S_{layer}")[:active]
+            dr = getattr(net, f"_death_row_{layer}")[:active]
+            pc = getattr(net, f"_probation_counter_{layer}")[:active]
+            bound = self._bounds[layer]
             W = getattr(net, self._W_attr[layer])
             rn = W[:active].data.norm(dim=1)
-            revived = in_death & (rn > net.cfg.death_threshold) & ~expired
+            if layer == "l4":
+                rn = rn * net.W1[:active].data.norm(dim=1)
+
+            n_live = int(S.sum())
+            in_death = dr.bool() & S
+            revived = in_death & (rn > net.cfg.death_threshold)
             if revived.any():
-                dr_a[revived] = False
-                pc_a[revived] = 0
-            expired_flags[layer] = expired if expired.any() else None
-        return expired_flags
+                dr[revived] = 0
+                pc[revived] = 0
+                in_death = dr.bool() & S
+
+            pc[in_death] += 1
+            expired = in_death & (pc >= dprob)
+            n_exp = int(expired.sum())
+            allow = max(0, n_live - bound)
+            if n_exp > allow:
+                ix = torch.where(expired)[0][:allow]
+                expired = torch.zeros_like(expired)
+                expired[ix] = True
+                n_exp = allow
+            if n_exp:
+                S[expired] = False
+                dr[expired] = 0
+                pc[expired] = 0
+                n_live -= n_exp
+
+            eligible = S & ~dr.bool()
+            n_elig = int(eligible.sum())
+            n_candidate = min(max(1, int(n_live * frac)), max(0, n_elig - bound))
+            if n_candidate <= 0:
+                continue
+            score = rn.masked_fill(~eligible, float("inf"))
+            _, ix = score.topk(n_candidate, dim=-1, largest=False)
+            dr[ix] = 1
+            pc[ix] = 0
+
+    def has_releasable(self) -> bool:
+        """释放工位是否已达压实门槛 (任一层的空位 ≥ 该层宽度 1%)."""
+        for layer in LAYERS:
+            S = getattr(self.net, f"_S_{layer}")
+            if (S.numel() - int(S.sum())) >= max(1, S.numel() // 100):
+                return True
+        return False
 
     def _permute_weights(
-        self,
-        layer: str,
-        active: int,
-        n_candidate: int,
-        expired: torch.Tensor | None,
-        perm_map: dict[str, torch.Tensor],
-        score_fn=None,
+        self, layer: str, active: int, perm_map: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor | None, int]:
-        """相对排名淘汰: 行范数 top-k 候选 + 过期强制, 生成 perm 并重排行向权重.
+        """压实重排: 只按 _S_l 落位 — S=1 行在前, S=0 行在后统一裁掉.
 
-        L4 传 score_fn (行范数 × W_lm 依赖), 只剪对预测无贡献的神经元; 其余层用纯行范数.
-        perm=None 表示无修剪 (n_alive=active).
+        判决不在本处: 谁该死由 decide() 每轮写进 S_l, 本处只做滞后物理折叠.
+        物理宽度按 8 对齐补齐 (不足时用已关位的行填充前段, 它们不点火).
+        perm=None 表示该层无需压实 (S 全一).
         """
         net = self.net
         W = getattr(net, self._W_attr[layer])
-        rn = W[:active].data.norm(dim=1)
-        if score_fn is not None:
-            rn = score_fn(rn, active)
-
-        _, dead_ix = rn.topk(n_candidate, dim=-1, largest=False)
-        candidate_mask = torch.zeros(active, dtype=torch.bool, device=rn.device)
-        candidate_mask[dead_ix] = True
-
-        if expired is not None:
-            candidate_mask = candidate_mask & ~expired
-
-        alive_mask = ~candidate_mask
-        if expired is not None:
-            alive_mask = alive_mask & ~expired
-
-        n_alive = max(self._bounds[layer], (int(alive_mask.sum().detach().item()) // 8) * 8)
-        n_alive = max(n_alive, active - n_candidate)
+        live = getattr(net, f"_S_{layer}")[:active].bool()
+        n_live = int(live.sum())
+        n_alive = max(self._bounds[layer], (n_live // 8) * 8)
         n_alive = min(n_alive, active)
-
         if n_alive >= active:
             return None, active
 
-        keep = torch.where(alive_mask)[0]
-        probation = torch.where(candidate_mask)[0]
-        if expired is not None:
-            dead = torch.where(expired)[0]
-        else:
-            dead = torch.zeros(0, dtype=torch.long, device=rn.device)
-        perm = torch.cat([keep, probation, dead])
-
-        new_dr = getattr(net, f"_death_row_{layer}")[:active].clone()
-        new_pc = getattr(net, f"_probation_counter_{layer}")[:active].clone()
-
-        if expired is not None:
-            new_dr[expired] = 0
-            new_pc[expired] = 0
-        new_dr[probation] = 1
-        new_pc[probation] = 0
-
+        perm = torch.cat([torch.where(live)[0], torch.where(~live)[0]])
         W.data = W.data[perm].contiguous()
         W_t = getattr(net, self._t_attr[layer])
         W_t.data = W_t.data[perm][:, perm].contiguous()
         b = getattr(net, self._b_attr[layer])
         b.data = b.data[perm].contiguous()
+        # 8 对齐补齐的前段占位行仍是关位: 不可用 ones 复活它们
+        new_S = torch.zeros(active, dtype=torch.bool, device=live.device)
+        new_S[:n_live] = True
+        net.register_buffer(f"_S_{layer}", new_S)
+        net.register_buffer(
+            f"_death_row_{layer}", getattr(net, f"_death_row_{layer}")[:active][perm].contiguous()
+        )
+        net.register_buffer(
+            f"_probation_counter_{layer}",
+            getattr(net, f"_probation_counter_{layer}")[:active][perm].contiguous(),
+        )
 
-        # L5 专属 perm: 方阵三张 + 行列向量
+        # L5 专属 perm: 行=L5 的权重 (列=L4 由 _sync_l4_aux, 列=L3 由 l3 分支)
         if layer == "l5":
-            net.W_pred_54.data = net.W_pred_54.data[perm].contiguous()  # 行=L5 (列=L4 由 _sync_l4_aux)
+            net.W_pred_54.data = net.W_pred_54.data[perm].contiguous()
             old_gm = net._gain_mask.data
-            net.register_buffer("_gain_mask", old_gm[perm].contiguous())  # 行=L5 (列=L3 由 l3 分支)
+            net.register_buffer("_gain_mask", old_gm[perm].contiguous())
             del old_gm
 
-        net.register_buffer(f"_death_row_{layer}", new_dr[perm])
-        net.register_buffer(f"_probation_counter_{layer}", new_pc[perm])
         perm_map[layer] = perm
         return perm, n_alive
 
@@ -341,6 +294,11 @@ class PruningEngine:
         setattr(net, self._b_attr[layer], nn.Parameter(old_b[:n_alive].contiguous()))
         del old_b
 
+        S_name = f"_S_{layer}"
+        S = getattr(net, S_name, None)
+        if isinstance(S, torch.Tensor) and S.shape[0] > n_alive:
+            net.register_buffer(S_name, S[:n_alive].contiguous())
+
         # L5 专属: 行=L5 的张量同步收缩
         if layer == "l5":
             a4_cur = net.active_size["l4"]
@@ -365,43 +323,23 @@ class PruningEngine:
 
         net.active_size[layer] = n_alive
 
-    def _prune(self):
-        """拓扑重塑: 发育期内不剪 → 死缓二级判决 → 相对排名淘汰."""
+    def compact(self) -> None:
+        """压实: 把 S_l=0 的工位连同其下游列真正裁掉, 回收显存.
+
+        滞后执行 — 只有在释放工位达门槛且距上次压实满一个间隔时才会被调用.
+        顺序严格保持依赖链: src 对应的层必须先 perm/裁 (L4→L2→L3, L3→L5→L6).
+        """
         net = self.net
-        # 顺序严格保持依赖链: 下游 src 对应的层必须先 perm/裁 (L3→L5→L6, L4→L2→L3)
-        layers = ["l4", "l2", "l3", "l5", "l6"]
-        self._W_attr = {"l4": "W_04", "l2": "W_42", "l3": "W_23", "l5": "W_35", "l6": "W_56"}
-        self._t_attr = {"l4": "W_t4", "l2": "W_t2", "l3": "W_t3", "l5": "W_t5", "l6": "W_t6"}
-        self._b_attr = {"l4": "bias_l4", "l2": "bias_l2", "l3": "bias_l3", "l5": "bias_l5", "l6": "bias_l6"}
+        self._attrs()
+        layers = list(LAYERS)
         src_layer = {"l4": "l0", "l2": "l4", "l3": "l2", "l5": "l3", "l6": "l5"}
-
-        bound = net.cfg.active_size_lower_bound
-        l4_bound = net.cfg.l4_lower_bound  # 预测主空间保底
-        frac = net.cfg.prune_fraction
-        dprob = net.cfg.death_probation
-        self._bounds = {"l4": l4_bound, "l2": bound, "l3": bound, "l5": bound, "l6": bound}
-
-        expired_flags = self._expire_flags(layers, dprob)
 
         # 阶段一: 行 perm 重排 (active_size 尚未更新, n_alive_map 记录新尺寸)
         n_alive_map: dict[str, int] = {}
         perm_map: dict[str, torch.Tensor] = {}
         for layer in layers:
             active = net.active_size[layer]
-            layer_bound = self._bounds[layer]
-            if active <= layer_bound:
-                n_alive_map[layer] = active
-                continue
-            n_candidate = max(1, int(active * frac))
-            expired = expired_flags.get(layer)
-            # L4 候选分数 = 表示层行范数 × W1 z4 段行范数, 只剪对预测无贡献的神经元
-            score_fn = None
-            if layer == "l4":
-                rn_w1 = net.W1[:active].data.norm(dim=1)
-
-                def score_fn(rn, a):
-                    return rn * rn_w1[:a]
-            perm, n_alive = self._permute_weights(layer, active, n_candidate, expired, perm_map, score_fn)
+            perm, n_alive = self._permute_weights(layer, active, perm_map)
             n_alive_map[layer] = n_alive
             if perm is None:
                 continue
@@ -420,7 +358,12 @@ class PruningEngine:
             self._shrink_columns(layer, n_alive, src, src_n, perm_map)
             up_size[layer] = n_alive
         # W_diff / W_state_pred L4 方阵随修剪同步
-        if net.active_size["l4"] < net.cfg.d_l4:
+        a4_new = net.active_size["l4"]
+        n_bind = net.bind_slot_dim
+        k_new = net._mem_m.shape[0]
+        l4_perm = perm_map.get("l4")
+        w1_stale = net.W1.shape[0] != a4_new + n_bind + k_new * a4_new
+        if a4_new < net.cfg.d_l4 or w1_stale:
             old_fut = net.W_diff.data
             net.W_diff = nn.Parameter(old_fut[: net.active_size["l4"], : net.active_size["l4"]].contiguous())
             del old_fut
@@ -437,11 +380,8 @@ class PruningEngine:
             单元块按 a4_new 切。头切片会把 z4 probation/死行误作 bind 与单元行，形状自洽不产 NaN, 是静默语义错位。
             """
             l4_perm = perm_map.get("l4")
-            a4_new = net.active_size["l4"]
-            n_bind = net.bind_slot_dim
-            k_new = net._mem_m.shape[0]
+            a4p = l4_perm.numel() if l4_perm is not None else a4_new
             if l4_perm is not None:
-                a4p = l4_perm.numel()
                 head = a4p + n_bind
 
                 def _gather_w1(old: torch.Tensor) -> torch.Tensor:
@@ -454,7 +394,7 @@ class PruningEngine:
             else:
 
                 def _gather_w1(old: torch.Tensor) -> torch.Tensor:
-                    # 地板无 perm (active≤bound): 布局未重排, 头切片即恒等
+                    # 无 L4 perm: 布局未被重排, 头切片即恒等 (K 变化时按新块数截断)
                     return old[: a4_new + n_bind + k_new * a4_new].contiguous()
 
             old_w1 = net.W1.data
@@ -469,7 +409,6 @@ class PruningEngine:
             net.register_buffer("_mem_m", old_mm[:, : net.active_size["l4"]].contiguous())  # 单元状态列
             del old_mm
             core = net._core_brain
-            a4_new = net.active_size["l4"]
             core.projector.P_short.data = core.projector.P_short.data[:a4_new].contiguous()
             core.projector.P_long.data = core.projector.P_long.data[:a4_new].contiguous()
             core.projector.register_buffer(

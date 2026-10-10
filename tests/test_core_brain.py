@@ -59,10 +59,10 @@ def test_cross_view_error_decreases_on_structured_input():
 
 
 def test_core_brain_and_attention_are_mandatory():
-    from crates.model import CyreneModel, DensePCNet
+    from crates.model import CyreneModel, HybridPCNet
 
     cfg = CyreneModel(d_l4=64, d_l2=32, d_l3=32, d_l5=32, d_l6=32, max_seq_len=16)
-    net = DensePCNet(cfg)
+    net = HybridPCNet(cfg)
     assert any(key.startswith("_core_brain.") for key in net.state_dict())
     assert any(key.startswith("_core_brain.attention.") for key in net.state_dict())
     assert net._core_brain.attention is not None

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ._common import _plastic
 from .action import ActionMixin
 from .bind import BindMixin
 from .feedforward import FeedforwardMixin
@@ -19,14 +20,14 @@ from .readout import ReadoutMixin
 from .temporal import TemporalMixin
 
 if TYPE_CHECKING:
-    from crates.model.model_cyrene import DensePCNet
+    from crates.model.model_cyrene import HybridPCNet
 
 
 @dataclass
 class LearnCtx:
     """learn() 步内共享量 (标量/掩码/形状)."""
 
-    net: DensePCNet
+    net: HybridPCNet
     N: int
     S: int
     k: int
@@ -103,6 +104,8 @@ class Shared:
     l5_local_err: torch.Tensor | None = None
     d_t: torch.Tensor | None = None
     metab_f: torch.Tensor | None = None
+    metab_f_base: torch.Tensor | None = None  # E9b-0 审计: 基线向量 (多尺度项前), 仅 audit
+    metab_f_ms: torch.Tensor | None = None  # E9b-0 审计: 多尺度向量贡献 λ·e_ms_norm, 仅 audit
 
 
 class EngineCore(
@@ -120,7 +123,7 @@ class EngineCore(
     import engine (readout 仅在函数内延迟导入 LmSignal), 无循环依赖.
     """
 
-    def __init__(self, net: DensePCNet):
+    def __init__(self, net: HybridPCNet):
         self.net = net
 
     def _closed_loop_input(self, byte_ids: torch.Tensor) -> torch.Tensor:
@@ -229,13 +232,14 @@ class EngineCore(
         z0 = net._z0
         z4, z2, z3, z5, z6 = net._z4, net._z2, net._z3, net._z5, net._z6
 
-        # 逐层预测误差 (自下而上 PC); L5 用时序差分误差, L6 用时间自预测
-        eps4 = z4 - (z0 @ net.W_04[:dim_4].T + net.bias_l4[:dim_4])
-        eps2 = z2 - (z4 @ net.W_42[:dim_2].T + net.bias_l2[:dim_2])
-        eps3 = z3 - (z2 @ W_23_a.T + net.bias_l3[:dim_3])
+        # 逐层预测误差 (自下而上 PC); L5 用时序差分误差, L6 用时间自预测.
+        # 逐位置误差先过可塑码门控 P_l (死/不活跃神经元不进 Hebbian).
+        eps4 = _plastic(z4 - (z0 @ net.W_04[:dim_4].T + net.bias_l4[:dim_4]), net, "l4")
+        eps2 = _plastic(z2 - (z4 @ net.W_42[:dim_2].T + net.bias_l2[:dim_2]), net, "l2")
+        eps3 = _plastic(z3 - (z2 @ W_23_a.T + net.bias_l3[:dim_3]), net, "l3")
         z6_pre = torch.cat([net._padmax[:, :, :dim_6], z6[:, :-1]], dim=1)
-        eps6 = z6 - z6_pre
-        eps5 = z5[:, 1:] - z5[:, :-1]  # L5: 跨时刻变化 z5[t]-z5[t-1]
+        eps6 = _plastic(z6 - z6_pre, net, "l6")
+        eps5 = _plastic(z5[:, 1:] - z5[:, :-1], net, "l5", pos=slice(1, None))  # L5: 跨时刻变化 z5[t]-z5[t-1]
 
         fe = net.forward_engine
         eps2_precise, eps6_precise = (
@@ -285,7 +289,7 @@ class EngineCore(
             self._update_wt_family(ctx, sh)
         sh.d_t = self._update_lm_head(ctx, sh)
         if not _fb:
-            self._update_mem_units(ctx, sh)
+            self.net.mem_pool.update(ctx, sh)
             self._update_bind(ctx, sh)
             self._update_w_act(ctx, sh)
         self._final_softnorm(ctx, sh)
@@ -297,6 +301,7 @@ class EngineCore(
         net._step_py += 1
         net._life_cnt.add_(1)  # 机体年龄: 跨 load 持久化, warmup 判据
 
+        core_stats = net._core_brain.learn() if (not free_run and not echo_world_frozen) else {}
         stats = {
             "free_energy": (
                 eps4.square().mean()
@@ -314,6 +319,14 @@ class EngineCore(
             # 观测器: 原始 L5 局部误差能量 (诊断用, 不参与更新)
             "l5_local_err": sh.l5_local_err,
         }
+        stats["core_xv_energy"] = core_stats.get("xv_energy", net._zero1)
+        stats["core_xv_energy_effective"] = core_stats.get("xv_energy_effective", net._zero1)
+        stats["core_delta_absmax"] = core_stats.get("delta_absmax", net._zero1)
+        stats["attention_gain_mean"] = core_stats.get("attention_gain_mean", net._zero1)
+        stats["attention_gain_min"] = core_stats.get("attention_gain_min", net._zero1)
+        stats["attention_gain_var"] = core_stats.get("attention_gain_var", net._zero1)
+        stats["attention_salience_norm"] = core_stats.get("attention_salience_norm", net._zero1)
+        stats["attention_top_down_norm"] = core_stats.get("attention_top_down_norm", net._zero1)
         # 释放每步状态引用: _z* 是 store_state 存的大张量, 不释放则显存逐步累积 OOM.
         # 释放前保留 z4/z5/z3/z2/z6 引用供观测器 (z3 = NaN 前哨)
         net._last_z4 = net._z4.detach()

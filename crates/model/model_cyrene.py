@@ -42,6 +42,7 @@ class CyreneModel:
     death_threshold: float = 1e-4
     active_size_lower_bound: int = 128
     l4_lower_bound: int = 512  # L4 承载表示+预测双任务, 维度坍缩到 NaN
+    compact_interval: int = 5000  # 判决与物理压实的最小间隔，滞后执行
     adaptive_traction: bool = False
     lm_lr_boost: float = 1.0
     adaptive_rho: bool = False
@@ -71,8 +72,6 @@ class CyreneModel:
     # 读出端诊断开关
     lm_freeze_w1: bool = False
     lm_no_contrast: bool = False
-    # F5 突触前白化 (wlm_head_f5_train_prereg.md): 学习步内 C 的 EMA + dW 白化注入, 默认关 (历史行为零变化)
-    lm_presyn_whiten: bool = False
 
     # 竞争性记忆单元群
     mem_k0: int = 6
@@ -205,7 +204,7 @@ def _cfg_from_snapshot(path: str, snap: str) -> CyreneModel:
     return CyreneModel(**raw)
 
 
-class DensePCNet(nn.Module):
+class HybridPCNet(nn.Module):
     """
     PPA 闭环网络
     权重声明 + 引擎委托
@@ -278,13 +277,11 @@ class DensePCNet(nn.Module):
         for sln, sdim in stp_layers:
             self.register_buffer(f"_stp_r_{sln}", torch.ones(sdim, dtype=torch.float16))
             self.register_buffer(f"_stp_active_ema_{sln}", torch.full((sdim,), 0.01, dtype=torch.float16))
-            tau_log = (
-                torch.log(torch.tensor(self.cfg.stp_tau_min, dtype=torch.float32))
-                + (torch.log(torch.tensor(self.cfg.stp_tau_max, dtype=torch.float32))
-                   - torch.log(torch.tensor(self.cfg.stp_tau_min, dtype=torch.float32)))
-                * torch.rand(sdim)
+            _log_lo = math.log(self.cfg.stp_tau_min)
+            tau_log = _log_lo + (math.log(self.cfg.stp_tau_max) - _log_lo) * torch.rand(
+                sdim, dtype=torch.float16
             )
-            self.register_buffer(f"_stp_tau_{sln}", torch.exp(tau_log).to(torch.float16))
+            self.register_buffer(f"_stp_tau_{sln}", torch.exp(tau_log))
             self.register_buffer(f"_stp_u_{sln}", torch.full((sdim,), self.cfg.stp_u_init, dtype=torch.float16))
         self._stp_r_end: dict[str, torch.Tensor] = {}
 
@@ -396,6 +393,38 @@ class DensePCNet(nn.Module):
         # 未来折扣目标/序列掩码 (predict 域): 预分配就地清零/置位, 零热路径新建
         self.register_buffer("_z4_fut_buf", torch.zeros(1, self.cfg.max_seq_len, d["l4"], dtype=torch.float16))
         self.register_buffer("_z5_fut_buf", torch.zeros(1, self.cfg.max_seq_len, d["l5"], dtype=torch.float16))
+
+        # E9 多尺度状态聚合预测误差 (e9_preregistration.md §4.4): roll out 瞬态累加器每步覆写,
+        # persistent=False 不入 state_dict; 诊断 buffer (eps_k/absmax/rung) 持久供报告.
+        self.register_buffer("_z4_roll_buf", torch.zeros(1, self.cfg.max_seq_len, d["l4"], dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_agg_fut_buf", torch.zeros(1, self.cfg.max_seq_len, d["l4"], dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_agg_pred_buf", torch.zeros(1, self.cfg.max_seq_len, d["l4"], dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_ek16_buf", torch.zeros(1, self.cfg.max_seq_len, d["l4"], dtype=torch.float16), persistent=False)
+        self.register_buffer("_ms_mask_k8", torch.zeros(self.cfg.max_seq_len, dtype=torch.bool), persistent=False)
+        self.register_buffer("_ms_mask_k32", torch.zeros(self.cfg.max_seq_len, dtype=torch.bool), persistent=False)
+        self.register_buffer("_eps_k_sq", torch.zeros(2, dtype=torch.float16))
+        self.register_buffer("_eps_k_ema", torch.zeros(2, dtype=torch.float16))
+        self.register_buffer("_f_ms_absmax", torch.zeros(1, dtype=torch.float16))
+        self.register_buffer("_f_ms_nonfinite", torch.zeros(1, dtype=torch.int32))
+        self.register_buffer("_f_ms_rung", torch.zeros(1, dtype=torch.int32))
+        # E9b-0 剂量/路径审计插桩 (e9b0_audit_preregistration.md): 全部 persistent=False,
+        # 不入 state_dict → 检查点比对零变更; 仅在 net._f_ms_audit 为真时写入, 不参与任何更新.
+        self.register_buffer("_audit_eps_lm_sq", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_eps4_sq", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_ms_scalar", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_f_total", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_ems_rms", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_ems_norm_rms", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_vec_base_rms", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_vec_ms_rms", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_dw04_base", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_dw04_ms", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_f_perc_ema", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_f_echo_ema", torch.zeros(1, dtype=torch.float16), persistent=False)
+        self.register_buffer("_audit_perc_steps", torch.zeros(1, dtype=torch.int32), persistent=False)
+        self.register_buffer("_audit_echo_steps", torch.zeros(1, dtype=torch.int32), persistent=False)
+        self.register_buffer("_audit_priced_steps", torch.zeros(1, dtype=torch.int32), persistent=False)
+        self.register_buffer("_audit_priced", torch.zeros(1, dtype=torch.int32), persistent=False)
         self.register_buffer("_seq_arange", torch.arange(self.cfg.max_seq_len, dtype=torch.int64))
         self.register_buffer("_arange20", torch.arange(20, dtype=torch.int64))
         self.register_buffer("_maskS_a", torch.zeros(self.cfg.max_seq_len + 1, dtype=torch.bool))
@@ -456,6 +485,10 @@ class DensePCNet(nn.Module):
         self.register_buffer("_step_counter", torch.zeros(1, dtype=torch.int32))
         self._step_py = 0
 
+        # 上次物理压实步，不改变形状, 只有压实才折叠; 跨 load 持久化
+        self.register_buffer("_last_compact", torch.zeros(1, dtype=torch.int32))
+        self._compact_py = 0
+
         # 代谢哨兵 python 标志 (代替对 GPU 张量的 `if _metab_F_prev < 0:` — 那是每步
         # 一次隐式 .item() 同步排空; 标志由 load 从 F_prev 一次性恢复)
         # 每行为独立哨兵 (_settled_perc/_settled_eco), _metab_settled = 全局首步
@@ -473,6 +506,10 @@ class DensePCNet(nn.Module):
             self.register_buffer(
                 f"_probation_counter_{_sln}", torch.zeros(self.active_size[_sln], dtype=torch.int16)
             )
+
+        from crates.neuron import init_survival
+
+        init_survival(self)
 
         # 神经调制与竞争机制
         self.register_buffer("_ent_buf", torch.zeros(20, dtype=torch.float16))
@@ -513,14 +550,20 @@ class DensePCNet(nn.Module):
 
         self._init_weights()
 
+        from crates.corebrain import CoreBrain, CoreBrainConfig
+
+        with torch.no_grad():
+            self._core_brain = CoreBrain(CoreBrainConfig(d_in=self.active_size["l4"])).to(self.W_04.device)
+
         # 引擎委托
-        from crates.dense.forward import ForwardEngine
-        from crates.dense.learning import LearningEngine
-        from crates.dense.pruning import PruningEngine
+        from crates.hybrid.forward import ForwardEngine
+        from crates.hybrid.learning import LearningEngine
+        from crates.neuron import MemoryPool, PruningEngine
 
         self.forward_engine = ForwardEngine(self)
         self.learning_engine = LearningEngine(self)
         self.pruner = PruningEngine(self)
+        self.mem_pool = MemoryPool(self)
 
     def _init_weights(self):
         for name, p in self.named_parameters():
@@ -547,10 +590,15 @@ class DensePCNet(nn.Module):
         """
         lm_in = self._lm_in
         dev = self.W1.device
-        # R: 固定随机正交 [lm_in, d_res] (列正交; fp32 QR 后转 fp16)
-        r32 = torch.randn(lm_in, d_res, dtype=torch.float32, device=dev)
-        q32, _ = torch.linalg.qr(r32)
-        self.register_buffer("w1v2_R", q32.to(torch.float16))
+        # R: 固定随机正交 [lm_in, d_res] (列正交; fp16 MGS 两遍正交化)
+        r = torch.randn(lm_in, d_res, dtype=torch.float16, device=dev)
+        for _ in range(2):
+            for j in range(d_res):
+                v = r[:, j]
+                if j:
+                    v = v - r[:, :j] @ (r[:, :j].T @ v)
+                r[:, j] = v / v.norm()
+        self.register_buffer("w1v2_R", r.contiguous())
         std_a = 1.0 / math.sqrt(lm_in)
         std_b = 1.0 / math.sqrt(d_head)
         for i in range(n_heads):
@@ -647,33 +695,36 @@ class DensePCNet(nn.Module):
         self._behavior_py = bool(self._metab_gate_hit.item())
 
     def maybe_prune(self, step: int) -> str | None:
-        """代谢触发修剪接缝: 连续饥饿或连续沉默达阈值 → 死亡回合.
+        """代谢触发死亡接缝: 连续饥饿或连续沉默达阈值 → 判决回合; 物理压实另行滞后执行.
 
         墙钟已退役. 轮询周期 8 步 (触发延迟 ≤8 步, 相对 N=250 的滞回可忽略);
         warmup 期计数器继续积累但回合被挡 (发育期免回合, 不免登记).
-        死亡回合 = 记忆单元饥荒击杀 (不可逆) + 拓扑修剪 (最弱 5%, 只减不增).
-        慢性饥荒/长期沉默 → 计数重新积累 → 反复死亡直到兜底 (l4=512/其余=128/K=1) 后自动 no-op.
-        返回触发原因 (starve/silence) 供事件遥测; 未触发返回 None.
+        判决回合 = 记忆单元饥荒击杀 (物理消失, 不可逆) + 拓扑判决 (只写 S_l 关位).
+        判决不动物理宽度: 死掉的神经元不再点火, 但它的行/列仍占宽度, 直到压实点回收.
+        压实滞后: 释放工位 ≥ 该层宽度 1% 且距上次压实满 compact_interval 步才折叠.
+        慢性饥荒/长期沉默 → 计数重新积累 → 反复判决直到兜底 (l4=512/其余=128/K=1) 后 no-op.
+        返回判决触发原因 (starve/silence) 供事件遥测; 未触发返回 None.
         """
-        if step % 8 != 0:
-            return None
-        # 发育期免疫: 回合计 _life_cnt (跨 load 持久化年龄) 判定, 计数器照常积累
-        if float(self._life_cnt.item()) <= self.cfg.prune_warmup:
-            return None
-        starve = float(self._metab_starve_cnt.item()) >= self.cfg.metab_death_steps
-        silence = float(self._metab_silence_cnt.item()) >= self.cfg.metab_silence_steps
-        if not (starve or silence):
-            return None
-        cause = "starve" if starve else "silence"
-        self._metab_starve_cnt.zero_()
-        self._metab_silence_cnt.zero_()
-        self._metab_death_round_cnt.add_(1)
-        self.learning_engine._mem_famine_kill()  # 先杀: reshape 在当前布局上自洽
-        self.pruner._prune()  # 后剪: _sync_l4_aux 按新 K 现场取数
+        cause = None
+        killed = False
+        if step % 8 == 0 and float(self._life_cnt.item()) > self.cfg.prune_warmup:
+            starve = float(self._metab_starve_cnt.item()) >= self.cfg.metab_death_steps
+            silence = float(self._metab_silence_cnt.item()) >= self.cfg.metab_silence_steps
+            if starve or silence:
+                cause = "starve" if starve else "silence"
+                self._metab_starve_cnt.zero_()
+                self._metab_silence_cnt.zero_()
+                self._metab_death_round_cnt.add_(1)
+                self.mem_pool.famine_kill()  # 先杀: reshape 在当前布局上自洽
+                self.pruner.decide()  # 后判: 只写 S_l 关位
+                killed = True
+        due = (step - self._compact_py) >= self.cfg.compact_interval
+        if killed or (due and self.pruner.has_releasable()):
+            # 饥荒击杀改变单元数 K, W1 的单元块布局必须同轮重建, 故 killed 时无条件压实
+            self.pruner.compact()
+            self._compact_py = int(step)
+            self._last_compact.fill_(self._compact_py)
         return cause
-
-    def _prune(self):
-        self.pruner._prune()
 
     def _extra_tensors(self) -> dict[str, torch.Tensor]:
         """游离运行时状态: 既非参数也非 buffer 的张量 (惰性建立, 跨调用存活).
@@ -752,7 +803,7 @@ class DensePCNet(nn.Module):
         return _cfg_from_snapshot(path, meta["config"])
 
     @classmethod
-    def load(cls, path: str, config: CyreneModel | None = None) -> DensePCNet:
+    def load(cls, path: str, config: CyreneModel | None = None) -> HybridPCNet:
         """加载完整检查点 (含修剪后形状对齐, 重设 active_size)."""
         from safetensors.torch import load_file
 
@@ -761,7 +812,7 @@ class DensePCNet(nn.Module):
             raise ValueError(
                 f"{path} 不是完整检查点 (缺 state_ver): weights-only 快照不含游离运行时状态 "
                 f"(_survival_signal / _stp_r_end / _last_z* 等), 续跑必然偏离. "
-                f"完整检查点由当前 DensePCNet.save 写出."
+                f"完整检查点由当前 HybridPCNet.save 写出."
             )
         sd = load_file(path, device="cpu")
         # 维度一律以检查点形状为准 (config 只补非维度字段): 修剪是物理切片, 出生 dims
@@ -783,6 +834,14 @@ class DensePCNet(nn.Module):
         else:
             config = replace(config, **dims)
         net = cls(config)
+        required_core = [key for key in net.state_dict() if key.startswith("_core_brain.")]
+        missing_core = [key for key in required_core if key not in sd]
+        if missing_core:
+            raise ValueError(
+                f"{path} 缺少 {len(missing_core)} 个 CoreBrain/Attention 状态键 "
+                "(旧架构检查点需一次性迁移, 运行时不提供关闭路径): "
+                f"{missing_core[:8]}{'…' if len(missing_core) > 8 else ''}"
+            )
         # 记忆单元群是运行时状态, 按检查点重建 K 形缓冲与 W1 (修剪/生长后形状不符)
         for _bn in ("_mem_m", "_mem_g", "_mem_q", "_mem_a", "_mem_death_cnt"):
             if _bn in sd and sd[_bn].shape != getattr(net, _bn).shape:
@@ -839,7 +898,8 @@ class DensePCNet(nn.Module):
         # 热路径 CPU 镜像一次性回填 (镜像每步与 buffer 同步递增, 不参与 state_dict)
         net._step_py = int(net._step_counter.item())
         net._mem_birth_py = int(net._mem_birth_cd.item())
-        from crates.dense.learning._common import restore_active_ema_init
+        net._compact_py = int(net._last_compact.item())
+        from crates.hybrid.learning._common import restore_active_ema_init
 
         net._active_ema_init = restore_active_ema_init(net)
         net._mem_alt = int(meta[f"{_PY_PREFIX}_mem_alt"])

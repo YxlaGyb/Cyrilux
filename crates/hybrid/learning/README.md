@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`crates.dense.learning` implements Hebbian learning for the dense PPA loop: a feed-forward pass, per-domain errors, then local weight updates with no backpropagation and no teacher targets. `LearningEngine` composes `EngineCore` with seven mixins. `engine.py` holds the `learn()` orchestration and the shared per-step context; `_common.py` holds the shared per-network state adapters, delegating the pure operators to `crates.kernels` (eligibility traces, energy constraints, decorrelation, spectral guard); `action.py`, `bind.py`, `feedforward.py`, `metabolism.py`, `predict.py`, `readout.py`, and `temporal.py` each own one update domain. All state flows through the network the engine holds a reference to.
+`crates.hybrid.learning` implements Hebbian learning for the dense PPA loop: a feed-forward pass, per-domain errors, then local weight updates with no backpropagation and no teacher targets. `LearningEngine` composes `EngineCore` with seven mixins. `engine.py` holds the `learn()` orchestration and the shared per-step context; `_common.py` holds the shared per-network state adapters, delegating the pure operators to `crates.kernels` (eligibility traces, energy constraints, decorrelation, spectral guard); `action.py`, `bind.py`, `feedforward.py`, `metabolism.py`, `predict.py`, `readout.py`, and `temporal.py` each own one update domain. All state flows through the network the engine holds a reference to.
 
 ## Table of Contents
 

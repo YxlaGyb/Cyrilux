@@ -35,7 +35,7 @@ Set up the device.
 
 | 导出 | 形状 | 含义 |
 |---|---|---|
-| `setup_cuda_device()` | Device selector | Returns a `torch.device` (CUDA when available, else CPU) and, on CUDA, sets float32 matmul precision to medium and enables cuDNN benchmark and tf32. |
+| `setup_cuda_device()` | Device selector | Returns a `torch.device` (CUDA when available, else CPU) and, on CUDA, enables cuDNN benchmark. |
 
 -----
 
@@ -55,5 +55,5 @@ The `cuda` subpackage holds three helpers. `setup_cuda_device` is the single CUD
 <a id="further-exploration"></a>
 ## Further exploration
 
-- [dense](../dense/README.md)：设备桥把事件批馈入密集感知管线。
+- [hybrid](../hybrid/README.md): the device bridge feeds event batches into the dense perception pipeline.
 - [architecture](../../docs/architecture.md)：top-k 与稀疏、事件驱动传输设计。

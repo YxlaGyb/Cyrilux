@@ -26,7 +26,7 @@ kind: "package-reference"
 
 | 导出 | 形状 | 含义 |
 |---|---|---|
-| `app train -d FILE...` | 训练 | 直接训练模式。逐行装载每个 JSONL 文件，批量组织字节窗，执行纯希伯 `net.learn`。将 `final.safetensors` 保存到输出目录。拒绝已冻结的 `sparse` 后端。 |
+| `app train -d FILE...` | 训练 | 直接训练模式。逐行装载每个 JSONL 文件，批量组织字节窗，执行纯希伯 `net.learn`。将 `final.safetensors` 保存到输出目录。 |
 | `app train --resume` | 训练 | 找到 `out/v*` 下最新的 `final.safetensors` 并续训。 |
 | `app from-config CFG.json` | 训练 | 从 JSON 配置加载参数并训练。`--batch-size`、`--lr`、`--epochs`、`--out-dir` 等选项覆写配置。 |
 | `app resume CKPT.safetensors` | 训练 | 依据检查点自身的配置重建网络，并可选以 `-d` 提供新数据继续训练。保留检查点的最大序列长度。 |
@@ -57,9 +57,9 @@ kind: "package-reference"
 
 `utils.py` 是共享中枢。`resolve_path` 把相对路径锚定到项目根。`run_dir` 惰性调用 `crates.utils.outver.ensure_run_dir` 分配当前进程的版本目录，`pin_run_dir` 把续跑过程锚定到既有训练线。`run_file`、`load_config`、`save_config`、`merge_config` 覆盖配置管线。它还携带 `TRAIN_CONFIG_TEMPLATE` 与 `AUTONOMOUS_CONFIG_TEMPLATE` 默认值。
 
-`train_cmd.py` 拥有 dense 训练循环。`skip_zero_windows` 与 `window_or_skip` 是纯函数，把样本文本编码为 utf-8、截断到 `max_seq_len`，并丢弃会变成全零的窗。`_train_dense` 辅助函数先扫一次行数以驱动进度条，再把字节窗堆叠成批张量并关闭梯度后调用 `net.learn`。若干仅对已归档 sparse 后端有意义的旧选项被接受并在提示中报告为忽略。
+`train_cmd.py` 拥有 dense 训练循环。`skip_zero_windows` 与 `window_or_skip` 是纯函数，把样本文本编码为 utf-8、截断到 `max_seq_len`，并丢弃会变成全零的窗。`_train_dense` 辅助函数先扫一次行数以驱动进度条，再把字节窗堆叠成批张量并关闭梯度后调用 `net.learn`。若干废弃选项被接受并在提示中报告为忽略，而不是直接拒绝。
 
-`train` 命令在归档的 `sparse` 后端以及缺失 `-d` 列表时快速失败。`resume` 先从检查点读取配置快照，因此维度字段一律跟随快照，并且仅当请求超过缓冲长度时才上调最大序列长度。
+`train` 命令在缺失 `-d` 列表时快速失败。`resume` 先从检查点读取配置快照，因此维度字段一律跟随快照，并且仅当请求超过缓冲长度时才上调最大序列长度。
 
 -----
 

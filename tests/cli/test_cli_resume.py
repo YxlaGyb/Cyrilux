@@ -6,13 +6,13 @@
 import torch
 from click.testing import CliRunner
 
-from crates.model import CyreneModel, DensePCNet
+from crates.model import CyreneModel, HybridPCNet
 from crates.cli import app
 
 
 def test_resume_reconciles_max_seq_len(tmp_path):
     cfg = CyreneModel(d_l4=64, d_l2=32, d_l3=32, d_l5=64, d_l6=16, max_seq_len=16)
-    net = DensePCNet(cfg)
+    net = HybridPCNet(cfg)
     b = torch.randint(0, 255, (1, 16), dtype=torch.long)
     for _ in range(2):
         net.learn(b)

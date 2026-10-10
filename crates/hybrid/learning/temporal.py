@@ -12,7 +12,7 @@ from crates.kernels import rms_norm, soft_norm_preserve
 from crates.kernels import spectral_radius_guard as _spectral_radius_guard
 from crates.model.constants import DIFF_TRUST_REGION
 
-from ._common import _elig_accum, _energy_constraint, _MixinBase
+from ._common import _elig_accum, _energy_constraint, _MixinBase, _plastic
 
 
 class TemporalMixin(_MixinBase):
@@ -75,7 +75,7 @@ class TemporalMixin(_MixinBase):
         phi_w = pred_d * (pred_d - th_w)
         # 差动赫布外积: dW = z4_prev^T @ (e - 0.1*phi_w), 学"当前 L4 状态 → 移动方向"
         z4_prev_n = z4r[:, :-1] / (z4r[:, :-1].norm(dim=-1, keepdim=True) + 1e-3)
-        e_mod = e_t_all - 0.1 * phi_w
+        e_mod = _plastic(e_t_all - 0.1 * phi_w, net, "l4", pos=slice(None, -1))
         dW_diff_t = torch.bmm(e_mod.transpose(-2, -1), z4_prev_n).mean(dim=0) * (1.0 / (ctx.S - 1))
         # 4 步时间窗环形缓冲 (GPU 索引, 图捕获兼容 — python 索引会在捕获时焊死):
         # 更新用最近 4 步平均外积 (保留误差记忆). 全持久缓冲零热路径新建:
@@ -110,7 +110,7 @@ class TemporalMixin(_MixinBase):
         dW_avg = dW_avg / (dW_avg.norm() + 1e-8)
         dW_avg = dW_avg + _elig_accum(net, "W_diff", dW_avg) * getattr(net, "_survival_signal", net._zero1)
         W_diff_a.data += (dW_avg * (~fut_mask).to(torch.float16)) * (DIFF_TRUST_REGION * W_diff_a.norm())
-        future_e = (sh.diff.dz4 - sh.diff.pred_d).mean(dim=(0, 1))
+        future_e = _plastic(sh.diff.dz4 - sh.diff.pred_d, net, "l4", pos=slice(None, -1)).mean(dim=(0, 1))
         net.b_diff[:dim_4].data += future_e * ctx.eta
 
     def _update_wt_family(self, ctx, sh):
@@ -123,11 +123,13 @@ class TemporalMixin(_MixinBase):
             return
         free_run = ctx.free_run
         a_sizes = [ctx.dim_4, ctx.dim_2, ctx.dim_3, ctx.dim_5, ctx.dim_6]
+        wt_layers = ["l4", "l2", "l3", "l5", "l6"]
         eta_t = ctx.eta_t
-        for (z_cur, wt_name, W_t), a_sz, E_t in zip(
+        for (z_cur, wt_name, W_t), a_sz, E_t, wt_layer in zip(
             [(net._z4, "wt4", net.W_t4), (net._z2, "wt2", net.W_t2), (net._z3, "wt3", net.W_t3), (net._z5, "wt5", net.W_t5), (net._z6, "wt6", net.W_t6)],
             a_sizes,
             [net.E_t4, net.E_t2, net.E_t3, net.E_t5, net.E_t6],
+            wt_layers,
         ):
             pre = z_cur[:, :-1]
             post = z_cur[:, 1:]
@@ -139,7 +141,7 @@ class TemporalMixin(_MixinBase):
                 # 绝对阈值 = z 平均范数的 2%: 动态帧 1, 静止帧 0 (分位阈值在塌缩后失效)
                 th = (post.norm(dim=-1).mean() * 0.02).unsqueeze(0)
                 s = (dz_n < th).to(dz_n.dtype)
-            dW_t = (rms_norm(pre).transpose(-2, -1) @ (rms_norm(post) * s.unsqueeze(-1))).mean(dim=0) * (
+            dW_t = (rms_norm(pre).transpose(-2, -1) @ _plastic(rms_norm(post) * s.unsqueeze(-1), net, wt_layer, pos=slice(1, None))).mean(dim=0) * (
                 1.0 / (ctx.S - 1)
             )
             # free_run 豁免 Oja 能量约束: 增益解放后 Oja 成死亡吸引子, 递归耗散改由 STP/分流/谱守卫承担

@@ -11,7 +11,7 @@ import torch
 
 from crates.kernels import rms_norm, soft_norm_preserve
 
-from ._common import _elig_accum, _energy_constraint, _MixinBase, _rho_ctrl
+from ._common import _elig_accum, _energy_constraint, _MixinBase, _plastic, _rho_ctrl
 
 # 折扣多步预测目标 (未来引力): 目标 = 未来 K 步折扣和
 K_FUT = 8
@@ -61,8 +61,8 @@ class PredictMixin(_MixinBase):
         local_err_l4 = z4_fut - pred_l4
         rpe = (1.0 + global_rpe).to(torch.float16)
         # 注入路径误差预归一化: 递归增益高时裸误差外积范数超 fp16 上限 → inf·0 = NaN (pre-norm 非 clamp)
-        err5_m = rms_norm(local_err_l5[:, mask5])  # [N,T5,dim_5]
-        err4_m = rms_norm(local_err_l4[:, mask4])  # [N,T4,dim_4]
+        err5_m = _plastic(rms_norm(local_err_l5[:, mask5]), net, "l5", pos=mask5)  # [N,T5,dim_5]
+        err4_m = _plastic(rms_norm(local_err_l4[:, mask4]), net, "l4", pos=mask4)  # [N,T4,dim_4]
         z3_m = z3[:, mask5]
         # W_35 注入 + 软范数: 回声相位冻结 (C5 合约: W_35 全族)
         if not ctx.echo_world_frozen:
@@ -74,7 +74,7 @@ class PredictMixin(_MixinBase):
         if not free_run and not ctx.echo_world_frozen:
             # W_42 注入: local_err_L4 逆映射到 dim_2 (free_run/回声相位 W_42 冻结)
             z4_m = z4[:, mask4]
-            local_err_l4_2 = rms_norm(err4_m @ net.W_42[:ctx.dim_2].T)
+            local_err_l4_2 = _plastic(rms_norm(err4_m @ net.W_42[:ctx.dim_2].T), net, "l2", pos=mask4)
             dW_pred42 = (local_err_l4_2.transpose(-2, -1) @ rms_norm(z4_m)).mean(dim=0) / max(1, int(mask4.sum()))
             net.W_42[:ctx.dim_2].data += _rho_ctrl(dW_pred42 * ctx.eta * rpe * 1.5, net.W_42[:ctx.dim_2], "inj42", net)
             soft_norm_preserve(net.W_42[:ctx.dim_2].data)

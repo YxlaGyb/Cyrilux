@@ -31,7 +31,7 @@ def test_redline_tokens_nonempty():
 
 def test_action_survival_source_is_internal():
     # 资格迹 R 来源只允许体内 _metab_R; 注入通道源码级零容忍
-    from crates.dense.learning.action import ActionMixin
+    from crates.hybrid.learning.action import ActionMixin
 
     src = inspect.getsource(ActionMixin._update_w_act)
     assert "_metab_R" in src, "资格迹信号源未走体内 _metab_R"
@@ -40,9 +40,22 @@ def test_action_survival_source_is_internal():
 
 
 def test_world_lang_module_isolated_from_model():
-    # 核心库 (model/) 任何文件不得 import world_lang (报告仪表不进核心库)
-    model_root = Path(__file__).resolve().parent.parent / "model"
+    # 核心库 (crates/model) 任何文件不得 import world_lang (报告仪表不进核心库)
+    model_root = Path(__file__).resolve().parent.parent / "crates" / "model"
     for p in model_root.rglob("*.py"):
         if "_archived_sparse" in p.parts:
             continue
         assert "world_lang" not in p.read_text(encoding="utf-8"), f"{p} 引用 world_lang"
+
+
+def test_default_scan_root_is_populated():
+    # 防回归: 扫描根必须真实存在且含 py 文件 (曾因写死已消失的 model/ 而静默扫空目录)
+    root = Path(__file__).resolve().parent.parent / "crates" / "model"
+    assert root.is_dir(), f"扫描根不存在: {root}"
+    assert list(root.rglob("*.py")), f"扫描根无 py 文件: {root}"
+
+
+def test_scanner_detects_planted_token(tmp_path):
+    # 负向对照: 扫描器必须能发现被植入的红线 token (防扫描器失活)
+    (tmp_path / "planted.py").write_text("x = step_E\n", encoding="utf-8")
+    assert scan_model_sources(tmp_path) == ["planted.py:1: step_E"]

@@ -21,7 +21,7 @@ LAYER_L6 = 14  # 多形层: 反馈调节, 最慢
 HIDDEN_LAYERS = [LAYER_L4, LAYER_L2, LAYER_L3, LAYER_L5, LAYER_L6]
 TOP_LAYER = LAYER_L4  # LM Head 输出层: L4 有输入区分度, L5 经 3 层随机投影后坍缩
 
-# 每层配置 (神经元数, 惯性α, k-WTA比例)
+# 每层配置, 神经元数, 惯性α, k-WTA比例
 LAYER_CONFIG = {
     LAYER_L4: (1024, 0.2, 0.10),
     LAYER_L2: (192, 0.4, 0.10),
@@ -30,12 +30,16 @@ LAYER_CONFIG = {
     LAYER_L6: (64, 0.95, 0.10),
 }
 
+# k-WTA 胜者比例, 按层名索引; 层名顺序与 HIDDEN_LAYERS 平行
+LAYER_NAMES = ("l4", "l2", "l3", "l5", "l6")
+KWTA_RATIO = {n: LAYER_CONFIG[L][2] for n, L in zip(LAYER_NAMES, HIDDEN_LAYERS)}
+
 # 连接类型
 CONN_FEEDFORWARD = 0
 CONN_FEEDBACK = 1
 CONN_LATERAL = 2
 
-# 页大小常量 (与 PageStorage 共享)
+# 页大小常量, 与 PageStorage 共享
 PAGE_NEURONS = 4096
 PAGE_SYNAPSES = 16384
 PAGE_TD = 16384

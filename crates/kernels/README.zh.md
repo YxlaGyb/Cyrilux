@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`crates.kernels` 是叶层算子库。它承载学习与前向路径共享的每一个无梯度、与设备无关的函数：激活、归一化、稀疏竞争、神经调制、正则化、直通估计、塑性规则与谱守卫。它只依赖 `torch`，不含状态、不持网络引用，因此 `crates.model`、`crates.dense`、`crates.corebrain` 与 `crates.attention` 都能依赖它而不产生环。
+`crates.kernels` 是叶层算子库。它承载学习与前向路径共享的每一个无梯度、与设备无关的函数：激活、归一化、稀疏竞争、神经调制、正则化、直通估计、塑性规则与谱守卫。它只依赖 `torch`，不含状态、不持网络引用，因此 `crates.model`、`crates.hybrid`、`crates.corebrain` 与 `crates.attention` 都能依赖它而不产生环。
 
 ## 目录
 
@@ -59,9 +59,9 @@ from crates.kernels import rms_norm, saturate, topk_wta
 <a id="understand-the-implementation"></a>
 ## 理解实现
 
-本 crate 是那些原先散落在 `crates.model`、`crates.dense`、`crates.corebrain` 与 `crates.attention` 中的算子的唯一归属。把它们移到这里，打断了从学习路径反向指回 `crates.model` 的依赖，因为纯数学从不需要编排层。
+本 crate 是那些原先散落在 `crates.model`、`crates.hybrid`、`crates.corebrain` 与 `crates.attention` 中的算子的唯一归属。把它们移到这里，打断了从学习路径反向指回 `crates.model` 的依赖，因为纯数学从不需要编排层。
 
-每个函数都是纯函数：读取参数并返回结果，就地正则化器（`soft_norm_preserve`、`foldiak_decorrelate`、`variance_floor`、`decorr_W`、`spectral_radius_guard`）例外，它们直接改写传入张量。没有函数持有网络引用。当算子需要网络状态（慢 EMA 缓冲、冷启动标志、`cfg` 系数）时，`crates.dense.learning._common` 的调用侧读取该状态并传入，使核保持可独立测试。
+每个函数都是纯函数：读取参数并返回结果，就地正则化器（`soft_norm_preserve`、`foldiak_decorrelate`、`variance_floor`、`decorr_W`、`spectral_radius_guard`）例外，它们直接改写传入张量。没有函数持有网络引用。当算子需要网络状态（慢 EMA 缓冲、冷启动标志、`cfg` 系数）时，`crates.hybrid.learning._common` 的调用侧读取该状态并传入，使核保持可独立测试。
 
 稀疏与调制路径保持 fp16 契约。`rms_norm` 与 `l2_norm` 用掩码式分母而非 clamp 保护零向量情形，`saturate` 与 `cubic` 以结构化方式约束其尾部，因此没有算子依赖破坏梯度的 clamp。`spectral` 内的两个模块级缓存（`_PROBE_CACHE` 与 `_EYE_CACHE`）按 `(device, dtype, size)` 复用探测向量与单位掩码，使热路径不产生新分配。
 
@@ -71,5 +71,5 @@ from crates.kernels import rms_norm, saturate, topk_wta
 ## 进一步探索
 
 - [model](../model/README.md)：配置及核所消费的数值常量。
-- [dense](../../crates/dense/README.md)：调用这些算子的前向与学习路径。
-- [learning](../dense/learning/README.md)：委托到本 crate 的状态适配层。
+- [dense](../../crates/hybrid/README.md)：调用这些算子的前向与学习路径。
+- [learning](../hybrid/learning/README.zh.md)：委托到本 crate 的状态适配层。

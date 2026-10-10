@@ -4,8 +4,8 @@ import inspect
 
 import torch
 
-from crates.model import CyreneModel, DensePCNet
-from crates.dense.learning.action import ActionMixin
+from crates.model import CyreneModel, HybridPCNet
+from crates.hybrid.learning.action import ActionMixin
 
 TAU_LO = 0.9
 TAU_HI = 2.5
@@ -17,7 +17,7 @@ def _make_net():
         d_l4=64, d_l2=32, d_l3=32, d_l5=64, d_l6=16,
         max_seq_len=16, free_run_window=16, mem_k0=2,
     )
-    return DensePCNet(cfg)
+    return HybridPCNet(cfg)
 
 
 def _echo(net):

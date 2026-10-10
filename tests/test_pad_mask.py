@@ -6,7 +6,7 @@ pad 0x00 (dataset ljust 填充) 不再经 W_lm[:,0] / bias_lm[0] / W_lm_2[:,0] �
 
 import torch
 
-from crates.model import CyreneModel, DensePCNet
+from crates.model import CyreneModel, HybridPCNet
 
 
 def _make_net():
@@ -15,7 +15,7 @@ def _make_net():
         d_l4=64, d_l2=32, d_l3=32, d_l5=64, d_l6=16,
         max_seq_len=16, free_run_window=16, mem_k0=2,
     )
-    return DensePCNet(cfg)
+    return HybridPCNet(cfg)
 
 
 def test_pad_target_zeroes_lm_col0_update():
