@@ -1,6 +1,6 @@
 """CUDA Stream 管理 — 多流并行支持.
 
-ponytail: 先留接口不实现。encode/predict/hebbian 三阶段用同一默认流。
+ponytail: 先留接口不实现。encode/predict/plasticity 三阶段用同一默认流。
 等 profile 确认瓶颈在流等待后再开启 stream pool.
 """
 
@@ -35,7 +35,7 @@ class StreamPool:
         return self._streams[1] if self._streams and len(self._streams) > 1 else None
 
     @property
-    def hebbian(self) -> torch.cuda.Stream | None:
+    def plasticity(self) -> torch.cuda.Stream | None:
         self._ensure()
         return self._streams[2] if self._streams and len(self._streams) > 2 else None
 

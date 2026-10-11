@@ -76,15 +76,16 @@ class TestOrgan2ExplainAway:
 
 
 class TestOrgan3RPE:
-    def test_rpe_ema_tracks_and_cold_start_is_raw(self):
+    def test_state_value_tracks_from_zero(self):
         net = _make_net()
-        assert net._metab_rpe_ema.abs().sum() == 0  # 冷启动: rpe = R
-        # W_act 只在行为步 (回声) 学习 — RPE 路径需 感知/回声 交替才被触发
+        assert net._rtr_v.abs().sum() == 0  # 冷启动: V 零 → m = r
+        # 首结算步 ΔF 可精确为 0 (R=0, m=0) → 需 感知/回声 交替几步才见 V 跟踪
         net.learn(torch.randint(32, 256, (1, 8), dtype=torch.long))  # 感知
-        net.learn()  # 回声 (行为步): RPE 首算, EMA ← 0.02·R
+        net.learn()  # 回声 (行为步)
         net.learn(torch.randint(32, 256, (1, 8), dtype=torch.long))
         net.learn()
-        assert net._metab_rpe_ema.abs().sum() > 0  # EMA 已跟踪
+        assert net._rtr_v.abs().sum() > 0  # 逐状态价值已跟踪
+        assert net._survival_signal.abs().sum() > 0  # 写点已产出残差
 
     def test_learning_alive_with_rpe(self):
         # W_act 在 RPE 调制下仍学习 (非死锁)

@@ -1,5 +1,5 @@
 ---
-description: "model：密集感知-预测-行动网络的配置与权重声明，加上共享神经调制与数值常量。"
+description: "model：稠密感知-预测-行动网络的配置与权重声明，加上共享神经调制与数值常量。"
 kind: "package-reference"
 ---
 
@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`crates.model` 承担密集感知-预测-行动（PPA）闭环的配置与权重声明面。它导出 `CyreneModel`，一个列举全部学习、修剪、代谢和振荡器超参数的 dataclass，以及 `HybridPCNet`，一个声明完整权重与 buffer 布局并把前馈、学习、修剪引擎委托出去的 `nn.Module`。该 crate 还承载定义层角色和信任域的数值常量。它不含训练循环，所有动力学都放在 `crates.hybrid`。
+`crates.model` 承担稠密感知-预测-行动（PPA）闭环的配置与权重声明面。它导出 `CyreneModel`，一个列举全部学习、修剪、代谢和振荡器超参数的 dataclass，以及 `HybridPCNet`，一个声明完整权重与 buffer 布局并把前馈、学习、修剪引擎委托出去的 `nn.Module`。该 crate 还承载定义层角色和信任域的数值常量。它不含训练循环，所有动力学都放在 `crates.hybrid`。
 
 ## 目录
 
@@ -37,13 +37,13 @@ kind: "package-reference"
 | `net.save(path)` | 写 | 将参数、buffer、游离运行时张量与 CPU 计数器写为 safetensors，并在 metadata 中写入 `state_ver` 与 `config` 快照。 |
 | `HybridPCNet.config_from_checkpoint(path)` | 读 | 在不加载张量的情况下读取 `config` 快照，适合 `list --detail` 之类的诊断。 |
 
-运行模型。以下均为对密集引擎的薄委托。
+运行模型。以下均为对稠密引擎的薄委托。
 
 | 导出 | 形状 | 含义 |
 |---|---|---|
 | `net.forward(byte_ids)` | 前馈 | 推理前馈，返回未来预测偏差，确定性，关闭 ACh。 |
 | `net.generate(prompt, n_tokens, temperature, dev)` | 生成 | 从提示字符串自回归生成，返回字节。 |
-| `net.learn(byte_ids, closed_loop, free_run, force_perception)` | 学习 | 无反向传播、无教师目标的希伯学习步。内部代谢决定该步走感知还是回声。 |
+| `net.learn(byte_ids, closed_loop, free_run, force_perception)` | 学习 | 无反向传播、无教师目标的迹调制学习步。内部代谢决定该步走感知还是回声。 |
 | `net.maybe_prune(step)` | 修剪 | 由代谢触发的重塑接缝。每 8 步轮询一次，返回触发原因或 None。判决委托给 `net.pruner.decide()`，物理折叠委托给 `net.pruner.compact()`。有些步只判决；当有死亡回合触发，或 `compact_interval` 已到且存在可释放工位时才做一次压实。 |
 | `net.sync_gate()` | 路由 | 每步一次的路由交接，读取 P3-b 行为门并镜像到 CPU 标志。 |
 

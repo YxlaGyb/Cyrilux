@@ -12,8 +12,9 @@ import torch
 
 from crates.kernels import decorr_W as _decorr_W
 from crates.kernels import rms_norm, soft_norm_preserve
+from crates.rtr import rtr_apply, trace
 
-from ._common import _elig_accum, _MixinBase, _plastic
+from ._common import _MixinBase, _plastic
 
 
 class BindMixin(_MixinBase):
@@ -86,7 +87,7 @@ class BindMixin(_MixinBase):
             net._intr_drive = (0.5 * A + 0.5 * omega.mean()).to(torch.float16)
         if has_bind and not echo_world_frozen:
             z4n = rms_norm(z4)
-            bind_t = net._bind_vec  # 纯 z_bind: 保留幅度差作 Hebbian 分化种子, 分流抑制防垄断
+            bind_t = net._bind_vec  # 纯 z_bind: 保留幅度差作分化种子, 分流抑制防垄断
             # 每样本独立 surprise EMA 门控 gain_n = s_n/ema_n (clamp 0.3..5), 高惊喜样本外积放大
             if ctx.free_run:
                 gain_n = net._one1  # 每样本独立 surprise EMA 门控 (预分配缓冲)
@@ -109,15 +110,11 @@ class BindMixin(_MixinBase):
             dW_bind = (
                 torch.einsum("nsd,nsq->dq", z4n_w, bind_t[:, :-1]) / (gain_n.sum() + 1e-8) * (1.0 / (S - 1))
             )
-            dW_bind_a = (
-                dW_bind
-                + _elig_accum(net, "W_bind", dW_bind)
-                * getattr(net, "_survival_signal", net._zero1)
-            ) * (ctx.eta * 2.0)
+            dW_bind_a = rtr_apply(trace(net, "W_bind", dW_bind), net._survival_signal) * (ctx.eta * 2.0)
             net._rho_bind = dW_bind_a.norm() / (net.W_bind[:dim_4].norm() + 1e-8)
             net.W_bind[:dim_4].data.mul_(0.9995)
             net.W_bind[:dim_4].data += dW_bind_a
-            # 自发噪声破缺: 注入与列间相似度成比例的涨落, 破对称吸引子 → Hebbian 放大差异
+            # 自发噪声破缺: 注入与列间相似度成比例的涨落, 破对称吸引子 → 迹调制放大差异
             W_col = net.W_bind[:dim_4].data.T  # [16, dim_4]
             cov_col = W_col @ W_col.T  # [16,16] 列间协方差
             repulsion = cov_col @ W_col  # [16, dim_4] 各列受到的净共线拉力
@@ -129,12 +126,11 @@ class BindMixin(_MixinBase):
                 (cov_col * (1.0 - torch.eye(net.bind_slot_dim, device=dev, dtype=torch.float16))).abs().mean()
             )
             W_col.add_(noise)
-            net.W_bind[:dim_4].data = W_col.T.contiguous()
             soft_norm_preserve(net.W_bind[:dim_4].data)
             # 行/列 decorr 破秩 1 自锁
             _decorr_W(net.W_bind[:dim_4].data, net.E_bind[:dim_4, :dim_4], learn_boost=ctx.learn_boost)
-            _decorr_W(net.W_bind[:dim_4].data.T.contiguous(), net.E_bind_col, learn_boost=ctx.learn_boost)
-            # W_bind_self 内在驱动 Hebbian: intrinsic_drive 门控自发生长, 独立于外部误差
+            _decorr_W(net.W_bind[:dim_4].data.T, net.E_bind_col, learn_boost=ctx.learn_boost)
+            # W_bind_self 内在驱动: intrinsic_drive 门控自发生长, 独立于外部误差
             if getattr(net, "_bind_loop", True):
                 zb = net._bind_vec
                 zb_pre = zb[:, :-1]  # [N,S-1,K]
@@ -150,9 +146,7 @@ class BindMixin(_MixinBase):
                 dW_self = dW_self * alive_self / torch.where(
                     alive_self > 0, n_self, torch.ones_like(n_self)
                 )
-                dW_self = dW_self + _elig_accum(net, "W_bind_self", dW_self) * getattr(
-                    net, "_survival_signal", net._zero1
-                )
+                dW_self = rtr_apply(trace(net, "W_bind_self", dW_self), net._survival_signal)
                 net.W_bind_self.data.mul_(0.9995)
                 # intrinsic 调制学习率 η_self = η_base·(1+0.5·A): 高潮期探索, 低谷期固化
                 eta_self = (ctx.eta * 2.0) * (1.0 + 0.5 * A)

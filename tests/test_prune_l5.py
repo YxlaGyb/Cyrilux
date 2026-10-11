@@ -158,7 +158,7 @@ def test_l5_compact_shapes_all_synced():
         shape = tuple(getattr(net, attr).shape)
         assert shape == (a5_new,), f"{attr} shape {shape}≠({a5_new},)"
 
-    # 7. 资格迹:L5 涉及的 Hebbian 权重名
+    # 7. 资格迹:L5 涉及的局部更新权重名
     for (attr, exp_shape) in [
         ("W_35_elig", (a5_new, a3_new)),
         ("W_t5_elig", (a5_new, a5_new)),

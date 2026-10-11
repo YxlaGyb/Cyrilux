@@ -15,7 +15,6 @@ from crates.kernels import (
     compute_uncertainty,
     cubic,
     decorr_W,
-    elig_accum,
     energy_constraint,
     foldiak_decorrelate,
     l2_norm,
@@ -172,16 +171,6 @@ def test_energy_constraint_matches_formula():
     assert torch.allclose(out, expect, atol=1e-2)
 
 
-def test_elig_accum_trace():
-    E = torch.zeros(2, 3, dtype=torch.float16)
-    dW = torch.ones(2, 3, dtype=torch.float16)
-    out = elig_accum(E, dW, 0.9)
-    assert torch.allclose(out, torch.ones(2, 3, dtype=torch.float16), atol=1e-3)
-    first = float(out[0, 0])
-    out2 = elig_accum(E, dW, 0.9)
-    assert float(out2[0, 0]) > first
-
-
 def test_rho_control_disabled_passthrough():
     dW = torch.randn(3, 3, dtype=torch.float16)
     W_ref = torch.randn(3, 3, dtype=torch.float16)
@@ -223,6 +212,51 @@ def test_decorr_W_shapes_and_updates_E():
     dW = decorr_W(W, E, coef=1.0, max_delta_ratio=0.05, learn_boost=1.0)
     assert dW.shape == W.shape
     assert E.abs().sum() > 0.0
+
+
+def test_decorr_W_gates_isotropic_spectrum():
+    torch.manual_seed(1)
+    W = torch.randn(64, 96, dtype=torch.float16)
+    E = torch.zeros(64, 64, dtype=torch.float16)
+    before = W.clone()
+    dW = decorr_W(W, E, coef=1.0, learn_boost=1.0)
+    assert float(dW.norm()) == 0.0
+    assert torch.equal(W, before)
+    assert E.abs().sum() > 0.0
+
+
+def test_decorr_W_fires_on_spanned_direction():
+    torch.manual_seed(2)
+    W = torch.randn(64, 96, dtype=torch.float16) * 0.1
+    W[:, 0] = W[:, 0] + 4.0
+    E = torch.zeros(64, 64, dtype=torch.float16)
+    before = W.clone()
+    dW = decorr_W(W, E, coef=1.0, learn_boost=1.0)
+    assert float(dW.norm()) > 0.0
+    assert not torch.equal(W, before)
+
+
+def test_decorr_W_writes_through_transposed_view():
+    torch.manual_seed(3)
+    W = torch.randn(64, 96, dtype=torch.float16) * 0.1
+    W[:, 0] = W[:, 0] + 4.0
+    E = torch.zeros(96, 96, dtype=torch.float16)
+    before = W.clone()
+    dW = decorr_W(W.T, E, coef=1.0, learn_boost=1.0)
+    assert dW.shape == (96, 64)
+    assert float(dW.norm()) > 0.0
+    assert not torch.equal(W, before)
+
+
+def test_decorr_W_copy_does_not_write_back():
+    torch.manual_seed(4)
+    W = torch.randn(64, 96, dtype=torch.float16) * 0.1
+    W[:, 0] = W[:, 0] + 4.0
+    E = torch.zeros(96, 96, dtype=torch.float16)
+    before = W.clone()
+    dW = decorr_W(W.T.contiguous(), E, coef=1.0, learn_boost=1.0)
+    assert float(dW.norm()) > 0.0
+    assert torch.equal(W, before)
 
 
 # ---------- 调制 ----------

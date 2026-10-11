@@ -8,6 +8,7 @@ class CoreBrainConfig:
     d_in: int = 1024
     n_slots: int = 32
     top_k: int = 4
+    window_len: int = 256
     short_frac: float = 0.25
 
     eta_proj: float = 5.0e-3

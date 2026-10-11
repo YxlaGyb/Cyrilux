@@ -24,7 +24,7 @@ def test_wt_syn_scaling_default_on():
 
 
 def test_wt_syn_scaling_rate_is_fast_enough():
-    # 第 83 轮实证: 速率必须与 Hebbian 增长同量级 (0.01 时操作点仍由守卫设定)
+    # 第 83 轮实证: 速率必须与局部更新增长同量级 (0.01 时操作点仍由守卫设定)
     cfg = CyreneModel()
     assert cfg.wt_syn_scaling_rate >= 0.05
 

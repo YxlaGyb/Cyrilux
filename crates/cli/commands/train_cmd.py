@@ -22,7 +22,7 @@ def _build_net(hidden_size: int, lr: float, max_seq_len: int, checkpoint: str | 
         d_l3=max(64, int(384 * ratio)),
         d_l5=max(64, int(256 * ratio)),
         d_l6=max(64, int(128 * ratio)),
-        lr_hebbian=lr,
+        lr_rtr=lr,
         max_seq_len=max_seq_len,
     )
     if checkpoint is not None:
@@ -38,25 +38,34 @@ def extract_window_text(sample: dict) -> str:
     return t
 
 
-def window_or_skip(sample: dict, max_seq_len: int) -> bytes | None:
-    """零窗判定 (纯函数): 提取文本 utf-8 编码为空 ⟺ ljust 填充后整窗全零 → None (跳过).
+def tiled_windows(sample: dict, max_seq_len: int) -> list[bytes]:
+    """样本 → 全部字节窗 (纯函数): utf-8 编码后按 stride = max_seq_len 左对齐平铺.
 
-    与 `_SamplePrefetch` (exp115_say.py) 判据同源; 跨路径一致性由
-    tests/test_zero_window_skip.py 保证. 非空文本返回截断到 max_seq_len 的字节窗.
+    窗拼接恒等于原文全字节 —— 旧路径 `[:max_seq_len]` 截断丢弃的 65.81% 语料不再丢弃.
+    零窗判定与 `_SamplePrefetch` (exp115_say.py) 同源: 空文本 → [] (整窗全零 → 跳过),
+    跨路径一致性由 tests/test_zero_window_skip.py 保证. 尾窗短于窗宽, 其 0x00 填充位
+    在 `learn` 的目标位掩码 (目标字节 <32) 下无学习信号.
     """
-    bs = extract_window_text(sample).encode("utf-8")[:max_seq_len]
-    return bs or None
+    bs = extract_window_text(sample).encode("utf-8")
+    return [bs[i : i + max_seq_len] for i in range(0, len(bs), max_seq_len)]
+
+
+def window_ids(bs: bytes, max_seq_len: int) -> torch.Tensor:
+    """字节窗 → 定长 id 张量 (纯函数): 前 len(bs) 位真实字节, 其余 0x00 填充 (左对齐)."""
+    ids = torch.zeros(max_seq_len, dtype=torch.long)
+    ids[: len(bs)] = torch.tensor(list(bs), dtype=torch.long)
+    return ids
 
 
 def skip_zero_windows(samples, max_seq_len: int) -> tuple[list[bytes], int]:
-    """批量口径 (审计计数): 样本序列 → (保留的字节窗列表, 零窗跳过数)."""
+    """批量口径 (审计计数): 样本序列 → (保留的全部平铺字节窗, 零窗样本跳过数)."""
     kept, skipped = [], 0
     for sample in samples:
-        bs = window_or_skip(sample, max_seq_len)
-        if bs is None:
+        wins = tiled_windows(sample, max_seq_len)
+        if not wins:
             skipped += 1
             continue
-        kept.append(bs)
+        kept.extend(wins)
     return kept, skipped
 
 
@@ -91,6 +100,7 @@ def _train_dense(
     step = 0
     fe_sum = 0.0
     zero_skipped = 0  # 审计: 零窗跳过计数 (空文本行 → ljust 全零窗, 无学习信号且污染代谢账)
+    windows_total = 0  # 审计: 平铺窗总数 (每文档 ceil(L/max_seq_len), 覆盖率 1.000)
     batch_ids: list = []
     for epoch in range(epochs):
         for fp in data_files:
@@ -99,41 +109,49 @@ def _train_dense(
             with open(fp, "r", encoding="utf-8") as f:
                 total = sum(1 for _ in f)
             n_lines = 0
+            n_windows = 0
             with open(fp, "r", encoding="utf-8") as f:
                 pbar = tqdm(total=total, desc=f"    {fname}", unit="it")
                 for line in f:
                     try:
                         s = _json.loads(line)
-                        bs = window_or_skip(s, max_seq_len)  # 零窗显式跳过 (批令 A): 代谢不得把"看不见"记成"看见全零"
-                        if bs is None:
-                            zero_skipped += 1
-                            pbar.update(1)
-                            continue
-                        ids = torch.zeros(max_seq_len, dtype=torch.long)
-                        ids[: len(bs)] = torch.tensor(list(bs), dtype=torch.long)
-                        batch_ids.append(ids)
+                        wins = tiled_windows(s, max_seq_len)
                     except Exception:
+                        continue
+                    if not wins:
+                        zero_skipped += 1  # 零窗显式跳过 (批令 A): 代谢不得把"看不见"记成"看见全零"
+                        pbar.update(1)
                         continue
                     n_lines += 1
                     pbar.update(1)
-                    if len(batch_ids) < batch_size:
-                        continue
+                    for bs in wins:
+                        batch_ids.append(window_ids(bs, max_seq_len))
+                        n_windows += 1
+                        if len(batch_ids) < batch_size:
+                            continue
+                        b = torch.stack(batch_ids).to(device)
+                        stats = net.learn(b)
+                        step += 1
+                        fe_sum += float(stats["future_err"])
+                        batch_ids = []
+                        pbar.set_postfix({"step": step, "fe": f"{fe_sum / step:.4f}"})
+                if batch_ids:  # 尾批落地: 不满一批的窗不得静默丢弃
                     b = torch.stack(batch_ids).to(device)
                     stats = net.learn(b)
                     step += 1
                     fe_sum += float(stats["future_err"])
                     batch_ids = []
-                    pbar.set_postfix({"step": step, "fe": f"{fe_sum / step:.4f}"})
                 pbar.close()
-            print(f"    {fname} 全文件跑完: {n_lines} 行")
+            windows_total += n_windows
+            print(f"    {fname} 全文件跑完: {n_lines} 行 → {n_windows} 窗")
     if not out_dir:
         out_dir = run_dir()
     os.makedirs(out_dir, exist_ok=True)
     net.save(os.path.join(out_dir, "final.safetensors"))
-    print(f"PPA model saved to {out_dir}/final.safetensors  final_free_energy_avg={fe_sum / max(step, 1):.4f}  zero_win_skipped={zero_skipped}")
+    print(f"PPA model saved to {out_dir}/final.safetensors  final_free_energy_avg={fe_sum / max(step, 1):.4f}  zero_win_skipped={zero_skipped}  windows={windows_total}")
 
 
-@click.command(name="train", help="直接训练模式 (dense PPA 闭环, 纯 Hebbian, 零反向传播)")
+@click.command(name="train", help="直接训练模式 (dense PPA 闭环, 迹调制, 零反向传播)")
 @click.option("--model-type", default="pc_unified", help="模型类型 (dense 忽略)")
 @click.option("--checkpoint", "-c", default=None, help="初始检查点 (续训时传入)")
 @click.option("--hidden-size", default=256, type=int, help="隐藏层维度 (L4 基准)")
@@ -286,7 +304,7 @@ def resume(checkpoint, data, batch_size, max_seq_len, epochs, lr, out_dir, verbo
     base = HybridPCNet.config_from_checkpoint(ckpt_path)
     net = HybridPCNet.load(ckpt_path, replace(base, max_seq_len=max(base.max_seq_len, max_seq_len)))
     if lr is not None:
-        net.cfg.lr_hebbian = lr
+        net.cfg.lr_rtr = lr
     if not data:
         print(f"Model loaded (L4={net.active_size['l4']}). 请用 -d 指定数据文件继续训练.")
         return
@@ -297,7 +315,7 @@ def resume(checkpoint, data, batch_size, max_seq_len, epochs, lr, out_dir, verbo
         out_dir,
         batch_size,
         max_seq_len,
-        net.cfg.lr_hebbian,
+        net.cfg.lr_rtr,
         epochs,
         net.active_size["l4"],
         device,

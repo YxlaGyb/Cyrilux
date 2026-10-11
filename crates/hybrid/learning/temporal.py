@@ -11,8 +11,9 @@ from crates.kernels import decorr_W as _decorr_W
 from crates.kernels import rms_norm, soft_norm_preserve
 from crates.kernels import spectral_radius_guard as _spectral_radius_guard
 from crates.model.constants import DIFF_TRUST_REGION
+from crates.rtr import rtr_apply, trace
 
-from ._common import _elig_accum, _energy_constraint, _MixinBase, _plastic
+from ._common import _energy_constraint, _MixinBase, _plastic
 
 
 class TemporalMixin(_MixinBase):
@@ -73,7 +74,7 @@ class TemporalMixin(_MixinBase):
         th_w = net._theta_w[:dim_4]
         th_w.mul_(0.975).add_(0.025 * (pred_d * pred_d).mean(dim=(0, 1)))
         phi_w = pred_d * (pred_d - th_w)
-        # 差动赫布外积: dW = z4_prev^T @ (e - 0.1*phi_w), 学"当前 L4 状态 → 移动方向"
+        # 差动外积: dW = z4_prev^T @ (e - 0.1*phi_w), 学"当前 L4 状态 → 移动方向"
         z4_prev_n = z4r[:, :-1] / (z4r[:, :-1].norm(dim=-1, keepdim=True) + 1e-3)
         e_mod = _plastic(e_t_all - 0.1 * phi_w, net, "l4", pos=slice(None, -1))
         dW_diff_t = torch.bmm(e_mod.transpose(-2, -1), z4_prev_n).mean(dim=0) * (1.0 / (ctx.S - 1))
@@ -108,13 +109,13 @@ class TemporalMixin(_MixinBase):
         mx = dW_avg.abs().max() + 1e-4
         dW_avg = dW_avg / mx / 64.0
         dW_avg = dW_avg / (dW_avg.norm() + 1e-8)
-        dW_avg = dW_avg + _elig_accum(net, "W_diff", dW_avg) * getattr(net, "_survival_signal", net._zero1)
+        dW_avg = rtr_apply(trace(net, "W_diff", dW_avg), net._survival_signal)
         W_diff_a.data += (dW_avg * (~fut_mask).to(torch.float16)) * (DIFF_TRUST_REGION * W_diff_a.norm())
         future_e = _plastic(sh.diff.dz4 - sh.diff.pred_d, net, "l4", pos=slice(None, -1)).mean(dim=(0, 1))
         net.b_diff[:dim_4].data += future_e * ctx.eta
 
     def _update_wt_family(self, ctx, sh):
-        """时序 Hebbian (W_t 学习, 高确定性时增强 → 记忆巩固) + 谱守卫.
+        """时序迹调制 (W_t 学习, 高确定性时增强 → 记忆巩固) + 谱守卫.
 
         回声相位整族冻结 (C5 合约): W_t 全族 + θ_wt4 + decorr + 谱守卫零触碰.
         """
@@ -147,7 +148,7 @@ class TemporalMixin(_MixinBase):
             # free_run 豁免 Oja 能量约束: 增益解放后 Oja 成死亡吸引子, 递归耗散改由 STP/分流/谱守卫承担
             if not free_run:
                 dW_t = _energy_constraint(net, W_t[:a_sz, :a_sz].data, dW_t, z_cur, f"_active_ema_{wt_name}")
-                dW_t = dW_t + _elig_accum(net, f"{wt_name[0].upper()}_{wt_name[1:]}", dW_t) * getattr(net, "_survival_signal", net._zero1)
+                dW_t = rtr_apply(trace(net, f"{wt_name[0].upper()}_{wt_name[1:]}", dW_t), net._survival_signal)
             # W_t4 输出端 homeostatic 抑制: g_j=1/(1+θ_j), 破 σ₁/σ₂ 垄断, 与 W_04 同构
             if W_t is net.W_t4:
                 th_wt4 = net._theta_wt4[:a_sz]

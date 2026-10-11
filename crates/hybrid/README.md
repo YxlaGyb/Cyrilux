@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`crates.hybrid` implements the runtime engines of the dense PPA (perception-prediction-action) closed loop. `forward.py` owns `ForwardEngine`, which walks the activation path from the byte input up through layers L0 to L6, applies the temporal recurrence kernels, binds sparse concept slots, and performs autoregressive continuation and generation. The dynamic-neuron mechanisms, topology pruning and memory-unit birth and death, live in the sibling crate `crates.neuron`. The per-domain learning updates live in the sibling sub-crate `crates.hybrid.learning`. Together these engines consume the network and configuration that `crates.model` declares and drive it through pure-Hebbian, no-backprop learning.
+`crates.hybrid` implements the runtime engines of the dense PPA (perception-prediction-action) closed loop. `forward.py` owns `ForwardEngine`, which walks the activation path from the byte input up through layers L0 to L6, applies the temporal recurrence kernels, binds sparse concept slots, and performs autoregressive continuation and generation. The dynamic-neuron mechanisms, topology pruning and memory-unit birth and death, live in the sibling crate `crates.neuron`. The per-domain learning updates live in the sibling sub-crate `crates.hybrid.learning`. Together these engines consume the network and configuration that `crates.model` declares and drive it through trace-modulated, no-backprop learning.
 
 ## Table of Contents
 

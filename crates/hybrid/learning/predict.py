@@ -10,8 +10,9 @@ from __future__ import annotations
 import torch
 
 from crates.kernels import rms_norm, soft_norm_preserve
+from crates.rtr import rtr_apply, trace
 
-from ._common import _elig_accum, _energy_constraint, _MixinBase, _plastic, _rho_ctrl
+from ._common import _energy_constraint, _MixinBase, _plastic, _rho_ctrl
 
 # 折扣多步预测目标 (未来引力): 目标 = 未来 K 步折扣和
 K_FUT = 8
@@ -81,12 +82,12 @@ class PredictMixin(_MixinBase):
         # W_pred_* 自更新; 回声相位冻结 (W_pred_* 是世界模型)
         if not ctx.echo_world_frozen:
             dWp54 = (err5_m.transpose(-2, -1) @ z4_pred_in[:, mask5]).mean(dim=0)
+            dWp54 = rtr_apply(trace(net, "W_pred_54", dWp54), net._survival_signal)
             dWp54 = _energy_constraint(net, Wp54_a.data, dWp54, err5_m, "_active_ema_wp54")
-            dWp54 = dWp54 + _elig_accum(net, "W_pred_54", dWp54) * getattr(net, "_survival_signal", net._zero1)
             Wp54_a.data += _rho_ctrl(dWp54 * ctx.eta, Wp54_a, "wp54", net)
             dWp43 = (err4_m.transpose(-2, -1) @ z3_pred_in[:, mask4]).mean(dim=0)
+            dWp43 = rtr_apply(trace(net, "W_pred_43", dWp43), net._survival_signal)
             dWp43 = _energy_constraint(net, Wp43_a.data, dWp43, err4_m, "_active_ema_wp43")
-            dWp43 = dWp43 + _elig_accum(net, "W_pred_43", dWp43) * getattr(net, "_survival_signal", net._zero1)
             Wp43_a.data += _rho_ctrl(dWp43 * ctx.eta, Wp43_a, "wp43", net)
             soft_norm_preserve(Wp54_a.data)
             soft_norm_preserve(Wp43_a.data)

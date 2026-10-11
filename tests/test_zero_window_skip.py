@@ -5,8 +5,9 @@
 
 覆盖范围:
   - 流式路径 `_SamplePrefetch` (exp115_say.py);
-  - 文件遍历路径 `window_or_skip` / `skip_zero_windows` (train_cmd.py, 批令 34 抽出的纯函数);
-  - 跨路径一致性: 同一批样本上两者的零窗判定必须等价 (ByteDataset 张量口径 vs 纯函数口径).
+  - 文件遍历路径 `tiled_windows` / `window_ids` / `skip_zero_windows` (train_cmd.py, 批令 34 抽出的纯函数);
+  - 跨路径一致性: 同一批样本上两者的零窗判定必须等价 (ByteDataset 张量口径 vs 纯函数口径);
+  - 平铺不变式: 窗拼接 == 原文全字节 (D1 修复; 旧 `[:max_seq_len]` 截断丢弃 65.81%).
 """
 
 import os
@@ -20,7 +21,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from exp115_say import _SamplePrefetch  # noqa: E402  (需先注入 scripts/ 到 sys.path)
 
-from crates.cli.commands.train_cmd import skip_zero_windows, window_or_skip  # noqa: E402
+from crates.cli.commands.train_cmd import skip_zero_windows, tiled_windows, window_ids  # noqa: E402
 
 
 class _StubDS:
@@ -73,20 +74,42 @@ def test_prefetch_all_zero_windows_raises():
 # ---------------------------------------------------------------- train_cmd 纯函数 (批令 34)
 
 
-def test_window_or_skip_text_field():
-    """text 字段: 空串 → None; 纯空白 → 保留 (字节非零); 超长 → 截断到 max_seq_len."""
-    assert window_or_skip({"text": ""}, 8) is None
-    assert window_or_skip({"text": "  "}, 8) == b"  "
-    assert window_or_skip({"text": "abcdefghijk"}, 8) == b"abcdefgh"
-    assert window_or_skip({"text": "你好"}, 8) == "你好".encode()
+def test_tiled_windows_text_field():
+    """text 字段: 空串 → []; 纯空白 → 保留 (字节非零); 超长 → 平铺全部字节, 无截断."""
+    assert tiled_windows({"text": ""}, 8) == []
+    assert tiled_windows({"text": "  "}, 8) == [b"  "]
+    assert tiled_windows({"text": "abcdefghijk"}, 8) == [b"abcdefgh", b"ijk"]
+    assert tiled_windows({"text": "你好"}, 8) == ["你好".encode()]
 
 
-def test_window_or_skip_conversations_field():
-    """conversations 字段: 全空 content → None; 有内容 → 拼接保留."""
+def test_tiled_windows_conversations_field():
+    """conversations 字段: 全空 content → []; 有内容 → 拼接后平铺."""
     empty = {"conversations": [{"role": "user", "content": ""}, {"role": "assistant", "value": ""}]}
-    assert window_or_skip(empty, 8) is None
+    assert tiled_windows(empty, 8) == []
     some = {"conversations": [{"role": "user", "content": "ab"}, {"role": "assistant", "value": "cd"}]}
-    assert window_or_skip(some, 8) == b"abcd"
+    assert tiled_windows(some, 8) == [b"abcd"]
+    long = {"conversations": [{"role": "user", "content": "abcdefghij"}]}
+    assert tiled_windows(long, 8) == [b"abcdefgh", b"ij"]
+
+
+def test_tiled_windows_covers_every_byte():
+    """平铺不变式 (D1): 窗数 = ceil(L/窗宽), 窗拼接 == 原文全字节, 只有尾窗短."""
+    raw = bytes((48 + (i % 40)) for i in range(1000))
+    tiles = tiled_windows({"text": raw.decode("ascii")}, 256)
+    assert len(tiles) == -(-len(raw) // 256)
+    assert b"".join(tiles) == raw
+    assert all(len(t) == 256 for t in tiles[:-1])
+    assert len(tiles[-1]) == len(raw) % 256
+
+
+def test_window_ids_left_aligned_zero_fill():
+    """id 张量形态: 左对齐真实字节 + 尾部 0x00 填充 (填充位由 learn 的目标位掩码作废)."""
+    ids = window_ids(b"ab", 8)
+    assert ids.dtype == torch.long
+    assert ids.shape == (8,)
+    assert ids.tolist() == [97, 98, 0, 0, 0, 0, 0, 0]
+    full = window_ids(bytes(range(65, 73)), 8)
+    assert bool((full == 0).sum() == 0)
 
 
 def test_skip_zero_windows_count():
@@ -98,6 +121,14 @@ def test_skip_zero_windows_count():
     assert len(kept) + skipped == len(samples)
 
 
+def test_skip_zero_windows_counts_tiles():
+    """批量口径按窗计数: 一文档多窗全部保留 (不再只留首窗)."""
+    samples = [{"text": "0123456789abc"}, {"text": ""}, {"text": "x"}]
+    kept, skipped = skip_zero_windows(samples, 8)
+    assert kept == [b"01234567", b"89abc", b"x"]
+    assert skipped == 1
+
+
 def test_cross_path_judge_equivalence():
     """跨路径一致性: ByteDataset 张量口径 ((t==0).all()) ⟺ 纯函数口径 (None) 必须等价.
 
@@ -106,9 +137,7 @@ def test_cross_path_judge_equivalence():
     """
     texts = ["", "a", "", "  ", "你好", "", "\n", "\t"]
     for t in texts:
-        ids = torch.zeros(16, dtype=torch.long)
-        bs = t.encode("utf-8")[:16]
-        ids[: len(bs)] = torch.tensor(list(bs), dtype=torch.long)
+        ids = window_ids(t.encode("utf-8"), 16)
         tensor_is_zero = bool((ids == 0).all())
-        pure_says_skip = window_or_skip({"text": t}, 16) is None
+        pure_says_skip = not tiled_windows({"text": t}, 16)
         assert tensor_is_zero == pure_says_skip, f"判据分歧: text={t!r}"

@@ -11,9 +11,10 @@ import torch
 import torch.nn.functional as F
 
 from crates.kernels import cubic, rms_norm, saturate, soft_norm_preserve
-from crates.model.constants import LM_TRUST_REGION
+from crates.model.constants import F_UNIT_SCALE, LM_TRUST_REGION
+from crates.rtr import rtr_apply, trace
 
-from ._common import _elig_accum, _MixinBase
+from ._common import _MixinBase
 
 
 class ReadoutMixin(_MixinBase):
@@ -102,12 +103,12 @@ class ReadoutMixin(_MixinBase):
         logits_t2 = logits_t2 + (1.0 - net._mask_print) * -1e4  # 与 logits_lm 同款打印掩码 (C3: probs 双域统一)
         target_lm = F.one_hot(ctx.byte_ids[:, 1:], num_classes=256).to(torch.float16)
         target_lm2 = F.one_hot(ctx.byte_ids[:, 2:], num_classes=256).to(torch.float16)
-        # 赫布版 softmax 误差: eps = target - softmax(logits); logits 已归一化 [-60,60] 无溢出
+        # 局部 softmax 误差: eps = target - softmax(logits); logits 已归一化 [-60,60] 无溢出
         probs_lm = torch.softmax(logits_lm, dim=-1)  # [N,S,256] fp16
         probs_t2 = torch.softmax(logits_t2, dim=-1)
         eps_lm = (target_lm - probs_lm[:, :-1]).detach()  # [N,S-1,256]
         eps_t2 = (target_lm2 - probs_t2).detach()  # [N,S-2,256]
-        # 多步差分目标: diff2 = (target_{t+2}-target_{t+1}) - (probs_{t+2}-probs_{t+1}), 额外的赫布误差通道
+        # 多步差分目标: diff2 = (target_{t+2}-target_{t+1}) - (probs_{t+2}-probs_{t+1}), 额外的局部误差通道
         probs_l1 = probs_lm[:, :-1]  # [N,S-1,256] = t+1 概率
         probs_l2 = probs_t2  # [N,S-2,256] = t+2 概率
         target_l1 = target_lm  # [N,S-1,256]
@@ -209,11 +210,13 @@ class ReadoutMixin(_MixinBase):
         # 结构化预缩放 (A1): 矩阵乘在 d_h 维累加可冲 fp16 上限, 溢出发生在 rms_norm
         # 之前 (后置归一化救不了); ÷64 = 指数移位, rms_norm 尺度不变 → 下游语义零变
         eps_in = eps_total / 64.0
-        eps_lm_proj = (eps_in @ net.W_lm.T @ W1_a.T)[:, :, :dim_4] * dz4_sig * gain  # [N,S-1,dim_4]
-        eps_lm_proj = rms_norm(eps_lm_proj)
-        eps_lm_pad = torch.cat(
-            [eps_lm_proj, net._padmax[:, :, :dim_4]], dim=1
-        )
+        eps_proj_raw = (eps_in @ net.W_lm.T @ W1_a.T)[:, :, :dim_4] * dz4_sig * gain  # [N,S-1,dim_4]
+        # 计价项取归一化前的投影能量. rms_norm 逐活行恒定输出 1/1.01 均方 (幅值被抹平),
+        # 拿它的输出计价会让 F 逐位退化成行存活计数 fp16(0.990099·alive/256): 死区 2.8e4 倍,
+        # 任一位点的信任域步都比翻一格台阶小 333 倍 → 无位点可被计价. ×F_UNIT_SCALE 只是
+        # 2 的幂换单位 (fp16 指数移位, 精确), 让 metab_c/metab_d/κ 的既有标定继续成立.
+        eps_proj_ms = eps_proj_raw.square().mean() * F_UNIT_SCALE
+        eps_lm_proj = rms_norm(eps_proj_raw)
 
         from .engine import LmSignal
 
@@ -222,7 +225,8 @@ class ReadoutMixin(_MixinBase):
             eps_t2_total=eps_t2_total,
             eps_lm=eps_lm,
             eps_lm_proj=eps_lm_proj,
-            eps_lm_pad=eps_lm_pad,
+            eps_proj_raw=eps_proj_raw,
+            eps_proj_ms=eps_proj_ms,
             logits_lm=logits_lm,
             probs_lm=probs_lm,
             h=h,
@@ -234,7 +238,7 @@ class ReadoutMixin(_MixinBase):
         )
 
     def _update_w1v2_heads(self, ctx, lm):
-        """w1v2 每头局部重建 (w1v2_prereg.md §1.3-1.5): 预测编码式局部规则, 非赫布非 BP.
+        """w1v2 每头局部重建 (w1v2_prereg.md §1.3-1.5): 预测编码式局部规则, 非共现非 BP.
 
         e_i = zh - GELU(zh@A_i)@B_i; 梯度只在头内:
           dA_i ∝ zhᵀ @ ((e_i @ B_iᵀ) ⊙ GELU'(zh@A_i));  dB_i ∝ GELU(zh@A_i)ᵀ @ e_i.
@@ -347,7 +351,7 @@ class ReadoutMixin(_MixinBase):
         return self._mig_unit(dW1_recon) * net._w1v2_eta_recon  # 辅信号比主小 (η_recon_ratio)
 
     def _update_lm_head(self, ctx, sh):
-        """LM 头自监督赫布更新: W_lm/W_lm_2/W1/bias_lm. 返回 d_t."""
+        """LM 头自监督局部更新: W_lm/W_lm_2/W1/bias_lm. 返回 d_t."""
         net = self.net
         if ctx.free_run or ctx.echo_world_frozen:
             return net._one_s[: ctx.N, : ctx.S - 1]  # tensor-guard: bound (冻结步恒一 d_t, 预分配)
@@ -404,9 +408,7 @@ class ReadoutMixin(_MixinBase):
         n_lm = dW_lm.norm()
         alive_n = (n_lm > 0).to(dW_lm.dtype)
         dW_lm = dW_lm * alive_n / torch.where(alive_n > 0, n_lm, torch.ones_like(n_lm))
-        dW_lm = dW_lm + _elig_accum(net, "W_lm", dW_lm) * getattr(
-            net, "_survival_signal", net._zero1
-        )
+        dW_lm = rtr_apply(trace(net, "W_lm", dW_lm), net._survival_signal)
         if (not _mig or _realign) and not _rdfrz:  # 迁移扩 h: W_lm 冻结; _readout_realign (E8a) 覆写; _readout_freeze (E8) 全冻结
             net.W_lm.data += dW_lm * (ctx.eta_lm * net.W_lm.norm() * LM_TRUST_REGION * _bhw)
         if not _rdfrz:
@@ -426,7 +428,7 @@ class ReadoutMixin(_MixinBase):
                 torch.minimum(torch.ones_like(mx_lm), 10.0 / (mx_lm + 1e-6)).to(torch.float16)  # 等比帽 (branchless min)
             )
 
-        # W1 混合层更新: 转置误差传播 (纯赫布); e_h = e @ W_lm.T · h_deriv
+        # W1 混合层更新: 转置误差传播; e_h = e @ W_lm.T · h_deriv
         # w1v2 分支 (w1v2_prereg.md §1.3-1.5): A_i/B_i 纯重建驱动, 头间隔离, 不接 next-byte 梯度
         if getattr(net, "_w1v2", False):
             self._update_w1v2_heads(ctx, lm)
@@ -444,9 +446,7 @@ class ReadoutMixin(_MixinBase):
             alive_n1 = (n_w1 > 0).to(dW1.dtype)
             dW1 = dW1 * alive_n1 / torch.where(alive_n1 > 0, n_w1, torch.ones_like(n_w1))
             if not net.cfg.lm_freeze_w1 and (not _mig or _realign) and not _rdfrz:
-                dW1 = dW1 + _elig_accum(net, "W1", dW1) * getattr(
-                    net, "_survival_signal", net._zero1
-                )
+                dW1 = rtr_apply(trace(net, "W1", dW1), net._survival_signal)
                 if getattr(net, "_single_recon", False):  # 单通道迁移: 加权重建辅信号
                     dW1 = dW1 + self._single_recon_w1(ctx, lm)
                 net.W1.data += dW1 * (ctx.eta_lm * net.W1.norm() * LM_TRUST_REGION * _bhw)
@@ -468,9 +468,7 @@ class ReadoutMixin(_MixinBase):
         dW_lm2_n = dW_lm2.norm()
         alive_n2 = (dW_lm2_n > 0).to(dW_lm2.dtype)
         dW_lm2 = dW_lm2 * alive_n2 / torch.where(alive_n2 > 0, dW_lm2_n, torch.ones_like(dW_lm2_n))  # 单步更新幅度上界 (零更新掩码: 1e-8 fp16 舍为 0)
-        dW_lm2 = dW_lm2 + _elig_accum(net, "W_lm_2", dW_lm2) * getattr(
-            net, "_survival_signal", net._zero1
-        )
+        dW_lm2 = rtr_apply(trace(net, "W_lm_2", dW_lm2), net._survival_signal)
         if not _mig and not _rdfrz:  # 迁移扩 h: W_lm_2 冻结; _readout_freeze (E8) 全冻结
             net.W_lm_2.data += dW_lm2 * (ctx.eta_lm * net.W_lm_2.norm() * LM_TRUST_REGION * _bhw)
             soft_norm_preserve(net.W_lm_2.data)
@@ -479,7 +477,7 @@ class ReadoutMixin(_MixinBase):
         if _mig and not _migfrz:  # E9f 拆门: migrate 新通道独立冻结门 (旧读出由 _rdfrz 守; 默认跟随 _rdfrz)
             self._update_migrate_heads(ctx, lm, err_scaled, d_t)
 
-        # ── 状态头赫布通道 (self_state_layered_prereg.md §2.1; 默认关零变更) ──
+        # ── 状态头预测通道 (self_state_layered_prereg.md §2.1; 默认关零变更) ──
         # 位置: free_run/echo_world_frozen 守卫之后 → 仅感知相位更新 (C5 冻结合约同域).
         # 两条更新: 头本体 (单位范数方向, 步长 η_lm·TR — 无自身范数缩放, 零初始化 ‖W‖=0)
         # + W1 转置传播 (与字节 e_h→dW1 同构; 不走 elig 迹, 避免与字节通道双消费 W1 迹).

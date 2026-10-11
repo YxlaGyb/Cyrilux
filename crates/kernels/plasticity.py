@@ -1,7 +1,7 @@
 """
 塑性算子
 
-活动基线 / Oja 能量约束 / 资格迹 / 通道级塑性控制; 状态切片与登记由调用侧适配.
+活动基线 / Oja 能量约束 / 通道级塑性控制; 状态切片与登记由调用侧适配.
 """
 
 from __future__ import annotations
@@ -44,16 +44,6 @@ def energy_constraint(
     p2, excess = activity_baseline(post, ema, initialized)
     coef = oja_alpha * p2 + oja_elasticity * excess
     return dW - coef.unsqueeze(1) * W
-
-
-def elig_accum(E: torch.Tensor, dW_raw: torch.Tensor, gamma: float) -> torch.Tensor:
-    """资格迹: E ← γ·E + dW_raw, 返回当前迹 (与权重同形, 前缘对齐修剪活性切片).
-
-    R 默认 0 → 迹只记录不注入 (ΔW=η·R·E=0); 生存环境接入时经 _survival_signal 启用.
-    """
-    E = E[: dW_raw.shape[0], : dW_raw.shape[1]]
-    E.mul_(gamma).add_(dW_raw)
-    return E
 
 
 def rho_control(

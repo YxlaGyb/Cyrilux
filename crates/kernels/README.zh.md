@@ -49,9 +49,8 @@ from crates.kernels import rms_norm, saturate, topk_wta
 | `participation_ratio(...)` | `regularize` | 标量 | 离差诊断量。 |
 | `activity_baseline(post, ema, initialized)` | `plasticity` | `[out]` | 窗内活动²及相对慢 EMA 的超额部分。 |
 | `energy_constraint(W, dW, post, ema, initialized, oja_alpha, oja_elasticity)` | `plasticity` | `[out, in]` | 真实 Oja 项加活动相关遗忘。 |
-| `elig_accum(E, dW_raw, gamma)` | `plasticity` | `[out, in]` | 资格迹 `E = gamma * E + dW_raw`。 |
 | `rho_control(dW, W_ref, adaptive)` | `plasticity` | `[out, in]` | 通道级塑性控制，返回缩放后的 `dW`、`rho` 与 `s`。 |
-| `decorr_W(W, E, coef, max_delta_ratio, learn_boost)` | `spectral` | 就地 | 以范数信任域移除 top-1 主方向。 |
+| `decorr_W(W, E, coef, max_delta_ratio, learn_boost, gate)` | `spectral` | 就地 | 当最大奇异值高于白噪声上界 `(√m+√n)/√(mn)·‖W‖_F` 的 `gate` 倍时，以范数信任域移除 top-1 主方向。 |
 | `spectral_radius_guard(W, rescale, bound)` | `spectral` | 就地 | 在估计谱半径发散时约束递归。 |
 
 -----

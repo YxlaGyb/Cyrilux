@@ -1,7 +1,7 @@
 """pad 泄漏掩码测试 (批 2): 目标字节 <32 的位置零学习信号进 LM 头.
 
 判据 = 模型自身 _mask_print 输出域 (0x00-0x1F 不可打印): 学习端与自身输出域自洽,
-pad 0x00 (dataset ljust 填充) 不再经 W_lm[:,0] / bias_lm[0] / W_lm_2[:,0] 注入赫布驱动.
+pad 0x00 (dataset ljust 填充) 不再经 W_lm[:,0] / bias_lm[0] / W_lm_2[:,0] 注入局部驱动.
 """
 
 import torch

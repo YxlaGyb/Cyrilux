@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`crates.hybrid` 实现密集 PPA（感知-预测-行动）闭环的运行时引擎。`forward.py` 拥有 `ForwardEngine`，它从字节输入沿 L0 到 L6 逐层走过激活路径，应用时间递归核，绑定稀疏概念槽，并执行自回归续写与生成。动态神经元机制（拓扑修剪与记忆单元群的生死）放在同级 crate `crates.neuron`。逐域学习更新放在同级子 crate `crates.hybrid.learning`。这些引擎共同消费 `crates.model` 声明的网络与配置，并以纯希伯、无反向传播的方式驱动它。
+`crates.hybrid` 实现密集 PPA（感知-预测-行动）闭环的运行时引擎。`forward.py` 拥有 `ForwardEngine`，它从字节输入沿 L0 到 L6 逐层走过激活路径，应用时间递归核，绑定稀疏概念槽，并执行自回归续写与生成。动态神经元机制（拓扑修剪与记忆单元群的生死）放在同级 crate `crates.neuron`。逐域学习更新放在同级子 crate `crates.hybrid.learning`。这些引擎共同消费 `crates.model` 声明的网络与配置，并以迹调制、无反向传播的方式驱动它。
 
 ## 目录
 

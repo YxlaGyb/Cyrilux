@@ -26,7 +26,7 @@ Run the training paths.
 
 | 导出 | 形状 | 含义 |
 |---|---|---|
-| `app train -d FILE...` | Training | Direct mode. Loads each JSONL file line by line, batches byte windows, and runs pure Hebbian `net.learn`. Saves `final.safetensors` into the output directory. |
+| `app train -d FILE...` | Training | Direct mode. Loads each JSONL file line by line, batches byte windows, and runs trace-modulated `net.learn`. Saves `final.safetensors` into the output directory. |
 | `app train --resume` | Training | Finds the newest `final.safetensors` under `out/v*` and continues from it. |
 | `app from-config CFG.json` | Training | Loads a JSON config and trains. CLI options such as `--batch-size`, `--lr`, `--epochs`, `--out-dir` override the config. |
 | `app resume CKPT.safetensors` | Training | Rebuilds the network from a checkpoint with its own config and optionally keeps training on new data with `-d`. Preserves the checkpoint max sequence length. |
@@ -57,7 +57,7 @@ Prepare data.
 
 `utils.py` is the shared spine. `resolve_path` anchors relative paths at the project root. `run_dir` lazily allocates this process version directory by calling `crates.utils.outver.ensure_run_dir`, and `pin_run_dir` anchors a resumed run to the existing training line. `run_file`, `load_config`, `save_config`, and `merge_config` cover the config plumbing. It also carries the `TRAIN_CONFIG_TEMPLATE` and `AUTONOMOUS_CONFIG_TEMPLATE` defaults.
 
-`train_cmd.py` owns the dense training loop. `skip_zero_windows` and `window_or_skip` are pure functions that encode sample text to utf-8, truncate to `max_seq_len`, and drop windows that would be all zeros. The `_train_dense` helper iterates JSONL with a line-scan first pass for progress reporting, stacks byte windows into batch tensors, and calls `net.learn` with gradients disabled. Several legacy options are accepted and reported as ignored rather than rejected.
+`train_cmd.py` owns the dense training loop. `tiled_windows`, `window_ids`, and `skip_zero_windows` are pure functions: sample text is encoded to utf-8 and **tiled** at `stride = max_seq_len` with no truncation, so the concatenated windows reproduce every byte of the corpus, and only samples that would become all-zero windows are dropped. The last tile of a document is left-aligned and zero-filled; those fill positions carry no learning signal because `learn` masks every target byte below 32. The `_train_dense` helper iterates JSONL with a line-scan first pass for progress reporting, stacks byte windows into batch tensors, flushes the trailing partial batch at the end of each file, and calls `net.learn` with gradients disabled. Several legacy options are accepted and reported as ignored rather than rejected.
 
 The `train` command fails fast on a missing `-d` list. `resume` reads the config snapshot from the checkpoint first so dimension fields always follow the snapshot, and bumps the buffer max sequence length only if the request exceeds it.
 

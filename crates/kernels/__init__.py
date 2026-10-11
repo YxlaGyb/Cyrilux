@@ -15,7 +15,6 @@ from crates.kernels.modulation import (
 from crates.kernels.normalize import l2_norm, rel_norm, rms_norm, soft_norm_preserve
 from crates.kernels.plasticity import (
     activity_baseline,
-    elig_accum,
     energy_constraint,
     rho_control,
 )
@@ -36,7 +35,6 @@ __all__ = [
     "compute_uncertainty",
     "cubic",
     "decorr_W",
-    "elig_accum",
     "energy_constraint",
     "foldiak_decorrelate",
     "gate_psay",

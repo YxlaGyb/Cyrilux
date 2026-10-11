@@ -36,7 +36,7 @@ def compete(
 
 
 def bind(C: torch.Tensor, S: torch.Tensor) -> torch.Tensor:
-    """可塑码 P = C ∩ S: 限定 Hebbian 只更新既活跃又存活的神经元."""
+    """可塑码 P = C ∩ S: 限定局部更新只作用于既活跃又存活的神经元."""
     return C & S
 
 

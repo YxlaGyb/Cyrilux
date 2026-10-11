@@ -46,6 +46,7 @@ _L4_ONLY = (  # 行 = L4
     ("W_pred_43_elig", "row", "aux"),
     ("W_bind", "row", "done"),
     ("W_bind_elig", "row", "aux"),
+    ("_rtr_proj", "row", "aux"),
 )
 _L5_ONLY = (
     ("M_l5", "sq", "aux"),

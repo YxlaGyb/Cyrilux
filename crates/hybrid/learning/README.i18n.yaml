@@ -1,4 +1,4 @@
-description: The pure-Hebbian learning engine of the dense PPA loop, organized as orchestrator plus per-domain mixins: action, bind, feedforward, metabolism, predict, readout, and temporal.
+description: The trace-modulated learning engine of the dense PPA loop, organized as orchestrator plus per-domain mixins: action, bind, feedforward, metabolism, predict, readout, and temporal.
 
-README.md: a378a2e7275c632f2828035fceb5fa1b75d4ab92
-README.zh.md: 09d75d18af2a7096674a1d1a91da4b68c66f49cc
+README.md: 0576fbc8cadee5acb0ad08e9b10acbe7c77405ea
+README.zh.md: 1f9eb58adcd7f499007b63ff1a76956e1ece93b0

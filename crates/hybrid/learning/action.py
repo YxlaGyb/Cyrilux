@@ -6,8 +6,9 @@ import torch
 import torch.nn.functional as F
 
 from crates.kernels import soft_norm_preserve
+from crates.rtr import rtr_apply, trace
 
-from ._common import _elig_accum, _MixinBase
+from ._common import _MixinBase
 
 
 class ActionMixin(_MixinBase):
@@ -94,22 +95,11 @@ class ActionMixin(_MixinBase):
         else:
             # 锚缺失 (从未跑过感知相位): d=0 → 映射中点 (无先验, 保守健康值)
             net._gen_temp.fill_((net.cfg.metab_tau_lo + net.cfg.metab_tau_hi) / 2.0)
-        # 资格迹: 迹输入 = 行为外积 (决策态槽 × 实际字节 one-hot), R 生存信号在迹更新后除迹调制
+        # 资格迹: 迹输入 = 行为外积 (决策态槽 × 实际字节 one-hot); 生存信号由 _update_metabolism 无条件写入
         zbg_ac = zb_g - zb_g.mean(dim=1, keepdim=True)
         dW_elig = (zbg_ac.transpose(-2, -1) @ oh_g).mean(dim=0)
-        E_act = _elig_accum(net, "W_act", dW_elig)
-        _wr = getattr(net, "_metab_R", None)
-        if _wr is not None:
-            # RPE — W_act 学"比预期好/差"而非绝对进度 (判词 §8 缺陷二:
-            # R 是进度量非预期差). rpe = R − EMA(R), EMA 速率复用 metab_gain_rate
-            # (行为账本同款时间尺度). 冷启动 EMA=0 → rpe=R (从原始进度平滑过渡).
-            _g_rpe = net.cfg.metab_gain_rate
-            _rpe = _wr - net._metab_rpe_ema
-            net._metab_rpe_ema.mul_(1.0 - _g_rpe).add_(_g_rpe * _wr)
-            net._survival_signal = _rpe / (E_act.norm() + 1e-6)
-        else:
-            net._survival_signal = net._zero1  # tensor-guard: rare (代谢未结算冷启动)
-        dW_act = dW_act + E_act * net._survival_signal
+        E_act = trace(net, "W_act", dW_elig)
+        dW_act = rtr_apply(E_act, net._survival_signal)
         net.W_act.data += dW_act * (net.cfg.lm_lr_boost * 0.2) * (0.5 + intr_d) * col_norm * 5.0
         # 复读检测跟踪 (随机扰动已升级为 forward.py 内部状态错误配对, 此处仅跟踪供诊断)
         gb_recent = gb[:, -10:]  # [N,10] 最近 10 字节

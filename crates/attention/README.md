@@ -55,7 +55,7 @@ g = (1 - floor) * K * softmax(g_raw / temperature) + floor
 
 keeps the mean at 1 and the minimum at `floor` without a clamp.
 
-CoreBrain keeps its existing JEPA target `topk_wta(long @ P_long_ema)`. Attention does not replace that target. It only computes `delta_eff = g * delta` and sends that effective error into both the predictor and projection updates. The projection update maps the effective error through `Q.T` before the existing WTA mask is applied.
+CoreBrain keeps its existing  target `topk_wta(long @ P_long_ema)`. Attention does not replace that target. It only computes `delta_eff = g * delta` and sends that effective error into both the predictor and projection updates. The projection update maps the effective error through `Q.T` before the existing WTA mask is applied.
 
 The layer is active only during perception learning. Free-run and echo-frozen phases do not update `a_long_ema`.
 

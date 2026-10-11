@@ -3,11 +3,10 @@
 
 锁三件事:
 1. model/ 活动源码零红线 token (断链不可复辟, 体外账本死代码不可复生);
-2. 资格迹信号源只允许体内 _metab_R (action.py 源码级断言);
+2. 生存信号源只允许体内 _metab_R (crates/rtr/signals.py 源码级断言);
 3. world_lang 仪表无 step_E (与 test_world_lang.py 双保险).
 """
 import importlib.util
-import inspect
 from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location("redline", "scripts/redline.py")
@@ -29,14 +28,12 @@ def test_redline_tokens_nonempty():
     assert "inject_world" in REDLINE_TOKENS
 
 
-def test_action_survival_source_is_internal():
-    # 资格迹 R 来源只允许体内 _metab_R; 注入通道源码级零容忍
-    from crates.hybrid.learning.action import ActionMixin
-
-    src = inspect.getsource(ActionMixin._update_w_act)
-    assert "_metab_R" in src, "资格迹信号源未走体内 _metab_R"
+def test_survival_source_is_internal():
+    # 生存信号 R 来源只允许体内 _metab_R; 注入通道源码级零容忍
+    src = (Path(__file__).resolve().parent.parent / "crates" / "rtr" / "signals.py").read_text(encoding="utf-8")
+    assert "_metab_R" in src, "生存信号源未走体内 _metab_R"
     for tok in ("step_E", "inject_world", "_world_R"):
-        assert tok not in src, f"资格迹源码出现红线 token: {tok}"
+        assert tok not in src, f"生存信号源码出现红线 token: {tok}"
 
 
 def test_world_lang_module_isolated_from_model():

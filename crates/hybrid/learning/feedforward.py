@@ -9,8 +9,15 @@ import torch
 
 from crates.kernels import decorr_W as _decorr_W
 from crates.kernels import rms_norm, soft_norm_preserve
+from crates.rtr import rtr_apply, trace
 
-from ._common import _activity_baseline, _elig_accum, _energy_constraint, _MixinBase, _plastic, _rho_ctrl
+from ._common import (
+    _activity_baseline,
+    _energy_constraint,
+    _MixinBase,
+    _plastic,
+    _rho_ctrl,
+)
 
 
 class FeedforwardMixin(_MixinBase):
@@ -113,8 +120,7 @@ class FeedforwardMixin(_MixinBase):
             g_homeo = (1.0 / (1.0 + th_w04)).unsqueeze(1)  # [dim_4,1] 每输出列增益
             net._theta_w04_dist = th_w04  # 诊断: θ_j 分布
             dW_04 = dW_04 * g_homeo
-            # 资格迹接力: 更新 = η·R·E 的滑均形式 (R 为生存信号时全迹缩放)
-            dW_04 = dW_04 + _elig_accum(net, "W_04", dW_04) * getattr(net, "_survival_signal", net._zero1)
+            dW_04 = rtr_apply(trace(net, "W_04", dW_04), net._survival_signal)
             net.W_04[:dim_4].data += dW_04 * eta
             soft_norm_preserve(net.W_04[:dim_4].data)
             # 行去同质化: 斜坡渐进 (coef 200 步升到 1) + 范数信任域 (单步 ≤5%‖W‖_F) 防 z4 突变换层
@@ -122,8 +128,8 @@ class FeedforwardMixin(_MixinBase):
             _decorr_W(net.W_04[:dim_4].data, net.E_04[:dim_4, :dim_4], coef=ramp, max_delta_ratio=0.05, learn_boost=ctx.learn_boost)
 
             dW42 = (sh.errs.eps2_precise.transpose(-2, -1) @ rms_norm(z4)).mean(dim=0) * inv_s
+            dW42 = rtr_apply(trace(net, "W_42", dW42), net._survival_signal)
             dW42 = _energy_constraint(net, net.W_42[:dim_2].data, dW42, sh.errs.eps2_precise, "_active_ema_w42")
-            dW42 = dW42 + _elig_accum(net, "W_42", dW42) * getattr(net, "_survival_signal", net._zero1)
             col_mask = torch.rand(dim_2, 1, device=dev) < net.cfg.column_dropout
             net.W_42[:dim_2].data += (dW42 * (~col_mask).to(torch.float16)) * eta
             _decorr_W(net.W_42[:dim_2].data, net.E_42[:dim_2, :dim_2], learn_boost=ctx.learn_boost)
@@ -131,8 +137,8 @@ class FeedforwardMixin(_MixinBase):
         # W_56 (L5→L6 内部动力学) 在自由运行同样学习; 回声冻结 (C5 合约)
         if not echo_world_frozen:
             dW_56 = (sh.errs.eps6_precise.transpose(-2, -1) @ rms_norm(z5)).mean(dim=0) * inv_s
+            dW_56 = rtr_apply(trace(net, "W_56", dW_56), net._survival_signal)
             dW_56 = _energy_constraint(net, net.W_56[:dim_6].data, dW_56, sh.errs.eps6_precise, "_active_ema_w56")
-            dW_56 = dW_56 + _elig_accum(net, "W_56", dW_56) * getattr(net, "_survival_signal", net._zero1)
             col_mask = torch.rand(net.W_56[:dim_6].shape[0], 1, device=dev) < net.cfg.column_dropout
             net.W_56[:dim_6].data += (dW_56 * (~col_mask).to(torch.float16)) * eta
 
@@ -153,8 +159,8 @@ class FeedforwardMixin(_MixinBase):
         gain_l3 = net._gain_l3[:dim_3, :dim_3] if dim_3 < 384 else net._gain_l3[:dim_3, :]
         if not echo_world_frozen:  # W_23 世界模型, 回声冻结 (C5 合约, 含 soft_norm/decorr)
             dW23 = (eps3_pc.transpose(-2, -1) @ rms_norm(z2)).mean(dim=0) * inv_s
+            dW23 = rtr_apply(trace(net, "W_23", dW23), net._survival_signal)
             dW23 = _energy_constraint(net, net.W_23[:dim_3].data, dW23, eps3_pc, "_active_ema_w23")
-            dW23 = dW23 + _elig_accum(net, "W_23", dW23) * getattr(net, "_survival_signal", net._zero1)
             err3_norm = sh.errs.eps3.pow(2).mean(dim=(0, 1)).sqrt() + 1e-8  # [dim_3] 每神经元
             gate3 = 0.1 + 0.9 * (err3_norm / err3_norm.max())
             dW23 = dW23 * gain_l3 * gate3.unsqueeze(1)
@@ -162,11 +168,11 @@ class FeedforwardMixin(_MixinBase):
             net.W_23[:dim_3].data += (dW23 * (~c3_mask).to(torch.float16)) * eta
             soft_norm_preserve(net.W_23[:dim_3].data)  # 0.8-1.2: 增益幅度保留, 权重有界
             _decorr_W(net.W_23[:dim_3].data, net.E_23[:dim_3, :dim_3], learn_boost=ctx.learn_boost)
-        # 状态预测矩阵自更新 (纯赫布): dW_sp = z4^T @ eps_state; echo_world_frozen 时冻结 (世界模型)
+        # 状态预测矩阵自更新: dW_sp = z4^T @ eps_state; echo_world_frozen 时冻结 (世界模型)
         if not echo_world_frozen:
             dW_sp = (net._z4[:, :-1].transpose(-2, -1) @ eps_state).mean(dim=0)
+            dW_sp = rtr_apply(trace(net, "W_state_pred", dW_sp), net._survival_signal)
             dW_sp = _energy_constraint(net, W_sp_a.data, dW_sp, net._z4, "_active_ema_wsp")
-            dW_sp = dW_sp + _elig_accum(net, "W_state_pred", dW_sp) * getattr(net, "_survival_signal", net._zero1)
             W_sp_a.data += dW_sp * eta
             soft_norm_preserve(W_sp_a.data)
 
@@ -174,7 +180,7 @@ class FeedforwardMixin(_MixinBase):
         """W_35 更新: 预测编码融合误差全量驱动. 回声相位整族冻结 (C5 合约)."""
         net = self.net
         if ctx.echo_world_frozen:
-            return  # W_35 全族 (Hebb+θ_l5+decorr+soft_norm) 世界模型, 回声零触碰
+            return  # W_35 全族 (RTR+θ_l5+decorr+soft_norm) 世界模型, 回声零触碰
         dev, N, S = ctx.dev, ctx.N, ctx.S
         free_run = ctx.free_run
         dim_3, dim_5 = ctx.dim_3, ctx.dim_5
@@ -238,15 +244,15 @@ class FeedforwardMixin(_MixinBase):
             b_mask = torch.rand(dim_5, 1, device=dev) < net.cfg.column_dropout
             dW_sub = dW_sub * (~b_mask).to(torch.float16)
             dW_h = dW_sub if dW_h is None else dW_h + dW_sub
+        dW_h = rtr_apply(trace(net, "W_35", dW_h), net._survival_signal)
         dW_h = _energy_constraint(net, Wb, dW_h, phi_b, "_active_ema_w35")
-        dW_h = dW_h + _elig_accum(net, "W_35", dW_h) * getattr(net, "_survival_signal", net._zero1)
         dW_h = dW_h * eta
         # 通道级塑性控制: ρ_i=‖ΔW_i‖/‖W_i‖, s_i=clip(0.03/ρ_i, 0.005, 1.0), 统一预测连接时间尺度
         nW = Wb.norm() + 1e-8  # decorr 前统一基准
 
         if net.cfg.adaptive_rho:
             net._rho_map = {}
-        Wb.add_(_rho_ctrl(dW_h, Wb, "hebb", net))
+        Wb.add_(_rho_ctrl(dW_h, Wb, "rtr", net))
         # 前馈链突触缩放 (自由运行): L5 入纤增益随自身活动双向调节, 与 W_t 同款; 训练模式保持 soft_norm
         if free_run and net.cfg.wt_syn_scaling:
             p2w5 = (z5 * z5).mean(dim=(0, 1))  # [dim_5] L5 窗内活动²
@@ -259,7 +265,7 @@ class FeedforwardMixin(_MixinBase):
             soft_norm_preserve(Wb)
         dW_corr = _decorr_W(Wb, net.E_l5[:dim_5, :dim_5], learn_boost=ctx.learn_boost)
         if net.cfg.adaptive_rho:
-            rho_raw, rho_eff, s_h = net._rho_map["hebb"]
+            rho_raw, rho_eff, s_h = net._rho_map["rtr"]
             cos_hc = (dW_h.flatten() @ dW_corr.flatten()) / (
                 dW_h.norm() * dW_corr.norm() + 1e-8
             )

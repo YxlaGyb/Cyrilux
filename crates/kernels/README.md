@@ -49,9 +49,8 @@ from crates.kernels import rms_norm, saturate, topk_wta
 | `participation_ratio(...)` | `regularize` | scalar | Spread diagnostic. |
 | `activity_baseline(post, ema, initialized)` | `plasticity` | `[out]` | Window activity squared plus its excess over a slow EMA. |
 | `energy_constraint(W, dW, post, ema, initialized, oja_alpha, oja_elasticity)` | `plasticity` | `[out, in]` | Real Oja term plus activity-dependent forgetting. |
-| `elig_accum(E, dW_raw, gamma)` | `plasticity` | `[out, in]` | Eligibility trace `E = gamma * E + dW_raw`. |
 | `rho_control(dW, W_ref, adaptive)` | `plasticity` | `[out, in]` | Channel-level plasticity control, returning scaled `dW`, `rho` and `s`. |
-| `decorr_W(W, E, coef, max_delta_ratio, learn_boost)` | `spectral` | in place | Removes the top-1 principal direction with a norm trust region. |
+| `decorr_W(W, E, coef, max_delta_ratio, learn_boost, gate)` | `spectral` | in place | Removes the top-1 principal direction with a norm trust region, when the largest singular value stands above the white-noise upper bound `(√m+√n)/√(mn)·‖W‖_F` by `gate`. |
 | `spectral_radius_guard(W, rescale, bound)` | `spectral` | in place | Bounds the recurrence when its estimated radius diverges. |
 
 -----

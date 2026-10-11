@@ -55,5 +55,5 @@ kind: "package-reference"
 <a id="further-exploration"></a>
 ## 进一步探索
 
-- [hybrid](../hybrid/README.zh.md)：设备桥把事件批馈入密集感知管线。
+- [hybrid](../hybrid/README.zh.md)：设备桥把事件批馈入稠密感知管线。
 - [architecture](../../docs/architecture.md)：top-k 与稀疏、事件驱动传输设计。

@@ -13,11 +13,9 @@ if TYPE_CHECKING:
 
 from crates.kernels import (
     activity_baseline,
-    elig_accum,
     energy_constraint,
     rho_control,
 )
-from crates.model.constants import ELIG_GAMMA
 
 
 class _MixinBase:
@@ -68,7 +66,7 @@ def _energy_constraint(
 
 
 def _plastic(post: torch.Tensor, net: HybridPCNet, layer: str, pos=None) -> torch.Tensor:
-    """Hebbian 可塑码门控 P_l = C_l ∩ S_l: 死/不活跃神经元不进权重更新.
+    """可塑码门控 P_l = C_l ∩ S_l: 死/不活跃神经元不进权重更新.
 
     post 为逐位置突触后信号; pos 对齐 P_l 与 post 的位置轴 (切片或布尔掩码).
     """
@@ -76,15 +74,6 @@ def _plastic(post: torch.Tensor, net: HybridPCNet, layer: str, pos=None) -> torc
     if pos is not None:
         P = P[:, pos]
     return post * P.to(post.dtype)
-
-
-def _elig_accum(net: HybridPCNet, wname: str, dW_raw: torch.Tensor) -> torch.Tensor:
-    """适配器: 取权重对应资格迹缓冲, 调 kernels.elig_accum (γ=ELIG_GAMMA).
-
-    R 默认 0 → 迹只记录不注入 (ΔW=η·R·E=0); 生存环境接入时经 _survival_signal 启用.
-    """
-    E = getattr(net, f"{wname}_elig")
-    return elig_accum(E, dW_raw, ELIG_GAMMA)
 
 
 def _rho_ctrl(dW: torch.Tensor, W_ref: torch.Tensor, tag: str, net: HybridPCNet) -> torch.Tensor:

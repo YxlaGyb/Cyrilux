@@ -69,7 +69,8 @@ class LmSignal:
     eps_t2_total: torch.Tensor
     eps_lm: torch.Tensor
     eps_lm_proj: torch.Tensor
-    eps_lm_pad: torch.Tensor
+    eps_proj_raw: torch.Tensor  # rms_norm 前投影 (D2: 迹与货币同源载体, 补零对齐 S 后作 final_error)
+    eps_proj_ms: torch.Tensor  # 计价项: rms_norm 前投影能量均方 × F_UNIT_SCALE (0-dim fp16)
     logits_lm: torch.Tensor
     probs_lm: torch.Tensor
     h: torch.Tensor
@@ -141,7 +142,7 @@ class EngineCore(
 
     def learn(self, byte_ids: torch.Tensor | None = None, closed_loop: bool = False, free_run: bool = False,
               force_perception: bool = False) -> dict:
-        """Hebbian 学习: 前馈 → 逐域误差 → 局部权重更新, 无反向传播, 不接收 targets.
+        """迹调制学习: 前馈 → 逐域误差 → 局部权重更新, 无反向传播, 不接收 targets.
 
         Args:
             byte_ids: [N, S] long 输入. free_run=True 时忽略.
@@ -205,7 +206,7 @@ class EngineCore(
         # 自回声: 目标 = 自身生成流 (他者响应). 回声相位冻结世界模型, 避免在乱码回声上
         # 学习污染感知 — C5 冻结合约 (单一出处, 各域守卫以此为准):
         #   冻结 {W_04, W_42+inj42, W_23, W_state_pred, W_pred_54/43, W_diff+b_diff,
-        #     W_35 全族(Hebb+inj35+θ_l5+decorr+soft_norm), W_56, W_t 全族(+θ_wt4+谱守卫),
+        #     W_35 全族(RTR+inj35+θ_l5+decorr+soft_norm), W_56, W_t 全族(+θ_wt4+谱守卫),
         #     M_l5, LM 头(W_lm/W_lm_2/W1/bias_lm), 偏置家族, 记忆单元群, W_bind/W_bind_self}
         #   仍推进 {W_act, 行为统计, 代谢账本 E/R, 节律 _intr_*, 行为门, 恒温器}
         #   边界: forward 侧状态 (θ_bind EMA/_mem_m/STP) 每步照走, 不属冻结域
@@ -216,7 +217,7 @@ class EngineCore(
         # echo 相位全权重更新 (移除 C5 对 echo 的冻结), 使 H2 的可学路径落在 W1/h/W_bind 上.
         echo_world_frozen = echo_loop and not getattr(net, "_echo_learn", False)
         # 学习位置掩码: 目标字节 <32 = 模型自身 _mask_print 输出域不可达 (0x00 管道填充、
-        # \n 行分隔等同段), 这些位置的误差信号不得进赫布驱动 — 学习端与自身输出域自洽.
+        # \n 行分隔等同段), 这些位置的误差信号不得进学习驱动 — 学习端与自身输出域自洽.
         # 对齐 S-1 (t+1 目标), 位置 i 对应目标 byte_ids[:, i+1]
         if byte_ids is not None:
             learn_mask = byte_ids[:, 1:] >= 32
@@ -233,7 +234,7 @@ class EngineCore(
         z4, z2, z3, z5, z6 = net._z4, net._z2, net._z3, net._z5, net._z6
 
         # 逐层预测误差 (自下而上 PC); L5 用时序差分误差, L6 用时间自预测.
-        # 逐位置误差先过可塑码门控 P_l (死/不活跃神经元不进 Hebbian).
+        # 逐位置误差先过可塑码门控 P_l (死/不活跃神经元不进权重更新).
         eps4 = _plastic(z4 - (z0 @ net.W_04[:dim_4].T + net.bias_l4[:dim_4]), net, "l4")
         eps2 = _plastic(z2 - (z4 @ net.W_42[:dim_2].T + net.bias_l2[:dim_2]), net, "l2")
         eps3 = _plastic(z3 - (z2 @ W_23_a.T + net.bias_l3[:dim_3]), net, "l3")
@@ -251,7 +252,7 @@ class EngineCore(
         learn_boost = 2.0 - net._traction_scale.to(torch.float16)
 
         # 学习率恒基准值 (无全局调制); 前 50 步减半 (先稳后放)
-        eta = net.cfg.lr_hebbian
+        eta = net.cfg.lr_rtr
         if net._step_py < 50:
             eta = eta * 0.5
         eta_t = eta * net.cfg.temporal_lr_ratio

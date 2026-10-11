@@ -1,6 +1,6 @@
 """Cyrene 模型定义
 
-密集 PPA 感知-预测-行动闭环网络.
+稠密 PPA 感知-预测-行动闭环网络.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, fields, replace
 import torch
 from torch import nn
 
-from crates.model.constants import LAMBDA_0
+from crates.model.constants import LAMBDA_0, RTR_PROJ_SEED, RTR_V_BUCKETS
 
 
 @dataclass
@@ -31,8 +31,8 @@ class CyreneModel:
     max_seq_len: int = 256
     input_history: bool = True  # W_04 输入拼接 [z0[t], z0[t-1]], 词序进入表示层
 
-    # Hebbian 学习
-    lr_hebbian: float = 0.003
+    # RTR 学习
+    lr_rtr: float = 0.003
     temporal_lr_ratio: float = 5.0
     oja_alpha: float = 0.05
     column_dropout: float = 0.25
@@ -340,9 +340,6 @@ class HybridPCNet(nn.Module):
         self.register_buffer("_metab_psay", torch.full((1,), 0.5, dtype=torch.float16))
         self.register_buffer("_metab_gate_hit", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_gate_rand", torch.full((1,), 0.5, dtype=torch.float16))
-        # RPE 预期基线 — EMA(R), rpe = R − 预期; W_act 学"比预期好/差"
-        # 而非绝对进度. 速率复用 metab_gain_rate (行为账本同款时间尺度).
-        self.register_buffer("_metab_rpe_ema", torch.zeros(1, dtype=torch.float16))
 
         # 死亡契约计数器: 连续饥饿 / 连续沉默 / 死亡回合计数, 随 state_dict 持久化
         self.register_buffer("_metab_starve_cnt", torch.zeros(1, dtype=torch.int32))
@@ -375,6 +372,8 @@ class HybridPCNet(nn.Module):
         # 打印掩码、序列掩码 — 全部随 state_dict 持久化, 每步复用
         self.register_buffer("_zero1", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_one1", torch.ones(1, dtype=torch.float16))
+        # 生存信号缓冲别名: 首个代谢步覆写为新张量, 之前读零 (零调制)
+        self._survival_signal = self._zero1
         self.register_buffer("_intr_d0", torch.full((1,), 0.5, dtype=torch.float16))
         self.register_buffer("_one_s", torch.ones(1, self.cfg.max_seq_len - 1, 1, dtype=torch.float16))
         self.register_buffer(
@@ -562,15 +561,25 @@ class HybridPCNet(nn.Module):
         self.register_buffer("_gain_mask", (0.5 + torch.rand(d["l5"], d["l3"])).to(torch.float16))
         self.register_buffer("_gain_l3", (0.5 + torch.rand(d["l3"], d["l2"])).to(torch.float16))
 
-        # 突触资格迹 (每 Hebbian 外积矩阵同形, 零初始化)
-        _hebb_para_names = (
+        # RTR 逐状态价值表 (两行: 感知 / 回声) + 固定投影 (池化 z4 → 桶号)
+        self.register_buffer("_rtr_v", torch.zeros(2, RTR_V_BUCKETS, dtype=torch.float16))
+        _rtr_g = torch.Generator().manual_seed(RTR_PROJ_SEED)
+        self.register_buffer(
+            "_rtr_proj",
+            (torch.randint(0, 2, (d["l4"], RTR_V_BUCKETS), generator=_rtr_g) * 2 - 1).to(
+                torch.float16
+            ),
+        )
+
+        # 突触资格迹 (每权重矩阵同形, 零初始化)
+        _elig_para_names = (
             "W_04", "W_42", "W_23", "W_35", "W_56",
             "W_t4", "W_t2", "W_t3", "W_t5", "W_t6",
             "W_diff", "W_state_pred", "W_pred_54", "W_pred_43",
             "W_bind", "W_bind_self", "W_act",
             "W_lm", "W_lm_2", "W1",
         )
-        for _wn in _hebb_para_names:
+        for _wn in _elig_para_names:
             self.register_buffer(f"{_wn}_elig", torch.zeros_like(getattr(self, _wn).data))
 
         self._init_weights()
@@ -578,7 +587,9 @@ class HybridPCNet(nn.Module):
         from crates.corebrain import CoreBrain, CoreBrainConfig
 
         with torch.no_grad():
-            self._core_brain = CoreBrain(CoreBrainConfig(d_in=self.active_size["l4"])).to(self.W_04.device)
+            self._core_brain = CoreBrain(
+                CoreBrainConfig(d_in=self.active_size["l4"], window_len=self.cfg.max_seq_len)
+            ).to(self.W_04.device)
 
         # 引擎委托
         from crates.hybrid.forward import ForwardEngine
@@ -702,7 +713,7 @@ class HybridPCNet(nn.Module):
 
     def learn(self, byte_ids: torch.Tensor | None = None, closed_loop: bool = False, free_run: bool = False,
               force_perception: bool = False) -> dict:
-        """Hebbian 学习: 前馈 → 逐域误差 → 局部权重更新, 无反向传播.
+        """RTR 学习: 前馈 → 逐域误差 → 局部权重更新, 无反向传播.
 
         P3-b 节律内生: byte_ids 非 None 时由行为门 (模型内部状态) 决定本次走感知还是
         回声 (learn() 内部路由); force_perception=True 强制感知 (首步/恢复期旁路).

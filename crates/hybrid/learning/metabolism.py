@@ -11,6 +11,8 @@ import math
 
 import torch
 
+from crates.rtr import update_survival_signal
+
 from ._common import _MixinBase
 
 # E9 多尺度状态聚合预测误差 (e9_preregistration.md §三): F 加一项 λ·Σ_k w_k·mean_t(eps_k²).
@@ -42,30 +44,22 @@ class MetabolismMixin(_MixinBase):
         # (预测相对变差) 会被误差自身标准差吸收, E 对饥荒零判别力 (术前探针实证:
         # 随机字节/分布漂移/W_t 渐进病理下 E min 都停在 -0.008 平台噪声带内).
         # 绝对货币: 乱码输入 → 原始误差能量暴涨 → E 深潜 → 死亡线可达.
-        # sh.metab_f 仍供学习链用归一化 final_error (feedforward 契约不变, 显式优于隐式).
-        eps_lm_pad = sh.lm.eps_lm_pad
+        # D2 迹与货币必须同源. 货币 = sh.lm.eps_proj_ms (rms_norm 前投影能量均方 × F_UNIT_SCALE);
+        # 迹载体落在同一张量 eps_proj_raw (补零对齐 S), 不归一化. 旧载体 eps_lm_pad 是 rms_norm
+        # 输出 (逐位 ≈ fp16(0.990099·alive/256), 行存活计数而非误差幅值), 再 std() 归一 ⇒ 迹均方
+        # 按构造恒 ≈1, 对计价目标零判别力 (实测 cos²(E,∇F) = 3.14× 底噪).
+        # F 对投影的梯度 ∝ eps_proj_raw: 保留幅值, 迹才与 ∇F 同源同向同量级.
+        proj_pad = torch.cat(
+            [sh.lm.eps_proj_raw, net._padmax[:, :, :ctx.dim_4]], dim=1
+        )  # [N,S,dim_4] (补零对齐 S, 与旧 eps_lm_pad 同构)
         eps4 = sh.errs.eps4
-        # 零向量保护 (rms_norm 同族掩码式): 全零窗误差 std=0 → 0/0=NaN (挂针实证, 步 13
-        # 全零窗 W_04 起爆). 分母归零 = 该误差通道本步零信息 → 信号归零, 不写 NaN.
-        # 阈值取 finfo.tiny (fp16=6.1e-5): 除数低于最小正规数在 fp16 下才会失稳;
-        # eps (2^-11) 过宽会误伤真实低误差窗, tiny 是"除法良定义"的精确边界.
-        s_pred = eps_lm_pad.std(dim=-1, keepdim=True) * 1.01 + eps_lm_pad.std() * 1e-3
-        alive_p = (s_pred > torch.finfo(s_pred.dtype).tiny).to(s_pred.dtype)
-        err_pred_norm = eps_lm_pad * alive_p / torch.where(
-            alive_p > 0, s_pred, torch.ones_like(s_pred)
-        )
-        s_rec = eps4.std(dim=-1, keepdim=True) * 1.01 + eps4.std() * 1e-3
-        alive_r = (s_rec > torch.finfo(s_rec.dtype).tiny).to(s_rec.dtype)
-        err_recon_norm = eps4 * alive_r / torch.where(
-            alive_r > 0, s_rec, torch.ones_like(s_rec)
-        )
-        final_error = err_pred_norm + 0.2 * err_recon_norm
-        f_now = eps_lm_pad.square().mean() + 0.2 * eps4.square().mean()  # 0-dim fp16 标量
+        final_error = proj_pad + 0.2 * eps4
+        f_now = sh.lm.eps_proj_ms + 0.2 * eps4.square().mean()  # 0-dim fp16 标量
         # E9b-0 剂量/路径审计插桩 (e9b0_audit_preregistration.md): 默认关 = 零变更. 全部为
         # 诊断 buffer 写入, 不改权重、不改计算图、不改 RNG; 基线向量与三分量落 buffer 供报告步取样.
         audit = getattr(net, "_f_ms_audit", False)
         if audit:
-            net._audit_eps_lm_sq.copy_(eps_lm_pad.square().mean())
+            net._audit_eps_lm_sq.copy_(proj_pad.square().mean())
             net._audit_eps4_sq.copy_(eps4.square().mean())
             net._audit_vec_base_rms.copy_(final_error.square().mean().sqrt())
             sh.metab_f_base = final_error
@@ -210,6 +204,8 @@ class MetabolismMixin(_MixinBase):
             mad.copy_(torch.maximum(df.abs(), torch.tensor(1e-5, dtype=torch.float16)))  # tensor-guard: rare (冷启动一次性)
             setattr(net, cold_flag, False)
         net._metab_R = torch.tanh(df / (net.cfg.metab_tanh_div * mad))
+        # RTR 生存信号: 感知/回声皆无条件写入 (原写点在 _update_w_act, 仅闭环/回声且感知相早退)
+        update_survival_signal(net, ctx)
         # 7) P3-b 行为账本: 仅运行行为记账 (|R| EMA — 该行为最近收益体验); 非运行行为
         # 不更新不衰减 (留档记忆 — 衰减方向留作标定网格备选, 默认不实现)
         if ctx.echo_loop:

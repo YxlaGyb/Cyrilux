@@ -1,5 +1,5 @@
 ---
-description: "model：密集感知-预测-行动网络的配置与权重声明，加上共享神经调制与数值常量。"
+description: "model：稠密感知-预测-行动网络的配置与权重声明，加上共享神经调制与数值常量。"
 kind: "package-reference"
 ---
 
@@ -43,7 +43,7 @@ Run the model. These are thin delegations to the dense engines.
 |---|---|---|
 | `net.forward(byte_ids)` | Feed-forward | Inference feed-forward. Returns the future prediction deviation. Deterministic, ACh off. |
 | `net.generate(prompt, n_tokens, temperature, dev)` | Generation | Autoregressive generation from a prompt string. Returns bytes. |
-| `net.learn(byte_ids, closed_loop, free_run, force_perception)` | Learning | Hebbian learning step with no backpropagation and no teacher targets. Internal metabolism routes the step to perception or echo. |
+| `net.learn(byte_ids, closed_loop, free_run, force_perception)` | Learning | Trace-modulated learning step with no backpropagation and no teacher targets. Internal metabolism routes the step to perception or echo. |
 | `net.maybe_prune(step)` | Pruning | Metabolism-triggered remodelling seam. Polled every 8 steps; returns the trigger cause or None. Delegates the verdict to `net.pruner.decide()` and the physical collapse to `net.pruner.compact()`. Some steps only decide; a compaction runs when a death round fired or `compact_interval` elapsed and slots are releasable. |
 | `net.sync_gate()` | Routing | One routing handoff per step that reads the P3-b behavior gate and mirrors it to a CPU flag. |
 

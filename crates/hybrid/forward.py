@@ -312,7 +312,7 @@ class ForwardEngine:
         )
         rate_ema(net._r_l4[:dim_4], C4, net._rate_decay)
         net._P_l4 = bind(C4, survival_mask(net, "l4"))
-        z4_used = z4 if free_run else z4 + net._core_brain.forward(z4).unsqueeze(1)
+        z4_used = z4 if free_run else z4 + net._core_brain.forward(z4, byte_ids != 0).unsqueeze(1)
         z4_n = l2_norm(z4_used)
         mu2 = z4_n @ W_42_a.T + net.bias_l2[:dim_2]
         if free_run:
