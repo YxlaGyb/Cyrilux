@@ -6,8 +6,8 @@
 import torch
 from click.testing import CliRunner
 
-from crates.model import CyreneModel, HybridPCNet
 from crates.cli import app
+from crates.model import CyreneModel, HybridPCNet
 
 
 def test_resume_reconciles_max_seq_len(tmp_path):

@@ -43,8 +43,6 @@ def test_world_lang_module_isolated_from_model():
     # 核心库 (crates/model) 任何文件不得 import world_lang (报告仪表不进核心库)
     model_root = Path(__file__).resolve().parent.parent / "crates" / "model"
     for p in model_root.rglob("*.py"):
-        if "_archived_sparse" in p.parts:
-            continue
         assert "world_lang" not in p.read_text(encoding="utf-8"), f"{p} 引用 world_lang"
 
 

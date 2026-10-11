@@ -4,8 +4,8 @@ import inspect
 
 import torch
 
-from crates.model import CyreneModel, HybridPCNet
 from crates.hybrid.learning.action import ActionMixin
+from crates.model import CyreneModel, HybridPCNet
 
 TAU_LO = 0.9
 TAU_HI = 2.5

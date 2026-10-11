@@ -30,6 +30,7 @@ _BY_LAYER = (  # (名字模板, 形态, 处理者)
     ("_stp_tau_{l}", "vec", "aux"),
     ("_stp_u_{l}", "vec", "aux"),
     ("_stp_active_ema_{l}", "vec", "aux"),
+    ("_r_{l}", "vec", "aux"),
 )
 _L4_ONLY = (  # 行 = L4
     ("b_diff", "vec", "aux"),
@@ -52,6 +53,14 @@ _L5_ONLY = (
     ("W_pred_54", "row", "done"),
     ("W_pred_54_elig", "row", "aux"),
 )
+_MX_LAYER = (  # (层, 全层激活侧抑制矩阵) — l5 在 foldiak 臂为恒零占位 (见 _MX_PLACEHOLDER)
+    ("l4", "M_x4"),
+    ("l2", "M_x2"),
+    ("l3", "M_x3"),
+    ("l5", "M_x5"),
+    ("l6", "M_x6"),
+)
+_MX_PLACEHOLDER = frozenset(("M_x5",))
 _SPECIAL = ("W1", "W1_elig", "_dw_buf", "_mem_m", "_gain_mask", "_gain_l3")
 _EXEMPT = (
     "W_bind_self_elig",
@@ -78,6 +87,7 @@ def _row_state() -> dict[str, tuple[str, str, str]]:
                 t[name] = (lyr, form, handler)
     for lyr, spec in (("l4", _L4_ONLY), ("l5", _L5_ONLY)):
         t.update({n: (lyr, f, h) for n, f, h in spec})
+    t.update({mx: (lyr, "sq", "aux") for lyr, mx in _MX_LAYER})
     t.update(dict.fromkeys(_SPECIAL, ("l4", "special", "done")))
     t.update(dict.fromkeys(_EXEMPT, ("-", "exempt", "exempt")))
     from crates.model.model_cyrene import _ACTIVE_EMA_LAYER
@@ -87,3 +97,5 @@ def _row_state() -> dict[str, tuple[str, str, str]]:
 
 
 ROW_STATE = _row_state()
+
+MX_PLACEHOLDER = _MX_PLACEHOLDER

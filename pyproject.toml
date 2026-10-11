@@ -36,9 +36,6 @@ include = [
     "crates","crates.*",
     "dataset","dataset.*",
 ]
-exclude = [
-    "crates._archived_sparse","crates._archived_sparse.*",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

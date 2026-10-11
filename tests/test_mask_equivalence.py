@@ -29,7 +29,7 @@ def _make_net(seed: int = 0) -> HybridPCNet:
     return HybridPCNet(cfg)
 
 
-def _full_compete(h, S, k):
+def _full_compete(h, S, k, M_x=None, lam=0.0, g=None):
     """竞争退化: 全通过 (等价掩码关闭, S 全一时与原 topk 恒等路径对齐)."""
     return h, torch.ones_like(h, dtype=torch.bool)
 
@@ -99,7 +99,7 @@ def test_mask_on_changes_trajectory_and_is_finite(monkeypatch):
     torch.manual_seed(321)
     for x in xin:
         net_on.learn(x)
-        assert torch.isfinite(net_on._z4).all()
+    assert all(torch.isfinite(p).all() for p in net_on.parameters()), "掩码开启下出现 NaN/inf"
     on = _snap_params(net_on)
 
     monkeypatch.setattr(fwd, "compete", _full_compete)
@@ -120,3 +120,40 @@ def test_dead_units_gated_out_of_plastic_code():
     net.learn(torch.randint(32, 256, (1, 12), dtype=torch.long))
     assert not net._P_l4[..., :8].any(), "死神经元进入可塑码"
     assert net._P_l4[..., 8:].any(), "活神经元被误杀"
+
+
+def _tiny_prune_net() -> HybridPCNet:
+    torch.manual_seed(0)
+    cfg = CyreneModel(
+        d_l4=512, d_l2=192, d_l3=192, d_l5=192, d_l6=128,
+        prune_warmup=0, prune_fraction=0.6, death_probation=1,
+        active_size_lower_bound=128, l4_lower_bound=512,
+        mem_k0=1, mem_k_max=1, input_history=True, max_seq_len=8,
+    )
+    return HybridPCNet(cfg)
+
+
+def test_survival_mask_tracks_physical_width_through_pruning():
+    """压实 (perm/shrink) 后 _S_l 物理宽度必须与 active_size 对齐, 且前向不崩."""
+    net = _tiny_prune_net()
+    net.learn(torch.randint(0, 256, (1, 4), dtype=torch.long))
+    with torch.no_grad():
+        w35 = net.W_35.data.clone()
+        a5, n_low = w35.shape[0], 115
+        top_a5 = a5 - n_low
+        w35[:top_a5] = w35[:top_a5] / (w35[:top_a5].norm(dim=1, keepdim=True) + 1e-6) * 3.0
+        w35[top_a5:] = w35[top_a5:] / (w35[top_a5:].norm(dim=1, keepdim=True) + 1e-6) * 1e-6
+        net.W_35.copy_(w35.to(torch.float16))
+        for name in ("W_04", "W_42", "W_23", "W_56"):
+            p = getattr(net, name).data
+            p.copy_((p / (p.norm(dim=1, keepdim=True) + 1e-6)).to(torch.float16))
+
+    net.pruner.decide()
+    net.pruner.decide()
+    net.pruner.compact()
+    assert net.active_size["l5"] < 192, "L5 未被剪, 测试前提失效"
+    for layer in _LAYERS:
+        assert getattr(net, f"_S_{layer}").shape[0] == net.active_size[layer], (
+            f"{layer} 压实后 S 宽度与物理宽度错位"
+        )
+    net.learn(torch.randint(0, 256, (1, 4), dtype=torch.long))

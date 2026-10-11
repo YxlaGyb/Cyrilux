@@ -30,9 +30,13 @@ LAYER_CONFIG = {
     LAYER_L6: (64, 0.95, 0.10),
 }
 
-# k-WTA 胜者比例, 按层名索引; 层名顺序与 HIDDEN_LAYERS 平行
+# 发放率目标比例 (k-WTA 胜者比例), 按层名索引; 层名顺序与 HIDDEN_LAYERS 平行
 LAYER_NAMES = ("l4", "l2", "l3", "l5", "l6")
-KWTA_RATIO = {n: LAYER_CONFIG[L][2] for n, L in zip(LAYER_NAMES, HIDDEN_LAYERS)}
+RHO_TARGET = {n: LAYER_CONFIG[L][2] for n, L in zip(LAYER_NAMES, HIDDEN_LAYERS)}
+
+# 侧抑制增益基频 λ0 (L5 现存经验值): λ_l = λ0·√(N_ref/N_l) 按出生维在 net 初始化定点标定,
+# 协方差元 ∈ [-1,1] → 1/√N 缩放保持抑制/驱动比跨层恒定; 定点一次, 不学习
+LAMBDA_0 = 0.2
 
 # 连接类型
 CONN_FEEDFORWARD = 0

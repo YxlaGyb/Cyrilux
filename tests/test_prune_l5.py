@@ -40,31 +40,53 @@ def _tiny_cfg(**over) -> CyreneModel:
     return CyreneModel(**kw)
 
 
-def test_l5_enters_layers_list():
-    """RED-1:layers 列表现在含 l5,且顺序保证依赖链 l3→l5→l6."""
+def test_layer_registry_covers_all_layers():
+    """RED-1:层登记表覆盖 l5,且下限/权重名与依赖链一致."""
+    from crates.neuron.survival import LAYERS
+
     cfg = _tiny_cfg()
     net = HybridPCNet(cfg)
     pruner = net.pruner
-    # 触发一次以填充内部字典
-    pruner._W_attr = None  # 强制重置状态
-    # 直接进 _prune 入口, 但不执行 (patch _step_counter 直接 return 的做法不好)
-    # 改用:读取主入口内部 hardcoded 顺序 — 我们 spy 通过手动调用 _prune 前先
-    #   检查 pruner._prune.__code__ 里的常量字符串太脆弱.
-    # 更直接: 手工构造 layers 字典 (按 _prune 内的字面量)
-    import inspect
-    src = inspect.getsource(pruner._prune)
-    # 断言顺序: l4,l2,l3,l5,l6
-    assert 'layers = ["l4", "l2", "l3", "l5", "l6"]' in src, (
-        "layers 未按依赖链登记 L5,或顺序不对"
-    )
-    assert '"l5": "W_35"' in src, "W_attr 漏登记 L5→W_35"
-    assert '"l5": "bias_l5"' in src, "b_attr 漏登记 L5→bias_l5"
-    assert '"l5": "l3"' in src, "src_layer 漏登记 L5→L3"
+    pruner._attrs()
+    assert tuple(LAYERS) == ("l4", "l2", "l3", "l5", "l6"), f"依赖链顺序错: {LAYERS}"
+    assert set(pruner._W_attr) == set(LAYERS)
+    assert pruner._W_attr["l5"] == "W_35", "W_attr 漏登记 L5→W_35"
+    assert pruner._b_attr["l5"] == "bias_l5", "b_attr 漏登记 L5→bias_l5"
+    assert pruner._bounds["l5"] == cfg.active_size_lower_bound
     del net
 
 
-def test_l5_prune_shapes_all_synced():
-    """RED-2: 真正剪一次 L5,断言 16 项张量形状同步 a5_new == active_size[l5].
+def _decide_until_dead(net, rounds: int = 2) -> None:
+    """跑满死缓期: 首轮登记死缓, 次轮死缓期满 → 关 S_l 工位."""
+    for _ in range(rounds):
+        net.pruner.decide()
+
+
+# 真死行的行范数: 必须低于 cfg.death_threshold (1e-4) 才不会被死缓复活
+_DEAD_NORM = 1e-6
+
+
+def test_l5_decide_marks_slots_without_reshaping():
+    """判决侧: decide 只关 S_l 工位, 不改 active_size 也不改任何张量形状."""
+    cfg = _tiny_cfg()
+    net = HybridPCNet(cfg)
+    a5_init = net.active_size["l5"]
+    shape_w35 = tuple(net.W_35.shape)
+    net.learn(torch.randint(0, D_INPUT, (1, 4), dtype=torch.long), closed_loop=False, free_run=False)
+    with torch.no_grad():
+        w = net.W_35.data
+        a5 = w.shape[0]
+        top_a5 = a5 - 115
+        w[top_a5:] = w[top_a5:] / (w[top_a5:].norm(dim=1, keepdim=True) + 1e-6) * _DEAD_NORM
+    _decide_until_dead(net)
+
+    assert int(net._S_l5.sum()) < a5_init, "判决侧未关任何 L5 工位"
+    assert net.active_size["l5"] == a5_init, "判决侧不得改变物理宽度"
+    assert tuple(net.W_35.shape) == shape_w35, "判决侧不得改变张量形状"
+
+
+def test_l5_compact_shapes_all_synced():
+    """压实侧: decide 关位后 compact 真正裁掉, 断言 16 项张量形状同步.
 
     准备:把 W_35 末尾 60 行手工设成极小 (触发排名淘汰), 其他层所有权重保持 0.1×
     随机 (保证不触发它们剪或剪也不影响 L5 观测).
@@ -74,30 +96,27 @@ def test_l5_prune_shapes_all_synced():
     # 初始形状
     assert net.active_size["l5"] == cfg.d_l5 == 192, f"init bad a5={net.active_size['l5']}"
 
-    # 手工制造 L5 低活:W_35 后 115 行 (约60%) 行范数压到几乎 0,其余行保持中等
+    byte_ids = torch.randint(0, D_INPUT, (1, 4), dtype=torch.long)
+    net.learn(byte_ids, closed_loop=False, free_run=False)
+
+    # learn 会重写权重范数 → 手工制造 L5 真死行必须在 learn 之后
     with torch.no_grad():
-        w35 = net.W_35.data.clone()
+        w35 = net.W_35.data
         a5 = w35.shape[0]
         n_low = 115
         top_a5 = a5 - n_low  # 77
-        # 前 top_a5 行放大 (给一个明显大的 norm)
         w35[:top_a5] = w35[:top_a5] / (w35[:top_a5].norm(dim=1, keepdim=True) + 1e-6) * 3.0
-        # 后 n_low 行压到 1e-3 级别
-        w35[top_a5:] = w35[top_a5:] / (w35[top_a5:].norm(dim=1, keepdim=True) + 1e-6) * 0.001
-        net.W_35.copy_(w35.to(torch.float16))
-        # 也给 L4/L2/L3/L6 的 W_* 保持合理范围,避免别的层触发过度修剪
+        w35[top_a5:] = w35[top_a5:] / (w35[top_a5:].norm(dim=1, keepdim=True) + 1e-6) * _DEAD_NORM
         for name in ("W_04", "W_42", "W_23", "W_56"):
             p = getattr(net, name).data
             p.copy_((p / (p.norm(dim=1, keepdim=True) + 1e-6) * 1.0).to(torch.float16))
 
-    # 用极短的字节序列跑 learn,推进内部状态后直调 _prune
-    byte_ids = torch.randint(0, D_INPUT, (1, 4), dtype=torch.long)
-    # 不关心 loss — 只要 shape 对就好
     try:
-        net.learn(byte_ids, closed_loop=False, free_run=False)
-        net.pruner._prune()
+        _decide_until_dead(net)
+        assert net.pruner.has_releasable(), "关位后应达到可压实门槛"
+        net.pruner.compact()
     except Exception as e:
-        pytest.fail(f"首步 learn 直接抛异常 {type(e).__name__}: {e}")
+        pytest.fail(f"判压直接抛异常 {type(e).__name__}: {e}")
 
     a5_new = net.active_size["l5"]
     assert a5_new < 192, f"L5 没被剪! a5_new={a5_new}"
@@ -165,19 +184,20 @@ def test_l5_prune_then_forward_no_crash():
     """RED-3:修剪后再跑一次 forward + learn,确保 matmul 形状全对齐,无 NaN/shape 崩。"""
     cfg = _tiny_cfg()
     net = HybridPCNet(cfg)
-    # 准备 L5 低活
-    with torch.no_grad():
-        a5 = net.W_35.shape[0]
-        n_low = 115
-        top_a5 = a5 - n_low
-        net.W_35.data[:top_a5].mul_(3.0)
-        net.W_35.data[top_a5:].mul_(0.001)
     byte_ids_a = torch.randint(0, D_INPUT, (1, 4), dtype=torch.long)
     byte_ids_b = torch.randint(0, D_INPUT, (1, 4), dtype=torch.long)
 
-    # Step1:修剪发生
+    # learn 会重写权重范数 → 手工制造真死行必须在 learn 之后
     net.learn(byte_ids_a, closed_loop=False, free_run=False)
-    net.pruner._prune()
+    with torch.no_grad():
+        w = net.W_35.data
+        a5 = w.shape[0]
+        top_a5 = a5 - 115
+        w[top_a5:] = w[top_a5:] / (w[top_a5:].norm(dim=1, keepdim=True) + 1e-6) * _DEAD_NORM
+
+    # Step1:判决 + 压实发生
+    _decide_until_dead(net)
+    net.pruner.compact()
     # 断言修剪真的发生
     assert net.active_size["l5"] < cfg.d_l5, "L5 未剪,测试前提失效"
 
@@ -215,7 +235,7 @@ def test_l4_shrink_w1_markers_aligned():
     """
     cfg = CyreneModel(
         d_l4=768, d_l2=128, d_l3=128, d_l5=128, d_l6=128,
-        prune_warmup=0, prune_fraction=0.05,
+        prune_warmup=0, prune_fraction=0.05, death_probation=1,
         active_size_lower_bound=128, l4_lower_bound=512,
         mem_k0=3, mem_k_max=3, max_seq_len=8,
     )
@@ -243,7 +263,8 @@ def test_l4_shrink_w1_markers_aligned():
     net._mem_g.copy_(torch.tensor([0.9, 0.5, 0.1], dtype=torch.float16))
     net.mem_pool.famine_kill()
     assert net._mem_m.shape[0] == K - 1
-    net.pruner._prune()
+    _decide_until_dead(net)
+    net.pruner.compact()
     a4 = net.active_size["l4"]
     assert a4 < 768 and a4 >= 512, f"L4 未剪/触底异常 a4={a4}"
 
@@ -273,7 +294,12 @@ def test_l4_shrink_then_learn_no_shape_crash():
     cfg = _tiny_cfg(d_l4=576)  # > l4_lower_bound=512 → L4 真收缩
     net = HybridPCNet(cfg)
     net.learn(torch.randint(0, 256, (1, 8), dtype=torch.long))
-    net.pruner._prune()
+    with torch.no_grad():
+        w = net.W_04.data
+        n_low = 64
+        w[-n_low:] = w[-n_low:] / (w[-n_low:].norm(dim=1, keepdim=True) + 1e-6) * _DEAD_NORM
+    _decide_until_dead(net)
+    net.pruner.compact()
     a4 = net.active_size["l4"]
     assert a4 < net.cfg.d_l4
     assert net._dw_slot.shape == (1, a4, a4)

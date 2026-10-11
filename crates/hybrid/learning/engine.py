@@ -284,7 +284,10 @@ class EngineCore(
             self._update_feed_ff(ctx, sh)
             self._update_W35(ctx, sh)
             self._update_pred_engine(ctx, sh)
-            self._update_Ml5(ctx, sh)
+            if net.cfg.l5_inhibition == "ml":
+                self._update_Mx(ctx, sh, "l5")
+            else:
+                self._update_Ml5(ctx, sh)
             self._apply_diff(ctx, sh)
             self._update_wt_family(ctx, sh)
         sh.d_t = self._update_lm_head(ctx, sh)
@@ -292,6 +295,8 @@ class EngineCore(
             self.net.mem_pool.update(ctx, sh)
             self._update_bind(ctx, sh)
             self._update_w_act(ctx, sh)
+            for _mx_layer in ("l4", "l2", "l3", "l6"):
+                self._update_Mx(ctx, sh, _mx_layer)
         self._final_softnorm(ctx, sh)
         # P3-b 行为门: 本步末算下一步的路由决策 (全 GPU 零同步; 自由运行不结算)
         self._update_gate(ctx, sh)

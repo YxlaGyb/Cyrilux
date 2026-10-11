@@ -13,6 +13,8 @@ from dataclasses import asdict, dataclass, fields, replace
 import torch
 from torch import nn
 
+from crates.model.constants import LAMBDA_0
+
 
 @dataclass
 class CyreneModel:
@@ -72,6 +74,10 @@ class CyreneModel:
     # 读出端诊断开关
     lm_freeze_w1: bool = False
     lm_no_contrast: bool = False
+
+    # L5 侧抑制机制二选一: "foldiak" = M_l5 协方差白化 (现行), "ml" = M_x5 反赫布共激活抑制.
+    # flag 同时门控前向项与学习规则; 其余层 M_x* 与 flag 无关恒活跃
+    l5_inhibition: str = "foldiak"
 
     # 竞争性记忆单元群
     mem_k0: int = 6
@@ -534,6 +540,25 @@ class HybridPCNet(nn.Module):
 
         # 侧抑制矩阵 L5 激活去相关
         self.M_l5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
+        # 全层激活侧抑制 M_x* (x=抑制): 反赫布共激活去同质化, 活跃空间与 E_* (权重空间) 正交.
+        # 零起步 = 无抑制, 出生时逐位等价旧路径; λ_l 由出生维定点标定一次 (不学习)
+        _lam_ref = d["l4"]
+        self._lam = {
+            _sln: LAMBDA_0 * math.sqrt(_lam_ref / d[_sln])
+            for _sln in ("l4", "l2", "l3", "l5", "l6")
+        }
+        self.M_x4 = nn.Parameter(torch.zeros(d["l4"], d["l4"], dtype=torch.float16))
+        self.M_x2 = nn.Parameter(torch.zeros(d["l2"], d["l2"], dtype=torch.float16))
+        self.M_x3 = nn.Parameter(torch.zeros(d["l3"], d["l3"], dtype=torch.float16))
+        self.M_x5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
+        self.M_x6 = nn.Parameter(torch.zeros(d["l6"], d["l6"], dtype=torch.float16))
+
+        # 发放率 EMA (胜者 mask 逐窗折叠占比): 率治理 g_rate 的内在状态, 零起步 → g≡1,
+        # 出生态逐位等价; 修剪置换对齐由 registry vec/aux 承载
+        self._rate_decay = 0.01
+        for _sln in ("l4", "l2", "l3", "l5", "l6"):
+            self.register_buffer(f"_r_{_sln}", torch.zeros(d[_sln], dtype=torch.float16))
+
         self.register_buffer("_gain_mask", (0.5 + torch.rand(d["l5"], d["l3"])).to(torch.float16))
         self.register_buffer("_gain_l3", (0.5 + torch.rand(d["l3"], d["l2"])).to(torch.float16))
 
@@ -569,7 +594,7 @@ class HybridPCNet(nn.Module):
         for name, p in self.named_parameters():
             if "bias" in name:
                 continue
-            if name in ("E_l5", "E_42", "E_23", "M_l5", "E_t2", "E_t3", "E_t4", "E_t5", "E_t6", "E_bind", "E_bind_col", "E_04", "E_bind_self"):
+            if name in ("E_l5", "E_42", "E_23", "M_l5", "E_t2", "E_t3", "E_t4", "E_t5", "E_t6", "E_bind", "E_bind_col", "E_04", "E_bind_self", "M_x4", "M_x2", "M_x3", "M_x5", "M_x6"):
                 continue
             if name == "W_act":
                 nn.init.normal_(p, mean=0.0, std=1.0 / math.sqrt(self.bind_slot_dim))

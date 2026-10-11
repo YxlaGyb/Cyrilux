@@ -18,15 +18,15 @@ if TYPE_CHECKING:
     from crates.model.model_cyrene import HybridPCNet
 
 from crates.kernels import cubic, l2_norm, rms_norm, saturate
-from crates.model.constants import KWTA_RATIO
+from crates.model.constants import RHO_TARGET
 from crates.neuron import survival_mask
 
-from .mask import bind, compete
+from .mask import bind, compete, g_rate, rate_ema
 
 
 def _k(layer: str, width: int) -> int:
     """k-WTA 胜者数: 由 LAYER_CONFIG 比例导出, 不新增常数."""
-    return max(1, int(KWTA_RATIO[layer] * width))
+    return max(1, int(RHO_TARGET[layer] * width))
 
 
 class ForwardEngine:
@@ -306,7 +306,11 @@ class ForwardEngine:
         else:
             stp4 = None
         z4 = self._recurrent(mu4, dev, net.W_t4[:dim_4, :dim_4], stp=stp4, stp_tag="l4" if free_run else None)
-        z4, C4 = compete(z4, survival_mask(net, "l4"), _k("l4", dim_4))
+        z4, C4 = compete(
+            z4, survival_mask(net, "l4"), _k("l4", dim_4),
+            net.M_x4[:dim_4, :dim_4], net._lam["l4"], g_rate(net._r_l4[:dim_4], RHO_TARGET["l4"]),
+        )
+        rate_ema(net._r_l4[:dim_4], C4, net._rate_decay)
         net._P_l4 = bind(C4, survival_mask(net, "l4"))
         z4_used = z4 if free_run else z4 + net._core_brain.forward(z4).unsqueeze(1)
         z4_n = l2_norm(z4_used)
@@ -318,7 +322,11 @@ class ForwardEngine:
             stp=(net._stp_r_l2[:dim_2], net._stp_tau_l2[:dim_2], net._stp_u_l2[:dim_2]) if free_run else None,
             stp_tag="l2" if free_run else None,
         )
-        z2, C2 = compete(z2, survival_mask(net, "l2"), _k("l2", dim_2))
+        z2, C2 = compete(
+            z2, survival_mask(net, "l2"), _k("l2", dim_2),
+            net.M_x2[:dim_2, :dim_2], net._lam["l2"], g_rate(net._r_l2[:dim_2], RHO_TARGET["l2"]),
+        )
+        rate_ema(net._r_l2[:dim_2], C2, net._rate_decay)
         net._P_l2 = bind(C2, survival_mask(net, "l2"))
         z2_n = l2_norm(z2)  # 只归一化输入, 保方向压尖峰
         mu3 = z2_n @ W_23_a.T + net.bias_l3[:dim_3]
@@ -336,7 +344,11 @@ class ForwardEngine:
         )
         if free_run:
             z3 = saturate(z3)  # 分流抑制: 断 z3 下游尖峰链, 仅自由运行
-        z3, C3 = compete(z3, survival_mask(net, "l3"), _k("l3", dim_3))
+        z3, C3 = compete(
+            z3, survival_mask(net, "l3"), _k("l3", dim_3),
+            net.M_x3[:dim_3, :dim_3], net._lam["l3"], g_rate(net._r_l3[:dim_3], RHO_TARGET["l3"]),
+        )
+        rate_ema(net._r_l3[:dim_3], C3, net._rate_decay)
         net._P_l3 = bind(C3, survival_mask(net, "l3"))
         z3_n = l2_norm(z3)
         # L5 统一单矩阵
@@ -344,10 +356,22 @@ class ForwardEngine:
         if free_run:
             z5 = z5 + net.cfg.osc_amp_f * vf  # 快节律 → L5 预激活
         # 路由分离: z5_raw 原始幅度喂 W_diff, z5 去中心化喂下游.
-        # Foldiak 反赫布侧抑制: M 学协方差 → 白化去相关 (零起步 = 恒等).
-        # z5 不做三阶: 稀疏尖峰经三阶翻转放大 → W_diff 差分 NaN, 非线性由 z3 承载
-        z5_fd = z5 - 0.2 * (net.M_l5[:dim_5, :dim_5] @ z5.transpose(-2, -1)).transpose(-2, -1)
-        z5_raw, C5 = compete(z5_fd, survival_mask(net, "l5"), _k("l5", dim_5))
+        # L5 侧抑制二选一 (cfg.l5_inhibition): "ml" = M_x5 反赫布共激活抑制; "foldiak" = M_l5
+        # 协方差白化 (z5_fd 项, 零起步恒等), M_x5 不进前向 (恒零占位). 两臂的 z5 去中心化
+        # 都在 compete 之后, 不属抑制机制
+        if net.cfg.l5_inhibition == "ml":
+            z5_raw, C5 = compete(
+                z5, survival_mask(net, "l5"), _k("l5", dim_5),
+                net.M_x5[:dim_5, :dim_5], net._lam["l5"], g_rate(net._r_l5[:dim_5], RHO_TARGET["l5"]),
+            )
+        else:
+            # Foldiak 反赫布侧抑制: M 学协方差 → 白化去相关 (零起步 = 恒等).
+            # z5 不做三阶: 稀疏尖峰经三阶翻转放大 → W_diff 差分 NaN, 非线性由 z3 承载
+            z5_fd = z5 - 0.2 * (net.M_l5[:dim_5, :dim_5] @ z5.transpose(-2, -1)).transpose(-2, -1)
+            z5_raw, C5 = compete(
+                z5_fd, survival_mask(net, "l5"), _k("l5", dim_5), g=g_rate(net._r_l5[:dim_5], RHO_TARGET["l5"]),
+            )
+        rate_ema(net._r_l5[:dim_5], C5, net._rate_decay)
         net._P_l5 = bind(C5, survival_mask(net, "l5"))
         z5 = z5_raw - z5_raw.mean(dim=-1, keepdim=True)
         mu6 = z5 @ W_56_a.T + net.bias_l6[:dim_6]
@@ -358,7 +382,11 @@ class ForwardEngine:
             stp=(net._stp_r_l6[:dim_6], net._stp_tau_l6[:dim_6], net._stp_u_l6[:dim_6]) if free_run else None,
             stp_tag="l6" if free_run else None,
         )
-        z6, C6 = compete(z6, survival_mask(net, "l6"), _k("l6", dim_6))
+        z6, C6 = compete(
+            z6, survival_mask(net, "l6"), _k("l6", dim_6),
+            net.M_x6[:dim_6, :dim_6], net._lam["l6"], g_rate(net._r_l6[:dim_6], RHO_TARGET["l6"]),
+        )
+        rate_ema(net._r_l6[:dim_6], C6, net._rate_decay)
         net._P_l6 = bind(C6, survival_mask(net, "l6"))
 
         # W_diff 在 L4 空间预测 Δz4, eps_diff 驱动 W_diff 学习动力学

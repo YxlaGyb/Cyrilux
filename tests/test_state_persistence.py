@@ -39,6 +39,24 @@ def _cfg(**over) -> CyreneModel:
 BATCH = torch.randint(0, 255, (1, 16), dtype=torch.long)
 
 
+def _kill_l4_rows(net: HybridPCNet, n: int = 64) -> None:
+    """制造真死行: 尾部 n 行范数压到 death_threshold (1e-4) 以下.
+
+    判决侧只认「死缓期满且未复活」的工位, 故行范数必须真低于阈值才能压实.
+    """
+    with torch.no_grad():
+        w = net.W_04.data
+        w[-n:] = w[-n:] / (w[-n:].norm(dim=1, keepdim=True) + 1e-6) * 1e-6
+
+
+def _decide_then_compact(net: HybridPCNet, rounds: int = 2) -> None:
+    """判决 → 压实: 首轮登记死缓, 次轮死缓期满关 S_l 工位, 最后物理折叠."""
+    _kill_l4_rows(net)
+    for _ in range(rounds):
+        net.pruner.decide()
+    net.pruner.compact()
+
+
 def _step(net: HybridPCNet, i: int) -> None:
     """三条路径轮换: 感知 / 回声 / 自由运行. 每步固定种子 → 两侧随机流一致."""
     torch.manual_seed(11 + i)
@@ -159,8 +177,8 @@ def test_pruned_checkpoint_roundtrips(tmp_path):
     net = HybridPCNet(cfg)
     for i in range(6):
         _step(net, i)
-    net._prune()
-    net._prune()
+    _decide_then_compact(net)
+    _decide_then_compact(net)
     assert net.active_size["l4"] < 600, "本测试需要真实收缩"
 
     p = tmp_path / "pruned.safetensors"
@@ -183,8 +201,8 @@ def test_load_dims_follow_checkpoint(tmp_path):
     net = HybridPCNet(_cfg(**kw))
     for i in range(6):
         _step(net, i)
-    net._prune()
-    net._prune()
+    _decide_then_compact(net)
+    _decide_then_compact(net)
     assert net.active_size["l4"] < 600, "本测试需要真实收缩"
 
     p = tmp_path / "pruned.safetensors"
@@ -264,7 +282,7 @@ def _prune_capture_perms(net: HybridPCNet) -> dict[str, torch.Tensor]:
 
     PruningEngine._permute_weights = _wrap
     try:
-        net._prune()
+        _decide_then_compact(net)
     finally:
         PruningEngine._permute_weights = orig
     return perms
@@ -300,7 +318,7 @@ def test_prune_then_train_stays_consistent():
     )
     for i in range(6):
         _step(net, i)
-    net._prune()
+    _decide_then_compact(net)
     for i in range(6, 12):
         _step(net, i)
     a4 = net.active_size["l4"]

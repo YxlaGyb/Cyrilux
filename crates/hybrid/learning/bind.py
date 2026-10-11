@@ -38,6 +38,27 @@ class BindMixin(_MixinBase):
         eye_mask = 1.0 - torch.eye(dim_5, device=dev, dtype=torch.float16)
         net.M_l5[:dim_5, :dim_5].data.mul_(0.99).add_((cov * eye_mask) * (0.01 * ctx.learn_boost))
 
+    _MX_PARAM = {"l4": "M_x4", "l2": "M_x2", "l3": "M_x3", "l5": "M_x5", "l6": "M_x6"}
+
+    def _update_Mx(self, ctx, sh, layer: str) -> None:
+        """反赫布共激活侧抑制更新: dM ∝ −(ccᵀ − diag(c²)), c = 胜者 mask 逐窗折叠 [N].
+
+        同时共激活的神经元对被抑制 (去同质化); c ∈ {0,1}/N_avg 折叠, 协方差元 ∈ [-1,1],
+        增量 fp16 直接可表示. 回声相位冻结 (C5 合约), 与 _update_Ml5 同构: 0.99 EMA +
+        零对角 + learn_boost 缩放. Oja 式约束由 EMA 遗忘 × 有界增量承载.
+        """
+        net = self.net
+        if ctx.echo_world_frozen:
+            return
+        dim = getattr(ctx, f"dim_{layer[1]}")
+        C = getattr(net, f"_P_{layer}")
+        c = C.to(torch.float16).mean(dim=(0, 1))
+        c = c / (c.norm() + 1e-3)
+        cov = torch.outer(c, c)
+        eye_mask = 1.0 - torch.eye(dim, device=ctx.dev, dtype=torch.float16)
+        M = getattr(net, self._MX_PARAM[layer])[:dim, :dim]
+        M.data.mul_(0.99).sub_((cov * eye_mask) * (0.01 * ctx.learn_boost))
+
     def _update_bind(self, ctx, sh):
         """竞争性概念绑定层更新 (纯外积) + 内在驱动 W_bind_self."""
         net = self.net

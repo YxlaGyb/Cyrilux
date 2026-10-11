@@ -19,6 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from exp115_say import _SamplePrefetch  # noqa: E402  (需先注入 scripts/ 到 sys.path)
+
 from crates.cli.commands.train_cmd import skip_zero_windows, window_or_skip  # noqa: E402
 
 
@@ -77,7 +78,7 @@ def test_window_or_skip_text_field():
     assert window_or_skip({"text": ""}, 8) is None
     assert window_or_skip({"text": "  "}, 8) == b"  "
     assert window_or_skip({"text": "abcdefghijk"}, 8) == b"abcdefgh"
-    assert window_or_skip({"text": "你好"}, 8) == "你好".encode("utf-8")
+    assert window_or_skip({"text": "你好"}, 8) == "你好".encode()
 
 
 def test_window_or_skip_conversations_field():
