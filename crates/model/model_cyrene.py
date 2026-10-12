@@ -1,6 +1,7 @@
-"""Cyrene 模型定义
+"""
+Cyrene 模型定义
 
-稠密 PPA 感知-预测-行动闭环网络.
+稠密 PPA 感知-预测-行动闭环网络
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from dataclasses import asdict, dataclass, fields, replace
 import torch
 from torch import nn
 
-from crates.model.constants import LAMBDA_0, RTR_PROJ_SEED, RTR_V_BUCKETS
+from crates.model.constants import LAMBDA_0
 
 
 @dataclass
@@ -22,7 +23,7 @@ class CyreneModel:
 
     # 维度
     d_input: int = 256
-    d_act: int = 256  # W_act 列数 (字节域 256, 具身模式 2)
+    d_act: int = 256  # W_act 列数，字节域 256
     d_l4: int = 1024
     d_l2: int = 384
     d_l3: int = 384
@@ -43,7 +44,7 @@ class CyreneModel:
     death_probation: int = 200
     death_threshold: float = 1e-4
     active_size_lower_bound: int = 128
-    l4_lower_bound: int = 512  # L4 承载表示+预测双任务, 维度坍缩到 NaN
+    l4_lower_bound: int = 512     # L4 承载表示+预测双任务, 维度坍缩到 NaN
     compact_interval: int = 5000  # 判决与物理压实的最小间隔，滞后执行
     adaptive_traction: bool = False
     lm_lr_boost: float = 1.0
@@ -111,6 +112,7 @@ class CyreneModel:
     metab_base_rate: float = 0.002
     metab_dip_margin: float = 0.10
     metab_death_steps: int = 250
+
     # 连续感知步 (无发声) 上限, 与 metab_death_steps 镜像 (留校准钮)
     metab_silence_steps: int = 250
 
@@ -123,6 +125,7 @@ class CyreneModel:
     metab_cost_learn: float = 1.0e-3
     metab_cost_mem: float = 3.0e-7
     metab_cost_say: float = 2.0e-3
+
     # E_ref = E 慢 EMA; 应激 = 饥荒契约进度 (starve_cnt/metab_death_steps), 零设计者增益
     metab_eref_rate: float = 0.002
 
@@ -260,7 +263,7 @@ class HybridPCNet(nn.Module):
         )
         self.register_buffer("_intr_omega", torch.tensor(0.3, dtype=torch.float16))
 
-        # 三尺度内源节律振荡器 (阶梯方波, fp16 可精确表示)
+        # 三尺度内源节律振荡器，阶梯方波
         for osc_name, osc_n in (("f", 64), ("m", 256), ("s", 1024)):
             self.register_buffer(f"_osc_{osc_name}_cnt", torch.zeros(1, dtype=torch.float16))
             self.register_buffer(
@@ -272,13 +275,13 @@ class HybridPCNet(nn.Module):
         for aen, lyr in _ACTIVE_EMA_LAYER.items():
             self.register_buffer(f"_active_ema_{aen}", torch.zeros(d[lyr], dtype=torch.float16))
 
-        # 冷启动登记: 集合给热路径 (免费成员判定), mask 给持久化. 缺 mask 键的旧检查点
+        # 冷启动登记: 集合给热路径，免费成员判定，mask 给持久化. 缺 mask 键的旧检查点
         # 解码为 0 → 集合空 → 首次用即快照, 与旧行为一致. 名称表与 buffer 同源, 不会漂移
         self._active_ema_names = tuple(f"_active_ema_{aen}" for aen in _ACTIVE_EMA_LAYER)
         self.register_buffer("_active_ema_init_mask", torch.zeros(1, dtype=torch.int32))
         self._active_ema_init: set[str] = set()
 
-        # STP 资源慢变量 (每递归层 + z_bind)
+        # STP 资源慢变量，每递归层 + z_bind
         stp_layers = [("l4", d["l4"]), ("l2", d["l2"]), ("l3", d["l3"]), ("l5", d["l5"]), ("l6", d["l6"]), ("bind", self.bind_slot_dim)]
         for sln, sdim in stp_layers:
             self.register_buffer(f"_stp_r_{sln}", torch.ones(sdim, dtype=torch.float16))
@@ -308,8 +311,8 @@ class HybridPCNet(nn.Module):
         self.register_buffer("_mem_g", torch.full((self.cfg.mem_k0,), self.cfg.mem_g_max / 2.0, dtype=torch.float16))
         self.register_buffer("_mem_q", torch.zeros(self.cfg.mem_k0, dtype=torch.float16))
 
-        # 出生冷却: int32 buffer 为持久化载体, _mem_birth_py 为热路径 CPU 镜像
-        # (对 GPU 张量做步级阈值比较是隐式 .item() 同步排空). 两者同步递增, load 回填镜像
+        # 出生冷却，int32 buffer 为持久化载体, _mem_birth_py 为热路径 CPU 镜像
+        # 对 GPU 张量做步级阈值比较是隐式 .item() 同步排空，两者同步递增，load 回填镜像
         self.register_buffer("_mem_birth_cd", torch.zeros(1, dtype=torch.int32))
         self._mem_birth_py = 0
         self.register_buffer("_mem_death_cnt", torch.zeros(self.cfg.mem_k0, dtype=torch.int32))
@@ -372,6 +375,7 @@ class HybridPCNet(nn.Module):
         # 打印掩码、序列掩码 — 全部随 state_dict 持久化, 每步复用
         self.register_buffer("_zero1", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_one1", torch.ones(1, dtype=torch.float16))
+
         # 生存信号缓冲别名: 首个代谢步覆写为新张量, 之前读零 (零调制)
         self._survival_signal = self._zero1
         self.register_buffer("_intr_d0", torch.full((1,), 0.5, dtype=torch.float16))
@@ -412,6 +416,7 @@ class HybridPCNet(nn.Module):
         self.register_buffer("_f_ms_absmax", torch.zeros(1, dtype=torch.float16))
         self.register_buffer("_f_ms_nonfinite", torch.zeros(1, dtype=torch.int32))
         self.register_buffer("_f_ms_rung", torch.zeros(1, dtype=torch.int32))
+
         # E9b-0 剂量/路径审计插桩 (e9b0_audit_preregistration.md): 全部 persistent=False,
         # 不入 state_dict → 检查点比对零变更; 仅在 net._f_ms_audit 为真时写入, 不参与任何更新.
         self.register_buffer("_audit_eps_lm_sq", torch.zeros(1, dtype=torch.float16), persistent=False)
@@ -539,6 +544,7 @@ class HybridPCNet(nn.Module):
 
         # 侧抑制矩阵 L5 激活去相关
         self.M_l5 = nn.Parameter(torch.zeros(d["l5"], d["l5"], dtype=torch.float16))
+
         # 全层激活侧抑制 M_x* (x=抑制): 反赫布共激活去同质化, 活跃空间与 E_* (权重空间) 正交.
         # 零起步 = 无抑制, 出生时逐位等价旧路径; λ_l 由出生维定点标定一次 (不学习)
         _lam_ref = d["l4"]
@@ -561,15 +567,8 @@ class HybridPCNet(nn.Module):
         self.register_buffer("_gain_mask", (0.5 + torch.rand(d["l5"], d["l3"])).to(torch.float16))
         self.register_buffer("_gain_l3", (0.5 + torch.rand(d["l3"], d["l2"])).to(torch.float16))
 
-        # RTR 逐状态价值表 (两行: 感知 / 回声) + 固定投影 (池化 z4 → 桶号)
-        self.register_buffer("_rtr_v", torch.zeros(2, RTR_V_BUCKETS, dtype=torch.float16))
-        _rtr_g = torch.Generator().manual_seed(RTR_PROJ_SEED)
-        self.register_buffer(
-            "_rtr_proj",
-            (torch.randint(0, 2, (d["l4"], RTR_V_BUCKETS), generator=_rtr_g) * 2 - 1).to(
-                torch.float16
-            ),
-        )
+        # RTR 逐状态价值账本 (行 = L4 特征轴, 随修剪同 perm; 列: 感知 / 回声)
+        self.register_buffer("_rtr_w", torch.zeros(d["l4"], 2, dtype=torch.float16))
 
         # 突触资格迹 (每权重矩阵同形, 零初始化)
         _elig_para_names = (
@@ -626,6 +625,7 @@ class HybridPCNet(nn.Module):
         """
         lm_in = self._lm_in
         dev = self.W1.device
+
         # R: 固定随机正交 [lm_in, d_res] (列正交; fp16 MGS 两遍正交化)
         r = torch.randn(lm_in, d_res, dtype=torch.float16, device=dev)
         for _ in range(2):
@@ -798,14 +798,18 @@ class HybridPCNet(nn.Module):
 
     def _apply(self, fn, recurse: bool = True):
         """游离张量随模型迁移设备 (nn.Module._apply 只搬参数与 buffer)."""
-        owned = {v.untyped_storage().data_ptr()
-                 for v in itertools.chain(self.parameters(), self.buffers())}
+        bufs = {v.untyped_storage().data_ptr(): n for n, v in self._buffers.items()}
+        owned = set(bufs) | {v.untyped_storage().data_ptr() for v in self.parameters()}
         out = super()._apply(fn, recurse)
         for k, v in list(self.__dict__.items()):
             if k in self._parameters or k in self._buffers:
                 continue
             if isinstance(v, torch.Tensor):
-                if v.untyped_storage().data_ptr() not in owned:
+                ptr = v.untyped_storage().data_ptr()
+                # buffer 别名必须改指搬过家的 buffer: 停在旧张量上会跨设备 (首次 learn 即崩)
+                if ptr in bufs:
+                    out.__dict__[k] = out._buffers[bufs[ptr]]
+                elif ptr not in owned:
                     out.__dict__[k] = fn(v)
             elif isinstance(v, dict):
                 for k2, v2 in list(v.items()):
@@ -851,6 +855,7 @@ class HybridPCNet(nn.Module):
                 f"完整检查点由当前 HybridPCNet.save 写出."
             )
         sd = load_file(path, device="cpu")
+
         # 维度一律以检查点形状为准 (config 只补非维度字段): 修剪是物理切片, 出生 dims
         # 与现存活尺寸故意不等, 若让 config 覆盖会得到 active_size 与 _mem_m 不一致的模型.
         dims = {
@@ -862,6 +867,7 @@ class HybridPCNet(nn.Module):
             "input_history": sd["W_04"].shape[1] != 256,
         }
         snap = meta.get("config")
+
         if snap is None:
             raise ValueError(f"{path} 缺 config 快照 (有 state_ver 就必须有)")
         _cfg_from_snapshot(path, snap)  # C9: 快照含未知字段一律 raise (显式 cfg 只管值, 不管口径校验)
@@ -878,6 +884,7 @@ class HybridPCNet(nn.Module):
                 "(旧架构检查点需一次性迁移, 运行时不提供关闭路径): "
                 f"{missing_core[:8]}{'…' if len(missing_core) > 8 else ''}"
             )
+
         # 记忆单元群是运行时状态, 按检查点重建 K 形缓冲与 W1 (修剪/生长后形状不符)
         for _bn in ("_mem_m", "_mem_g", "_mem_q", "_mem_a", "_mem_death_cnt"):
             if _bn in sd and sd[_bn].shape != getattr(net, _bn).shape:
@@ -893,6 +900,7 @@ class HybridPCNet(nn.Module):
                 net.W_lm_2 = nn.Parameter(torch.empty(net.d_h, net.cfg.d_input, dtype=torch.float16))
                 net.register_buffer("W_lm_elig", torch.zeros(net.d_h, net.cfg.d_input, dtype=torch.float16))
                 net.register_buffer("W_lm_2_elig", torch.zeros(net.d_h, net.cfg.d_input, dtype=torch.float16))
+
         if "w1v2_A_0" in sd:  # w1v2 检查点: 惰性重建 A_i/B_i/R (w1v2_prereg.md §1)
             net.init_w1v2()
         if "W1_new" in sd:  # 迁移扩 h 检查点: 惰性重建 W1_new/W_lm_new/B_new (migrate_expand_prereg.md §1)
@@ -900,6 +908,7 @@ class HybridPCNet(nn.Module):
         if "B_recon" in sd:  # 单通道迁移检查点: 惰性重建 B_recon (single_recon_prereg.md §1)
             net.init_single_recon()
         nsd = net.state_dict()
+
         # C9 fail-fast: 未知 state 键 = 检查点与当前模型口径错配 (退役键), 静默丢弃会让
         # 续跑在旧口径上静默漂移; attr.* 豁免 (游离张量, 下方第二循环消费)
         unknown = [k for k in sd if k not in nsd and not k.startswith(_ATTR_PREFIX)]
@@ -924,6 +933,7 @@ class HybridPCNet(nn.Module):
             "l5": net.W_56.shape[1],
             "l6": net.W_56.shape[0],
         }
+
         # 代谢哨兵标志一次性恢复 (CPU 侧): F_prev<0 → 未结算 (首步哨兵); MAD≤0 → 冷启动
         net._metab_settled = float(net._metab_F_prev_perc.item()) >= 0.0
         net._settled_perc = net._metab_settled
@@ -931,6 +941,7 @@ class HybridPCNet(nn.Module):
         net._metab_mad_cold_perc = float(net._metab_df_mad_perc.item()) <= 0.0
         net._metab_mad_cold_eco = float(net._metab_df_mad_eco.item()) <= 0.0
         net._lang_eps_cold = bool(torch.isnan(net._lang_eps_ema).item())
+
         # 热路径 CPU 镜像一次性回填 (镜像每步与 buffer 同步递增, 不参与 state_dict)
         net._step_py = int(net._step_counter.item())
         net._mem_birth_py = int(net._mem_birth_cd.item())
@@ -944,6 +955,7 @@ class HybridPCNet(nn.Module):
             "rep": int(meta[f"{_PY_PREFIX}_block_rep"]),
             "gen": int(meta[f"{_PY_PREFIX}_block_gen"]),
         }
+
         # 游离运行时张量: state_ver 门已保证存在, 故直接索引字典形态
         for k, v in sd.items():
             if not k.startswith(_ATTR_PREFIX):
@@ -954,7 +966,8 @@ class HybridPCNet(nn.Module):
                 getattr(net, dk)[dkey] = v
             else:
                 setattr(net, name, v)
-        # _mem_m 对齐活性 L4 (修剪后检查点)
+
+        # _mem_m 对齐活性 L4，修剪后检查点
         if net._mem_m.shape[1] != net.active_size["l4"]:
             old_m = net._mem_m.data
             net.register_buffer("_mem_m", old_m[:, : net.active_size["l4"]].contiguous())

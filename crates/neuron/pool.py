@@ -1,10 +1,10 @@
 """
 MemoryPool
-竞争性记忆单元群的生死原语 (全部纯局部机制).
+竞争性记忆单元群的生死原语，全部纯局部机制
 
-出生: 从父单元二分 (α×2 或 ÷2 交替).
-死亡: 归一/饥荒击杀, 单元缓冲 + W1 行 + W1_elig 迹同步重注册.
-复用工位与扩桌由 resize/birth 在同一 lm_in 不变量下完成.
+出生: 从父单元二分 (α×2 或 ÷2 交替)
+死亡: 归一/饥荒击杀, 单元缓冲 + W1 行 + W1_elig 迹同步重注册
+复用工位与扩桌由 resize/birth 在同一 lm_in 不变量下完成
 """
 
 from __future__ import annotations
@@ -21,13 +21,18 @@ if TYPE_CHECKING:
 
 
 class MemoryPool:
-    """记忆单元池: 持 net 引用, 操作 net._mem_*/W1 单元块."""
+    """
+    记忆单元池
+    持 net 引用, 操作 net._mem_*/W1 单元块.
+    """
 
     def __init__(self, net: HybridPCNet):
         self.net = net
 
     def update(self, ctx, sh):
-        """竞争性记忆单元群: 适应度 → 增益 → 出生/死亡 (全部纯局部机制).
+        """
+        竞争性记忆单元群:
+        适应度 → 增益 → 出生/死亡，全部纯局部机制
 
         出生: 读取误差快 EMA > 长程慢 EMA × 阈值 → 增益最高单元二分出子.
         死亡: g < g_min 持续超限 → 删除 (K_min=1 保底).
@@ -85,7 +90,9 @@ class MemoryPool:
             net._mem_birth_py = 0
 
     def resize(self, keep: torch.Tensor):
-        """K 变化: 单元缓冲 + W1 行 + W1_elig 迹同步重注册."""
+        """
+        K 变化: 单元缓冲 + W1 行 + W1_elig 迹同步重注册.
+        """
         net = self.net
         dim_4 = net._mem_m.shape[1]
         d_h = net.d_h
@@ -144,7 +151,8 @@ class MemoryPool:
         net._lm_in = head + keep.shape[0] * dim_4
 
     def famine_kill(self):
-        """饥荒击杀: 移除最低 _mem_g 的记忆单元 (索引 0 免疫, K_min=1 保底).
+        """
+        饥荒击杀: 移除最低 _mem_g 的记忆单元，索引 0 免疫, K_min=1 保底
 
         与 _update_mem_units 的 2000 步慢死亡不同: 这是代谢死亡回合的直接不可逆
         损失，内容与身份永久消失, 后续 birth 只会从存活父克隆新单元.

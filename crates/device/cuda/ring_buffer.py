@@ -1,10 +1,10 @@
-"""TensorRingBuffer — GPU 侧固定大小环形缓冲.
+"""
+TensorRingBuffer — GPU 侧固定大小环形缓冲.
 
 替代旧 EventBridge 中的 deque[SensoryEvent] Python 对象队列.
 单生产者单消费者, 无锁设计.
 
-ponytail: 当前 EventBridge 直接用 tensor slice 管理,
-此模块预留用于未来异步多流场景.
+当前 EventBridge 直接用 tensor slice 管理, 此模块预留用于未来异步多流场景.
 """
 
 from __future__ import annotations

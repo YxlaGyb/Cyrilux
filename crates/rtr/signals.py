@@ -16,12 +16,13 @@ if TYPE_CHECKING:
 
 
 def update_survival_signal(net: HybridPCNet, ctx) -> None:
-    """生存信号写点: 桶号 = argmax(池化 z4 · 固定投影), 行 = 感知 / 回声 双轨.
+    """
+    生存信号写点
+    状态 = 池化 z4, 账本 = 权向量 _rtr_w[:, 列], 列 = 感知 / 回声 双轨.
 
-    残差 m = _metab_R − V[行, 桶号] 由 rtr_residual 就地追踪后写入 net._survival_signal.
+    残差 m = _metab_R − w·ẑ 由 rtr_residual 就地追踪后写入 net._survival_signal.
     _metab_R 由 _update_metabolism 在本调用前结算 (行为门之外, 感知相亦有值).
     """
     pooled = net._z4.mean(dim=(0, 1))
-    index = (pooled @ net._rtr_proj).argmax().reshape(1)
-    row = 1 if ctx.echo_loop else 0
-    net._survival_signal = rtr_residual(net._rtr_v[row], index, net._metab_R, RTR_ETA_V)
+    col = 1 if ctx.echo_loop else 0
+    net._survival_signal = rtr_residual(net._rtr_w[:, col], pooled, net._metab_R, RTR_ETA_V)

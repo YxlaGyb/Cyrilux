@@ -1,7 +1,8 @@
-"""视图投影
+"""
+视图投影
 
-P_short / P_long 两组独立投影, 局部 delta 规则学. P_long_ema 是慢速目标编码器,
-只由 EMA 跟随 P_long, 不接收误差 (stop-grad).
+P_short / P_long 两组独立投影, 局部 delta 规则学.
+P_long_ema 是慢速目标编码器, 只由 EMA 跟随 P_long, 不接收误差 (stop-grad).
 """
 
 from __future__ import annotations

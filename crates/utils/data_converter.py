@@ -14,7 +14,7 @@ import argparse
 import json
 import os
 
-# ── 角色标记 ──
+# 角色标记
 ROLE_MARKERS = {
     "user": "<|user|>",
     "assistant": "<|assistant|>",
@@ -26,7 +26,9 @@ EOS = "<|end|>"
 
 
 def conversations_to_text(conv_list: list, gt_list: list | None = None) -> str:
-    """将 conversations 数组转换为纯文本。"""
+    """
+    将 conversations 数组转换为纯文本
+    """
     parts = []
     for msg in conv_list:
         role = msg.get("role", "user")
@@ -43,7 +45,9 @@ def conversations_to_text(conv_list: list, gt_list: list | None = None) -> str:
 
 
 def convert_sample(line: str) -> str | None:
-    """转换单行 jsonl 样本。返回 text 格式的 json 行，或 None（跳过）。"""
+    """
+    转换单行 jsonl 样本。返回 text 格式的 json 行，或 None 跳过
+    """
     try:
         sample = json.loads(line)
     except json.JSONDecodeError:
@@ -69,7 +73,9 @@ def convert_sample(line: str) -> str | None:
 
 
 def convert_file(input_path: str, output_path: str, max_samples: int | None = None):
-    """转换整个 jsonl 文件。"""
+    """
+    转换整个 jsonl 文件
+    """
     count = 0
     skipped = 0
     with open(input_path, "r", encoding="utf-8") as fin, open(output_path, "w", encoding="utf-8") as fout:
@@ -89,7 +95,9 @@ def convert_file(input_path: str, output_path: str, max_samples: int | None = No
 
 
 def scan_dataset_dir(data_dir: str) -> list[dict]:
-    """扫描目录，识别需要转换的文件。返回文件信息列表。"""
+    """
+    扫描目录，识别需要转换的文件。返回文件信息列表
+    """
     results = []
     if not os.path.isdir(data_dir):
         return results

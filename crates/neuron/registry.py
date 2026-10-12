@@ -1,13 +1,16 @@
 """
 行索引状态登记表.
 
-按神经元行索引的张量 → (层, 形态). 形态 vec=t[perm] / sq=t[perm][:,perm] / row=只排行.
-名录须完整: 漏项会让状态挂到别的神经元上 (test_prune_row_state_audit 校验覆盖度).
+按神经元行索引的张量 → (层, 形态).
+形态 vec=t[perm] / sq=t[perm][:,perm] / row=只排行.
+
+名录须完整，漏项会让状态挂到别的神经元上
+test_prune_row_state_audit 校验覆盖度
 """
 
 from __future__ import annotations
 
-# (层, 主权重, 时间核, Foldiak, 时间核去相关) — l6 无 Foldiak
+# (层, 主权重, 时间核, Foldiak, 时间核去相关)，l6 无 Foldiak
 _LAYERS = (
     ("l4", "W_04", "W_t4", "E_04", "E_t4"),
     ("l2", "W_42", "W_t2", "E_42", "E_t2"),
@@ -15,7 +18,9 @@ _LAYERS = (
     ("l5", "W_35", "W_t5", "E_l5", "E_t5"),
     ("l6", "W_56", "W_t6", "", "E_t6"),
 )
-_BY_LAYER = (  # (名字模板, 形态, 处理者)
+
+# (名字模板, 形态, 处理者)
+_BY_LAYER = (
     ("{w}", "row", "done"),
     ("{w}_elig", "row", "aux"),
     ("bias_{l}", "vec", "done"),
@@ -32,7 +37,9 @@ _BY_LAYER = (  # (名字模板, 形态, 处理者)
     ("_stp_active_ema_{l}", "vec", "aux"),
     ("_r_{l}", "vec", "aux"),
 )
-_L4_ONLY = (  # 行 = L4
+
+# 行 = L4
+_L4_ONLY = (
     ("b_diff", "vec", "aux"),
     ("E_bind", "sq", "aux"),
     ("_theta_w", "vec", "aux"),
@@ -46,23 +53,29 @@ _L4_ONLY = (  # 行 = L4
     ("W_pred_43_elig", "row", "aux"),
     ("W_bind", "row", "done"),
     ("W_bind_elig", "row", "aux"),
-    ("_rtr_proj", "row", "aux"),
+    ("_rtr_w", "row", "aux"),
 )
+
 _L5_ONLY = (
     ("M_l5", "sq", "aux"),
     ("_theta_l5", "vec", "aux"),
     ("W_pred_54", "row", "done"),
     ("W_pred_54_elig", "row", "aux"),
 )
-_MX_LAYER = (  # (层, 全层激活侧抑制矩阵) — l5 在 foldiak 臂为恒零占位 (见 _MX_PLACEHOLDER)
+
+# (层, 全层激活侧抑制矩阵)，l5 在 foldiak 臂为恒零占位
+_MX_LAYER = (
     ("l4", "M_x4"),
     ("l2", "M_x2"),
     ("l3", "M_x3"),
     ("l5", "M_x5"),
     ("l6", "M_x6"),
 )
+
 _MX_PLACEHOLDER = frozenset(("M_x5",))
+
 _SPECIAL = ("W1", "W1_elig", "_dw_buf", "_mem_m", "_gain_mask", "_gain_l3")
+
 _EXEMPT = (
     "W_bind_self_elig",
     "W_act_elig",

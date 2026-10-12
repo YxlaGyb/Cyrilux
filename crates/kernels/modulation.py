@@ -12,7 +12,9 @@ import torch
 
 
 def compute_uncertainty(F_hist: list[float], window: int = 10) -> float:
-    """从自由能历史计算不确定度 (标量, 滑动窗口太小不值得 GPU)."""
+    """
+    从自由能历史计算不确定度，标量，滑动窗口太小不值得 GPU
+    """
     if len(F_hist) < 3:
         return 0.5
     window = min(window, len(F_hist))

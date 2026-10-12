@@ -26,13 +26,17 @@ if TYPE_CHECKING:
 
 
 class PruningEngine:
-    """修剪引擎: 持 net 引用, 操作 net.active_size/_S_l/_death_row_*/权重张量."""
+    """
+    修剪引擎，持 net 引用, 操作 net.active_size/_S_l/_death_row_*/权重张量
+    """
 
     def __init__(self, net: HybridPCNet):
         self.net = net
 
     def _attrs(self) -> None:
-        """登记表 + 各层下限. 判决与压实共用, 避免两处字面量漂移."""
+        """
+        登记表 + 各层下限. 判决与压实共用, 避免两处字面量漂移
+        """
         net = self.net
         self._W_attr = {"l4": "W_04", "l2": "W_42", "l3": "W_23", "l5": "W_35", "l6": "W_56"}
         self._t_attr = {"l4": "W_t4", "l2": "W_t2", "l3": "W_t3", "l5": "W_t5", "l6": "W_t6"}
@@ -43,7 +47,8 @@ class PruningEngine:
         }
 
     def decide(self) -> None:
-        """判决: 行范数相对排名 → 死缓登记; 死缓期满未复活 → S_l 关位.
+        """
+        判决: 行范数相对排名 → 死缓登记; 死缓期满未复活 → S_l 关位.
 
         本方法不改变 active_size 与任何张量形状 — 被关位的神经元只是不再点火,
         它的行/列仍占物理宽度直到压实点. 所有关位都受下限约束, 不会把活体数

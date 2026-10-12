@@ -78,13 +78,13 @@ class TestOrgan2ExplainAway:
 class TestOrgan3RPE:
     def test_state_value_tracks_from_zero(self):
         net = _make_net()
-        assert net._rtr_v.abs().sum() == 0  # 冷启动: V 零 → m = r
+        assert net._rtr_w.abs().sum() == 0  # 冷启动: w 零 → m = r
         # 首结算步 ΔF 可精确为 0 (R=0, m=0) → 需 感知/回声 交替几步才见 V 跟踪
         net.learn(torch.randint(32, 256, (1, 8), dtype=torch.long))  # 感知
         net.learn()  # 回声 (行为步)
         net.learn(torch.randint(32, 256, (1, 8), dtype=torch.long))
         net.learn()
-        assert net._rtr_v.abs().sum() > 0  # 逐状态价值已跟踪
+        assert net._rtr_w.abs().sum() > 0  # 逐状态价值已跟踪
         assert net._survival_signal.abs().sum() > 0  # 写点已产出残差
 
     def test_learning_alive_with_rpe(self):

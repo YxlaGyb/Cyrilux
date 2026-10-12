@@ -50,7 +50,8 @@ class CoreBrain(nn.Module):
     def _views(
         self, z4: torch.Tensor, valid: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """短视图 = 最后 q 个内容位池化,
+        """
+        短视图 = 最后 q 个内容位池化,
         长视图 = 全内容池化, 范围按内容长度, 与填充位置无关.
 
         valid 是填充边界掩码, 非填充位 True.
@@ -99,7 +100,9 @@ class CoreBrain(nn.Module):
 
     @torch.no_grad()
     def learn(self) -> dict[str, torch.Tensor]:
-        """一步跨视图预测更新, 只动中心脑自己的权重, 字节损失不参与."""
+        """
+        一步跨视图预测更新, 只动中心脑自己的权重, 字节损失不参与.
+        """
         st = self._state
         if st is None:
             return dict(self._stats)
@@ -137,7 +140,9 @@ class CoreBrain(nn.Module):
     def observe(
         self, z4: torch.Tensor | None = None, valid: torch.Tensor | None = None
     ) -> dict[str, torch.Tensor]:
-        """诊断读数, 传 z4 则跑一步 forward+learn, 否则返回最近一步读数."""
+        """
+        诊断读数, 传 z4 则跑一步 forward+learn, 否则返回最近一步读数.
+        """
         if z4 is not None:
             self.forward(z4, valid)
             return self.learn()

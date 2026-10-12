@@ -1,6 +1,8 @@
-"""EventBridge — GPU → CPU 事件桥接 (张量化).
+"""
+EventBridge GPU → CPU 事件桥接，张量化
 
-事件以 tensor batch 传递: (pos, ch, val, layer, block_id) 各为 [E] tensor.
+事件以 tensor batch 传递:
+    (pos, ch, val, layer, block_id) 各为 [E] tensor.
 """
 
 from __future__ import annotations
@@ -9,7 +11,8 @@ import torch
 
 
 class SensoryEventBatch:
-    """批量感官事件, 全部为 GPU tensor (或 CPU tensor, 取决于 device).
+    """
+    批量感官事件, 全部为 GPU tensor 或 CPU tensor, 取决于 device
 
     Fields:
         pos:      Tensor[E] int32  序列位置
@@ -44,7 +47,7 @@ class SensoryEventBatch:
 
 
 class EventBridge:
-    """事件桥接 — GPU 端 top-k 过滤 + 事件 batch 管理.
+    """事件桥接 GPU 端 top-k 过滤 + 事件 batch 管理
 
     职责:
       - 从 SensoryFrontend h_list 提取事件
@@ -92,16 +95,14 @@ class EventBridge:
     def set_warmup(self, warmup_steps: int):
         self._warmup_remaining = warmup_steps
 
-    # ═══════════════════════════════════════════════════════════════
-    # 感官事件提取 (GPU top-k)
-    # ═══════════════════════════════════════════════════════════════
 
     def ingest_hlist(
         self,
         h_list: list[torch.Tensor],
         top_k: int = 0,
     ) -> SensoryEventBatch | None:
-        """从 SensoryFrontend 输出提取事件 batch.
+        """
+        从 SensoryFrontend 输出提取事件 batch.
 
         在 GPU 上做 top-k 过滤, 不再逐元素 .item().
 
@@ -110,7 +111,7 @@ class EventBridge:
             top_k: 每 position 保留的事件数 (0 = warmup: 全部)
 
         Returns:
-            SensoryEventBatch, 或 None (无事件).
+            SensoryEventBatch, 或 None 无事件
         """
         is_warmup = self._warmup_remaining > 0
         threshold = 0.02 if is_warmup else self.sensory_threshold
@@ -176,12 +177,10 @@ class EventBridge:
 
         return batch
 
-    # ═══════════════════════════════════════════════════════════════
-    # 网络事件 (CPU 侧)
-    # ═══════════════════════════════════════════════════════════════
-
     def push_network_events(self, nids: torch.Tensor, eps: torch.Tensor):
-        """批量推入网络事件 (活跃神经元)."""
+        """
+        批量推入网络事件，活跃神经元
+        """
         n = nids.shape[0]
         if n == 0:
             return
@@ -201,7 +200,8 @@ class EventBridge:
         self._total_network += space
 
     def pop_network_events(self, max_events: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
-        """消费网络事件.
+        """
+        消费网络事件.
 
         Returns:
             (nids, eps) tensors, 各为 [M] (M <= max_events).
@@ -238,10 +238,6 @@ class EventBridge:
 
         self._net_count -= available
         return nids, eps
-
-    # ═══════════════════════════════════════════════════════════════
-    # 统计
-    # ═══════════════════════════════════════════════════════════════
 
     def get_stats(self) -> dict:
         return {

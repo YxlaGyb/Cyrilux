@@ -76,12 +76,10 @@ def setup_seed(seed: int = 42):
 
 
 # ── 参数统计 ──
-# count_parameters / count_budget 已删除 — 页面化池不使用 nn.Module.parameters().
-# effective_params / effective_capacity 保留, 用于分析池内权重稀疏度.
-
 
 def effective_params(tensor: torch.Tensor, eps: float = 1e-4) -> int:
-    """统计张量中当前"有效"的参数数。
+    """
+    统计张量中当前"有效"的参数数。
 
     使用相对阈值: |w| > max(|w|) * eps 的权重计入有效参数。
     eps=1e-4 意味着"至少是最大权重的 0.01%"。
@@ -96,7 +94,7 @@ def effective_params(tensor: torch.Tensor, eps: float = 1e-4) -> int:
 
 
 def effective_capacity(model: torch.nn.Module, eps: float = 1e-4) -> float:
-    """统计模型当前有效参数数 (百万单位)。"""
+    """统计模型当前有效参数数，百万单位"""
     total = 0
     for p in model.parameters():
         if p.requires_grad:

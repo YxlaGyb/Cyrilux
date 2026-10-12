@@ -34,16 +34,30 @@ def test_elig_accum_front_aligns_pruned_slice():
 
 
 def test_rtr_residual_tracks_value_in_place():
-    v = torch.zeros(4, dtype=torch.float16)
+    w = torch.zeros(4, dtype=torch.float16)
+    z = torch.ones(4, dtype=torch.float16)  # ẑ = z/‖z‖ = 0.5
     r = torch.tensor(1.0, dtype=torch.float16)
-    index = torch.tensor([2], dtype=torch.long)
-    m = rtr_residual(v, index, r, 0.5)
+    m = rtr_residual(w, z, r, 0.5)
     assert m.shape == (1,)
-    assert torch.allclose(m, torch.ones(1, dtype=torch.float16), atol=1e-3)  # 冷启动 V=0 → m=r
-    assert torch.allclose(v[2], torch.tensor(0.5, dtype=torch.float16), atol=1e-3)
-    m2 = rtr_residual(v, index, r, 0.5)
+    assert torch.allclose(m, torch.ones(1, dtype=torch.float16), atol=1e-3)  # 冷启动 w=0 → m = r
+    assert torch.allclose(w, torch.full((4,), 0.25, dtype=torch.float16), atol=1e-3)
+    m2 = rtr_residual(w, z, r, 0.5)
     assert torch.allclose(m2, torch.full((1,), 0.5, dtype=torch.float16), atol=1e-3)  # 残差递减
-    assert v[0] == 0 and v[1] == 0 and v[3] == 0  # 未命中桶不动
+
+
+def test_rtr_residual_covers_nearby_states():
+    # 无桶边界: 账本落在权向量上, 邻近状态与已记账状态共享同一批分量
+    torch.manual_seed(0)
+    z = torch.randn(16, dtype=torch.float16)
+    z_near = z + 0.05 * torch.randn(16, dtype=torch.float16)
+    r = torch.tensor(1.0, dtype=torch.float16)
+    cold = torch.zeros(16, dtype=torch.float16)
+    assert float(rtr_residual(cold, z_near, r, 0.2)[0]) > 0.9  # 对照: 空账本无覆盖
+
+    w = torch.zeros(16, dtype=torch.float16)
+    for _ in range(20):
+        rtr_residual(w, z, r, 0.2)
+    assert float(rtr_residual(w, z_near, r, 0.2)[0]) < 0.2  # 已记账状态的邻近状态被覆盖
 
 
 def test_rtr_apply_is_self_normalised():
@@ -69,39 +83,36 @@ def test_trace_reads_and_advances_named_buffer():
     assert torch.allclose(net.W_x_elig, dW * (1.0 + ELIG_GAMMA), atol=1e-2)
 
 
-def _signal_stub(echo_loop: bool, d_l4: int = 8, buckets: int = 4, channel: int = 3):
-    proj = torch.zeros(d_l4, buckets, dtype=torch.float16)
-    proj[channel, :] = torch.tensor([1, -1, 1, -1], dtype=torch.float16)
+def _signal_stub(echo_loop: bool, d_l4: int = 8, channel: int = 3):
     z4 = torch.zeros(2, 1, d_l4, dtype=torch.float16)
     z4[:, :, channel] = 1.0
     net = SimpleNamespace(
         _z4=z4,
-        _rtr_proj=proj,
-        _rtr_v=torch.zeros(2, buckets, dtype=torch.float16),
+        _rtr_w=torch.zeros(d_l4, 2, dtype=torch.float16),
         _metab_R=torch.tensor(1.0, dtype=torch.float16),
     )
     return net, SimpleNamespace(echo_loop=echo_loop)
 
 
-def test_survival_signal_writes_bucket_and_phase_row():
+def test_survival_signal_writes_phase_column():
     net, ctx = _signal_stub(echo_loop=False)
     update_survival_signal(net, ctx)
     assert net._survival_signal.shape == (1,)
-    assert int(net._survival_signal[0]) == 1  # 冷启动 V=0 → m = r
-    assert abs(float(net._rtr_v[0, 0]) - RTR_ETA_V) < 1e-4  # 感知行被跟踪
-    assert net._rtr_v[1].abs().sum() == 0  # 回声行未触及
+    assert int(net._survival_signal[0]) == 1  # 冷启动 w=0 → m = r
+    assert abs(float(net._rtr_w[3, 0]) - RTR_ETA_V) < 1e-4  # 感知列被跟踪
+    assert net._rtr_w[:, 1].abs().sum() == 0  # 回声列未触及
 
     net2, ctx2 = _signal_stub(echo_loop=True)
     update_survival_signal(net2, ctx2)
-    assert abs(float(net2._rtr_v[1, 0]) - RTR_ETA_V) < 1e-4
-    assert net2._rtr_v[0].abs().sum() == 0
+    assert abs(float(net2._rtr_w[3, 1]) - RTR_ETA_V) < 1e-4
+    assert net2._rtr_w[:, 0].abs().sum() == 0
 
 
-def test_survival_signal_rows_are_independent():
-    # 双轨互不干扰: 同桶在两相各自累积, 残差独立
+def test_survival_signal_columns_are_independent():
+    # 双轨互不干扰: 同状态在两相各自累积, 残差独立
     net, perc_ctx = _signal_stub(echo_loop=False)
     update_survival_signal(net, perc_ctx)
-    perc_track = net._rtr_v[0, 0].clone()
+    perc_track = net._rtr_w[3, 0].clone()
     update_survival_signal(net, SimpleNamespace(echo_loop=True))
-    assert net._rtr_v[0, 0] == perc_track
-    assert net._rtr_v[1, 0] > 0
+    assert net._rtr_w[3, 0] == perc_track
+    assert net._rtr_w[3, 1] > 0

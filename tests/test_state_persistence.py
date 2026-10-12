@@ -23,7 +23,7 @@ from crates.neuron import ROW_STATE, PruningEngine
 _AUDIT_ALLOWLIST = (
     "E_bind_col", "E_bind_self", "W_act", "W_bind_self", "_osc_f_tab", "_seq_arange",
     "_stp_active_ema_bind", "_stp_r_bind", "_stp_tau_bind", "_stp_u_bind", "_theta_bind",
-    "_rtr_proj", "_ms_mask_k8", "_ms_mask_k32",
+    "_ms_mask_k8", "_ms_mask_k32",
 )
 
 
@@ -370,3 +370,26 @@ def test_prune_between_free_run_calls():
         if k in perms:
             assert torch.equal(v, before[k][perms[k]][: net.active_size[k]]), f"_stp_r_end[{k}] 未随 perm"
     net.learn(BATCH, free_run=True)  # 修剪后立刻 free_run 不崩
+
+
+def test_apply_keeps_buffer_alias_on_device():
+    """
+    别名必须跟住 buffer 一起搬家:
+    停在旧张量上 → 首次 learn 跨设备，哨兵早退先于写点
+    """
+    net = HybridPCNet(_cfg())
+    assert net._survival_signal is net._zero1
+    net.to("meta")
+    assert net._zero1.device == torch.device("meta")
+    assert net._survival_signal.device == net._zero1.device
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="复现跨设备首步需 CUDA")
+def test_first_learn_after_cuda_move():
+    """
+    新模型直接上 GPU 后首步 learn 不得跨设备
+    """
+    net = HybridPCNet(_cfg()).to("cuda")
+    assert net._survival_signal.device == net._zero1.device
+    net.learn(BATCH.to("cuda"))
+    assert net._survival_signal.device.type == "cuda"

@@ -1,6 +1,7 @@
-"""CUDA Stream 管理 — 多流并行支持.
+"""
+CUDA Stream 管理，多流并行支持.
 
-ponytail: 先留接口不实现。encode/predict/plasticity 三阶段用同一默认流。
+先留接口不实现。encode/predict/plasticity 三阶段用同一默认流。
 等 profile 确认瓶颈在流等待后再开启 stream pool.
 """
 
@@ -40,7 +41,9 @@ class StreamPool:
         return self._streams[2] if self._streams and len(self._streams) > 2 else None
 
     def synchronize(self):
-        """等待所有 stream 完成."""
+        """
+        等待所有 stream 完成.
+        """
         if self._streams:
             for s in self._streams:
                 s.synchronize()

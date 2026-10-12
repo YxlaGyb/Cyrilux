@@ -72,10 +72,10 @@ def prepare_4tasks(data_dir: str | None = None, output_dir: str | None = None, n
     切分 4 个任务数据集。
 
     任务定义:
-      A (daily)  = pretrain_t2t_mini.jsonl    — 日常对话
-      B (tech)   = lora_exam.jsonl            — 科技知识
-      C (medical)= agent_rl_math.jsonl        — 医疗问诊 (原命名有误但保留)
-      D (sft)    = lora_identity.jsonl + SFT  — 指令遵循
+      A (daily)  = pretrain_t2t_mini.jsonl
+      B (tech)   = lora_exam.jsonl
+      C (medical)= agent_rl_math.jsonl
+      D (sft)    = lora_identity.jsonl + SFT
     """
     data_dir = data_dir or DATASETS_DIR
     output_dir = output_dir or data_dir

@@ -54,6 +54,4 @@ F_UNIT_SCALE = 2048.0  # 计价单位: 投影能量 → 旧 F 量纲 (2^11, fp16
 ELIG_GAMMA = 0.95        # 突触资格迹折扣
 DIFF_TRUST_REGION = 0.02  # W_diff 信任域: 每步 ‖ΔW‖_F = 2%·‖W_diff‖_F (W1 解冻实测 2.5% 同数量级)
 
-RTR_V_BUCKETS = 64  # 逐状态价值表桶数 (每行)
-RTR_ETA_V = 0.02    # 价值表追踪速率 (与 metab_gain_rate 同尺度)
-RTR_PROJ_SEED = 1337  # 池化 z4 → 桶号 固定投影种子
+RTR_ETA_V = 0.02  # 价值账本追踪速率，与 metab_gain_rate 同尺度

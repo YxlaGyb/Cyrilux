@@ -13,7 +13,9 @@ from crates.kernels import soft_norm_preserve
 
 
 class SlotPredictor(nn.Module):
-    """跨视图预测器: A_short → ŝ(A_long 的 EMA 目标)."""
+    """
+    跨视图预测器: A_short → ŝ(A_long 的 EMA 目标).
+    """
 
     def __init__(self, cfg):
         super().__init__()
