@@ -90,7 +90,7 @@ per-file-ignores = { "__init__.py" = ["F401"] }
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["crates", "scripts", "dataset"]
+known-first-party = ["crates", "scripts"]
 
 [tool.ruff.format]
 # Like Black, use double quotes for strings.

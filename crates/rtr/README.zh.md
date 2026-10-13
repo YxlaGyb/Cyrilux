@@ -1,5 +1,5 @@
 ---
-description: "rtr：迹调制的资格可塑性，每个稠密权重更新如今都经由它完成信用分配。"
+description: "迹调制的资格可塑性，每个稠密权重更新如今都经由它完成信用分配。"
 kind: "package-reference"
 ---
 

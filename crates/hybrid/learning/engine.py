@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from crates.modal.text.geometry import PRINTABLE_START
+
 from ._common import _plastic
 from .action import ActionMixin
 from .bind import BindMixin
@@ -38,7 +40,7 @@ class LearnCtx:
     free_run: bool
     echo_loop: bool
     echo_world_frozen: bool
-    learn_mask: torch.Tensor  # [N,S-1] 目标位掩码 (目标字节 <32 → False, free_run 全一)
+    learn_mask: torch.Tensor  # [N,S-1] 目标位掩码 (目标字节低于可打印起点 → False, free_run 全一)
     dim_4: int
     dim_2: int
     dim_3: int
@@ -118,7 +120,8 @@ class EngineCore(
     ActionMixin,
     MetabolismMixin,
 ):
-    """学习引擎基类: 持 net 引用, 组装 learn() 编排 (域逻辑在 mixin).
+    """
+    学习引擎基类: 持 net 引用, 组装 learn() 编排 (域逻辑在 mixin).
 
     继承关系即组合 (LearningEngine = EngineCore + mixin); mixin 模块不
     import engine (readout 仅在函数内延迟导入 LmSignal), 无循环依赖.
@@ -128,7 +131,8 @@ class EngineCore(
         self.net = net
 
     def _closed_loop_input(self, byte_ids: torch.Tensor) -> torch.Tensor:
-        """自回归暴露输入: 前 k 位真实锚定 + 后 S-k 位模型自生成.
+        """
+        自回归暴露输入: 前 k 位真实锚定 + 后 S-k 位模型自生成.
 
         前半是真实分布 (锚定, 防初始漂移), 后半是模型自己的输出 (暴露,对治复读自锁)
         完全交给内生快慢散度多巴胺 (learning.py D 极性翻转), 无外部干预.
@@ -142,7 +146,8 @@ class EngineCore(
 
     def learn(self, byte_ids: torch.Tensor | None = None, closed_loop: bool = False, free_run: bool = False,
               force_perception: bool = False) -> dict:
-        """迹调制学习: 前馈 → 逐域误差 → 局部权重更新, 无反向传播, 不接收 targets.
+        """
+        迹调制学习: 前馈 → 逐域误差 → 局部权重更新, 无反向传播, 不接收 targets.
 
         Args:
             byte_ids: [N, S] long 输入. free_run=True 时忽略.
@@ -160,6 +165,7 @@ class EngineCore(
             stats dict (future_err, 各层误差范数).
         """
         net = self.net
+
         # P3-b 内部路由: 门选回声 (或 byte_ids None 恒回声) → 回声分支; 感知默认/
         # force_perception 旁路 → 感知分支; closed_loop 恒感知等价 (暴露训练语义不变)
         route_echo = (not free_run) and (not closed_loop) and (
@@ -181,6 +187,7 @@ class EngineCore(
             else:
                 # 门选回声: 把喂入的世界样本尾部作种子 (替代脚本 last_text_tail 注射)
                 seed = byte_ids[:, -net.cfg.echo_seed_n:]
+
             # 温度采样为变异通道; 温度由恒温器负反馈自调 (action.py). 首步 (从未回声) 无
             # _gen_temp → 映射中点 (软带中位, 无先验保守值; 4.0 硬退场 — 超出软带).
             # rep_backstop 默认关 (反循环门已移除, 循环由内部裁判 + 恒温器处置).
@@ -203,6 +210,7 @@ class EngineCore(
         N, S = inp.shape if inp is not None else (1, net.cfg.free_run_window)
         dev = next(net.parameters()).device
         k = S // 2 if closed_loop else 0
+
         # 自回声: 目标 = 自身生成流 (他者响应). 回声相位冻结世界模型, 避免在乱码回声上
         # 学习污染感知 — C5 冻结合约 (单一出处, 各域守卫以此为准):
         #   冻结 {W_04, W_42+inj42, W_23, W_state_pred, W_pred_54/43, W_diff+b_diff,
@@ -213,14 +221,16 @@ class EngineCore(
         echo_loop = (not free_run) and route_echo
         if echo_loop:
             byte_ids = inp
+
         # echo 不冻结旁路 (multi_step_commit_b_prereg.md §1; 默认关零变更): _echo_learn 开时
         # echo 相位全权重更新 (移除 C5 对 echo 的冻结), 使 H2 的可学路径落在 W1/h/W_bind 上.
         echo_world_frozen = echo_loop and not getattr(net, "_echo_learn", False)
-        # 学习位置掩码: 目标字节 <32 = 模型自身 _mask_print 输出域不可达 (0x00 管道填充、
+
+        # 学习位置掩码: 目标字节低于可打印起点 = 模型自身 _mask_print 输出域不可达 (管道填充、
         # \n 行分隔等同段), 这些位置的误差信号不得进学习驱动 — 学习端与自身输出域自洽.
         # 对齐 S-1 (t+1 目标), 位置 i 对应目标 byte_ids[:, i+1]
         if byte_ids is not None:
-            learn_mask = byte_ids[:, 1:] >= 32
+            learn_mask = byte_ids[:, 1:] >= PRINTABLE_START
         else:
             learn_mask = torch.ones(N, S - 1, dtype=torch.bool, device=dev)  # free_run: 内生动力学全位放行
         if closed_loop:
@@ -256,6 +266,7 @@ class EngineCore(
         if net._step_py < 50:
             eta = eta * 0.5
         eta_t = eta * net.cfg.temporal_lr_ratio
+
         # 速率自适应: W_lm 熵下降 (预测好) → 表示层放慢; 熵上升 → 放大重组. scale 每 100 步更新
         if net.cfg.adaptive_traction:
             eta = eta * net._traction_scale.to(torch.float16)
@@ -279,6 +290,7 @@ class EngineCore(
         if not _fb:
             self._update_bias(ctx, sh)
         sh.lm = self._build_lm_signal(ctx)
+
         # 体内代谢: F 每步计价 (感知/回声) → E → R; 必须在 _update_w_act 前 (本步 R 本步消费)
         self._update_metabolism(ctx, sh)
         if not _fb:
@@ -299,6 +311,7 @@ class EngineCore(
             for _mx_layer in ("l4", "l2", "l3", "l6"):
                 self._update_Mx(ctx, sh, _mx_layer)
         self._final_softnorm(ctx, sh)
+
         # P3-b 行为门: 本步末算下一步的路由决策 (全 GPU 零同步; 自由运行不结算)
         self._update_gate(ctx, sh)
 
@@ -333,6 +346,7 @@ class EngineCore(
         stats["attention_gain_var"] = core_stats.get("attention_gain_var", net._zero1)
         stats["attention_salience_norm"] = core_stats.get("attention_salience_norm", net._zero1)
         stats["attention_top_down_norm"] = core_stats.get("attention_top_down_norm", net._zero1)
+
         # 释放每步状态引用: _z* 是 store_state 存的大张量, 不释放则显存逐步累积 OOM.
         # 释放前保留 z4/z5/z3/z2/z6 引用供观测器 (z3 = NaN 前哨)
         net._last_z4 = net._z4.detach()

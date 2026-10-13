@@ -1,5 +1,5 @@
 ---
-description: "model：稠密感知-预测-行动网络的配置与权重声明，加上共享神经调制与数值常量。"
+description: "稠密感知-预测-行动网络的配置与权重声明，加上共享神经调制与数值常量。"
 kind: "package-reference"
 ---
 
@@ -62,12 +62,15 @@ The pure operators that were once split across this crate and the learning path 
 
 `constants.py` defines the neuron state-column indices, the six-layer cortex roles, the per-layer configuration (neuron count, inertia, k-WTA fraction), connection kinds, and the trust regions and eligibility discount that the learning domain consumes.
 
+The byte domain is not one of those constants. `HybridPCNet.__init__` materialises its runtime masks from the text modality's presets in `crates.modal.text.geometry`: the symbol domain sizes the id projections and the generation read-out, the printable start and the two UTF-8 boundary tables become registered bool and fp16 buffers, and the padding byte is taken from the same organ, so adding or moving a modality moves no literal in this crate. Window width, layer widths and the rhythm periods are this crate's own numbers rather than the symbol domain, even where a value happens to coincide with it.
+
 -----
 
 <a id="further-exploration"></a>
 ## Further exploration
 
 - [architecture](../../docs/architecture.md): the design intent of this crate is recorded there.
+- [modal](../modal/README.md): the geometry and topology presets these runtime masks are built from.
 - [hybrid](../hybrid/README.md): the forward, generation, and learning engines this model delegates to.
 - [neuron](../neuron/README.md): the dynamic-neuron engines this model delegates to.
 - [learning](../hybrid/learning/README.md): the per-domain learning sub-crate.

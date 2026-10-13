@@ -1,5 +1,5 @@
 ---
-description: "neuron：动态神经元机制，主链拓扑修剪与记忆单元群的出生与死亡。"
+description: "动态神经元机制，主链拓扑修剪与记忆单元群的出生与死亡。"
 kind: "package-reference"
 ---
 

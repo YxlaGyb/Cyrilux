@@ -1,5 +1,5 @@
 ---
-description: "model：稠密感知-预测-行动网络的配置与权重声明，加上共享神经调制与数值常量。"
+description: "稠密感知-预测-行动网络的配置与权重声明，加上共享神经调制与数值常量。"
 kind: "package-reference"
 ---
 
@@ -62,12 +62,15 @@ kind: "package-reference"
 
 `constants.py` 定义神经元状态列索引、六层皮层角色、每层配置（神经元数、惯性、k-WTA 比例）、连接类型，以及学习域消费的信任域与资格迹折扣。
 
+字节域不在这些常量里。`HybridPCNet.__init__` 的运行期掩码由文本模态的预设 `crates.modal.text.geometry` 物化：符号域决定 id 投影与生成读数的宽度，可打印起点与两张 UTF-8 边界表变成注册的 bool 与 fp16 缓冲，填充字节同样取自那个器官，因此新增或搬动一个模态不会在本 crate 里挪动任何字面量。窗宽、各层宽度与节律周期是本 crate 自己的数，不是符号域，即使某个值恰好与之相同。
+
 -----
 
 <a id="further-exploration"></a>
 ## 进一步探索
 
 - [architecture](../../docs/architecture.md)：本 crate 的设计意图记录在这里。
+- [modal](../modal/README.zh.md)：这些运行期掩码据以构造的几何与拓扑预设。
 - [hybrid](../hybrid/README.zh.md)：本模型委托的正向、生成与学习引擎。
 - [neuron](../neuron/README.zh.md)：本模型委托的动态神经元引擎。
 - [learning](../hybrid/learning/README.zh.md)：逐域学习子 crate。

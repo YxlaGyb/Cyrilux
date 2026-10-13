@@ -1,5 +1,5 @@
 ---
-description: "learning：稠密 PPA 循环的迹调制学习引擎，组织为编排器加七个逐域 mixin：action、bind、feedforward、metabolism、predict、readout、temporal。"
+description: "稠密 PPA 循环的迹调制学习引擎，组织为编排器加七个逐域 mixin：action、bind、feedforward、metabolism、predict、readout、temporal。"
 kind: "package-reference"
 ---
 

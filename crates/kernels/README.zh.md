@@ -1,5 +1,5 @@
 ---
-description: "kernels：dense、corebrain 与 attention 各 crate 共享的叶层算子库。"
+description: "dense、corebrain 与 attention 各 crate 共享的叶层算子库。"
 kind: "package-reference"
 ---
 

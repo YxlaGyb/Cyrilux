@@ -5,7 +5,7 @@
 
 覆盖范围:
   - 流式路径 `_SamplePrefetch` (exp115_say.py);
-  - 文件遍历路径 `tiled_windows` / `window_ids` / `skip_zero_windows` (train_cmd.py, 批令 34 抽出的纯函数);
+  - 文件遍历路径 `tiled_windows` / `window_ids` / `skip_zero_windows` (crates/utils/codec.py, 字节窗口口径工具);
   - 跨路径一致性: 同一批样本上两者的零窗判定必须等价 (ByteDataset 张量口径 vs 纯函数口径);
   - 平铺不变式: 窗拼接 == 原文全字节 (D1 修复; 旧 `[:max_seq_len]` 截断丢弃 65.81%).
 """
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from exp115_say import _SamplePrefetch  # noqa: E402  (需先注入 scripts/ 到 sys.path)
 
-from crates.cli.commands.train_cmd import skip_zero_windows, tiled_windows, window_ids  # noqa: E402
+from crates.utils.codec import skip_zero_windows, tiled_windows, window_ids  # noqa: E402
 
 
 class _StubDS:

@@ -1,5 +1,5 @@
 ---
-description: "kernels: the leaf operator library shared by every dense, CoreBrain and attention crate."
+description: "the leaf operator library shared by every dense, CoreBrain and attention crate."
 kind: "package-reference"
 ---
 

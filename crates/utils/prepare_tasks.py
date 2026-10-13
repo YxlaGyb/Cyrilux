@@ -1,5 +1,5 @@
 """
-按领域切分 + 异构数据集统一转换 → core/dataset.py 可读的 {"text": "..."} 格式。
+按领域切分 + 异构数据集统一转换 → crates/utils/codec.py 可读的 {"text": "..."} 格式。
 
 功能:
   1. prepare_4tasks: 从 pretrain_t2t_mini/lora_exam/agent_rl_math/lora_medical/sft_t2t_mini

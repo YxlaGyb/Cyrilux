@@ -1,5 +1,5 @@
 ---
-description: "device：抽象物理设备代码，提供 GPU→CPU 事件桥、批量感官事件容器、CUDA 初始化与流原语。"
+description: "抽象物理设备代码，提供 GPU → CPU 事件桥、批量感官事件容器、CUDA 初始化与流原语。"
 kind: "package-reference"
 ---
 

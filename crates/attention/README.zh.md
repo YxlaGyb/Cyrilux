@@ -1,5 +1,5 @@
 ---
-description: "attention：调制 CoreBrain 跨视图预测误差的误差精度注意力层。"
+description: "attention 调制 CoreBrain 跨视图预测误差的误差精度注意力层。"
 kind: "package-reference"
 ---
 

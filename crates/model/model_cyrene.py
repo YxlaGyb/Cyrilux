@@ -14,6 +14,12 @@ from dataclasses import asdict, dataclass, fields, replace
 import torch
 from torch import nn
 
+from crates.modal.text.geometry import (
+    ALPHABET,
+    PRINT_MASK,
+    UTF8_BLOCK_CNT,
+    UTF8_BLOCK_START,
+)
 from crates.model.constants import LAMBDA_0
 
 
@@ -22,8 +28,8 @@ class CyreneModel:
     """PPA 网络配置."""
 
     # 维度
-    d_input: int = 256
-    d_act: int = 256  # W_act 列数，字节域 256
+    d_input: int = ALPHABET
+    d_act: int = ALPHABET  # W_act 列数, 字节域基数
     d_l4: int = 1024
     d_l2: int = 384
     d_l3: int = 384
@@ -296,7 +302,7 @@ class HybridPCNet(nn.Module):
 
         # 动作读出矩阵 W_act
         self.W_act = nn.Parameter(torch.empty(self.bind_slot_dim, self.cfg.d_act, dtype=torch.float16))
-        self.register_buffer("_freq_act", torch.full((self.cfg.d_input,), 1.0 / 256.0, dtype=torch.float16))
+        self.register_buffer("_freq_act", torch.full((self.cfg.d_input,), 1.0 / ALPHABET, dtype=torch.float16))
         self.register_buffer("_s_ema_n", torch.ones(8, dtype=torch.float16))
 
         # 竞争性记忆单元群
@@ -381,10 +387,9 @@ class HybridPCNet(nn.Module):
         self.register_buffer("_intr_d0", torch.full((1,), 0.5, dtype=torch.float16))
         self.register_buffer("_one_s", torch.ones(1, self.cfg.max_seq_len - 1, 1, dtype=torch.float16))
         self.register_buffer(
-            "_padmax", torch.zeros(1, 1, max(d["l4"], self.cfg.d_input, 256), dtype=torch.float16)
+            "_padmax", torch.zeros(1, 1, max(d["l4"], self.cfg.d_input, ALPHABET), dtype=torch.float16)
         )
-        _mp = torch.zeros(256, dtype=torch.float16)
-        _mp[32:] = 1.0
+        _mp = torch.tensor(PRINT_MASK, dtype=torch.float16)
         self.register_buffer("_mask_print", _mp)
 
         # continuation/_predict 工作缓冲: 续写流 (定长预分配+长度游标)、UTF-8 状态、L0 one-hot、
@@ -451,16 +456,10 @@ class HybridPCNet(nn.Module):
         self.register_buffer("_w_soft", torch.tensor([0.1, 0.8, 0.1], dtype=torch.float16))
 
         # UTF-8 语法阻断掩码 (生成路径逐字节向量化: 原逐字节 .item() 布尔分支 =
-        # 每回声步 ~120 次同步排空, GPU 利用率主嫌; 禁止集/值与逐位分支逐位等价).
-        # block_cnt = 字符中途禁字节集 {0x00-0x7F}∪{0xC0-0xFF}; block_start = 边界禁
-        # 字节集 {0x80-0xC1} (0xC0-0xC1 overlong) — 与 forward.py 历史分支一字不差.
-        _b_cnt = torch.zeros(256, dtype=torch.bool)
-        _b_cnt[0x00:0x80] = True
-        _b_cnt[0xC0:0x100] = True
-        self.register_buffer("_utf8_block_cnt", _b_cnt)
-        _b_start = torch.zeros(256, dtype=torch.bool)
-        _b_start[0x80:0xC2] = True
-        self.register_buffer("_utf8_block_start", _b_start)
+        # 每回声步 ~120 次同步排空, GPU 利用率主嫌). 两个集合由文本模态几何预设给出
+        # (crates.modal.text.geometry), 表值同前逐位构造.
+        self.register_buffer("_utf8_block_cnt", torch.tensor(UTF8_BLOCK_CNT, dtype=torch.bool))
+        self.register_buffer("_utf8_block_start", torch.tensor(UTF8_BLOCK_START, dtype=torch.bool))
         self.register_buffer("_e_ema_2", torch.tensor(0.05, dtype=torch.float16))
         self.register_buffer("_e_ema_4", torch.tensor(0.05, dtype=torch.float16))
         self.register_buffer("_e_ema_8", torch.tensor(0.05, dtype=torch.float16))
@@ -864,7 +863,7 @@ class HybridPCNet(nn.Module):
             "d_l3": sd["W_23"].shape[0],
             "d_l5": sd["W_56"].shape[1],
             "d_l6": sd["W_56"].shape[0],
-            "input_history": sd["W_04"].shape[1] != 256,
+            "input_history": sd["W_04"].shape[1] != ALPHABET,
         }
         snap = meta.get("config")
 

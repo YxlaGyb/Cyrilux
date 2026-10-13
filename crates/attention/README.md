@@ -1,5 +1,5 @@
 ---
-description: "attention: error-precision modulation for CoreBrain's cross-view prediction error."
+description: "attention, error-precision modulation for CoreBrain's cross-view prediction error."
 kind: "package-reference"
 ---
 

@@ -1,5 +1,5 @@
 ---
-description: "neuron: dynamic-neuron mechanisms, main-chain topology pruning and the birth and death of the memory units."
+description: "dynamic-neuron mechanisms, main-chain topology pruning and the birth and death of the memory units."
 kind: "package-reference"
 ---
 

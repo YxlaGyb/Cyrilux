@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from crates.kernels import cubic, rms_norm, saturate, soft_norm_preserve
+from crates.modal.text.geometry import ALPHABET, CONTINUATION_PREFIX
 from crates.model.constants import F_UNIT_SCALE, LM_TRUST_REGION
 from crates.rtr import rtr_apply, trace
 
@@ -21,7 +22,10 @@ class ReadoutMixin(_MixinBase):
     """读出端域 (方法挂载到 LearningEngine)."""
 
     def _w1v2_forward(self, zh: torch.Tensor) -> torch.Tensor:
-        """w1v2 前向 (w1v2_prereg.md §1.8): h = RMSNorm(concat(zh@R, GELU(zh@A_i)...)) [N,S,256]."""
+        """
+        w1v2 前向 (w1v2_prereg.md §1.8):
+            h = RMSNorm(concat(zh@R, GELU(zh@A_i)...)) [N,S,256].
+        """
         net = self.net
         parts = [zh @ net.w1v2_R]
         for i in range(net._w1v2_n_heads):
@@ -29,9 +33,11 @@ class ReadoutMixin(_MixinBase):
         return rms_norm(torch.cat(parts, dim=-1))
 
     def _build_lm_signal(self, ctx):
-        """LM 头前向信号: 输入调制 → 混合层 → logits → 误差 → 投影.
+        """
+        LM 头前向信号:
+            输入调制 → 混合层 → logits → 误差 → 投影
 
-        回声相位同样构建 (W_act 需要 probs_lm 决策态), 无 echo_world_frozen 守卫.
+        回声相位同样构建，W_act 需要 probs_lm 决策态)，无 echo_world_frozen 守卫
         """
         net = self.net
         if ctx.free_run:
@@ -40,22 +46,25 @@ class ReadoutMixin(_MixinBase):
         dim_4 = ctx.dim_4
         z4 = net._z4
 
-        # 输入 = z4 + W_diff 预测差 (对齐训练/生成管线), 能量调制 + 三阶非线性
+        # 输入 = z4 + W_diff 预测差，对齐训练/生成管线, 能量调制 + 三阶非线性
         z4_n_ = z4 / (z4.norm(dim=-1, keepdim=True) + 1e-3)
         pred_delta_ = z4_n_ @ net.W_diff[:dim_4, :dim_4].T + net.b_diff[:dim_4].unsqueeze(0).unsqueeze(0)
         z4r = z4 + pred_delta_
         z4_lm = saturate(z4r)
         z4_lm = rms_norm(z4_lm)
         z4_lm = cubic(z4_lm)
+
         # 三阶输出分流 x/(1+|x|): |x|>1.4 放大区尾部压回 ≤1, 防 W1 logits 溢出 NaN
         z4_lm = saturate(z4_lm)
+
         # 输出缩放 1/√H; 竞争性记忆单元群 K 个泄漏积分单元 → zh 尾段 (与 z4_lm 直连段互补)
         zh = torch.cat([z4_lm, net._bind_vec, net._mem_out], dim=-1)  # [N,S,dim_4+32+K·dim_4]
         zh = rms_norm(zh)  # 与更新侧 rms_norm(zh) 对称
 
         # 非线性混合层: h = zh @ W1 → 三阶激活 → logits = h @ W_lm (多项式激活 FP16 原生安全)
         d_h = net.d_h
-        W1_a = net.W1  # [lm_in, d_h] (w1v2 时仅用于 eps_lm_proj 表示层反馈投影, 不更新)
+        W1_a = net.W1  # [lm_in, d_h] w1v2 时仅用于 eps_lm_proj 表示层反馈投影, 不更新
+
         if getattr(net, "_w1v2", False):
             h = self._w1v2_forward(zh)  # [N,S,256] concat(残差, 4 头)
             h_deriv = None  # w1v2 不用 h_deriv (W1 不更新, mem units 被 freeze-below 跳过)
@@ -67,6 +76,7 @@ class ReadoutMixin(_MixinBase):
             h_in = h
             h = cubic(h_in)  # 多项式激活, 零 BP
             h_deriv = 1.0 - 1.5 * h_in.pow(2)  # 激活导数 (必须用激活输入 x 算)
+
         # 迁移扩 h (migrate_expand_prereg.md §1): 新通道 h_new = zh @ W1_new (三阶激活), logits 加和
         h_new = None
         h_new_deriv = None
@@ -78,15 +88,17 @@ class ReadoutMixin(_MixinBase):
             h_new = cubic(h_new_in)
             h_new_deriv = 1.0 - 1.5 * h_new_in.pow(2)
         inv_h = 1.0 / math.sqrt(d_h)
-        logits_lm = (h @ net.W_lm + net.bias_lm) * inv_h  # [N,S,256]
+        logits_lm = (h @ net.W_lm + net.bias_lm) * inv_h  # [N,S,ALPHABET]
         if h_new is not None:
-            logits_lm = logits_lm + h_new @ net.W_lm_new  # 新通道贡献 (W_lm_new std 已压低)
+            logits_lm = logits_lm + h_new @ net.W_lm_new  # 新通道贡献
+
         # 能量调制: 中心化 + 归一化 + max_abs 缩放严格落在 [-60,60] (fp16 极值安全)
         logits_c = (logits_lm - logits_lm.mean(dim=-1, keepdim=True)) / (
             logits_lm.std(dim=-1, keepdim=True) + 1e-4
         )
         logits_lm = logits_c / logits_c.abs().max(dim=-1, keepdim=True).values * 60.0
-        # 可打印物理掩码: 0x00-0x1F 强制 -1e4 (fp16 安全极弱值)
+
+        # 可打印物理掩码: 低于可打印起点的符号强制 -1e4 (fp16 安全极弱值)
         logits_lm = logits_lm + (1.0 - net._mask_print) * -1e4  # tensor-guard: bound (打印屏蔽设计界)
 
         # 多步预测: W_lm 专责 t+1, W_lm_2 独立子预测器专责 t+2 (共享 h, 各自更新)
@@ -99,33 +111,38 @@ class ReadoutMixin(_MixinBase):
             h2 = saturate(h2)
             h2 = rms_norm(h2)
             h2 = cubic(h2)
-        logits_t2 = (h2 @ net.W_lm_2 + net.bias_lm) * inv_h  # [N,S-2,256]
+        logits_t2 = (h2 @ net.W_lm_2 + net.bias_lm) * inv_h  # [N,S-2,ALPHABET]
         logits_t2 = logits_t2 + (1.0 - net._mask_print) * -1e4  # 与 logits_lm 同款打印掩码 (C3: probs 双域统一)
-        target_lm = F.one_hot(ctx.byte_ids[:, 1:], num_classes=256).to(torch.float16)
-        target_lm2 = F.one_hot(ctx.byte_ids[:, 2:], num_classes=256).to(torch.float16)
+        target_lm = F.one_hot(ctx.byte_ids[:, 1:], num_classes=ALPHABET).to(torch.float16)
+        target_lm2 = F.one_hot(ctx.byte_ids[:, 2:], num_classes=ALPHABET).to(torch.float16)
+
         # 局部 softmax 误差: eps = target - softmax(logits); logits 已归一化 [-60,60] 无溢出
-        probs_lm = torch.softmax(logits_lm, dim=-1)  # [N,S,256] fp16
+        probs_lm = torch.softmax(logits_lm, dim=-1)  # [N,S,ALPHABET] fp16
         probs_t2 = torch.softmax(logits_t2, dim=-1)
-        eps_lm = (target_lm - probs_lm[:, :-1]).detach()  # [N,S-1,256]
-        eps_t2 = (target_lm2 - probs_t2).detach()  # [N,S-2,256]
+        eps_lm = (target_lm - probs_lm[:, :-1]).detach()  # [N,S-1,ALPHABET]
+        eps_t2 = (target_lm2 - probs_t2).detach()  # [N,S-2,ALPHABET]
+
         # 多步差分目标: diff2 = (target_{t+2}-target_{t+1}) - (probs_{t+2}-probs_{t+1}), 额外的局部误差通道
-        probs_l1 = probs_lm[:, :-1]  # [N,S-1,256] = t+1 概率
-        probs_l2 = probs_t2  # [N,S-2,256] = t+2 概率
-        target_l1 = target_lm  # [N,S-1,256]
-        target_l2 = target_lm2  # [N,S-2,256]
-        diff2 = (target_l2 - target_l1[:, :-1]) - (probs_l2 - probs_l1[:, :-1])  # [N,S-2,256]
+        probs_l1 = probs_lm[:, :-1]  # [N,S-1,ALPHABET] = t+1 概率
+        probs_l2 = probs_t2  # [N,S-2,ALPHABET] = t+2 概率
+        target_l1 = target_lm  # [N,S-1,ALPHABET]
+        target_l2 = target_lm2  # [N,S-2,ALPHABET]
+        diff2 = (target_l2 - target_l1[:, :-1]) - (probs_l2 - probs_l1[:, :-1])  # [N,S-2,ALPHABET]
+
         # 行掩码: t+1 与 t+2 目标均 ≥32 的行才保留 (C3: 幻影目标行整行清零)
         diff2 = diff2 * (ctx.learn_mask[:, :-1] & ctx.learn_mask[:, 1:]).to(torch.float16).unsqueeze(-1)
-        diff2 = torch.cat([diff2, net._padmax[:, :, :256]], dim=1)  # S-1 对齐
+        diff2 = torch.cat([diff2, net._padmax[:, :, :ALPHABET]], dim=1)  # S-1 对齐
+
         # 学习位置掩码 (engine 端从目标字节推导): t+1 位 [N,S-1,1], t+2 位 [N,S-2,1]
         lm_mask = ctx.learn_mask.to(torch.float16).unsqueeze(-1)
         eps_lm = eps_lm * lm_mask
+
         # scaffold 实验通道 (wordstart_add_prereg.md; 默认 0 零变更): eps 行加权, 全程 fp16
         # A: 目标字节为 UTF-8 首字节的行 ×boundary_w; 词首加法: 词首行额外 +word_start_add (不减词内)
         _bw = float(getattr(net, "_boundary_w", 0.0) or 0.0)
         _wsa = float(getattr(net, "_word_start_add", 0.0) or 0.0)
         if _bw > 0.0 or _wsa > 0.0:
-            _lead = (ctx.byte_ids[:, 1:] & 0xC0) != 0x80  # [N,S-1] target = UTF-8 首字节
+            _lead = (ctx.byte_ids[:, 1:] & CONTINUATION_PREFIX[0]) != CONTINUATION_PREFIX[1]  # [N,S-1] target = UTF-8 首字节
             if _bw > 0.0:
                 _rw = 1.0 + (_bw - 1.0) * _lead.to(torch.float16)
             else:
@@ -134,13 +151,14 @@ class ReadoutMixin(_MixinBase):
             if _wsa > 0.0 and _wsm is not None:
                 _rw = _rw + _wsa * _wsm.to(torch.float16)
             eps_lm = eps_lm * _rw.unsqueeze(-1)
+
         # 字符级 eps 聚合 (pre_2a_step2_prereg.md; 默认关零变更): 同字符内各字节共享该字符的平均误差,
-        # 学习信号单元 = 字符而非字节. eps 形状 [N,S-1,256] (256=字节类维), 按位置维段聚合; 全程 fp16
+        # 学习信号单元 = 字符而非字节. eps 形状 [N,S-1,ALPHABET], 按位置维段聚合; 全程 fp16
         if getattr(net, "_char_agg", False):
             _tgt = ctx.byte_ids[:, 1:]  # [N,S-1] 目标字节
-            _lead_t = ((_tgt & 0xC0) != 0x80).to(torch.float16)  # 字符首字节
+            _lead_t = ((_tgt & CONTINUATION_PREFIX[0]) != CONTINUATION_PREFIX[1]).to(torch.float16)  # 字符首字节
             _seg = (torch.cumsum(_lead_t, dim=1) - _lead_t).long()  # [N,S-1] 每位置所属字符 id (0 起)
-            _idx3 = _seg.unsqueeze(-1).expand_as(eps_lm)  # [N,S-1,256]
+            _idx3 = _seg.unsqueeze(-1).expand_as(eps_lm)  # [N,S-1,ALPHABET]
             _sum = torch.zeros_like(eps_lm)
             _cnt = torch.zeros_like(_seg, dtype=torch.float16)
             _sum.scatter_add_(1, _idx3, eps_lm)
@@ -149,6 +167,7 @@ class ReadoutMixin(_MixinBase):
             _mean = _sum / _den.unsqueeze(-1)
             eps_lm = _mean.gather(1, _idx3) * lm_mask
         eps_t2 = eps_t2 * ctx.learn_mask[:, 1:].to(torch.float16).unsqueeze(-1)
+
         # 0.2 权重: diff2 能量占比 ~22%, 保留为辅助结构信号
         eps_total = (eps_lm + 0.2 * diff2).detach()  # W_lm: t+1 + 差分 (S-1 对齐)
         eps_t2_total = (eps_t2 + 0.2 * diff2[:, :-1]).detach()  # W_lm_2: t+2 + 差分 (S-2)
@@ -198,19 +217,23 @@ class ReadoutMixin(_MixinBase):
                 slope20 = (net._t_center * w).sum() / net._t_denom * 20.0  # 20 步总变化
                 sigma = w.std() + 1e-4
                 net._traction_scale.copy_(2.0 / (1.0 + torch.exp(-slope20 / sigma)))
+
         # 显著性反馈: 回传误差 × 时间突变范数, 状态剧变且预测失误时大幅改写表示层.
         # 投影用全量 W_lm 取 z4 维, 不受池门控排挤, 防表示层收不到误差而漂移 NaN.
         dz4_sig = (z4[:, 1:] - z4[:, :-1]).norm(dim=-1, keepdim=True)  # [N,S-1,1]
         dz4_sig = dz4_sig / (dz4_sig.max() + 1e-3)
+
         # soft 饱和增益: gain = x/(0.5·mean+0.5·x) ∈ (0,2)
         err_mag = eps_total.norm(dim=-1, keepdim=True)  # [N,S-1,1]
         err_ref = err_mag.mean() + 1e-3
         gain = err_mag / (0.5 * err_ref + 0.5 * err_mag)
+
         # 混合层转置投影: e → W_lm.T → W1.T → z4 段; RMS 归一化防 W_04 更新爆
         # 结构化预缩放 (A1): 矩阵乘在 d_h 维累加可冲 fp16 上限, 溢出发生在 rms_norm
         # 之前 (后置归一化救不了); ÷64 = 指数移位, rms_norm 尺度不变 → 下游语义零变
         eps_in = eps_total / 64.0
         eps_proj_raw = (eps_in @ net.W_lm.T @ W1_a.T)[:, :, :dim_4] * dz4_sig * gain  # [N,S-1,dim_4]
+
         # 计价项取归一化前的投影能量. rms_norm 逐活行恒定输出 1/1.01 均方 (幅值被抹平),
         # 拿它的输出计价会让 F 逐位退化成行存活计数 fp16(0.990099·alive/256): 死区 2.8e4 倍,
         # 任一位点的信任域步都比翻一格台阶小 333 倍 → 无位点可被计价. ×F_UNIT_SCALE 只是
@@ -238,7 +261,8 @@ class ReadoutMixin(_MixinBase):
         )
 
     def _update_w1v2_heads(self, ctx, lm):
-        """w1v2 每头局部重建 (w1v2_prereg.md §1.3-1.5): 预测编码式局部规则, 非共现非 BP.
+        """
+        w1v2 每头局部重建 (w1v2_prereg.md §1.3-1.5): 预测编码式局部规则, 非共现非 BP.
 
         e_i = zh - GELU(zh@A_i)@B_i; 梯度只在头内:
           dA_i ∝ zhᵀ @ ((e_i @ B_iᵀ) ⊙ GELU'(zh@A_i));  dB_i ∝ GELU(zh@A_i)ᵀ @ e_i.
@@ -260,11 +284,13 @@ class ReadoutMixin(_MixinBase):
                 r_w = (r @ net._w1v2_wzh).unsqueeze(-1)  # [N,S-1,1] 组合方向投影误差
                 e = r + net._w1v2_wzh_lam * r_w * net._w1v2_wzh.unsqueeze(0).unsqueeze(0)
             recon.append(r.square().mean().detach())  # 遥测报纯重建 MSE (可与第一步对比)
+
             # GELU 导数 (sigmoid 近似: gelu(x)≈x·σ(1.702x))
             sig = torch.sigmoid(1.702 * z)
             g = sig + 1.702 * z * sig * (1.0 - sig)  # [N,S-1,d_head]
             dA = (zh_prev.transpose(-2, -1) @ ((e @ B.transpose(-2, -1)) * g)).mean(dim=0)  # [lm_in,d_head]
             dB = (h_i.transpose(-2, -1) @ e).mean(dim=0)  # [d_head,lm_in]
+
             # 单位范数 + 相对幅度 (同 W1 更新风格), 零更新掩码防 fp16 0/0=NaN
             for d, p in ((dA, A), (dB, B)):
                 mx = d.abs().max() + 1e-4
@@ -328,8 +354,10 @@ class ReadoutMixin(_MixinBase):
             p.data.mul_(torch.minimum(torch.ones_like(pn), 50.0 / (pn + 1e-6)))
 
     def _single_recon_w1(self, ctx, lm):
-        """单通道加权重建辅信号 (single_recon_prereg.md §1.5): dW1_recon = zh.T @ (e_eff@B.T ⊙ h_deriv).
-        返回单位范数 × η_recon_ratio 的 dW1_recon; 同时更新 B_recon (相对幅度 + 等比帽)."""
+        """
+        单通道加权重建辅信号 (single_recon_prereg.md §1.5): dW1_recon = zh.T @ (e_eff@B.T ⊙ h_deriv).
+        返回单位范数 × η_recon_ratio 的 dW1_recon; 同时更新 B_recon (相对幅度 + 等比帽).
+        """
         net = self.net
         zh_prev = lm.zh[:, :-1]  # [N,S-1,lm_in]
         mask = ctx.learn_mask.to(torch.float16).unsqueeze(-1)
@@ -362,9 +390,11 @@ class ReadoutMixin(_MixinBase):
         _mig = getattr(net, "_migrate_expand", False)  # migrate_expand_prereg.md: W1/W_lm 冻结, 新通道可训练
         _realign = getattr(net, "_readout_realign", False)  # E8a: 覆写 _mig 冻结门 (默认关, 逐位不变)
         _rdfrz = getattr(net, "_readout_freeze", False)  # E8: 读出侧全冻结 (默认关, 逐位不变)
+
         # E9f 拆门: 旧读出 (W1/W_lm/bias_lm/W_lm_2) 与 migrate 新通道 (W1_new/W_lm_new/B_new) 各用一个门;
         # 未显式接线 _migrate_freeze 时跟随 _rdfrz, 保证 E8/E9/默认路径逐位不变.
         _migfrz = getattr(net, "_migrate_freeze", _rdfrz)
+
         # 字节头降权 (self_state_layered_prereg.md §2.2; 默认 1.0 逐位零变更): eps 单位能量
         # 归一 + dW 单位范数化对信号侧全局缩放不变 → 降权落更新幅度 (×_bhw, 仅 ssp 开启时生效)
         _bhw = float(getattr(net, "_byte_head_w", 1.0)) if getattr(net, "_self_state_pred", False) else 1.0
@@ -377,16 +407,18 @@ class ReadoutMixin(_MixinBase):
         err_scaled = lm.eps_total * alive / denom  # 单位能量, 方向保留
 
         # 结构对比度惩罚: 非目标列按"与目标列 logits 距离"加权, 区分差的错误列放大排斥
-        target_oh = F.one_hot(byte_ids[:, 1:], num_classes=256).to(torch.float16)  # [N,S-1,256]
+        target_oh = F.one_hot(byte_ids[:, 1:], num_classes=ALPHABET).to(torch.float16)  # [N,S-1,ALPHABET]
         logits_d = (lm.h[:, :-1] @ net.W_lm) * inv_h  # 未去偏 logits (对比度基准)
         tgt_logits = (logits_d * target_oh).sum(dim=-1, keepdim=True)  # [N,S-1,1] 目标列值
         contrast = (logits_d - tgt_logits).abs()  # 与目标列的距离
         contrast_w = 1.0 / (1.0 + contrast * 0.1)  # 距离近 → 权重大 (排斥), 距离远 → 小
         contrast_w = contrast_w * (1.0 - target_oh) + target_oh  # 目标位权重保持 1
+
         if net.cfg.lm_no_contrast:
             err_contrast = err_scaled * (1.0 - target_oh) + target_oh * err_scaled
         else:
             err_contrast = err_scaled * contrast_w  # 对比度加权误差 (空间排斥)
+
         # 快慢散度学习窗口: η = sigmoid(N - τ) ∈ (0,1) 只调变化量, 不翻转方向
         # (翻转会让 W_lm 因一次异常生成被重解释)
         if hasattr(net, "_novelty"):
@@ -400,7 +432,8 @@ class ReadoutMixin(_MixinBase):
         lm_update_mask = ctx.learn_mask.to(torch.float16).unsqueeze(-1)  # [N,S-1,1]
         dW_lm = (
             rms_norm(lm.h[:, :-1]).transpose(-2, -1) @ (err_contrast * lm_update_mask * d_t)
-        ).mean(dim=0) * math.sqrt(d_h)  # [d_h,256] (补偿输出缩放)
+        ).mean(dim=0) * math.sqrt(d_h)  # [d_h,ALPHABET] (补偿输出缩放)
+
         # 单位向量 (单步更新幅度上界), 信任域防从零初始化时信号被噪声淹没
         # 零更新保护: 1e-8 在 fp16 下舍为 0, 零窗 dW≡0 → 0/0=NaN (步 3012 实证); 掩码式归零
         # 交底: 旧代码 +1e-8 在 fp16 下等于 +0——ε 从未被观测到; 本修复不是换更好的 ε
@@ -413,7 +446,7 @@ class ReadoutMixin(_MixinBase):
             net.W_lm.data += dW_lm * (ctx.eta_lm * net.W_lm.norm() * LM_TRUST_REGION * _bhw)
         if not _rdfrz:
             # bias 硬复位: 范数锁定 target=10, 更新降 20× (去均值只学相对偏置)
-            bias_err = lm.eps_lm  # [N,S-1,256] 原始 target - probs, 无归一化
+            bias_err = lm.eps_lm  # [N,S-1,ALPHABET] 原始 target - probs, 无归一化
             bias_d = bias_err.mean(dim=(0, 1))
             net.bias_lm.data += (bias_d - bias_d.mean()) * (ctx.eta_lm / 20.0 * _bhw)
             bn = net.bias_lm.norm()
@@ -438,6 +471,7 @@ class ReadoutMixin(_MixinBase):
             lm.e_h = e_h
             dW1 = (rms_norm(lm.zh[:, :-1]).transpose(-2, -1) @ rms_norm(e_h)).mean(dim=0)
             net._dW1_absmax_raw = dW1.abs().max().detach()  # 遥测: 缩放前条目绝对最大
+
             # 结构化预缩放: 除条目绝对最大再除 64 → 范数 ≤4 (防 fp16 平方和溢出 → inf → 死锁/NaN)
             # 末级归一化同款零更新保护: 1e-8 fp16 舍为 0, 零窗 0/0=NaN → 掩码式归零
             mx1 = dW1.abs().max() + 1e-4
@@ -487,6 +521,7 @@ class ReadoutMixin(_MixinBase):
             _ez_alive = (_ez_norm > 1e-8).to(_ez.dtype)
             _ez_den = torch.where(_ez_alive > 0, _ez_norm, torch.ones_like(_ez_norm))
             _ez_unit = _ez * _ez_alive / _ez_den  # 逐行单位能量 (掩码式, 防 fp16 0/0)
+
             # 1) 头本体
             _dW_z4 = (
                 rms_norm(lm.h[:, :-1]).transpose(-2, -1) @ (_ez_unit * lm_update_mask * d_t)
@@ -495,6 +530,7 @@ class ReadoutMixin(_MixinBase):
             _alive_z4 = (_n_z4 > 0).to(_dW_z4.dtype)
             _dW_z4 = _dW_z4 * _alive_z4 / torch.where(_alive_z4 > 0, _n_z4, torch.ones_like(_n_z4))
             self._ssp_w += _dW_z4 * (ctx.eta_lm * LM_TRUST_REGION)
+
             # 2) W1 转置传播: e = eps @ W_z4_headᵀ ⊙ h_deriv; 头为零 → e≡0 → 掩码式零更新
             _e_z4h = (_ez_unit @ self._ssp_w.T) * lm.h_deriv[:, :-1]  # [N,S-1,d_h]
             _dW1_z4 = (rms_norm(lm.zh[:, :-1]).transpose(-2, -1) @ rms_norm(_e_z4h)).mean(dim=0)
@@ -524,6 +560,7 @@ class ReadoutMixin(_MixinBase):
             net.W1.data[:_a4, :] += _dW1_state * (ctx.eta_lm * net.W1[:_a4, :].norm() * LM_TRUST_REGION)
             soft_norm_preserve(net.W1.data)
             self._eps_state = None  # 单步消费
+
         # 每步清除新奇度 (前向已更新, 防陈旧信号跨步复用)
         if hasattr(net, "_novelty"):
             del net._novelty

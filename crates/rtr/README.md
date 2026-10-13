@@ -1,5 +1,5 @@
 ---
-description: "rtr: trace-modulated eligibility plasticity, the credit-assigned rule every dense weight update now runs through."
+description: "trace-modulated eligibility plasticity, the credit-assigned rule every dense weight update now runs through."
 kind: "package-reference"
 ---
 

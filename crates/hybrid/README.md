@@ -1,5 +1,5 @@
 ---
-description: "hybrid：密集感知-预测-行动闭环的引擎，前馈、推理、生成与引擎委托。"
+description: "密集感知-预测-行动闭环的引擎，前馈、推理、生成与引擎委托。"
 kind: "package-reference"
 ---
 

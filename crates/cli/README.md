@@ -1,5 +1,5 @@
 ---
-description: "cli：train、resume、配置、检视与数据准备的 click 命令行入口，面向 dense PPA 后端。"
+description: "train、resume、配置、检视与数据准备的 click 命令行入口，面向 dense PPA 后端。"
 kind: "package-reference"
 ---
 
@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`crates.cli` is the command surface of the project. It builds a single click group named `app` that registers six subcommands: `train`, `from-config`, `resume`, plus `data`, `list`, and `config` groups. It selects the dense PPA backend, wires data files and checkpoints, allocates versioned output directories under `out/`, and delegates heavy work to `crates.model` and `crates.utils`. Paths are resolved relative to the project root, and byte windows are utf-8 encoded and zero-padded before they reach the model. It holds no model code and no training loop of its own.
+`crates.cli` is the command surface of the project. It builds a single click group named `app` that registers six subcommands: `train`, `from-config`, `resume`, plus `data`, `list`, and `config` groups. It selects the dense PPA backend, wires data files and checkpoints, allocates versioned output directories under `out/`, and delegates heavy work to `crates.model` and `crates.utils`. Paths are resolved relative to the project root, and byte windows are encoded and zero-padded by the helpers in `crates.utils.codec` before they reach the model. It holds no model code and no training loop of its own.
 
 ## Table of Contents
 
@@ -57,7 +57,7 @@ Prepare data.
 
 `utils.py` is the shared spine. `resolve_path` anchors relative paths at the project root. `run_dir` lazily allocates this process version directory by calling `crates.utils.outver.ensure_run_dir`, and `pin_run_dir` anchors a resumed run to the existing training line. `run_file`, `load_config`, `save_config`, and `merge_config` cover the config plumbing. It also carries the `TRAIN_CONFIG_TEMPLATE` and `AUTONOMOUS_CONFIG_TEMPLATE` defaults.
 
-`train_cmd.py` owns the dense training loop. `tiled_windows`, `window_ids`, and `skip_zero_windows` are pure functions: sample text is encoded to utf-8 and **tiled** at `stride = max_seq_len` with no truncation, so the concatenated windows reproduce every byte of the corpus, and only samples that would become all-zero windows are dropped. The last tile of a document is left-aligned and zero-filled; those fill positions carry no learning signal because `learn` masks every target byte below 32. The `_train_dense` helper iterates JSONL with a line-scan first pass for progress reporting, stacks byte windows into batch tensors, flushes the trailing partial batch at the end of each file, and calls `net.learn` with gradients disabled. Several legacy options are accepted and reported as ignored rather than rejected.
+`train_cmd.py` owns the dense training loop, and the byte-domain helpers it calls live with the tools rather than here: `tiled_windows` and `window_ids` come from `crates.utils.codec`, which reads the container's padding byte from `crates.modal.text.geometry`. Sample text is encoded to utf-8 and **tiled** at `stride = max_seq_len` with no truncation, so the concatenated windows reproduce every byte of the corpus, and only samples that would become all-zero windows are dropped. The last tile of a document is left-aligned and zero-filled; those fill positions carry no learning signal because `learn` masks every target byte below the printable start. The `_train_dense` helper iterates JSONL with a line-scan first pass for progress reporting, stacks byte windows into batch tensors, flushes the trailing partial batch at the end of each file, and calls `net.learn` with gradients disabled. Several legacy options are accepted and reported as ignored rather than rejected.
 
 The `train` command fails fast on a missing `-d` list. `resume` reads the config snapshot from the checkpoint first so dimension fields always follow the snapshot, and bumps the buffer max sequence length only if the request exceeds it.
 

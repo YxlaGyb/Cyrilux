@@ -9,6 +9,7 @@ import click
 import torch
 
 from crates.cli.utils import load_config, resolve_path, run_dir
+from crates.utils.codec import tiled_windows, window_ids
 
 
 def _build_net(hidden_size: int, lr: float, max_seq_len: int, checkpoint: str | None = None):
@@ -28,45 +29,6 @@ def _build_net(hidden_size: int, lr: float, max_seq_len: int, checkpoint: str | 
     if checkpoint is not None:
         return HybridPCNet.load(resolve_path(checkpoint), d_cfg), d_cfg
     return HybridPCNet(d_cfg), d_cfg
-
-
-def extract_window_text(sample: dict) -> str:
-    """样本 → 训练文本: `text` 字段; 含 `conversations` 则拼接其 content/value."""
-    t = sample.get("text", "")
-    if "conversations" in sample:
-        t = "".join(m.get("content", m.get("value", "")) for m in sample["conversations"])
-    return t
-
-
-def tiled_windows(sample: dict, max_seq_len: int) -> list[bytes]:
-    """样本 → 全部字节窗 (纯函数): utf-8 编码后按 stride = max_seq_len 左对齐平铺.
-
-    窗拼接恒等于原文全字节 —— 旧路径 `[:max_seq_len]` 截断丢弃的 65.81% 语料不再丢弃.
-    零窗判定与 `_SamplePrefetch` (exp115_say.py) 同源: 空文本 → [] (整窗全零 → 跳过),
-    跨路径一致性由 tests/test_zero_window_skip.py 保证. 尾窗短于窗宽, 其 0x00 填充位
-    在 `learn` 的目标位掩码 (目标字节 <32) 下无学习信号.
-    """
-    bs = extract_window_text(sample).encode("utf-8")
-    return [bs[i : i + max_seq_len] for i in range(0, len(bs), max_seq_len)]
-
-
-def window_ids(bs: bytes, max_seq_len: int) -> torch.Tensor:
-    """字节窗 → 定长 id 张量 (纯函数): 前 len(bs) 位真实字节, 其余 0x00 填充 (左对齐)."""
-    ids = torch.zeros(max_seq_len, dtype=torch.long)
-    ids[: len(bs)] = torch.tensor(list(bs), dtype=torch.long)
-    return ids
-
-
-def skip_zero_windows(samples, max_seq_len: int) -> tuple[list[bytes], int]:
-    """批量口径 (审计计数): 样本序列 → (保留的全部平铺字节窗, 零窗样本跳过数)."""
-    kept, skipped = [], 0
-    for sample in samples:
-        wins = tiled_windows(sample, max_seq_len)
-        if not wins:
-            skipped += 1
-            continue
-        kept.extend(wins)
-    return kept, skipped
 
 
 def _train_dense(
