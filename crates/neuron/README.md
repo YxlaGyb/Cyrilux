@@ -43,7 +43,7 @@ Memory pool.
 
 | Export | Shape | Meaning |
 |---|---|---|
-| `mem_pool.update(ctx, sh)` | Per step | Fitness, gain, then death and birth of the memory units. Called after the LM head update. |
+| `mem_pool.update(ctx, sh)` | Per step | Survival income, then death and birth of the memory units. Called after the LM head update. |
 | `mem_pool.famine_kill()` | Death round | Evicts the lowest-gain unit (index 0 immune, K floor 1). Content and identity are lost permanently. |
 | `mem_pool.birth(parent)` | Birth | Splits a child off the parent unit and appends a zero `W1` block. |
 | `mem_pool.resize(keep)` | Re-index | Re-registers the unit buffers and the `W1`/`W1_elig` rows for a new K. |
@@ -57,7 +57,7 @@ Memory pool.
 
 The memory pool keeps the K units in a fixed layout: their state lives in `_mem_m`, `_mem_a`, `_mem_g`, and `_mem_q`, and their decoder rows sit in the `W1` block from `dim_4 + bind_slot_dim` onward. Both death and birth re-register that block, so the invariant `net._lm_in == W1.shape[0]` holds after every event: it is the single merge point that keeps the `zh` columns and the `W1` rows from ever misaligning.
 
-Fitness is the batch-mean cosine between a unit's memory and the error projected back into `zh` space, tracked as the slow `_mem_q` EMA. Gain follows multiplicatively with a bounded decay, so a unit with zero contribution drives `g` toward zero. Death fires when `g` stays below `mem_g_min` for `mem_death_steps`; birth fires when the fast error EMA exceeds the slow EMA times `mem_birth_thresh` and the cooldown has expired. Index 0 is immune to death, and `mem_k_max` caps growth.
+Membership is priced by the survival ledger, not by the byte loss. The income of a unit is the magnitude of the survival residual times the cosine between its memory and the direction of the ledger state `ẑ`, smoothed into the slow `_mem_q` EMA. The gain is bounded, and a unit with no income at all decays toward zero. Death fires when `g` stays below `mem_g_min` for `mem_death_steps`; birth fires when the fast error EMA exceeds the slow EMA times `mem_birth_thresh` and the cooldown has expired. Index 0 is immune to death, and `mem_k_max` caps growth.
 
 The famine kill is the direct loss of a metabolic death round: it evicts the lowest-gain unit at once, and that content and identity are gone permanently. A later birth clones a new unit from a surviving parent, so K can rebound; the irreversibility lives in `active_size`, which only ever shrinks.
 

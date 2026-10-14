@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
-from crates.kernels import l2_norm, rms_norm
+from crates.kernels import l2_norm
 
 if TYPE_CHECKING:
     from crates.model.model_cyrene import HybridPCNet
@@ -32,8 +32,9 @@ class MemoryPool:
     def update(self, ctx, sh):
         """
         竞争性记忆单元群:
-        适应度 → 增益 → 出生/死亡，全部纯局部机制
+        生存定价(收入) → 增益 → 出生/死亡，全部纯局部机制
 
+        收入: |m| · cos(单元内容, 账本状态方向 ẑ), m = 生存账本残差.
         出生: 读取误差快 EMA > 长程慢 EMA × 阈值 → 增益最高单元二分出子.
         死亡: g < g_min 持续超限 → 删除 (K_min=1 保底).
         时机: 在 _update_lm_head 之后, K 变化只影响下一步 (zh 列与 W1 行永不错位).
@@ -42,24 +43,18 @@ class MemoryPool:
         if ctx.free_run or ctx.echo_world_frozen or sh.lm is None:
             return
         cfg = net.cfg
-        dim_4 = ctx.dim_4
-        N = ctx.N
         K = net._mem_m.shape[0]
-        m_out = net._mem_out
-        if m_out is None or m_out.shape[2] != K * dim_4:
-            return
         lm = sh.lm
-        if lm.e_h is None:
+        if lm.e_h is None or getattr(net, "_w1v2", False):
             return
 
-        # 1) 适应度: 误差投影回 zh 空间, 取单元段与单元记忆的余弦
-        e_zh = rms_norm(lm.e_h) @ net.W1.T  # [N,S-1,lm_in]
-        e_cells = e_zh[:, :, dim_4 + net.bind_slot_dim :].reshape(N, lm.e_h.shape[1], K, dim_4).detach()
-        mc = m_out[:, :-1].reshape(N, lm.e_h.shape[1], K, dim_4).detach()
-        cos = (l2_norm(mc) * l2_norm(e_cells)).sum(dim=-1).mean(dim=(0, 1))  # [K] ∈ [-1,1]
-        net._mem_q.mul_(0.99).add_(0.01 * cos)
+        # 1) 收入: 生存货币 |m| × 单元内容与账本状态方向 ẑ 的余弦
+        pooled = net._z4.mean(dim=(0, 1))
+        z_hat = pooled / (pooled.norm() + 1e-6)
+        q = net._survival_signal.abs() * (l2_norm(net._mem_m) @ z_hat)  # [K] ∈ [-2,2]
+        net._mem_q.mul_(0.99).add_(0.01 * q)
 
-        # 2) 增益 (有界参数 clamp, 非梯度路径): q>0 上推, 乘性衰减让零贡献单元 g→0
+        # 2) 增益: 生存货币入账 (clamp 为界, 非梯度路径, 非溢出修补)
         net._mem_g.mul_(1.0 - cfg.mem_g_decay).clamp_(min=0.0)  # tensor-guard: bound (记忆增益界, 非梯度)
         net._mem_g.add_(cfg.mem_eta_g * net._mem_q)
         net._mem_g.clamp_(max=cfg.mem_g_max)  # tensor-guard: bound (记忆增益界, 非梯度)
