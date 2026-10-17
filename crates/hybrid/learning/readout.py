@@ -378,7 +378,7 @@ class ReadoutMixin(_MixinBase):
         net.B_recon.data.mul_(torch.minimum(torch.ones_like(pn), 50.0 / (pn + 1e-6)))
         return self._mig_unit(dW1_recon) * net._w1v2_eta_recon  # 辅信号比主小 (η_recon_ratio)
 
-    def _update_lm_head(self, ctx, sh):
+    def _update_lm_head(self, ctx, lm):
         """LM 头自监督局部更新: W_lm/W_lm_2/W1/bias_lm. 返回 d_t."""
         net = self.net
         if ctx.free_run or ctx.echo_world_frozen:
@@ -386,7 +386,6 @@ class ReadoutMixin(_MixinBase):
         d_h = net.d_h
         inv_h = 1.0 / math.sqrt(d_h)
         byte_ids = ctx.byte_ids
-        lm = sh.lm
         _mig = getattr(net, "_migrate_expand", False)  # migrate_expand_prereg.md: W1/W_lm 冻结, 新通道可训练
         _realign = getattr(net, "_readout_realign", False)  # E8a: 覆写 _mig 冻结门 (默认关, 逐位不变)
         _rdfrz = getattr(net, "_readout_freeze", False)  # E8: 读出侧全冻结 (默认关, 逐位不变)

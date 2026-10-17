@@ -20,7 +20,7 @@ from ._common import _MixinBase, _plastic
 class BindMixin(_MixinBase):
     """绑定域 (方法挂载到 LearningEngine)."""
 
-    def _update_Ml5(self, ctx, sh):
+    def _update_Ml5(self, ctx):
         """Foldiak 反赫布侧抑制更新: dM = z_out 协方差 (白化本质), 零对角, 指数遗忘防爆炸.
 
         z_out 已逐行 RMS 归一化, 协方差元素 ∈[-1,1], 增量 fp16 直接可表示 (不做 Frobenius 归一化).
@@ -41,7 +41,7 @@ class BindMixin(_MixinBase):
 
     _MX_PARAM = {"l4": "M_x4", "l2": "M_x2", "l3": "M_x3", "l5": "M_x5", "l6": "M_x6"}
 
-    def _update_Mx(self, ctx, sh, layer: str) -> None:
+    def _update_Mx(self, ctx, layer: str) -> None:
         """反赫布共激活侧抑制更新: dM ∝ −(ccᵀ − diag(c²)), c = 胜者 mask 逐窗折叠 [N].
 
         同时共激活的神经元对被抑制 (去同质化); c ∈ {0,1}/N_avg 折叠, 协方差元 ∈ [-1,1],
@@ -60,7 +60,7 @@ class BindMixin(_MixinBase):
         M = getattr(net, self._MX_PARAM[layer])[:dim, :dim]
         M.data.mul_(0.99).sub_((cov * eye_mask) * (0.01 * ctx.learn_boost))
 
-    def _update_bind(self, ctx, sh):
+    def _update_bind(self, ctx, lm):
         """竞争性概念绑定层更新 (纯外积) + 内在驱动 W_bind_self."""
         net = self.net
         dev, N, S = ctx.dev, ctx.N, ctx.S
@@ -92,7 +92,7 @@ class BindMixin(_MixinBase):
             if ctx.free_run:
                 gain_n = net._one1  # 每样本独立 surprise EMA 门控 (预分配缓冲)
             else:
-                s_n = sh.lm.eps_total.square().mean(dim=-1).mean(dim=-1)  # [N] 每样本均方误差
+                s_n = lm.eps_total.square().mean(dim=-1).mean(dim=-1)  # [N] 每样本均方误差
                 # 缓冲按 batch 扩容 (新样本 EMA=1.0 起)
                 if net._s_ema_n.shape[0] < N:
                     old = net._s_ema_n

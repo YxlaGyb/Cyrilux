@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -11,11 +12,26 @@ import torch
 if TYPE_CHECKING:
     from crates.model.model_cyrene import HybridPCNet
 
+    from .engine import LearnCtx
+
 from crates.kernels import (
     activity_baseline,
     energy_constraint,
     rho_control,
 )
+
+
+@dataclass
+class LayerErrs:
+    """逐层预测误差，精度加权版"""
+
+    eps4: torch.Tensor
+    eps2: torch.Tensor
+    eps3: torch.Tensor
+    eps5: torch.Tensor
+    eps6: torch.Tensor
+    eps2_precise: torch.Tensor
+    eps6_precise: torch.Tensor
 
 
 class _MixinBase:
@@ -84,3 +100,22 @@ def _rho_ctrl(dW: torch.Tensor, W_ref: torch.Tensor, tag: str, net: HybridPCNet)
     nW_i = W_ref.norm() + 1e-8
     net._rho_map[tag] = (rho, dW_s.norm() / nW_i, s_i)
     return dW_s
+
+
+def layer_errs(ctx: LearnCtx) -> LayerErrs:
+    """
+    逐层预测误差块 (自下而上 PC): L5 用时序差分误差, L6 用时间自预测.
+
+    逐位置误差先过可塑码门控 P_l (死/不活跃神经元不进权重更新).
+    """
+    net = ctx.net
+    dim_4, dim_2, dim_3, dim_6 = ctx.dim_4, ctx.dim_2, ctx.dim_3, ctx.dim_6
+    z0, z4, z2, z3, z5, z6 = net._z0, net._z4, net._z2, net._z3, net._z5, net._z6
+    eps4 = _plastic(z4 - (z0 @ net.W_04[:dim_4].T + net.bias_l4[:dim_4]), net, "l4")
+    eps2 = _plastic(z2 - (z4 @ net.W_42[:dim_2].T + net.bias_l2[:dim_2]), net, "l2")
+    eps3 = _plastic(z3 - (z2 @ net.W_23[:dim_3].T + net.bias_l3[:dim_3]), net, "l3")
+    z6_pre = torch.cat([net._padmax[:, :, :dim_6], z6[:, :-1]], dim=1)
+    eps6 = _plastic(z6 - z6_pre, net, "l6")
+    eps5 = _plastic(z5[:, 1:] - z5[:, :-1], net, "l5", pos=slice(1, None))
+    fe = net.forward_engine
+    return LayerErrs(eps4, eps2, eps3, eps5, eps6, fe._precise(eps2), fe._precise(eps6))

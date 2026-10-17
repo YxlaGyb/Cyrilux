@@ -399,6 +399,8 @@ class HybridPCNet(nn.Module):
             torch.zeros(1, self.cfg.max_seq_len + self.cfg.free_run_window + 64, dtype=torch.long),
         )
         self.register_buffer("_cont_expect", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("_gen_counts", torch.zeros(3, dtype=torch.long), persistent=False)
+        self._bind_commit = False
         self.register_buffer(
             "_mem_m_seq",
             torch.zeros(1, self.cfg.max_seq_len, max(self.cfg.mem_k0, self.cfg.mem_k_max), d["l4"], dtype=torch.float16),

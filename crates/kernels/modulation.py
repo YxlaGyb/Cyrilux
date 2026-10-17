@@ -47,6 +47,11 @@ def compute_ach(uncertainty: float, beta_0: float = 0.0) -> float:
     return 1.0 / (1.0 + math.exp(x))
 
 
+def ach_noise(mu3: torch.Tensor, nov: torch.Tensor) -> torch.Tensor:
+    """ACh 抖动，逐元素 ±(0.03·(0.5+nov)) 随机符号叠加到激活上"""
+    return mu3 + torch.sign(2.0 * (torch.rand_like(mu3) - 0.5)) * (0.03 * (0.5 + nov))
+
+
 def combine_modulation(D: float, ACh: float) -> float:
     """组合调制信号: 0.5*D + 0.5*ACh."""
     return 0.5 * D + 0.5 * ACh

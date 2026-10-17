@@ -22,7 +22,7 @@ GAMMA = 0.9
 class PredictMixin(_MixinBase):
     """自组织预测引擎域 (方法挂载到 LearningEngine)."""
 
-    def _update_pred_engine(self, ctx, sh):
+    def _update_pred_engine(self, ctx, lm):
         """未来折扣目标 + W_pred_54/43 更新 + W_35/W_42 注入 + local_err 诊断."""
         net = self.net
         free_run = ctx.free_run
@@ -36,7 +36,7 @@ class PredictMixin(_MixinBase):
         if free_run:
             global_rpe = net._zero1  # tensor-guard: rare (自由运行, 无字节误差 → rpe=1)
         else:
-            global_rpe = (sh.lm.eps_total.square().mean().sqrt() * 10.0).clamp(max=1.0)  # tensor-guard: bound (全局误差幅度界)
+            global_rpe = (lm.eps_total.square().mean().sqrt() * 10.0).clamp(max=1.0)  # tensor-guard: bound (全局误差幅度界)
         Wp54_a = net.W_pred_54[:dim_5, :dim_4]
         Wp43_a = net.W_pred_43[:dim_4, :dim_3]
         pred_l5 = z4_pred_in @ Wp54_a.T  # [N,S,dim_5]
@@ -67,7 +67,7 @@ class PredictMixin(_MixinBase):
         z3_m = z3[:, mask5]
         # W_35 注入 + 软范数: 回声相位冻结 (C5 合约: W_35 全族)
         if not ctx.echo_world_frozen:
-            dW_pred35 = (err5_m.transpose(-2, -1) @ rms_norm(z3_m)).mean(dim=0) / max(1, int(mask5.sum()))
+            dW_pred35 = (err5_m.transpose(-2, -1) @ rms_norm(z3_m)).mean(dim=0) / mask5.sum().clamp_min(1).to(torch.float16)
             Wb.data += _rho_ctrl(dW_pred35 * ctx.eta * rpe * 1.5, Wb, "inj35", net)
             # free_run+突触缩放时豁免 soft_norm (行范数 = 增益自由度归系统, 训练模式保持)
             if not (free_run and net.cfg.wt_syn_scaling):
@@ -76,7 +76,7 @@ class PredictMixin(_MixinBase):
             # W_42 注入: local_err_L4 逆映射到 dim_2 (free_run/回声相位 W_42 冻结)
             z4_m = z4[:, mask4]
             local_err_l4_2 = _plastic(rms_norm(err4_m @ net.W_42[:ctx.dim_2].T), net, "l2", pos=mask4)
-            dW_pred42 = (local_err_l4_2.transpose(-2, -1) @ rms_norm(z4_m)).mean(dim=0) / max(1, int(mask4.sum()))
+            dW_pred42 = (local_err_l4_2.transpose(-2, -1) @ rms_norm(z4_m)).mean(dim=0) / mask4.sum().clamp_min(1).to(torch.float16)
             net.W_42[:ctx.dim_2].data += _rho_ctrl(dW_pred42 * ctx.eta * rpe * 1.5, net.W_42[:ctx.dim_2], "inj42", net)
             soft_norm_preserve(net.W_42[:ctx.dim_2].data)
         # W_pred_* 自更新; 回声相位冻结 (W_pred_* 是世界模型)
@@ -96,4 +96,4 @@ class PredictMixin(_MixinBase):
         z4_scale = z4.square().mean() + 0.01 * z4.square().mean() + 1e-4
         net._local_err_l5 = (local_err_l5[:, mask5].square().mean() / z5_scale).detach()
         net._local_err_l4 = (local_err_l4[:, mask4].square().mean() / z4_scale).detach()
-        sh.l5_local_err = local_err_l5[:, mask5].square().mean().detach()
+        return local_err_l5[:, mask5].square().mean().detach()

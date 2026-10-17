@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`crates.corebrain` holds the Core Brain, a parallel layer beside the dense PPA network. It reads the native `z4` state, pools two views (the last quarter of the window's content and all of its content), projects both into one shared slot space, and runs a top-k winner-take-all inside each view. A small predictor maps the short-view activation onto the slow target built from the long view, and that prediction error is the only learning signal the layer receives. The forward output is a window-level correction added to the L4 state before the L2 normalisation. It is a mandatory part of the dense network and is always constructed. It is not an association cortex: both of its views are tapped from one source, so its shared slots serve one signal's two apertures.
+`crates.corebrain` holds the Core Brain, a parallel layer beside the dense PPA network and a mandatory part of it. It reads the native `z4` state, pools two views (the window's last quarter and the whole window), projects both into one shared slot space and runs top-k winner-take-all per view. A predictor maps the short-view activation onto the slow long-view target, and that error is the layer's only learning signal. Its forward output is a window-level correction added to the L4 state before the L2 normalisation. Both views tap one source, so its shared slots serve one signal's two apertures.
 
 ## Table of Contents
 

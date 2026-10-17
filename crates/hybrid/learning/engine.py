@@ -1,6 +1,8 @@
 """
 LearningEngine 编排
-learn() 主循环 + 共享上下文字段.
+learn() 主循环:
+    声明学习图 → 求值 → 记账.
+域间值全部经图的名字传递, 无共享载体.
 """
 
 from __future__ import annotations
@@ -10,9 +12,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from crates.graphs import defined_names
 from crates.modal.text.geometry import PRINTABLE_START
 
-from ._common import _plastic
 from .action import ActionMixin
 from .bind import BindMixin
 from .feedforward import FeedforwardMixin
@@ -84,33 +86,6 @@ class LmSignal:
     h_new_deriv: torch.Tensor | None = None  # 迁移扩 h: 新通道激活导数
 
 
-@dataclass
-class LayerErrs:
-    """逐层预测误差 (+ 精度加权版)."""
-
-    eps4: torch.Tensor
-    eps2: torch.Tensor
-    eps3: torch.Tensor
-    eps5: torch.Tensor
-    eps6: torch.Tensor
-    eps2_precise: torch.Tensor
-    eps6_precise: torch.Tensor
-
-
-@dataclass
-class Shared:
-    """域间传递: 层误差 / diff 窗 / LM 信号 (free_run 时 diff/lm 为 None)."""
-
-    errs: LayerErrs
-    diff: DiffWindow | None = None
-    lm: LmSignal | None = None
-    l5_local_err: torch.Tensor | None = None
-    d_t: torch.Tensor | None = None
-    metab_f: torch.Tensor | None = None
-    metab_f_base: torch.Tensor | None = None  # E9b-0 审计: 基线向量 (多尺度项前), 仅 audit
-    metab_f_ms: torch.Tensor | None = None  # E9b-0 审计: 多尺度向量贡献 λ·e_ms_norm, 仅 audit
-
-
 class EngineCore(
     FeedforwardMixin,
     TemporalMixin,
@@ -129,6 +104,9 @@ class EngineCore(
 
     def __init__(self, net: HybridPCNet):
         self.net = net
+        from ..learning_graph import LearningGraphs
+
+        self._graphs = LearningGraphs(net, self)
 
     def _closed_loop_input(self, byte_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -239,25 +217,6 @@ class EngineCore(
             net.active_size[k] for k in ("l4", "l2", "l3", "l5", "l6")
         )
 
-        W_23_a = net.W_23[:dim_3]
-        z0 = net._z0
-        z4, z2, z3, z5, z6 = net._z4, net._z2, net._z3, net._z5, net._z6
-
-        # 逐层预测误差 (自下而上 PC); L5 用时序差分误差, L6 用时间自预测.
-        # 逐位置误差先过可塑码门控 P_l (死/不活跃神经元不进权重更新).
-        eps4 = _plastic(z4 - (z0 @ net.W_04[:dim_4].T + net.bias_l4[:dim_4]), net, "l4")
-        eps2 = _plastic(z2 - (z4 @ net.W_42[:dim_2].T + net.bias_l2[:dim_2]), net, "l2")
-        eps3 = _plastic(z3 - (z2 @ W_23_a.T + net.bias_l3[:dim_3]), net, "l3")
-        z6_pre = torch.cat([net._padmax[:, :, :dim_6], z6[:, :-1]], dim=1)
-        eps6 = _plastic(z6 - z6_pre, net, "l6")
-        eps5 = _plastic(z5[:, 1:] - z5[:, :-1], net, "l5", pos=slice(1, None))  # L5: 跨时刻变化 z5[t]-z5[t-1]
-
-        fe = net.forward_engine
-        eps2_precise, eps6_precise = (
-            fe._precise(eps2),
-            fe._precise(eps6),
-        )
-
         # learn_boost (去主成分超量抑制系数): 在 _traction_scale 更新前取样
         learn_boost = 2.0 - net._traction_scale.to(torch.float16)
 
@@ -282,38 +241,10 @@ class EngineCore(
             eta=eta, eta_t=eta_t, eta_lm=eta_lm, inv_s=inv_s,
             learn_boost=learn_boost,
         )
-        sh = Shared(errs=LayerErrs(eps4, eps2, eps3, eps5, eps6, eps2_precise, eps6_precise))
 
-        # 域调用 (顺序固定, 数值逐位等价)
-        _fb = getattr(net, "_freeze_below", False)  # layerA_prereg.md §1: 冻结 zh 及以下, 只更新 W1/W_lm 头
-        sh.diff = self._build_diff_window(ctx)
-        if not _fb:
-            self._update_bias(ctx, sh)
-        sh.lm = self._build_lm_signal(ctx)
-
-        # 体内代谢: F 每步计价 (感知/回声) → E → R; 必须在 _update_w_act 前 (本步 R 本步消费)
-        self._update_metabolism(ctx, sh)
-        if not _fb:
-            self._update_feed_ff(ctx, sh)
-            self._update_W35(ctx, sh)
-            self._update_pred_engine(ctx, sh)
-            if net.cfg.l5_inhibition == "ml":
-                self._update_Mx(ctx, sh, "l5")
-            else:
-                self._update_Ml5(ctx, sh)
-            self._apply_diff(ctx, sh)
-            self._update_wt_family(ctx, sh)
-        sh.d_t = self._update_lm_head(ctx, sh)
-        if not _fb:
-            self.net.mem_pool.update(ctx, sh)
-            self._update_bind(ctx, sh)
-            self._update_w_act(ctx, sh)
-            for _mx_layer in ("l4", "l2", "l3", "l6"):
-                self._update_Mx(ctx, sh, _mx_layer)
-        self._final_softnorm(ctx, sh)
-
-        # P3-b 行为门: 本步末算下一步的路由决策 (全 GPU 零同步; 自由运行不结算)
-        self._update_gate(ctx, sh)
+        # 域表 (顺序固定, 数值逐位等价): 变体键选表, 图缓存复用
+        graph, env = self._graphs.step(ctx)
+        errs, diff, d_t = env["errs"], env["diff"], env["d_t"]
 
         # 拓扑重塑: 修剪触发权由编排层经 net.maybe_prune(step) 显式交出
         net._step_counter.add_(1)
@@ -321,22 +252,23 @@ class EngineCore(
         net._life_cnt.add_(1)  # 机体年龄: 跨 load 持久化, warmup 判据
 
         core_stats = net._core_brain.learn() if (not free_run and not echo_world_frozen) else {}
+        l5_defined = "l5_local_err" in defined_names(graph)
         stats = {
             "free_energy": (
-                eps4.square().mean()
-                + eps2.square().mean()
-                + eps3.square().mean()
-                + eps5.square().mean()
-                + eps6.square().mean()
+                errs.eps4.square().mean()
+                + errs.eps2.square().mean()
+                + errs.eps3.square().mean()
+                + errs.eps5.square().mean()
+                + errs.eps6.square().mean()
             ),
-            "future_err": (sh.diff.dz4 - sh.diff.pred_d).square().mean()
-            if (not free_run and not echo_world_frozen and sh.diff is not None)
+            "future_err": (diff.dz4 - diff.pred_d).square().mean()
+            if (not free_run and not echo_world_frozen and diff is not None)
             else net._zero1,
-            "d_polarity": sh.d_t.mean()
-            if (not free_run and not echo_world_frozen and sh.d_t is not None and hasattr(net, "_novelty"))
+            "d_polarity": d_t.mean()
+            if (not free_run and not echo_world_frozen and d_t is not None and hasattr(net, "_novelty"))
             else net._zero1,
             # 观测器: 原始 L5 局部误差能量 (诊断用, 不参与更新)
-            "l5_local_err": sh.l5_local_err,
+            "l5_local_err": env["l5_local_err"] if l5_defined else None,
         }
         stats["core_xv_energy"] = core_stats.get("xv_energy", net._zero1)
         stats["core_xv_energy_effective"] = core_stats.get("xv_energy_effective", net._zero1)

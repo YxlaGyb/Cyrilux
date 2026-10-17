@@ -1,4 +1,4 @@
 description: crates.device abstracts physical device code, providing a GPU-to-CPU event bridge, batch sensory event containers, CUDA setup, and stream primitives.
 
-README.md: cb139758a8626f97c7909ed0706abffbb7111ed2
-README.zh.md: fbb68a33387dd09c1c07fb95ebc8c2bdfc70cac6
+README.md: 5f8d578be6bbd7a4edf6b1b573188afa9d64b8ff
+README.zh.md: 199209265c130cc0f9220883f3306689732e5e99

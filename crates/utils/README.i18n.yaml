@@ -1,4 +1,4 @@
-description: Reusable, model-neutral helpers: data conversion, splitting, task dataset preparation, training utilities, and versioned run directories for the shared layer.
+description: "Reusable, model-neutral helpers: data conversion, splitting, task dataset preparation, training utilities, and versioned run directories for the shared layer."
 
 README.md: fba8ea1c0ea1798331027c5492fcfc2d1f5485d2
 README.zh.md: 4c69900d74b6aa0b2d51d1681cd764f9aa59f51a

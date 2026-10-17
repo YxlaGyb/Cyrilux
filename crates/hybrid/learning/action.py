@@ -17,7 +17,7 @@ from ._common import _MixinBase
 class ActionMixin(_MixinBase):
     """表达端域 (方法挂载到 LearningEngine)."""
 
-    def _update_w_act(self, ctx, sh):
+    def _update_w_act(self, ctx, lm):
         """W_act 闭环自洽生成学习 (表达者范式): 切断外部目标驱动, 仅 closed_loop/自回声."""
         net = self.net
         dev = ctx.dev
@@ -50,7 +50,7 @@ class ActionMixin(_MixinBase):
         gb_a = gb[:, 1:]  # [N,n_a] 对齐生成字节
         oh_g = F.one_hot(gb_a, num_classes=ALPHABET).to(torch.float16)  # [N,n_a,ALPHABET]
         gb_start = ctx.S - N_gen  # 生成段起始位置
-        probs_g = sh.lm.probs_lm[:, gb_start : gb_start + n_a]  # [N,n_a,ALPHABET] 决策态分布
+        probs_g = lm.probs_lm[:, gb_start : gb_start + n_a]  # [N,n_a,ALPHABET] 决策态分布
         p_gen = (probs_g * oh_g).sum(dim=-1, keepdim=True)  # [N,n_a,1]
         wlm_err = (1.0 - p_gen).detach()  # [N,n_a,1] 外部弱约束
 

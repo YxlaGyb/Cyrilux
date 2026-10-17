@@ -91,7 +91,7 @@ class TemporalMixin(_MixinBase):
 
         return DiffWindow(dz4=dz4, pred_d=pred_d, dW_avg=dW_avg, e_t_all=e_t_all)
 
-    def _apply_diff(self, ctx, sh):
+    def _apply_diff(self, ctx, diff):
         """W_diff 下一状态预测更新 (4 步时间窗平均外积) + b_diff 偏置 (free_run 冻结)."""
         net = self.net
         if ctx.free_run or ctx.echo_world_frozen:
@@ -104,17 +104,17 @@ class TemporalMixin(_MixinBase):
         # 死锁根因: raw dW_avg 结构健康 (‖dW‖_F≈0.11) 但 ×η(0.003) 后条目 1e-7 ≈ 0.7% ULP →
         # 亚 ULP 静默死锁 (W1 能解冻因 η_lm=1.0, 本族 η=0.003 差 333×, 信任域系数单独给定).
         # 应用增益 = DIFF_TRUST_REGION·‖W_diff‖_F (2% 每步, ≈W1 解冻实测 2.5%; 每条目 ≈20 ULP).
-        dW_avg = sh.diff.dW_avg
+        dW_avg = diff.dW_avg
         net._dW_diff_absmax_raw = dW_avg.abs().max().detach()
         mx = dW_avg.abs().max() + 1e-4
         dW_avg = dW_avg / mx / 64.0
         dW_avg = dW_avg / (dW_avg.norm() + 1e-8)
         dW_avg = rtr_apply(trace(net, "W_diff", dW_avg), net._survival_signal)
         W_diff_a.data += (dW_avg * (~fut_mask).to(torch.float16)) * (DIFF_TRUST_REGION * W_diff_a.norm())
-        future_e = _plastic(sh.diff.dz4 - sh.diff.pred_d, net, "l4", pos=slice(None, -1)).mean(dim=(0, 1))
+        future_e = _plastic(diff.dz4 - diff.pred_d, net, "l4", pos=slice(None, -1)).mean(dim=(0, 1))
         net.b_diff[:dim_4].data += future_e * ctx.eta
 
-    def _update_wt_family(self, ctx, sh):
+    def _update_wt_family(self, ctx):
         """时序迹调制 (W_t 学习, 高确定性时增强 → 记忆巩固) + 谱守卫.
 
         回声相位整族冻结 (C5 合约): W_t 全族 + θ_wt4 + decorr + 谱守卫零触碰.

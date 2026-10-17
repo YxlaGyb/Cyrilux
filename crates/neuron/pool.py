@@ -29,7 +29,7 @@ class MemoryPool:
     def __init__(self, net: HybridPCNet):
         self.net = net
 
-    def update(self, ctx, sh):
+    def update(self, ctx, lm):
         """
         竞争性记忆单元群:
         生存定价(收入) → 增益 → 出生/死亡，全部纯局部机制
@@ -40,11 +40,10 @@ class MemoryPool:
         时机: 在 _update_lm_head 之后, K 变化只影响下一步 (zh 列与 W1 行永不错位).
         """
         net = self.net
-        if ctx.free_run or ctx.echo_world_frozen or sh.lm is None:
+        if ctx.free_run or ctx.echo_world_frozen or lm is None:
             return
         cfg = net.cfg
         K = net._mem_m.shape[0]
-        lm = sh.lm
         if lm.e_h is None or getattr(net, "_w1v2", False):
             return
 

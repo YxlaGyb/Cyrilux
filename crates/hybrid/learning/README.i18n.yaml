@@ -1,4 +1,4 @@
-description: The trace-modulated learning engine of the dense PPA loop, organized as orchestrator plus per-domain mixins: action, bind, feedforward, metabolism, predict, readout, and temporal.
+description: "The trace-modulated learning engine of the dense PPA loop, organized as orchestrator plus per-domain mixins: action, bind, feedforward, metabolism, predict, readout, and temporal."
 
-README.md: 0576fbc8cadee5acb0ad08e9b10acbe7c77405ea
-README.zh.md: 1f9eb58adcd7f499007b63ff1a76956e1ece93b0
+README.md: cfe02fa1ee6b3d0b76cf43468c4fc161b368d98a
+README.zh.md: 9013fc109621b02e6df1a273b0d2a59f4e33a0d2

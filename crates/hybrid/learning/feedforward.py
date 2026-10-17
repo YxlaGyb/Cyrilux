@@ -23,7 +23,7 @@ from ._common import (
 class FeedforwardMixin(_MixinBase):
     """前馈链域 (方法挂载到 LearningEngine)."""
 
-    def _update_bias(self, ctx, sh):
+    def _update_bias(self, ctx, errs):
         """自由运行/自回声偏置稳态更新."""
         net = self.net
         free_run, echo_loop, echo_world_frozen = ctx.free_run, ctx.echo_loop, ctx.echo_world_frozen
@@ -47,7 +47,7 @@ class FeedforwardMixin(_MixinBase):
                 b_gate[id(b_par)] = act2 / (b2 + act2 + 1e-6)
             eta = ctx.eta
             eps4, eps2, eps3, eps5, eps6 = (
-                sh.errs.eps4, sh.errs.eps2, sh.errs.eps3, sh.errs.eps5, sh.errs.eps6,
+                errs.eps4, errs.eps2, errs.eps3, errs.eps5, errs.eps6,
             )
             net.bias_l4[:ctx.dim_4].data += eta * (eps4.mean(dim=(0, 1)) / (1.0 + beta * ex4)) * b_gate[id(net.bias_l4)]
             net.bias_l2[:ctx.dim_2].data += eta * (eps2.mean(dim=(0, 1)) / (1.0 + beta * ex2)) * b_gate[id(net.bias_l2)]
@@ -66,7 +66,7 @@ class FeedforwardMixin(_MixinBase):
                     share = b2 / (b2 + act2 + 1e-6)  # bias 占比 ∈ [0,1]
                     b_par[:a_sz].data.mul_(1.0 - net.cfg.bias_leak_rate * (1.0 + share))
 
-    def _update_feed_ff(self, ctx, sh):
+    def _update_feed_ff(self, ctx, errs, metab_f, metab_f_base, metab_f_ms, lm):
         """W_04/W_42/W_56/W_23 + eps_state 融合 + W_state_pred 自更新."""
         net = self.net
         dev = ctx.dev
@@ -82,11 +82,11 @@ class FeedforwardMixin(_MixinBase):
             # explain-away — 高层 (z2) 经 W_42 无转置生成 z4 预测 (生成方向),
             # 未能解释部分占比 pw ∈ (0,1] 作为精度权重: 高层已解释的成分不再驱动
             # 低层学习 (Rao-Ballard explain-away; 判词 §8 缺陷一). 只乘本函数局部副本,
-            # sh.metab_f (代谢 F 单一出处) 原样不动.
+            # metab_f (代谢 F 单一出处) 原样不动.
             td_hat = z2 @ net.W_42[:dim_2, :dim_4]  # 生成方向: 高层生成低层预测
             res_td = (z4 - td_hat).norm(dim=-1)  # [N,S] 未解释范数
             pw = res_td / (z4.norm(dim=-1) + res_td + 1e-3)  # 未解释占比 ∈ (0,1)
-            final_error = _plastic(sh.metab_f * pw.unsqueeze(-1), net, "l4")
+            final_error = _plastic(metab_f * pw.unsqueeze(-1), net, "l4")
 
             # 幅度-方向解耦: dW 归一化单位向量, 显著性只选方向不放大幅度
             # → 单步最大幅度 = lr, 防极端样本单步爆 NaN
@@ -94,9 +94,9 @@ class FeedforwardMixin(_MixinBase):
             dW_04n = torch.bmm(final_error.transpose(-2, -1), z0_n)  # [N,dim_4,in]
             # E9b-0 路径审计: 拆分向量路径的基线/多尺度贡献 (外积范数, 归一化前). 默认关零变更.
             if (getattr(net, "_f_ms_audit", False)
-                    and sh.metab_f_base is not None and sh.metab_f_ms is not None):
-                base_fe = sh.metab_f_base * pw.unsqueeze(-1)
-                ms_fe = sh.metab_f_ms * pw.unsqueeze(-1)
+                    and metab_f_base is not None and metab_f_ms is not None):
+                base_fe = metab_f_base * pw.unsqueeze(-1)
+                ms_fe = metab_f_ms * pw.unsqueeze(-1)
                 net._audit_dw04_base.copy_(torch.bmm(base_fe.transpose(-2, -1), z0_n).norm())
                 net._audit_dw04_ms.copy_(torch.bmm(ms_fe.transpose(-2, -1), z0_n).norm())
             nrm_04 = dW_04n.norm(dim=(-2, -1), keepdim=True)
@@ -127,18 +127,18 @@ class FeedforwardMixin(_MixinBase):
             ramp = min(1.0, net._step_py / 200.0)
             _decorr_W(net.W_04[:dim_4].data, net.E_04[:dim_4, :dim_4], coef=ramp, max_delta_ratio=0.05, learn_boost=ctx.learn_boost)
 
-            dW42 = (sh.errs.eps2_precise.transpose(-2, -1) @ rms_norm(z4)).mean(dim=0) * inv_s
+            dW42 = (errs.eps2_precise.transpose(-2, -1) @ rms_norm(z4)).mean(dim=0) * inv_s
             dW42 = rtr_apply(trace(net, "W_42", dW42), net._survival_signal)
-            dW42 = _energy_constraint(net, net.W_42[:dim_2].data, dW42, sh.errs.eps2_precise, "_active_ema_w42")
+            dW42 = _energy_constraint(net, net.W_42[:dim_2].data, dW42, errs.eps2_precise, "_active_ema_w42")
             col_mask = torch.rand(dim_2, 1, device=dev) < net.cfg.column_dropout
             net.W_42[:dim_2].data += (dW42 * (~col_mask).to(torch.float16)) * eta
             _decorr_W(net.W_42[:dim_2].data, net.E_42[:dim_2, :dim_2], learn_boost=ctx.learn_boost)
         # 字节域块结束: free_run / echo_world_frozen 冻结 W_04/W_42 (感知链)
         # W_56 (L5→L6 内部动力学) 在自由运行同样学习; 回声冻结 (C5 合约)
         if not echo_world_frozen:
-            dW_56 = (sh.errs.eps6_precise.transpose(-2, -1) @ rms_norm(z5)).mean(dim=0) * inv_s
+            dW_56 = (errs.eps6_precise.transpose(-2, -1) @ rms_norm(z5)).mean(dim=0) * inv_s
             dW_56 = rtr_apply(trace(net, "W_56", dW_56), net._survival_signal)
-            dW_56 = _energy_constraint(net, net.W_56[:dim_6].data, dW_56, sh.errs.eps6_precise, "_active_ema_w56")
+            dW_56 = _energy_constraint(net, net.W_56[:dim_6].data, dW_56, errs.eps6_precise, "_active_ema_w56")
             col_mask = torch.rand(net.W_56[:dim_6].shape[0], 1, device=dev) < net.cfg.column_dropout
             net.W_56[:dim_6].data += (dW_56 * (~col_mask).to(torch.float16)) * eta
 
@@ -149,7 +149,7 @@ class FeedforwardMixin(_MixinBase):
         eps_state = rms_norm(eps_state)
         eps_state = _plastic(eps_state, net, "l4", pos=slice(None, -1))  # 可塑码门控: 死/不活跃神经元不进 W_state_pred
         eps_state_3 = eps_state @ net.W_42[:dim_2].T[:, :dim_3]  # dim_4 → dim_3 (经 W_42 逆映射)
-        eps3_pc = sh.errs.eps3 + 0.3 * torch.cat(
+        eps3_pc = errs.eps3 + 0.3 * torch.cat(
             [eps_state_3, net._padmax[:, :, :dim_3]], dim=1
         )
         eps3_pc = net.forward_engine._precise(eps3_pc)
@@ -161,7 +161,7 @@ class FeedforwardMixin(_MixinBase):
             dW23 = (eps3_pc.transpose(-2, -1) @ rms_norm(z2)).mean(dim=0) * inv_s
             dW23 = rtr_apply(trace(net, "W_23", dW23), net._survival_signal)
             dW23 = _energy_constraint(net, net.W_23[:dim_3].data, dW23, eps3_pc, "_active_ema_w23")
-            err3_norm = sh.errs.eps3.pow(2).mean(dim=(0, 1)).sqrt() + 1e-8  # [dim_3] 每神经元
+            err3_norm = errs.eps3.pow(2).mean(dim=(0, 1)).sqrt() + 1e-8  # [dim_3] 每神经元
             gate3 = 0.1 + 0.9 * (err3_norm / err3_norm.max())
             dW23 = dW23 * gain_l3 * gate3.unsqueeze(1)
             c3_mask = torch.rand(dim_3, 1, device=dev) < net.cfg.column_dropout
@@ -176,7 +176,7 @@ class FeedforwardMixin(_MixinBase):
             W_sp_a.data += dW_sp * eta
             soft_norm_preserve(W_sp_a.data)
 
-    def _update_W35(self, ctx, sh):
+    def _update_W35(self, ctx, lm):
         """W_35 更新: 预测编码融合误差全量驱动. 回声相位整族冻结 (C5 合约)."""
         net = self.net
         if ctx.echo_world_frozen:
@@ -188,7 +188,7 @@ class FeedforwardMixin(_MixinBase):
         if not free_run:
             # 预测编码向下平移: W_lm 误差 → dim_3 (补零对齐 S, 经 W_42 逆映射)
             eps_lm_proj_pad = torch.cat(
-                [sh.lm.eps_lm_proj, net._padmax[:, :, :ctx.dim_4]], dim=1
+                [lm.eps_lm_proj, net._padmax[:, :, :ctx.dim_4]], dim=1
             )
             eps_lm_3 = eps_lm_proj_pad @ net.W_42[:ctx.dim_2].T[:, :dim_3]
             eps_lm_3 = rms_norm(eps_lm_3)
@@ -273,7 +273,7 @@ class FeedforwardMixin(_MixinBase):
             net._rho_corr = dW_corr.norm() / nW
             net._cos_hc = cos_hc
 
-    def _final_softnorm(self, ctx, sh):
+    def _final_softnorm(self, ctx):
         """前馈权重软范数保持 (0.8-1.2): 无 BCM 约束的权重长训累积溢出 fp16.
 
         echo_world_frozen 时全族冻结不触碰 (soft_norm 非幂等, 触碰即漏气); free_run 只保 W_56.

@@ -27,7 +27,7 @@ _MS_THETA_ABS_DEFAULT = 1e4  # §4.5 θ_abs 占位; §5.4 标定后以 10×A0 �
 class MetabolismMixin(_MixinBase):
     """代谢域 (方法挂载到 LearningEngine)."""
 
-    def _update_metabolism(self, ctx, sh):
+    def _update_metabolism(self, ctx, errs, diff, lm):
         """体内代谢: F 每步计价 (感知/回声同构) → E 账本 (收入−成本) → R 生存信号.
 
         双账本 (P3-c 判定): E 携带成本 (资本/应激/门控货币), R 吃纯 ΔF —
@@ -35,39 +35,43 @@ class MetabolismMixin(_MixinBase):
         R 的输入永不得换成 F 水平、误差绝对值或任何"压平即胜"的可收割量
         (dark room 禁区: 奖励误差水平会让压平分布成为过关最便宜路径).
         成本只进 E 不进 R — 否则平台期 ΔE 常态负 → R 常态负 → 条件二点状失效.
+
+        返回 (metab_f, metab_f_base, metab_f_ms); 后两者非 None 仅当 E9b-0 审计开.
         """
         net = self.net
-        if ctx.free_run or sh.lm is None:
+        if ctx.free_run or lm is None:
             # free_run 无 lm 信号 (_build_lm_signal 返回 None), 代谢不结算
-            return
+            return net._zero1, None, None
         # 1) F := 绝对误差能量: 归一化误差平方是尺度无关的 — 饥荒
         # (预测相对变差) 会被误差自身标准差吸收, E 对饥荒零判别力 (术前探针实证:
         # 随机字节/分布漂移/W_t 渐进病理下 E min 都停在 -0.008 平台噪声带内).
         # 绝对货币: 乱码输入 → 原始误差能量暴涨 → E 深潜 → 死亡线可达.
-        # D2 迹与货币必须同源. 货币 = sh.lm.eps_proj_ms (rms_norm 前投影能量均方 × F_UNIT_SCALE);
+        # D2 迹与货币必须同源. 货币 = lm.eps_proj_ms (rms_norm 前投影能量均方 × F_UNIT_SCALE);
         # 迹载体落在同一张量 eps_proj_raw (补零对齐 S), 不归一化. 旧载体 eps_lm_pad 是 rms_norm
         # 输出 (逐位 ≈ fp16(0.990099·alive/256), 行存活计数而非误差幅值), 再 std() 归一 ⇒ 迹均方
         # 按构造恒 ≈1, 对计价目标零判别力 (实测 cos²(E,∇F) = 3.14× 底噪).
         # F 对投影的梯度 ∝ eps_proj_raw: 保留幅值, 迹才与 ∇F 同源同向同量级.
         proj_pad = torch.cat(
-            [sh.lm.eps_proj_raw, net._padmax[:, :, :ctx.dim_4]], dim=1
+            [lm.eps_proj_raw, net._padmax[:, :, :ctx.dim_4]], dim=1
         )  # [N,S,dim_4] (补零对齐 S, 与旧 eps_lm_pad 同构)
-        eps4 = sh.errs.eps4
+        eps4 = errs.eps4
         final_error = proj_pad + 0.2 * eps4
-        f_now = sh.lm.eps_proj_ms + 0.2 * eps4.square().mean()  # 0-dim fp16 标量
+        f_now = lm.eps_proj_ms + 0.2 * eps4.square().mean()  # 0-dim fp16 标量
         # E9b-0 剂量/路径审计插桩 (e9b0_audit_preregistration.md): 默认关 = 零变更. 全部为
         # 诊断 buffer 写入, 不改权重、不改计算图、不改 RNG; 基线向量与三分量落 buffer 供报告步取样.
+        metab_f_base = None
+        metab_f_ms = None
         audit = getattr(net, "_f_ms_audit", False)
         if audit:
             net._audit_eps_lm_sq.copy_(proj_pad.square().mean())
             net._audit_eps4_sq.copy_(eps4.square().mean())
             net._audit_vec_base_rms.copy_(final_error.square().mean().sqrt())
-            sh.metab_f_base = final_error
+            metab_f_base = final_error
             net._audit_priced.zero_()
         # E9 双出处同改 (§3.3): 标量 f_now 与向量 final_error 同步加多尺度项. flag 关 = 短路 (§4.1
         # 选项 A), _multiscale_pred_error 不被调用, 5 个新增持久 buffer 全程保持 __init__ 初值.
-        # 相位门 (§3.5): 仅感知相 (sh.diff is not None) 计价; 回声相冻结 W_diff, 不计价.
-        if getattr(net, "_f_multiscale", False) and sh.diff is not None:
+        # 相位门 (§3.5): 仅感知相 (diff is not None) 计价; 回声相冻结 W_diff, 不计价.
+        if getattr(net, "_f_multiscale", False) and diff is not None:
             ms_term, e_ms = self._multiscale_pred_error(ctx)
             f_now = f_now + ms_term
             s_ms = e_ms.std(dim=-1, keepdim=True) * 1.01 + e_ms.std() * 1e-3
@@ -82,7 +86,7 @@ class MetabolismMixin(_MixinBase):
                 net._audit_ems_norm_rms.copy_(e_ms_norm.square().mean().sqrt())
                 net._audit_vec_ms_rms.copy_((_MS_LAMBDA * e_ms_norm).square().mean().sqrt())
                 net._audit_priced.fill_(1)
-                sh.metab_f_ms = _MS_LAMBDA * e_ms_norm
+                metab_f_ms = _MS_LAMBDA * e_ms_norm
         if audit:
             net._audit_f_total.copy_(f_now)
             if ctx.echo_loop:
@@ -92,7 +96,7 @@ class MetabolismMixin(_MixinBase):
                 net._audit_f_perc_ema.mul_(0.99).add_(0.01 * f_now)
                 net._audit_perc_steps.add_(1)
             net._audit_priced_steps.add_(net._audit_priced)
-        sh.metab_f = final_error  # 供 _update_feed_ff 取用 (归一化, F 单一出处)
+        metab_f = final_error  # 供 _update_feed_ff 取用 (归一化, F 单一出处)
         # 2) P3-c 全行为计价 (判词 §2.4): 看/学/记/说全耗能. 成本全部来自既有信号
         # (f_now / W1 行数 / 步型标志), 零 .item() 零热路径新建; W1 行数是主机侧 int
         # 直乘 (禁止 torch.tensor — 免掉各 resize 点的缓冲同步陷阱).
@@ -133,7 +137,7 @@ class MetabolismMixin(_MixinBase):
             # (张量布尔 = 每步一次隐式 .item() 同步排空 — 利用率主嫌之一)
             net._metab_R = torch.zeros(1, dtype=torch.float16, device=ctx.dev)  # tensor-guard: rare (哨兵一次性)
             net._metab_settled = True  # 下步起结算 (哨兵只一次)
-            return
+            return metab_f, metab_f_base, metab_f_ms
         # 4) 有符号收入 − 成本: E ← E·(1−d) + c·ΔF − Σcost; 退步=负收入, E 可短负=濒死记账
         net._metab_E.mul_(1.0 - net.cfg.metab_d).add_(net.cfg.metab_c * df).sub_(
             net._metab_cost_tot
@@ -216,13 +220,14 @@ class MetabolismMixin(_MixinBase):
             net._metab_gain_perc.mul_(1.0 - net.cfg.metab_gain_rate).add_(
                 net.cfg.metab_gain_rate * net._metab_R.abs()
             )
+        return metab_f, metab_f_base, metab_f_ms
 
     def _multiscale_pred_error(self, ctx):
         """E9 多尺度状态聚合预测误差 (§三/§4.3): 对 horizon k 用冻结 W_diff roll out k 步状态,
         与 teacher-forced 未来态均值比对; 返回 (标量项 λ·Σ_k w_k·mean_t eps_k², 向量项 Σ_k w_k·e_k).
 
         仅当 net._f_multiscale 为真时被调用 (flag 关 = 短路, §4.1 选项 A); 相位门由调用侧
-        (sh.diff is not None) 保证. 未来态 z4(t+j) 直接取 net._z4 (§4.2: 因果递归已 teacher-forced,
+        (diff is not None) 保证. 未来态 z4(t+j) 直接取 net._z4 (§4.2: 因果递归已 teacher-forced,
         无需二次前向; 调用点在 learn() 释放 net._z4 之前). 一次 32 步 roll out 复用聚合缓冲取部分和:
         k=8 部分和在 j=8 就地取用, k=16 部分和快照入 _z4_ek16_buf, k=32 部分和在末态取用 (§3.2 逐 k
         部分和 = (1/k)Σ_{j≤k}). 全 GPU fp16 零同步 (.item() 一律禁止); 降级阶梯 (§4.5) 以 GPU 掩码
@@ -321,7 +326,7 @@ class MetabolismMixin(_MixinBase):
         e_ms = torch.where(torch.isfinite(e_ms), e_ms, torch.zeros_like(e_ms))
         return _MS_LAMBDA * ms, e_ms  # 标量含 λ (§3.3); 向量未乘 λ 未归一化, 由调用侧处理
 
-    def _update_gate(self, ctx, sh):
+    def _update_gate(self, ctx, lm):
         """P3-b 行为门 (节律内生): 本步末算, 供下一步路由 — 全 GPU 零同步.
 
         门输入全部来自体内 (见 gate_psay 纯函数, 两侧公式一一对应): 行为账本差
@@ -332,7 +337,7 @@ class MetabolismMixin(_MixinBase):
         (借阀门既有每步同步, 零新增同步点). free_run 无 lm 不结算 (门冻结).
         """
         net = self.net
-        if ctx.free_run or sh.lm is None:
+        if ctx.free_run or lm is None:
             return
         A = net._intr_sin.index_select(0, net._intr_cnt.long().squeeze(0))  # [1] fp16
         _stress = getattr(net, "_metab_stress", net._zero1)
