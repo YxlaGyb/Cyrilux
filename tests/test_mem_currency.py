@@ -52,7 +52,7 @@ def _run(net, ctx, sh):
         q0 = net._mem_q.clone()
         g0 = net._mem_g.clone()
         e0 = net._mem_err_ema.clone()
-        net.mem_pool.update(ctx, sh)
+        net.mem_pool.decide(net.mem_pool.account(ctx, sh.lm))
         dq = net._mem_q - q0
         dg = net._mem_g - g0
         de = net._mem_err_ema - e0
@@ -105,7 +105,7 @@ def test_w1v2_court_disabled():
         net._w1v2 = True
         ctx, sh = _stub()
         before = (net._mem_q.clone(), net._mem_g.clone(), net._mem_death_cnt.clone())
-        net.mem_pool.update(ctx, sh)
+        net.mem_pool.decide(net.mem_pool.account(ctx, sh.lm))
         assert torch.equal(net._mem_q, before[0])
         assert torch.equal(net._mem_g, before[1])
         assert torch.equal(net._mem_death_cnt, before[2])

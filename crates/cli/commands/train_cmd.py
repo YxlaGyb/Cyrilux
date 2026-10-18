@@ -43,19 +43,26 @@ def _train_dense(
     subset,
     checkpoint=None,
     net=None,
+    graph_backend="capture",
 ):
     """dense — PPA 闭环批次训练: JSONL 逐行装载 → 批量 learn → 保存 state_dict."""
     import json as _json
 
     from tqdm import tqdm
 
+    from crates.device import capture_available
+    from crates.graphs import set_backend
+
+    if graph_backend == "capture" and not capture_available():
+        graph_backend = "ref"
+    set_backend(graph_backend)
     torch.set_grad_enabled(False)
     if net is None:
         net, d_cfg = _build_net(hidden_size, lr, max_seq_len, checkpoint=checkpoint)
     else:
         d_cfg = net.cfg
     net = net.to(device)
-    print(f"PPA dense training  L4={d_cfg.d_l4}  params={d_cfg.param_count():,}  device={device}")
+    print(f"PPA dense training  L4={d_cfg.d_l4}  params={d_cfg.param_count():,}  device={device}  graph={graph_backend}")
     if checkpoint is not None:
         print(f"  从检查点续训: {resolve_path(checkpoint)}")
 
@@ -136,6 +143,8 @@ def _train_dense(
 @click.option("--abstraction-bank/--no-abstraction-bank", default=False, help="抽象记忆库 (dense 忽略)")
 @click.option("--auto-phase2", is_flag=True, default=False, help="训练后自动进入 Phase 2 (dense 忽略)")
 @click.option("--resume", is_flag=True, default=False, help="从断点恢复 (out_dir/final.safetensors 或 -c 指定)")
+@click.option("--graph-backend", type=click.Choice(["capture", "ref"]), default="capture",
+              help="图执行后端: capture=CUDA Graph 回放 (默认), ref=解释求值 (回退/复现)")
 @click.option("--verbose", "-v", is_flag=True, default=False, help="verbose logging")
 def train(
     model_type,
@@ -160,6 +169,7 @@ def train(
     abstraction_bank,
     auto_phase2,
     resume,
+    graph_backend,
     verbose,
 ):
 
@@ -205,6 +215,7 @@ def train(
         device,
         subset,
         checkpoint=checkpoint,
+        graph_backend=graph_backend,
     )
 
 
@@ -238,6 +249,7 @@ def from_config(config, batch_size, lr, epochs, out_dir, verbose):
         device,
         data_cfg.get("subset", train_cfg.get("subset", 0)),
         checkpoint=model_cfg.get("checkpoint_path"),
+        graph_backend=cfg.get("graph_backend", "capture"),
     )
 
 
@@ -249,8 +261,10 @@ def from_config(config, batch_size, lr, epochs, out_dir, verbose):
 @click.option("--epochs", "-e", default=1, type=int, help="训练轮数")
 @click.option("--lr", default=None, type=float, help="覆盖学习率 (默认用检查点配置)")
 @click.option("--out-dir", "-o", default=None, help="覆盖输出目录 (默认=检查点所在目录)")
+@click.option("--graph-backend", type=click.Choice(["capture", "ref"]), default="capture",
+              help="图执行后端: capture=CUDA Graph 回放 (默认), ref=解释求值 (回退/复现)")
 @click.option("--verbose", "-v", is_flag=True, default=False, help="详细日志")
-def resume(checkpoint, data, batch_size, max_seq_len, epochs, lr, out_dir, verbose):
+def resume(checkpoint, data, batch_size, max_seq_len, epochs, lr, out_dir, graph_backend, verbose):
     """从检查点文件恢复训练 (dense PPA 闭环)."""
     from dataclasses import replace
 
@@ -283,6 +297,7 @@ def resume(checkpoint, data, batch_size, max_seq_len, epochs, lr, out_dir, verbo
         device,
         0,
         net=net,
+        graph_backend=graph_backend,
     )
 
 

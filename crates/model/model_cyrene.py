@@ -496,6 +496,9 @@ class HybridPCNet(nn.Module):
         self.register_buffer("_step_counter", torch.zeros(1, dtype=torch.int32))
         self._step_py = 0
 
+        # 结构纪元: 任何改变张量形状/参数布局的事件 (出生/死亡/扩容) 使 +1, 静态图据此失效重建
+        self._struct_epoch = 0
+
         # 上次物理压实步，不改变形状, 只有压实才折叠; 跨 load 持久化
         self.register_buffer("_last_compact", torch.zeros(1, dtype=torch.int32))
         self._compact_py = 0
@@ -766,21 +769,26 @@ class HybridPCNet(nn.Module):
     def _extra_tensors(self) -> dict[str, torch.Tensor]:
         """游离运行时状态: 既非参数也非 buffer 的张量 (惰性建立, 跨调用存活).
 
-        别名 (如 _metab_stress → _metab_famine_prog) 靠存储指针排除 — 另存一份会让
-        load 后变成两个不同张量, 破坏别名语义. 形状随调用序列长度变, 故不可在
-        __init__ 预声明为 buffer.
+        别名 (如 _metab_stress → _metab_famine_prog, _last_z4 → _z4) 靠存储指针排除 —
+        另存一份会让 load 后变成两个不同张量, 破坏别名语义. 形状随调用序列长度变,
+        故不可在 __init__ 预声明为 buffer.
         """
         owned = {v.untyped_storage().data_ptr()
                  for v in itertools.chain(self.parameters(), self.buffers())}
         out: dict[str, torch.Tensor] = {}
         for k, v in self.__dict__.items():
             if isinstance(v, torch.Tensor):
-                if v.untyped_storage().data_ptr() not in owned:
+                ptr = v.untyped_storage().data_ptr()
+                if ptr not in owned:
+                    owned.add(ptr)
                     out[k] = v
             elif isinstance(v, dict):
                 for k2, v2 in v.items():
-                    if isinstance(v2, torch.Tensor) and v2.untyped_storage().data_ptr() not in owned:
-                        out[f"{k}.{k2}"] = v2
+                    if isinstance(v2, torch.Tensor):
+                        ptr = v2.untyped_storage().data_ptr()
+                        if ptr not in owned:
+                            owned.add(ptr)
+                            out[f"{k}.{k2}"] = v2
         return out
 
     def _py_counters(self) -> dict[str, int]:

@@ -8,7 +8,7 @@ learn() 主循环:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -107,6 +107,22 @@ class EngineCore(
         from ..learning_graph import LearningGraphs
 
         self._graphs = LearningGraphs(net, self)
+        self._ctx: LearnCtx | None = None
+
+    def _sync_ctx(self, ctx: LearnCtx, **fields: Any) -> LearnCtx:
+        """复用同一个 ctx 对象, 张量字段原位覆盖 — 静态图握的是地址."""
+        for name, value in fields.items():
+            cur = getattr(ctx, name)
+            if (
+                torch.is_tensor(value)
+                and torch.is_tensor(cur)
+                and cur.shape == value.shape
+                and cur.dtype == value.dtype
+            ):
+                cur.copy_(value)
+            else:
+                setattr(ctx, name, value)
+        return ctx
 
     def _closed_loop_input(self, byte_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -233,26 +249,41 @@ class EngineCore(
         eta_lm = net.cfg.lm_lr_boost
         inv_s = 1.0 / S
 
-        ctx = LearnCtx(
-            net=net, N=N, S=S, k=k, dev=dev, inp=inp, byte_ids=byte_ids,
-            closed_loop=closed_loop, free_run=free_run, echo_loop=echo_loop,
-            echo_world_frozen=echo_world_frozen, learn_mask=learn_mask,
-            dim_4=dim_4, dim_2=dim_2, dim_3=dim_3, dim_5=dim_5, dim_6=dim_6,
-            eta=eta, eta_t=eta_t, eta_lm=eta_lm, inv_s=inv_s,
-            learn_boost=learn_boost,
-        )
+        ctx = self._ctx
+        if ctx is None:
+            ctx = LearnCtx(
+                net=net, N=N, S=S, k=k, dev=dev, inp=inp, byte_ids=byte_ids,
+                closed_loop=closed_loop, free_run=free_run, echo_loop=echo_loop,
+                echo_world_frozen=echo_world_frozen, learn_mask=learn_mask,
+                dim_4=dim_4, dim_2=dim_2, dim_3=dim_3, dim_5=dim_5, dim_6=dim_6,
+                eta=eta, eta_t=eta_t, eta_lm=eta_lm, inv_s=inv_s,
+                learn_boost=learn_boost,
+            )
+            self._ctx = ctx
+        else:
+            self._sync_ctx(
+                ctx, N=N, S=S, k=k, dev=dev, inp=inp, byte_ids=byte_ids,
+                closed_loop=closed_loop, free_run=free_run, echo_loop=echo_loop,
+                echo_world_frozen=echo_world_frozen, learn_mask=learn_mask,
+                dim_4=dim_4, dim_2=dim_2, dim_3=dim_3, dim_5=dim_5, dim_6=dim_6,
+                eta=eta, eta_t=eta_t, eta_lm=eta_lm, inv_s=inv_s,
+                learn_boost=learn_boost,
+            )
 
         # 域表 (顺序固定, 数值逐位等价): 变体键选表, 图缓存复用
         graph, env = self._graphs.step(ctx)
         errs, diff, d_t = env["errs"], env["diff"], env["d_t"]
+        names = defined_names(graph)
+        if "mem_dead" in names:
+            net.mem_pool.decide(env["mem_dead"])
 
         # 拓扑重塑: 修剪触发权由编排层经 net.maybe_prune(step) 显式交出
         net._step_counter.add_(1)
         net._step_py += 1
         net._life_cnt.add_(1)  # 机体年龄: 跨 load 持久化, warmup 判据
 
-        core_stats = net._core_brain.learn() if (not free_run and not echo_world_frozen) else {}
-        l5_defined = "l5_local_err" in defined_names(graph)
+        core_stats = env["core_stats"] if "core_stats" in names else {}
+        l5_defined = "l5_local_err" in names
         stats = {
             "free_energy": (
                 errs.eps4.square().mean()
@@ -279,14 +310,11 @@ class EngineCore(
         stats["attention_salience_norm"] = core_stats.get("attention_salience_norm", net._zero1)
         stats["attention_top_down_norm"] = core_stats.get("attention_top_down_norm", net._zero1)
 
-        # 释放每步状态引用: _z* 是 store_state 存的大张量, 不释放则显存逐步累积 OOM.
-        # 释放前保留 z4/z5/z3/z2/z6 引用供观测器 (z3 = NaN 前哨)
+        # 保留每步状态引用: _z* 是 store_state 存的大张量, 但对象必须跨步存活 —
+        # 捕获图的入参按地址绑定, 每步换对象即让回放读旧值. 稳定缓冲原地覆盖, 不累积显存.
         net._last_z4 = net._z4.detach()
         net._last_z5 = net._z5.detach()
         net._last_z3 = net._z3.detach()
         net._last_z2 = net._z2.detach()
         net._last_z6 = net._z6.detach()
-        for k_ in ("_z0", "_z4", "_z2", "_z3", "_z5", "_z5_raw", "_z6"):
-            if hasattr(net, k_):
-                delattr(net, k_)
         return stats

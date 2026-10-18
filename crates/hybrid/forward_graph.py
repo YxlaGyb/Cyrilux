@@ -14,7 +14,17 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from crates.graphs import Graph, Op, apply_writes, defined_names, run_ref, validate_graph
+from crates.device import CaptureBank, capture_available
+from crates.graphs import (
+    CAPTURE,
+    Graph,
+    Op,
+    apply_writes,
+    backend,
+    defined_names,
+    run_ref,
+    validate_graph,
+)
 from crates.hybrid.mask import bind, compete, g_rate, rate_ema
 from crates.kernels import (
     ach_noise,
@@ -324,11 +334,13 @@ class ForwardGraphs:
         self.misses = 0
         self.fingerprints: dict[tuple[Any, ...], str] = {}
         self._cache: dict[tuple[Any, ...], Graph] = {}
+        self._bank = CaptureBank("predict", self.net)
 
     def clear(self) -> None:
         """结构事件 (出生/死亡/剪枝/压缩/init_* 迁移) 后由宿主调用."""
         self._cache.clear()
         self.fingerprints.clear()
+        self._bank.drop()
 
     def step(
         self, byte_ids: torch.Tensor | None, *, store_state: bool, is_inference: bool
@@ -359,17 +371,23 @@ class ForwardGraphs:
         else:
             self.hits += 1
         env = self._feed(graph, byte_ids=byte_ids, dev=dev, s_len=s_len, n_batch=n_batch, free_run=free_run)
-        run_ref(graph, env)
+        if self._captures(store_state, is_inference):
+            env = self._bank.step(key, graph, env)
+        else:
+            run_ref(graph, env)
         apply_writes(graph, env, net)
         if key not in self.fingerprints:
             self.fingerprints[key] = graph.fingerprint(env)
         return graph, env
 
+    def _captures(self, store_state: bool, is_inference: bool) -> bool:
+        """预锁 §二: 带状态的训练前向入捕获, 推理与无状态前向退让给 ref."""
+        return store_state and not is_inference and backend() == CAPTURE and capture_available(self.net)
+
     def _identity(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """结构键: 参数与 buffer 的名字序列, 名字增删即换键.
 
-        形状归变体键, 值不参与; 写回会把 buffer 重绑为新对象 (如 `_mem_m`),
-        身份键若持对象 id 则每次调用都换键, 复用永久失效.
+        形状归变体键, 值不参与; 写回原位覆盖, 名字序在训练循环里保持不变.
         """
         return (
             tuple(n for n, _ in self.net.named_parameters()),

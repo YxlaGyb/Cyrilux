@@ -102,6 +102,9 @@ class CoreBrain(nn.Module):
     def learn(self) -> dict[str, torch.Tensor]:
         """
         一步跨视图预测更新, 只动中心脑自己的权重, 字节损失不参与.
+
+        `_state` 不在此清除: 静态图回放期 Python 不执行, 前向与学习分居两张图,
+        状态必须跨图存活; 下一次 forward 原位覆盖.
         """
         st = self._state
         if st is None:
@@ -133,7 +136,6 @@ class CoreBrain(nn.Module):
             "attention_salience_norm": attn.salience.norm(dim=-1).mean(),
             "attention_top_down_norm": attn.top_down.norm(),
         }
-        self._state = None
         return dict(self._stats)
 
     @torch.no_grad()

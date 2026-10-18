@@ -29,23 +29,20 @@ class MemoryPool:
     def __init__(self, net: HybridPCNet):
         self.net = net
 
-    def update(self, ctx, lm):
+    def account(self, ctx, lm):
         """
-        竞争性记忆单元群:
-        生存定价(收入) → 增益 → 出生/死亡，全部纯局部机制
+        竞争性记忆单元群的生存账目 (纯张量, 可入静态图):
+        收入 → 增益 → 死亡计数 → 出生统计
 
         收入: |m| · cos(单元内容, 账本状态方向 ẑ), m = 生存账本残差.
-        出生: 读取误差快 EMA > 长程慢 EMA × 阈值 → 增益最高单元二分出子.
-        死亡: g < g_min 持续超限 → 删除 (K_min=1 保底).
-        时机: 在 _update_lm_head 之后, K 变化只影响下一步 (zh 列与 W1 行永不错位).
+        返回判死掩码, 生死判定与 K 变化交给 decide (宿主).
         """
         net = self.net
         if ctx.free_run or ctx.echo_world_frozen or lm is None:
-            return
+            return net._mem_death_cnt < 0
         cfg = net.cfg
-        K = net._mem_m.shape[0]
         if lm.e_h is None or getattr(net, "_w1v2", False):
-            return
+            return net._mem_death_cnt < 0
 
         # 1) 收入: 生存货币 |m| × 单元内容与账本状态方向 ẑ 的余弦
         pooled = net._z4.mean(dim=(0, 1))
@@ -58,20 +55,35 @@ class MemoryPool:
         net._mem_g.add_(cfg.mem_eta_g * net._mem_q)
         net._mem_g.clamp_(max=cfg.mem_g_max)  # tensor-guard: bound (记忆增益界, 非梯度)
 
-        # 3) 死亡: g 低 → 计数, 持续超限 → 删除; 索引 0 永不判死
+        # 3) 死亡: g 低 → 计数, 持续超限 → 判死; 索引 0 永不判死
         low = net._mem_g < cfg.mem_g_min
         net._mem_death_cnt.copy_(torch.where(low, net._mem_death_cnt + 1, torch.zeros_like(net._mem_death_cnt)))
         dead_mask = (net._mem_death_cnt >= cfg.mem_death_steps) & low
-        dead_mask[0] = False
-        if dead_mask[1:].any():  # tensor-guard: rare (死亡事件, 每 2000 步窗口至多一次)
-            net._mem_death_cnt.copy_(torch.where(~dead_mask, net._mem_death_cnt, torch.zeros_like(net._mem_death_cnt)))
-            self.resize(~dead_mask)
+        dead_mask[0:1].fill_(False)
 
-        # 4) 出生: 误差快 EMA 超阈值, 冷却期满, K<上限 → 增益最高单元二分
+        # 4) 出生统计: 误差快/慢 EMA, 冷却计数
         err_rms = lm.eps_total.square().mean().sqrt()
         net._mem_err_ema.mul_(0.99).add_(0.01 * err_rms)
         net._mem_err_long.mul_(0.999).add_(0.001 * err_rms)
         net._mem_birth_cd.add_(1)
+        return dead_mask
+
+    def decide(self, dead_mask):
+        """
+        生死判定 (宿主): 判死 → 冷却 → 收缩, 冷却期满 → 增益最高单元二分出生
+
+        宿主侧与图形分离: 判死/出生要 resize 重注册整张参数布局, 无法入静态图.
+        时机: 整步图之后 → K 变化只影响下一步 (zh 列与 W1 行永不错位).
+        """
+        if dead_mask is None:
+            return
+        net = self.net
+        K = net._mem_m.shape[0]
+        if dead_mask.shape[0] == K:
+            if dead_mask[1:].any():  # tensor-guard: rare (死亡事件, 每 2000 步窗口至多一次)
+                net._mem_death_cnt.copy_(torch.where(~dead_mask, net._mem_death_cnt, torch.zeros_like(net._mem_death_cnt)))
+                self.resize(~dead_mask)
+        cfg = net.cfg
         net._mem_birth_py += 1
         if (
             net._mem_birth_py >= cfg.mem_birth_cooldown
@@ -143,6 +155,7 @@ class MemoryPool:
                 dim=0,
             ).contiguous()
         net._lm_in = head + keep.shape[0] * dim_4
+        net._struct_epoch += 1
 
     def famine_kill(self):
         """
@@ -232,3 +245,4 @@ class MemoryPool:
                 [_wzh, torch.zeros(dim_4, dtype=_wzh.dtype, device=_wzh.device)]
             )
         net._lm_in = head + (K + 1) * dim_4
+        net._struct_epoch += 1

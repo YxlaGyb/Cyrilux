@@ -59,12 +59,8 @@ def pred_delta(z4_n: torch.Tensor, W_diff: torch.Tensor, b_diff: torch.Tensor, d
     return z4_n @ W_diff[:dim_4, :dim_4].T + b_diff[:dim_4].unsqueeze(0).unsqueeze(0)
 
 
-def bind_hold(
-    bind_vec: torch.Tensor, hold: torch.Tensor, expect_cont: torch.Tensor, commit: bool
-) -> torch.Tensor:
+def bind_hold(bind_vec: torch.Tensor, hold: torch.Tensor, expect_cont: torch.Tensor) -> torch.Tensor:
     """字符中途用承诺 hold 覆盖末位绑定 (只覆盖 zh, 不动 W_act)."""
-    if not commit:
-        return bind_vec
     mid = expect_cont.unsqueeze(-1) > 0
     merged = torch.where(mid, hold, bind_vec[:, -1])
     return torch.cat([bind_vec[:, :-1], merged.unsqueeze(1)], dim=1)

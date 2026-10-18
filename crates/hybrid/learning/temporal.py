@@ -45,9 +45,9 @@ class TemporalMixin(_MixinBase):
             pred_k = z_shift_n @ W_diff_a.T + net.b_diff[:dim_4]
             err_k = (dz4 - pred_k[:, :-1]).square().mean()
             if k == 8:
-                valid = net._seq_arange[: S_full - 1] >= (k_eff - 1)  # 预分配 arange 缓冲 (H4)
-                err_k = ((dz4[:, valid] - pred_k[:, :-1][:, valid]).square()).mean()
-            masks[kname] = valid if k == 8 else None
+                valid_from = k_eff - 1  # 有效区 = 尾段切片, 布尔掩码索引在图捕获下不可用
+                err_k = (dz4[:, valid_from:] - pred_k[:, :-1][:, valid_from:]).square().mean()
+            masks[kname] = valid_from if k == 8 else None
             preds_k[kname] = pred_k
             errs_k[kname] = err_k
         # EMA 平滑各尺度误差 (α=0.9, 时间常数~10步)
@@ -65,7 +65,7 @@ class TemporalMixin(_MixinBase):
         pred_d = w2 * preds_k["2"][:, :-1] + w4 * preds_k["4"][:, :-1] + w8 * preds_k["8"][:, :-1]
         # 误差用掩码后的有效区 (K=8 前 7 步剔除)
         if masks["8"] is not None:
-            e_t = (dz4[:, masks["8"]] - pred_d[:, masks["8"]]).detach()
+            e_t = (dz4[:, masks["8"]:] - pred_d[:, masks["8"]:]).detach()
             e_t_all = dz4 - pred_d
         else:
             e_t = dz4 - pred_d

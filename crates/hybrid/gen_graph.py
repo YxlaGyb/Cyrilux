@@ -101,8 +101,10 @@ def declare(
     add("z4_rms", rms_norm, ("z4_sat",), ("z4_rms",))
     add("z4_cub", cubic, ("z4_rms",), ("z4_cub",))
     add("z4_nl", saturate, ("z4_cub",), ("z4_nl",))
-    add("bind", bind_hold, ("bind_vec_post", "hold", "expect_cont", "commit"), ("zh_bind",))
-    add("zh_cat", join3, ("z4_nl", "zh_bind", "mem_out"), ("zh_cat",))
+    if commit:
+        add("bind", bind_hold, ("bind_vec_post", "hold", "expect_cont"), ("zh_bind",))
+    zh_src = "zh_bind" if commit else "bind_vec_post"
+    add("zh_cat", join3, ("z4_nl", zh_src, "mem_out"), ("zh_cat",))
     add("zh_rms", rms_norm, ("zh_cat",), ("zh",))
     add("h_old_mix", mix, ("zh", "W1"), ("h_old_m",))
     add("h_old_sat", saturate, ("h_old_m",), ("h_old_sat",))
