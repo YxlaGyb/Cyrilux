@@ -17,9 +17,9 @@ from world_lang import WorldLangPhysics
 
 from crates.cli.utils import pin_run_dir, resolve_path, run_dir, run_file
 from crates.kernels import cubic, rms_norm, saturate
-from crates.model import CyreneModel, DensePCNet
+from crates.utils.codec import ByteDataset
+from crates.model import CyreneModel, HybridPCNet
 from crates.utils.outver import latest_run_dir_with
-from dataset import ByteDataset
 
 torch.set_grad_enabled(False)
 
@@ -178,16 +178,16 @@ def _score_windows(net, wins, dev, want_ranks=False, want_sgrid=False):
         x = w.unsqueeze(0).to(dev)
         lc = _readout_lc(net, x, dev)
         tgt = x[0, 1:]
-        lsm60 = torch.log_softmax(lc[0] * 60.0, dim=-1).float()  # tensor-guard: report (bpb 评估口径)
+        lsm60 = torch.log_softmax(lc[0] * 60.0, dim=-1)  # bpb 评估口径 (fp16 原生)
         leg_nll += (-lsm60[pos, tgt] / math.log(2)).sum().item()
         if want_sgrid:
             for s in S_GRID:
-                lsm = torch.log_softmax(lc[0] * s, dim=-1).float()  # tensor-guard: report (bpb 评估口径)
+                lsm = torch.log_softmax(lc[0] * s, dim=-1)  # fp16 原生
                 grid_nll[s] += (-lsm[pos, tgt] / math.log(2)).sum().item()
         if want_ranks:
             order = (lc[0] * 60.0).argsort(dim=-1, descending=True)
             r = order.argsort(dim=-1)[pos, tgt]
-            ranks.append(r.float())  # tensor-guard: report (rank 统计口径)
+            ranks.append(r.to(torch.float16))  # rank 统计口径 (名次 ≤255, fp16 精确)
             top1 += (r == 0).sum().item()
             top15 += (r < 15).sum().item()
         n += S_MAX - 1
@@ -210,7 +210,7 @@ def eval_gauge(ckpt_path, cfg, gauge, dev):
       tail[1000:]   → 旧口径补段
       trunc 全量    → 旧口径
     s* 由标定切片 bpb 网格 argmin 决定 (阶段四硬约束)."""
-    net = DensePCNet.load(ckpt_path, cfg).to(dev)
+    net = HybridPCNet.load(ckpt_path, cfg).to(dev)
     if dev.type == "cuda":
         net.forward_engine._predict = GraphedPredict(net.forward_engine, net)
     tail, trunc = gauge["tail"], gauge["trunc"]
@@ -512,7 +512,7 @@ def _sample_dump(net, tag, cfg, dev, step, n, nbytes, temp, logf):
     """输出优先 (E9f): 从当前检查点快照加载独立实例采样生成, 零状态污染, 追加人工可读样本."""
     snap = tag + f"_sample{step}.safetensors"
     net.save(snap)
-    fresh = DensePCNet.load(snap, cfg).to(dev)
+    fresh = HybridPCNet.load(snap, cfg).to(dev)
     lines = []
     for k in range(n):
         torch.manual_seed(step * 1000 + k)
@@ -549,8 +549,6 @@ def main():
     ap.add_argument("--max-samples", type=int, default=1270000)
     ap.add_argument("--trigram-lines", type=int, default=None)
     ap.add_argument("--eager", action="store_true")
-    ap.add_argument("--f5-whiten", action="store_true",
-                    help="F5 突触前白化 (wlm_head_f5_train_prereg.md): 前 100 步纯积累 C, 此后每 100 步重估注入")
     ap.add_argument("--boundary-weight", type=float, default=0.0,
                     help="scaffold A 路: 目标字节为 UTF-8 首字节的 eps 行 ×W (0=关闭; scaffold_prereg.md)")
     ap.add_argument("--char-agg", action="store_true",
@@ -558,7 +556,7 @@ def main():
     ap.add_argument("--word-start-add", type=float, default=0.0,
                     help="词首加法位 (wordstart_add_prereg.md): 词首行在 A 的 ×W 之上额外 +δ; 掩码由 prefetch 线程 CPU 侧计算")
     ap.add_argument("--self-state-pred", action="store_true",
-                    help="self-state 分层臂 (self_state_layered_prereg.md): 状态头赫布通道 + 字节头降权")
+                    help="self-state 分层臂 (self_state_layered_prereg.md): 状态头局部通道 + 字节头降权")
     ap.add_argument("--byte-head-w", type=float, default=1.0,
                     help="字节头更新幅度权重 (仅在 --self-state-pred 时生效; 预锁 0.1)")
     ap.add_argument("--wire-state-pred", action="store_true",
@@ -611,8 +609,7 @@ def main():
     random.seed(args.seed)
     dev = torch.device(args.device)
     cfg = CyreneModel(d_input=256, d_act=256, max_seq_len=S_MAX,
-                        lm_freeze_w1=False,  # 115 唯一训练臂差异: W1 解冻
-                        lm_presyn_whiten=args.f5_whiten)  # F5-B 白化 (预锁 wlm_head_f5_train_prereg.md)
+                      lm_freeze_w1=False)  # 115 唯一训练臂差异: W1 解冻
 
     t0 = time.time()
     print("exp115: 构建世界语言物理 (常用字 2 万行 + 3-gram 位图)...", flush=True)
@@ -630,7 +627,7 @@ def main():
         load_path = f"{tag}_step{step0}.safetensors"
         if not os.path.exists(load_path):
             load_path = tag + ".safetensors"
-        net = DensePCNet.load(load_path, cfg).to(dev)
+        net = HybridPCNet.load(load_path, cfg).to(dev)
         # P3-a: τ 是状态纯函数 (每回声步重算) — 侧车 τ 只打印不回填
         print(f"exp115_say: resume 权重={load_path} 侧车={sidecar} step={step0} "
               f"E(体内,来自检查点)= {float(net._metab_E.item()):.4f} τ(侧车,参考)={gt0:.3f} "
@@ -640,7 +637,7 @@ def main():
         with open(args.init_sidecar, encoding="utf-8") as f:
             st = json.load(f)
         _, gt0 = world.load_state(st)
-        net = DensePCNet.load(args.init_ckpt, cfg).to(dev)
+        net = HybridPCNet.load(args.init_ckpt, cfg).to(dev)
         if args.expand_h is not None:
             net = _expand_h(net, args.expand_h)
         if args.w1v2:
@@ -650,7 +647,7 @@ def main():
         if args.single_recon:
             net.init_single_recon()
         if args.merge:
-            net_v100 = DensePCNet.load("out/Archive/v100-20260916-161644/signal_amplify.safetensors", cfg).to(dev)
+            net_v100 = HybridPCNet.load("out/Archive/v100-20260916-161644/signal_amplify.safetensors", cfg).to(dev)
             net.init_merge(net_v100.W1.data, net_v100.W_lm.data)  # 残差初始化 (single_recon − v100)
         if args.w1v2_wzh is not None:
             net._w1v2_wzh = torch.load(args.w1v2_wzh).to(dev)  # 组合方向 (单位范数)
@@ -693,7 +690,7 @@ def main():
 
     tracked = ("W_lm", "W_lm_2", "W_04", "W_42", "W_diff", "W_bind",
                "W_t4", "W_t2", "W_t3", "W_t5", "W_t6", "W1")
-    init_w = {n: getattr(net, n).detach().float().cpu().clone() for n in tracked}  # tensor-guard: report (冻结快照口径)
+    init_w = {n: getattr(net, n).detach().cpu().clone() for n in tracked}  # 冻结快照 (fp16)
 
     logf = open(run_file(tag_name + ".log"), "a" if args.resume else "w",
                 encoding="utf-8", buffering=1)
@@ -701,7 +698,7 @@ def main():
                  encoding="utf-8", buffering=1)
     temp_hist, r_hist, e_hist, leg_hist, q_hist = [], [], [], [], []
     w1_raw_hist, w1_disk_hist, wd_raw_hist = [], [], []
-    w1_start = net.W1.data.float().clone()  # tensor-guard: report (冻结快照口径)
+    w1_start = net.W1.data.clone()  # 冻结快照 (fp16)
     last_q = 0.0
     last_sc = {"q": 0.0, "L": 0.0, "S": 0.0, "X": 0.0}  # 最近一次回声步的外部评分 (报告口径)
     last_gen = b""
@@ -712,7 +709,6 @@ def main():
     step = step0
     nan_at = None
     first_abnormal = None
-    f5_rejects = 0  # 连续白化拒绝计数 (预锁 v3 §5: 达 3 停机)
 
     for i in range(1, args.steps + 1):
         step = step0 + i
@@ -720,8 +716,8 @@ def main():
         # W1 resize 守卫 (mem 增单元使 W1 变形, 冻结快照重置, 位移从 resize 起算)
         if w1_start.shape != net.W1.data.shape:
             old = tuple(w1_start.shape)
-            w1_start = net.W1.data.float().clone()
-            init_w["W1"] = net.W1.detach().float().cpu().clone()
+            w1_start = net.W1.data.clone()
+            init_w["W1"] = net.W1.detach().cpu().clone()
             print(f"[W1] step {step}: shape {old} -> {tuple(net.W1.data.shape)} "
                   f"(mem 增单元 resize) 冻结快照重置, 位移从 resize 起算", flush=True)
         w1_ref = net.W1.data.clone() if do_report else None  # 报告步起点快照 (区间位移口径)
@@ -887,27 +883,6 @@ def main():
             wd_raw = getattr(net, "_dW_diff_absmax_raw", None)
             wd_raw_hist.append(float(wd_raw.item()) if wd_raw is not None else float("nan"))
 
-        if args.f5_whiten and step % 100 == 0:
-            # F5-B 白化器重估 (预锁 v3 §2: 每 100 学习步; step 30600 首次 = 第 100 个学习步, 之前纯积累)
-            st_w = net.learning_engine.rebuild_wlm_whiten()
-            if st_w is None:
-                msg_f5 = f"[f5] step {step}: C 未积累 (异常, 不应发生)"
-            else:
-                msg_f5 = (f"[f5] step {step}: C 重估 status={st_w['status']} cond={st_w['cond']:.4g} "
-                          f"eig_min={st_w['eig_min']:.4f}"
-                          + (" → Wh(fp16) 注入 ON" if st_w["status"] == "ok" else " → 拒绝注入, 保留上一 Wh"))
-                if st_w["status"] == "reject":
-                    f5_rejects = f5_rejects + 1
-                    if f5_rejects >= 3:
-                        msg_f5 += " | 连续 3 次拒绝 → 按预锁 v3 §5 停机判读"
-                        print(msg_f5, flush=True)
-                        logf.write(msg_f5 + "\n")
-                        raise RuntimeError("f5 whiten: 连续 3 次病态重估 (预锁 v3 §5)")
-                else:
-                    f5_rejects = 0
-            print(msg_f5, flush=True)
-            logf.write(msg_f5 + "\n")
-
         # 代谢触发修剪 (P2 下探缺失 + P3-b 对称牙): 墙钟已退役 — 连续饥饿 (F 无下探) 或
         # 连续沉默 (只看不说) 达阈值 → 模型内死亡回合 (mem 饥荒击杀 + 拓扑修剪).
         # 轮询 8 步, 触发权完全在模型中; 返回触发原因供事件行遥测.
@@ -965,7 +940,7 @@ def main():
                    f"q={last_q:.3f} | "
                    f"W1: raw_max={max(r50) if r50 else float('nan'):.1f} "
                    f"disk̄={sum(w50)/len(w50):.4f} "
-                   f"disp={float((net.W1.data.float()-w1_start).norm().item()):.2f}")  # tensor-guard: report (摘要位移口径)
+                   f"disp={float((net.W1.data-w1_start).norm().item()):.2f}")  # 摘要位移口径 (fp16 原生)
             if (args.w1v2 or args.migrate_expand or args.single_recon or args.merge) and hasattr(net, "_w1v2_recon_err"):
                 msg += f" | recon={float(net._w1v2_recon_err.item()):.4f}"  # 重建 MSE 遥测
             if exec_b:
@@ -1038,7 +1013,7 @@ def main():
                 os.remove(os.path.join(run_dir(), f))
 
     # frozen_moved 复测 (entrywise rel_frob, 阶段六口径)
-    fin_w = {n: getattr(net, n).detach().float().cpu() for n in tracked}  # tensor-guard: report (摘要快照口径)
+    fin_w = {n: getattr(net, n).detach().cpu() for n in tracked}  # 摘要快照 (fp16)
     moved = {}
     for n in tracked:
         w0, w1 = init_w[n], fin_w[n]
@@ -1050,7 +1025,7 @@ def main():
     half = n_echo // 2
     last100 = slice(max(0, n_echo - 100), n_echo)
     r_last = r_hist[last100]
-    w1_fin = net.W1.data.float()  # tensor-guard: report (摘要位移口径)
+    w1_fin = net.W1.data
     summary = {
         "steps_done": step,
         "nan_at": nan_at,

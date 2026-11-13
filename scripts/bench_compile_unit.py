@@ -21,8 +21,8 @@ import torch
 from _probe_meta import config_meta
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from crates.model import DensePCNet
 from crates.cli.utils import run_file
+from crates.model import HybridPCNet
 
 
 def _opname(func: Any) -> str:
@@ -65,7 +65,7 @@ def main() -> None:
     args.out = args.out or run_file("bench_compile_unit.json")
 
     torch.set_grad_enabled(False)
-    net = DensePCNet.load(args.ckpt).to("cuda")
+    net = HybridPCNet.load(args.ckpt).to("cuda")
     x = torch.randint(0, 256, (1, args.s), device="cuda", dtype=torch.long)
 
     def f(t: torch.Tensor):

@@ -30,6 +30,8 @@ from crates.kernels.cascade import (
     seq_diff,
     unit_norm,
     zero_input,
+    z4_state,
+    z4_state_read,
 )
 from crates.kernels.estimator import ste_delta
 from crates.kernels.gen import (
@@ -178,4 +180,6 @@ __all__ = [
     "variance_floor",
     "win_buf",
     "zero_input",
+    "z4_state",
+    "z4_state_read",
 ]

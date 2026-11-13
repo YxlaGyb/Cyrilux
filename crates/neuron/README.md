@@ -1,5 +1,5 @@
 ---
-description: "dynamic-neuron mechanisms, main-chain topology pruning and the birth and death of the memory units."
+description: "dynamic-neuron mechanisms: main-chain topology pruning, the birth and death of the memory units, and a standalone single-cell forward."
 kind: "package-reference"
 ---
 
@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`crates.neuron` holds the dynamic-neuron mechanisms of the dense PPA: topology pruning of the main chain and the birth and death of the competing memory units. Both reshape the live network in place, re-registering the affected tensors so every row-mapped weight stays aligned with its downstream columns. The crate is a mandatory part of the network, not an optional switch.
+`crates.neuron` holds the dynamic-neuron mechanisms of the dense PPA: topology pruning of the main chain, the birth and death of the competing memory units, and a standalone single-cell forward. The reshaping engines work in place, re-registering the affected tensors so every row-mapped weight stays aligned with its downstream columns. The crate is a mandatory part of the network, not an optional switch.
 
 ## Table of Contents
 
@@ -48,6 +48,13 @@ Memory pool.
 | `mem_pool.birth(parent)` | Birth | Splits a child off the parent unit and appends a zero `W1` block. |
 | `mem_pool.resize(keep)` | Re-index | Re-registers the unit buffers and the `W1`/`W1_elig` rows for a new K. |
 
+Single cell. `Cell` is standalone: it holds its own weights and mask and is not attached to a network.
+
+| Export | Shape | Meaning |
+|---|---|---|
+| `Cell(d, h, n)` | Cell | Single-cell forward: `a = sigmoid(x @ W1.T)`, `y = (a * alive) @ W2.T`. `W1` is `(h, d)`, `W2` is `(n, h)`, `h` is a multiple of 128, and `alive` is a per-hidden-unit 0/1 fp16 mask. |
+| `cell.update_alive(x, m)` | Per step | Income death: income is `abs(m) * sum(abs(W2)) * mean(a * alive)`, smoothed by `income_decay`; a unit below `income_floor` times the population mean for `death_steps` consecutive steps is permanently zeroed. Defaults: `income_floor=0.2`, `death_steps=200`, `income_decay=0.99`. |
+
 -----
 
 <a id="understand-the-implementation"></a>
@@ -60,6 +67,8 @@ The memory pool keeps the K units in a fixed layout: their state lives in `_mem_
 Membership is priced by the survival ledger, not by the byte loss. The income of a unit is the magnitude of the survival residual times the cosine between its memory and the direction of the ledger state `ẑ`, smoothed into the slow `_mem_q` EMA. The gain is bounded, and a unit with no income at all decays toward zero. Death fires when `g` stays below `mem_g_min` for `mem_death_steps`; birth fires when the fast error EMA exceeds the slow EMA times `mem_birth_thresh` and the cooldown has expired. Index 0 is immune to death, and `mem_k_max` caps growth.
 
 The famine kill is the direct loss of a metabolic death round: it evicts the lowest-gain unit at once, and that content and identity are gone permanently. A later birth clones a new unit from a surviving parent, so K can rebound; the irreversibility lives in `active_size`, which only ever shrinks.
+
+`Cell` replaces the whole-cell single threshold with an intra-cell width: every hidden unit bends on its own, and the surviving units are summed back to `n` outputs. `alive` multiplies the hidden activation, so a dead unit contributes exactly zero while the matmul keeps its shape and stays dense. `update_alive(x, m)` prices each hidden unit by `abs(m) * sum(abs(W2)) * mean(a * alive)`, smooths that income, and permanently zeroes any unit that stays below `income_floor` times the population mean for `death_steps` consecutive steps. The cell carries no learning rule; `crates.rtr` drives any weight update unchanged.
 
 -----
 

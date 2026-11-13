@@ -14,8 +14,8 @@ from collections import Counter
 
 import torch
 
-from crates.model import DensePCNet
 from crates.cli.utils import run_file
+from crates.model import HybridPCNet
 
 torch.set_grad_enabled(False)
 if hasattr(sys.stdout, "reconfigure"):
@@ -137,7 +137,7 @@ def main():
     # B. 终检查点重生成
     # config=None: 按检查点形状派生 (修剪后检查点兼容路径 — 显式 cfg 会走切片补齐,
     # 产生 _mem_m 列数与 active_size 错位的 Frankenstein)
-    net = DensePCNet.load(args.ckpt).to(DEV)
+    net = HybridPCNet.load(args.ckpt).to(DEV)
     net._entropy_sample = False
     snap = snapshot_state(net)
     texts = read_lines(DATA, 5000, 300, 160)

@@ -54,6 +54,11 @@ _L4_ONLY = (
     ("W_bind", "row", "done"),
     ("W_bind_elig", "row", "aux"),
     ("_rtr_w", "row", "aux"),
+    ("_z4_s", "vec", "aux"),
+    ("_z4_bar", "vec", "aux"),
+    ("_z4_mix", "vec", "aux"),
+    ("_z4_scratch", "vec", "aux"),
+    ("_z4_raw_bar", "vec", "aux"),
 )
 
 _L5_ONLY = (
@@ -89,6 +94,9 @@ _EXEMPT = (
     "_core_brain._cov_s",
     "_core_brain._cov_l",
     "_core_brain.attention._a_long_ema",
+    "_z4_anchors",
+    "_z4_diff",
+    "_z4_d2",
 )
 
 

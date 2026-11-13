@@ -54,4 +54,9 @@ F_UNIT_SCALE = 2048.0  # 计价单位: 投影能量 → 旧 F 量纲 (2^11, fp16
 ELIG_GAMMA = 0.95        # 突触资格迹折扣
 DIFF_TRUST_REGION = 0.02  # W_diff 信任域: 每步 ‖ΔW‖_F = 2%·‖W_diff‖_F (W1 解冻实测 2.5% 同数量级)
 
-RTR_ETA_V = 0.02  # 价值账本追踪速率，与 metab_gain_rate 同尺度
+RTR_ETA_V = 0.02  # 价值账本追踪速率: 从 P3-b 标量 |R| EMA 移植而来, 未经 RTR 标定
+
+Z4_ANCHOR_K = 64       # L4 持久状态锚点库容量
+Z4_STATE_ETA = 0.01    # 持久状态 EMA 速率 (离线验证值, 接入时不调)
+Z4_STATE_PULL = 0.03   # 锚点拉回强度 (离线验证值)
+Z4_STATE_TEMP = 0.05   # 锚点 softmax 温度 (离线验证值)

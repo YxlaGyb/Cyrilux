@@ -17,9 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from _probe_meta import config_meta
 
-from dataset import ByteDataset
-from crates.model import DensePCNet
 from crates.cli.utils import run_file
+from crates.utils.codec import ByteDataset
+from crates.model import HybridPCNet
 
 SEED_N = 16
 
@@ -36,7 +36,7 @@ def main() -> None:
 
     torch.set_grad_enabled(False)
     dev = "cuda"
-    net = DensePCNet.load(args.ckpt).to(dev)
+    net = HybridPCNet.load(args.ckpt).to(dev)
     ds = ByteDataset(args.data, max_length=args.max_length, max_samples=1270000, lazy=True)
 
     def train_step(i: int, tail: torch.Tensor) -> torch.Tensor:

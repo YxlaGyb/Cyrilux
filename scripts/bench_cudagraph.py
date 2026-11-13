@@ -19,8 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from _probe_meta import config_meta
 
-from crates.model import DensePCNet
 from crates.cli.utils import run_file
+from crates.model import HybridPCNet
 
 
 def _timeit(fn, reps: int) -> float:
@@ -48,7 +48,7 @@ def main() -> None:
     args.out = args.out or run_file("bench_cudagraph.json")
 
     torch.set_grad_enabled(False)
-    net = DensePCNet.load(args.ckpt).to("cuda")
+    net = HybridPCNet.load(args.ckpt).to("cuda")
 
     def f(t: torch.Tensor):
         return net.forward_engine._predict(t, store_state=True, is_inference=True)

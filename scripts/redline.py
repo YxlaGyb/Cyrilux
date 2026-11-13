@@ -16,12 +16,10 @@ REDLINE_TOKENS = (
 
 
 def scan_model_sources(root: str | Path | None = None) -> list[str]:
-    """扫描 model/ 活动源码, 返回命中清单 "相对路径:行号: token" (空 = 干净)."""
-    base = Path(root) if root is not None else Path(__file__).resolve().parent.parent / "model"
+    """扫描 crates/model 活动源码, 返回命中清单 "相对路径:行号: token" (空 = 干净)."""
+    base = Path(root) if root is not None else Path(__file__).resolve().parent.parent / "crates" / "model"
     hits: list[str] = []
     for p in sorted(base.rglob("*.py")):
-        if "_archived_sparse" in p.parts:
-            continue
         text = p.read_text(encoding="utf-8")
         for i, line in enumerate(text.splitlines(), 1):
             for tok in REDLINE_TOKENS:

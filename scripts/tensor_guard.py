@@ -28,18 +28,19 @@ import re
 import sys
 
 MODEL_FILES = [
-    "model/dense/forward.py", "model/dense/pruning.py", "model/model_cyrene.py",
-    "model/dense/learning/engine.py", "model/dense/learning/action.py",
-    "model/dense/learning/bind.py", "model/dense/learning/feedforward.py",
-    "model/dense/learning/metabolism.py", "model/dense/learning/predict.py",
-    "model/dense/learning/readout.py", "model/dense/learning/temporal.py",
-    "model/dense/learning/_common.py",
+    "crates/hybrid/forward.py", "crates/neuron/topology.py", "crates/neuron/pool.py",
+    "crates/neuron/registry.py", "crates/model/model_cyrene.py",
+    "crates/hybrid/learning/engine.py", "crates/hybrid/learning/action.py",
+    "crates/hybrid/learning/bind.py", "crates/hybrid/learning/feedforward.py",
+    "crates/hybrid/learning/metabolism.py", "crates/hybrid/learning/predict.py",
+    "crates/hybrid/learning/readout.py", "crates/hybrid/learning/temporal.py",
+    "crates/hybrid/learning/_common.py",
 ]
 SCRIPT_FILES = ["scripts/exp115_say.py"]
 EXEMPT_CTX = {"__init__", "_init_weights", "load", "save", "_migrate_mem",
               "forward", "generate",
               # 事件驱动函数 (非每步): 记忆生/死/修剪/拓扑重塑
-              "_mem_birth", "_mem_resize", "_mem_famine_kill", "_prune",
+              "birth", "resize", "famine_kill", "_prune",
               "maybe_prune", "_permute_weights", "_sync_l4_aux",
               # P3-b 每步一次的路由交接: learn 全异步发射, .item() 是每步唯一同步点
               "sync_gate"}

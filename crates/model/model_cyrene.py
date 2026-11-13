@@ -20,7 +20,7 @@ from crates.modal.text.geometry import (
     UTF8_BLOCK_CNT,
     UTF8_BLOCK_START,
 )
-from crates.model.constants import LAMBDA_0
+from crates.model.constants import LAMBDA_0, Z4_ANCHOR_K
 
 
 @dataclass
@@ -432,6 +432,23 @@ class HybridPCNet(nn.Module):
         self.register_buffer("_audit_f_total", torch.zeros(1, dtype=torch.float16), persistent=False)
         self.register_buffer("_audit_ems_rms", torch.zeros(1, dtype=torch.float16), persistent=False)
         self.register_buffer("_audit_ems_norm_rms", torch.zeros(1, dtype=torch.float16), persistent=False)
+
+        # L4 持久状态 (z4_state 通路): anchors 冻结自离线轨迹, s 跨窗持久.
+        # 默认关; load_z4_anchors() 载入锚点并启用, 未启用时前向图不含该节点.
+        self.register_buffer("_z4_s", torch.zeros(d["l4"], dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_anchors", torch.zeros(Z4_ANCHOR_K, d["l4"], dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_s_init", torch.zeros(1, dtype=torch.int32), persistent=False)
+        self.register_buffer("_z4_bar", torch.zeros(d["l4"], dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_diff", torch.zeros(Z4_ANCHOR_K, d["l4"], dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_d2", torch.zeros(Z4_ANCHOR_K, dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_max", torch.zeros((), dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_arg", torch.zeros((), dtype=torch.long), persistent=False)
+        self.register_buffer("_z4_den", torch.zeros((), dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_mix", torch.zeros(d["l4"], dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_scratch", torch.zeros(d["l4"], dtype=torch.float16), persistent=False)
+        self.register_buffer("_z4_first", torch.zeros(1, dtype=torch.bool), persistent=False)
+        self.register_buffer("_z4_raw_bar", torch.zeros(d["l4"], dtype=torch.float16), persistent=False)
+        self._z4_state_on = False
         self.register_buffer("_audit_vec_base_rms", torch.zeros(1, dtype=torch.float16), persistent=False)
         self.register_buffer("_audit_vec_ms_rms", torch.zeros(1, dtype=torch.float16), persistent=False)
         self.register_buffer("_audit_dw04_base", torch.zeros(1, dtype=torch.float16), persistent=False)
@@ -714,6 +731,22 @@ class HybridPCNet(nn.Module):
     def _predict(self, byte_ids: torch.Tensor, store_state: bool = True, is_inference: bool = False) -> dict:
         """核心前馈: 感知 (L0→L6) + 去相关 + 增量预测."""
         return self.forward_engine._predict(byte_ids, store_state=store_state, is_inference=is_inference)
+
+    def load_z4_anchors(self, anchors: torch.Tensor) -> None:
+        """冻结 L4 持久状态锚点库 [K, active l4] 并启用 s 通路; s 从下一步重新起账."""
+        a = anchors.detach().to(device=self._z4_anchors.device, dtype=torch.float16)
+        if a.shape != self._z4_anchors.shape:
+            raise ValueError(
+                f"anchors shape {tuple(a.shape)} != {tuple(self._z4_anchors.shape)} "
+                f"(active l4 = {self.active_size['l4']})"
+            )
+        with torch.no_grad():
+            self._z4_anchors.copy_(a)
+            self._z4_s.zero_()
+            self._z4_s_init.zero_()
+            self._z4_raw_bar.zero_()
+        self._z4_state_on = True
+        self.forward_engine._graphs.clear()
 
     def learn(self, byte_ids: torch.Tensor | None = None, closed_loop: bool = False, free_run: bool = False,
               force_perception: bool = False) -> dict:

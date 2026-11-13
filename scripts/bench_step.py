@@ -20,9 +20,9 @@ import torch
 from _probe_meta import config_meta
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from dataset import ByteDataset
-from crates.model import DensePCNet
 from crates.cli.utils import run_file
+from crates.utils.codec import ByteDataset
+from crates.model import HybridPCNet
 
 SEED_N = 16
 
@@ -95,7 +95,7 @@ def main() -> None:
 
     torch.set_grad_enabled(False)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    net = DensePCNet.load(args.ckpt).to(dev)
+    net = HybridPCNet.load(args.ckpt).to(dev)
     ds = ByteDataset(args.data, max_length=args.max_length, max_samples=1270000, lazy=True)
 
     def fresh() -> torch.Tensor:

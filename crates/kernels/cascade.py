@@ -143,3 +143,62 @@ def nov_advance(zslow: torch.Tensor, z4: torch.Tensor, t: int) -> None:
 def nov_read(z4: torch.Tensor, zslow: torch.Tensor) -> torch.Tensor:
     """快慢散度逐帧新奇度."""
     return ((z4 - zslow).square().mean(dim=-1)).detach()
+
+
+def z4_state(
+    z4: torch.Tensor,
+    s: torch.Tensor,
+    anchors: torch.Tensor,
+    s_init: torch.Tensor,
+    bar: torch.Tensor,
+    diff: torch.Tensor,
+    d2: torch.Tensor,
+    maxv: torch.Tensor,
+    arg: torch.Tensor,
+    den: torch.Tensor,
+    mix: torch.Tensor,
+    scratch: torch.Tensor,
+    first: torch.Tensor,
+    raw_bar: torch.Tensor,
+    eta: float,
+    pull: float,
+    temp: float,
+) -> torch.Tensor:
+    """持久 L4 状态: 池化 EMA + 冻结锚点 softmax 拉回, 下游用 s 替换窗均值."""
+    torch.mean(z4, dim=(0, 1), out=bar)
+    raw_bar.copy_(bar)
+    torch.eq(s_init, 0, out=first)
+    torch.sub(bar, s, out=scratch)
+    scratch.mul_(eta)
+    s.add_(scratch)
+    torch.where(first, bar, s, out=s)
+    s_init[0] = 1
+    torch.sub(anchors, s.unsqueeze(0), out=diff)
+    torch.mul(diff, diff, out=diff)
+    torch.sum(diff, dim=-1, out=d2)
+    d2.div_(temp).neg_()
+    torch.max(d2, dim=0, out=(maxv, arg))
+    d2.sub_(maxv).exp_()
+    torch.sum(d2, dim=0, out=den)
+    d2.div_(den)
+    torch.mv(anchors.t(), d2, out=mix)
+    torch.sub(mix, s, out=scratch)
+    scratch.mul_(pull)
+    s.add_(scratch)
+    used = torch.sub(z4, bar)
+    used.add_(s)
+    return used
+
+
+def z4_state_read(
+    z4: torch.Tensor,
+    s: torch.Tensor,
+    bar: torch.Tensor,
+    raw_bar: torch.Tensor,
+) -> torch.Tensor:
+    """持久 L4 状态只读变体: 记录窗均值但不推进 s, 下游用 s 替换窗均值."""
+    torch.mean(z4, dim=(0, 1), out=bar)
+    raw_bar.copy_(bar)
+    used = torch.sub(z4, bar)
+    used.add_(s)
+    return used

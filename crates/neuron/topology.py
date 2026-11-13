@@ -174,7 +174,10 @@ class PruningEngine:
                 if name in net._parameters:  # b_diff 等是 nn.Parameter
                     setattr(net, name, nn.Parameter(new.contiguous()))
                 else:
-                    net.register_buffer(name, new.contiguous())
+                    net.register_buffer(
+                        name, new.contiguous(),
+                        persistent=name not in net._non_persistent_buffers_set,
+                    )
         if layer in net._stp_r_end:  # STP 资源窗口写回 (dict, 非 buffer)
             old_r = net._stp_r_end[layer]
             if perm is not None and old_r.shape[0] == perm.numel():
@@ -195,6 +198,12 @@ class PruningEngine:
             + [head + i * a4p + perm for i in range(K)]
         )
         net.W1.data = net.W1.data[idx].contiguous()
+        # 迁移扩 h 通道: W1_new 行 / B_new 列 与 W1 同 idx 重排 (漏 → 与 W1 布局错位, 静默语义错位)
+        if getattr(net, "_migrate_expand", False) and hasattr(net, "W1_new"):
+            net.W1_new.data = net.W1_new.data[idx].contiguous()
+            old_bn = net.B_new.data
+            net.B_new = nn.Parameter(old_bn[:, idx].contiguous())
+            del old_bn
         """
         W1_elig 迹必须与 W1 行同 idx 重排
         否则迹留在原始行序, 与 W1 布局错位 → W1 解冻下每步把迹注入错误行
@@ -409,6 +418,23 @@ class PruningEngine:
             old_ew1 = net.W1_elig.data
             net.register_buffer("W1_elig", _gather_w1(old_ew1))
             del old_ew1
+            # 迁移扩 h 通道: W1_new 行 / B_new 列 与 W1 同结构 gather (漏 → 静默语义错位)
+            if getattr(net, "_migrate_expand", False) and hasattr(net, "W1_new"):
+                old_w1n = net.W1_new.data
+                net.W1_new = nn.Parameter(_gather_w1(old_w1n))
+                del old_w1n
+                if hasattr(net, "B_new"):
+
+                    def _gather_w1_cols(old: torch.Tensor) -> torch.Tensor:
+                        return torch.cat(
+                            [old[:, :a4_new], old[:, a4p : a4p + n_bind]]
+                            + [old[:, head + i * a4p : head + i * a4p + a4_new] for i in range(k_new)],
+                            dim=1,
+                        ).contiguous()
+
+                    old_bn = net.B_new.data
+                    net.B_new = nn.Parameter(_gather_w1_cols(old_bn))
+                    del old_bn
             net._lm_in = net.W1.shape[0]  # zh 列数 = W1 行数 (虚不变式, 喂 _mem_out 守卫)
             old_mm = net._mem_m.data
             net.register_buffer("_mem_m", old_mm[:, : net.active_size["l4"]].contiguous())  # 单元状态列
@@ -452,8 +478,19 @@ class PruningEngine:
         for name, want in (("_dw_slot", (None, a4, a4)),
                            ("_z4_fut_buf", (None, None, a4)),
                            ("_z5_fut_buf", (None, None, a5)),
-                           ("_theta_w04", (a4,))):
+                           ("_theta_w04", (a4,)),
+                           ("_z4_s", (a4,)),
+                           ("_z4_bar", (a4,)),
+                           ("_z4_mix", (a4,)),
+                           ("_z4_scratch", (a4,)),
+                           ("_z4_raw_bar", (a4,)),
+                           ("_z4_anchors", (None, a4)),
+                           ("_z4_diff", (None, a4))):
             buf = getattr(net, name)
             target = tuple(s if s is not None else b for s, b in zip(want, buf.shape))
             if buf.shape != target:
-                net.register_buffer(name, buf[tuple(slice(0, w) for w in target)].contiguous())
+                net.register_buffer(
+                    name,
+                    buf[tuple(slice(0, w) for w in target)].contiguous(),
+                    persistent=name not in net._non_persistent_buffers_set,
+                )

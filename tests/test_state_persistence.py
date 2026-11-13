@@ -384,6 +384,19 @@ def test_apply_keeps_buffer_alias_on_device():
     assert net._survival_signal.device == net._zero1.device
 
 
+def test_z4_state_inference_keeps_s():
+    """推理/生成前向只读 s; 训练窗前向才推进."""
+    net = HybridPCNet(_cfg())
+    anchors = torch.randn(64, net.active_size["l4"], dtype=torch.float16)
+    net.load_z4_anchors(anchors)
+    s0 = net._z4_s.clone()
+    with torch.no_grad():
+        net.forward_engine.forward(BATCH)
+        assert torch.equal(net._z4_s, s0)
+        net.forward_engine._predict(BATCH, store_state=True, is_inference=False)
+        assert not torch.equal(net._z4_s, s0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="复现跨设备首步需 CUDA")
 def test_first_learn_after_cuda_move():
     """

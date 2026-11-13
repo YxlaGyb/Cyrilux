@@ -12,7 +12,7 @@ import time
 
 import torch
 
-from crates.model import DensePCNet
+from crates.model import HybridPCNet
 
 torch.set_grad_enabled(False)
 
@@ -20,7 +20,7 @@ torch.set_grad_enabled(False)
 def load_model(path):
     t0 = time.perf_counter()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = DensePCNet.load(path).to(dev)
+    net = HybridPCNet.load(path).to(dev)
     cfg = net.cfg
     elapsed = time.perf_counter() - t0
     d = cfg.dims()
@@ -50,7 +50,7 @@ def test_free_energy(net, texts=None):
     for text in texts:
         bv = _byte_tensor(text, dev)
         out = net(bv)
-        results[text[:20]] = net._z5[0, -1].float().clone()
+        results[text[:20]] = net._z5[0, -1].clone()
         print(f"    {text[:30]:32s}  FE={float(out['free_energy']):.4f}  rpe={float(out['rpe']):.4f}")
     # cos(z5) 分化
     keys = list(results.keys())

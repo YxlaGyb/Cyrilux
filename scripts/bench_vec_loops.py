@@ -1,4 +1,4 @@
-"""两个线性递推循环: 原 Python 循环 vs 分块前缀扫描 — 全 fp16 (FP16 死令, 无 fp32/fp64 对照路).
+"""两个线性递推循环: 原 Python 循环 vs 分块前缀扫描 — 全 fp16 (FP16 死令, 无高位浮点对照路).
 
 实测: 耗时 / 派发数 / 两 fp16 实现间 max|Δ| 与非有限计数 (互为参照).
 m[t]     = (1-α)·m[t-1] + α·z4[t]        α = net._mem_a
@@ -24,8 +24,8 @@ import torch
 from _probe_meta import config_meta
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from crates.model import DensePCNet
 from crates.cli.utils import run_file
+from crates.model import HybridPCNet
 
 CHUNK = 8  # 块长: d^{-C} 须落在 fp16 值域 (α=0.5 → 256; α=0.75 → 65536 临界)
 
@@ -146,7 +146,7 @@ def main() -> None:
     args.out = args.out or run_file("bench_vec_loops.json")
 
     torch.set_grad_enabled(False)
-    net = DensePCNet.load(args.ckpt).to("cuda")
+    net = HybridPCNet.load(args.ckpt).to("cuda")
     x = torch.randint(0, 256, (1, 256), device="cuda", dtype=torch.long)
     net.forward_engine.forward(x)
 

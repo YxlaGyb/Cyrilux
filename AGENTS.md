@@ -1,10 +1,14 @@
 # AGENTS.md
 
+Limit the amount of comments you put in the code to a strict minimum. You should almost never add comments, except sometimes on non-trivial code, function definitions if the arguments aren't self-explanatory, and class definitions and their members.
+
+Do not remove existing comments unless they are directly related to what you are changing.
+
+If you see a good first bug that isn't directly related to your work, don't hesitate to propose it as a good first bug
+
+It is not advisable to run `rg` or `grep` commands blindly without specifying the directory scope for the search. If you must perform a local text search via the shell, it is recommended to use `rg`, which is faster than `grep`.
+
 Cyrilux is a project based on the concepts of the primal cause of life and self-organization; please read [@docs/architecture.md](docs/architecture.md) before making any modifications.
-
-## Repository layout
-
-## Commands
 
 ## Host sandbox failures
 
@@ -13,8 +17,6 @@ If a required gh, pnpm, build, test, or generator command fails because the sand
 ## Conventions
 
  - Explicit is better than implicit; layered decoupling; composition over inheritance; no enforcement, but extension points are provided; there is no monolithic Trainer, but extension mechanisms such as hooks, FX, and distributed support are available.
- - No comments in code. Write one only where the logic is genuinely hard to follow, never to restate what the code already says.
- - New architecture = delete the old architecture: when adding a new pattern/architecture, remove the corresponding old code and never keep if-else branches coexisting; always ask before acting: any decision involving architecture replacement must be confirmed with the user first; make no additions and no half-measures: do one thing at a time, do it thoroughly and cleanly, and leave no backdoors.
  - **FP16 Ironclad Mandate:** this project forever uses only fp16 or lower precision; model weights, activations, gradients, Hebbian updates, and all tensors must remain fp16; never write `.float()` in any function, never convert to fp32 in the training loop, and never discuss whether to switch to fp32—that option does not exist; core principle: numerical instability is sophistry—biological brains do not have such large values or overflow.
  - **FP16 Numerical Stability Guidelines:** core ban: never use clamp to solve fp16 overflow—clamp is brute force, destroys gradient information, and masks root causes; correct approach: structured methods such as pre-norm (RMSNorm/LayerNorm), weight scaling, and gradient clipping; allowed clamp: `loss.clamp(max=100.0)` only before logging and without affecting gradients; no tensor involved in gradients may be clamped; alternatives: if activations are too large → downstream projection overflow, do not `x.clamp(-N, N)`, instead add RMSNorm before projection; if projection output overflows, multiply the output by scaling factor `1/√H`; if weights grow uncontrollably, inspect the Hebbian update rule/Oja term.
  - Numerical instability is sophistry; biological brains do not have such large values or overflow.

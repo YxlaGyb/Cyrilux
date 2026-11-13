@@ -22,8 +22,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 sys.path.insert(0, ROOT)
 
-from dataset import ByteDataset  # noqa: E402
 from crates.cli.utils import run_file  # noqa: E402
+from crates.utils.codec import ByteDataset  # noqa: E402
 
 
 def _stats_of_line(raw_line: bytes, max_seq_len: int) -> tuple[str, int | None]:

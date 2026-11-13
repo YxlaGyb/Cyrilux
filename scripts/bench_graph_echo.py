@@ -21,9 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from _probe_meta import config_meta
 
-from dataset import ByteDataset
-from crates.model import DensePCNet
 from crates.cli.utils import run_file
+from crates.utils.codec import ByteDataset
+from crates.model import HybridPCNet
 
 SEED_N = 16
 
@@ -72,7 +72,7 @@ def main() -> None:
 
     torch.set_grad_enabled(False)
     dev = "cuda"
-    net = DensePCNet.load(args.ckpt).to(dev)
+    net = HybridPCNet.load(args.ckpt).to(dev)
     ds = ByteDataset(args.data, max_length=args.max_length, max_samples=1270000, lazy=True)
 
     seed_t = ds[101][-SEED_N:].unsqueeze(0).to(dev).contiguous()
@@ -106,7 +106,7 @@ def main() -> None:
         def _cmp(a, b):
             row = {"shapes_match": list(a.shape) == list(b.shape)}
             if row["shapes_match"]:
-                d = (a.float() - b.float()).abs()
+                d = (a - b).abs()
                 row["exact_equal"] = bool(torch.equal(a, b))
                 row["max_abs_diff"] = float(d.max().item())
                 row["n_diff_elem"] = int((d > 0).sum().item())
@@ -181,7 +181,7 @@ def main() -> None:
         torch.manual_seed(0); torch.cuda.manual_seed_all(0)
         out_g = _snap(landed(seed_t, n_gen, temperature=net._gen_temp, rep_backstop=False))
         rep["landed_vs_eager_exact"] = bool(torch.equal(out_e, out_g))
-        rep["landed_vs_eager_max_abs_diff"] = float((out_e.float() - out_g.float()).abs().max().item())
+        rep["landed_vs_eager_max_abs_diff"] = float((out_e - out_g).abs().max().item())
         print(json.dumps({k: rep[k] for k in ("eager_step_s", "eager_cont_s", "capture_wall_s",
                                               "replay_cont_s", "landed_capture_wall_s", "graph_step_s",
                                               "step_speedup", "landed_vs_eager_exact",

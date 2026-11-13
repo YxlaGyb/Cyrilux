@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 from redline import scan_model_sources
 
-from crates.model import DensePCNet
+from crates.model import HybridPCNet
 from crates.utils.outver import ensure_run_dir
 
 torch.set_grad_enabled(False)
@@ -37,11 +37,30 @@ def _latest(pattern: str) -> Path | None:
     return hits[-1] if hits else None
 
 
+_CKPT_PATTERNS = (
+    "*/migrated/exp115_say.safetensors",
+    "*/migrated/e9*.safetensors",
+    "*/migrated/*.safetensors",
+    "*/*.safetensors",
+)
+
+
+def _loadable(path: Path) -> bool:
+    """口径化石判定: 旧架构 ckpt 缺 CoreBrain 状态键, 本闸只接受当前口径可加载的."""
+    try:
+        HybridPCNet.load(str(path))
+    except Exception:
+        return False
+    return True
+
+
 def _resolve_ckpt() -> str:
-    p = _latest("*/migrated/exp115_say.safetensors")
-    if p is None:
-        raise FileNotFoundError("out/*/migrated/exp115_say.safetensors 不存在 — 先跑 scripts/migrate_ckpt.py")
-    return str(p)
+    for pat in _CKPT_PATTERNS:
+        hits = sorted(OUT.glob(pat), key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in hits:
+            if _loadable(p):
+                return str(p)
+    raise FileNotFoundError("out/ 下无当前口径可加载的 ckpt — 先跑训练或 scripts/migrate_ckpt.py")
 
 
 def _resolve_baseline() -> str:
@@ -52,8 +71,6 @@ def _resolve_baseline() -> str:
     return str(p)
 
 
-CKPT = _resolve_ckpt()
-BASELINE = _resolve_baseline()
 FIXED_PROMPT = "春"
 FIXED_N = 64
 SEED = 117
@@ -96,7 +113,7 @@ def _gen_signature(net, prompt: str, n: int, dev) -> dict:
 def _learn_signature(net, steps: int, dev) -> dict:
     """CPU 固定步纯感知 learn → 关键 W 增量 SHA256 (learn 数值锚).
 
-    learn(byte_ids, closed_loop=False, free_run=False) 纯前向+Hebbian,
+    learn(byte_ids, closed_loop=False, free_run=False) 纯前向+局部更新,
     固定 seed 随机输入, 无采样随机 — fp16 CPU 逐位可复现. 哈希各 W 的
     增量(终态 - 初态), 改名/改序若动数值, 增量哈希必变.
     """
@@ -106,13 +123,13 @@ def _learn_signature(net, steps: int, dev) -> dict:
     def wget(n):
         return getattr(net, n).data  # 权重是 nn.Parameter/Buffer, 走 getattr 而非 __dict__
 
-    base = {w: wget(w).float().detach().cpu().clone() for w in LEARN_W}
+    base = {w: wget(w).detach().cpu().clone() for w in LEARN_W}
     for _ in range(steps):
         x = torch.randint(0, 256, (1, 8), dtype=torch.long, device=dev)
         net.learn(x, closed_loop=False, free_run=False)
     h = hashlib.sha256()
     for w in LEARN_W:
-        delta = (wget(w).float().cpu() - base[w]).detach()
+        delta = (wget(w).cpu() - base[w]).detach()
         h.update(delta.contiguous().view(-1).numpy().tobytes())
     return {"learn_steps": steps, "sha256": h.hexdigest()}
 
@@ -129,8 +146,8 @@ def _redline_scan() -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=CKPT)
-    ap.add_argument("--baseline", default=BASELINE)
+    ap.add_argument("--ckpt", default=None)
+    ap.add_argument("--baseline", default=None)
     ap.add_argument("--prompt", default=FIXED_PROMPT)
     ap.add_argument("--n", type=int, default=FIXED_N)
     ap.add_argument("--learn-steps", type=int, default=LEARN_STEPS)
@@ -139,8 +156,10 @@ def main() -> int:
     ap.add_argument("--no-pytest", action="store_true")
     args = ap.parse_args()
 
+    ckpt = args.ckpt or _resolve_ckpt()
+    baseline = args.baseline or _resolve_baseline()
     dev = torch.device(args.device)
-    net = DensePCNet.load(args.ckpt).to(dev)
+    net = HybridPCNet.load(ckpt).to(dev)
     sig = _gen_signature(net, args.prompt, args.n, dev)
     lsig = None if args.no_learn else _learn_signature(net, args.learn_steps, dev)
     rsig = _redline_scan()
@@ -149,10 +168,10 @@ def main() -> int:
     if not args.no_pytest:
         pytest_out = _run_pytest()
 
-    if not os.path.exists(args.baseline):
+    if not os.path.exists(baseline):
         doc = {
             "anchored_at": {
-                "ckpt": args.ckpt,
+                "ckpt": ckpt,
                 "prompt": args.prompt,
                 "n": args.n,
                 "learn_steps": args.learn_steps,
@@ -163,9 +182,9 @@ def main() -> int:
             "learn_golden": lsig,
             "redline": rsig,
         }
-        with open(args.baseline, "w", encoding="utf-8") as f:
+        with open(baseline, "w", encoding="utf-8") as f:
             json.dump(doc, f, ensure_ascii=False, indent=2)
-        print(f"[arch_guard] 列表锚定: {args.baseline}")
+        print(f"[arch_guard] 列表锚定: {baseline}")
         print(f"  generate: n_bytes={sig['n_bytes']} sha256={sig['sha256']}")
         print(f"  decoded={sig['decoded']!r}")
         if lsig is not None:
@@ -176,8 +195,16 @@ def main() -> int:
         print("[arch_guard] 锚定成功 (本闸首跑). 后续每轮重跑本闸做逐位对照.")
         return 0
 
-    with open(args.baseline, encoding="utf-8") as f:
+    with open(baseline, encoding="utf-8") as f:
         doc = json.load(f)
+    anchor_ckpt = doc["anchored_at"]["ckpt"]
+    if os.path.normcase(os.path.abspath(anchor_ckpt)) != os.path.normcase(os.path.abspath(ckpt)):
+        print(
+            f"[arch_guard] FAIL — 对照 ckpt 与锚定不同 (锚定 {anchor_ckpt} / 本次 {ckpt}); "
+            "逐位对照只有在同一 ckpt 上才有意义.",
+            file=sys.stderr,
+        )
+        return 1
     g = doc["golden"]
     ok = (
         sig["n_bytes"] == g["n_bytes"]

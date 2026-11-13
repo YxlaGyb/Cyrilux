@@ -59,9 +59,11 @@ from crates.kernels import (
     seq_diff,
     unit_norm,
     zero_input,
+    z4_state,
+    z4_state_read,
 )
 from crates.modal.text.geometry import ALPHABET
-from crates.model.constants import RHO_TARGET
+from crates.model.constants import RHO_TARGET, Z4_STATE_ETA, Z4_STATE_PULL, Z4_STATE_TEMP
 from crates.neuron import survival_mask
 
 if TYPE_CHECKING:
@@ -166,13 +168,35 @@ def declare(
     add("l4_compete", compete, ("z4_r", "mask_l4", "k_l4", "M_x4_a", "lam_l4", "g_l4"), ("z4", "C4"))
     add("l4_rate", rate_ema, ("r_l4_a", "C4", "rate_decay"), ("r_l4_step",))
     add("l4_bind", bind, ("C4", "mask_l4"), ("P_l4",))
-    z4_used = "z4"
+    z4_base = "z4"
+    if net._z4_state_on:
+        if not is_inference:
+            add(
+                "l4_state",
+                z4_state,
+                (
+                    "z4", "z4_s", "z4_anchors", "z4_s_init", "z4_bar", "z4_diff", "z4_d2",
+                    "z4_max", "z4_arg", "z4_den", "z4_mix", "z4_scratch", "z4_first",
+                    "z4_raw_bar", "z4_eta", "z4_pull", "z4_temp",
+                ),
+                ("z4_used",),
+            )
+        else:
+            add(
+                "l4_state",
+                z4_state_read,
+                ("z4", "z4_s", "z4_bar", "z4_raw_bar"),
+                ("z4_used",),
+            )
+        z4_base = "z4_used"
     if not free_run:
         add("valid_pos", nonzero_mask, ("byte_ids",), ("valid_pos",))
-        add("core_brain", net._core_brain.forward, ("z4", "valid_pos"), ("core_delta",))
-        add("z4_core", add_unsqueezed, ("z4", "core_delta"), ("z4_core",))
-        z4_used = "z4_core"
-    add("z4_norm", l2_norm, (z4_used,), ("z4_n",))
+        add("core_brain", net._core_brain.forward, (z4_base, "valid_pos"), ("core_delta",))
+        add("z4_core", add_unsqueezed, (z4_base, "core_delta"), ("z4_core",))
+        z4_norm_in = "z4_core"
+    else:
+        z4_norm_in = z4_base
+    add("z4_norm", l2_norm, (z4_norm_in,), ("z4_n",))
 
     add("mu2_project", project, ("z4_n", "W_42_a", "b_l2"), ("mu2",))
     mu2_used = "mu2"
@@ -235,9 +259,9 @@ def declare(
     add("l6_rate", rate_ema, ("r_l6_a", "C6", "rate_decay"), ("r_l6_step",))
     add("l6_bind", bind, ("C6", "mask_l6"), ("P_l6",))
 
-    add("dz4_diff", seq_diff, ("z4",), ("dz4",))
+    add("dz4_diff", seq_diff, (z4_base,), ("dz4",))
     add("dz4_norm", unit_norm, ("dz4",), ("dz4_n",))
-    add("z4_prev", drop_last, ("z4",), ("z4_prev",))
+    add("z4_prev", drop_last, (z4_base,), ("z4_prev",))
     add("z4_prev_norm", unit_norm, ("z4_prev",), ("z4_prev_n",))
     add("z4_prev_pad", prepend_pad, ("z4_prev_n", "padmax", "dim_4"), ("z4_prev_pad",))
     add("b_diff_3d", bias_3d, ("b_diff_a",), ("b_diff_3d",))
@@ -258,19 +282,19 @@ def declare(
 
     if store_state:
         if free_run:
-            add("stp_writeback", engine._stp_writeback, ("stp_end", "z4", "z2", "z3", "z6"), ("stp_step",))
+            add("stp_writeback", engine._stp_writeback, ("stp_end", z4_base, "z2", "z3", "z6"), ("stp_step",))
         add("mem_reset", mem_reset, ("mem_seq", "mem_m", "n_batch"), ("mem_step_0",))
         for t in range(1, s_len):
-            add(f"mem_t{t}", mem_advance, ("mem_seq", "z4", f"t_{t}", "mem_a"), (f"mem_step_{t}",))
-        add("mem_read", mem_read, ("mem_seq", "z4", "kk"), ("mem_out",))
+            add(f"mem_t{t}", mem_advance, ("mem_seq", z4_base, f"t_{t}", "mem_a"), (f"mem_step_{t}",))
+        add("mem_read", mem_read, ("mem_seq", z4_base, "kk"), ("mem_out",))
         add("mem_last", mem_last, ("mem_seq",), ("mem_last",))
-        add("nov_reset", nov_reset, ("z4",), ("zslow",))
+        add("nov_reset", nov_reset, (z4_base,), ("zslow",))
         for t in range(1, s_len):
-            add(f"nov_t{t}", nov_advance, ("zslow", "z4", f"t_{t}"), (f"nov_step_{t}",))
-        add("nov_read", nov_read, ("z4", "zslow"), ("nov_out",))
+            add(f"nov_t{t}", nov_advance, ("zslow", z4_base, f"t_{t}"), (f"nov_step_{t}",))
+        add("nov_read", nov_read, (z4_base, "zslow"), ("nov_out",))
         writes += [
             ("z0", "_z0"),
-            ("z4", "_z4"),
+            (z4_base, "_z4"),
             ("z2", "_z2"),
             ("z3", "_z3"),
             ("z5_c", "_z5"),
@@ -281,7 +305,7 @@ def declare(
             ("nov_out", "_novelty"),
         ]
 
-    add("bind_slots", engine._bind, ("z4", "vf" if free_run else "none_vf"), ("bind_raw", "bind_vec", "intent_pot"))
+    add("bind_slots", engine._bind, (z4_base, "vf" if free_run else "none_vf"), ("bind_raw", "bind_vec", "intent_pot"))
 
     graph = Graph(
         name="predict",
@@ -315,6 +339,9 @@ def _inputs(s_len: int, *, free_run: bool) -> tuple[str, ...]:
         "amp_f", "amp_m", "amp_s",
         "mem_m", "mem_a", "mem_m_seq", "kk", "k_mem", "a_mem",
         "nov", "none_vf", "none_l5", "lam_zero",
+        "z4_s", "z4_anchors", "z4_s_init", "z4_bar", "z4_diff", "z4_d2",
+        "z4_max", "z4_arg", "z4_den", "z4_mix", "z4_scratch", "z4_first",
+        "z4_raw_bar", "z4_eta", "z4_pull", "z4_temp",
     ]
     if free_run:
         for layer in _STP_LAYERS:
@@ -343,7 +370,11 @@ class ForwardGraphs:
         self._bank.drop()
 
     def step(
-        self, byte_ids: torch.Tensor | None, *, store_state: bool, is_inference: bool
+        self,
+        byte_ids: torch.Tensor | None,
+        *,
+        store_state: bool,
+        is_inference: bool,
     ) -> tuple[Graph, dict[str, Any]]:
         net = self.net
         free_run = byte_ids is None
@@ -407,6 +438,7 @@ class ForwardGraphs:
             ("free_run", free_run),
             ("l5_inhibition", net.cfg.l5_inhibition),
             ("input_history", net.cfg.input_history),
+            ("z4_state", net._z4_state_on),
             ("generator_variant", None),
             ("dims", tuple(net.active_size[k] for k in _LAYERS)),
             ("K", k_mem),
@@ -518,6 +550,22 @@ class ForwardGraphs:
             "none_vf": None,
             "none_l5": None,
             "lam_zero": 0.0,
+            "z4_s": net._z4_s,
+            "z4_anchors": net._z4_anchors,
+            "z4_s_init": net._z4_s_init,
+            "z4_bar": net._z4_bar,
+            "z4_diff": net._z4_diff,
+            "z4_d2": net._z4_d2,
+            "z4_max": net._z4_max,
+            "z4_arg": net._z4_arg,
+            "z4_den": net._z4_den,
+            "z4_mix": net._z4_mix,
+            "z4_scratch": net._z4_scratch,
+            "z4_first": net._z4_first,
+            "z4_raw_bar": net._z4_raw_bar,
+            "z4_eta": Z4_STATE_ETA,
+            "z4_pull": Z4_STATE_PULL,
+            "z4_temp": Z4_STATE_TEMP,
         }
         for layer in _STP_LAYERS:
             for ch in ("r", "tau", "u"):

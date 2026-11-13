@@ -1,5 +1,5 @@
 ---
-description: "动态神经元机制，主链拓扑修剪与记忆单元群的出生与死亡。"
+description: "动态神经元机制：主链拓扑修剪、记忆单元群的出生与死亡，以及独立的单细胞前向。"
 kind: "package-reference"
 ---
 
@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`crates.neuron` 持有稠密 PPA 的动态神经元机制：主链的拓扑修剪，以及竞争性记忆单元群的出生与死亡。两者都在原地重塑活动网络并重新注册受影响的张量，使每个行映射权重始终与其下游列保持对齐。本 crate 是网络的强制组成部分，不是可选开关。
+`crates.neuron` 持有稠密 PPA 的动态神经元机制：主链的拓扑修剪、竞争性记忆单元群的出生与死亡，以及独立的单细胞前向。重塑引擎在原地工作并重新注册受影响的张量，使每个行映射权重始终与其下游列保持对齐。本 crate 是网络的强制组成部分，不是可选开关。
 
 ## 目录
 
@@ -48,6 +48,13 @@ kind: "package-reference"
 | `mem_pool.birth(parent)` | 出生 | 从父单元二分出子单元，并尾插一个零 `W1` 块。 |
 | `mem_pool.resize(keep)` | 重索引 | 为新的 K 重新注册单元缓冲以及 `W1`/`W1_elig` 行。 |
 
+单细胞。`Cell` 独立存在：自带权重与掩码，不挂接网络。
+
+| 导出 | 形状 | 含义 |
+|---|---|---|
+| `Cell(d, h, n)` | 细胞 | 单细胞前向：`a = sigmoid(x @ W1.T)`，`y = (a * alive) @ W2.T`。`W1` 为 `(h, d)`，`W2` 为 `(n, h)`，`h` 取 128 的倍数，`alive` 是逐隐藏单元的 0/1 fp16 掩码。 |
+| `cell.update_alive(x, m)` | 每步 | 收入死亡：收入为 `abs(m) * sum(abs(W2)) * mean(a * alive)`，按 `income_decay` 平滑；连续 `death_steps` 步低于种群均值 `income_floor` 倍的单元永久置 0。默认 `income_floor=0.2`、`death_steps=200`、`income_decay=0.99`。 |
+
 -----
 
 <a id="understand-the-implementation"></a>
@@ -60,6 +67,8 @@ kind: "package-reference"
 成员资格由生存账本定价，而不是由字节损失定价。单元的收入是生存残差的模长与"单元记忆同账本状态方向 `ẑ` 之间的余弦"之积，以慢速 `_mem_q` EMA 平滑。增益有界，完全没有收入的单元会把 `g` 推向零。当 `g` 低于 `mem_g_min` 持续 `mem_death_steps` 步时触发死亡；当误差快 EMA 超过慢 EMA 的 `mem_birth_thresh` 倍且冷却期满时触发出生。索引 0 免疫死亡，`mem_k_max` 限制增长。
 
 饥荒击杀是代谢死亡回合的直接损失：它立即移除增益最低的单元，该内容与身份永久消失。之后的出生从存活父单元克隆出新单元，因此 K 可以回弹；不可逆性体现在只减不增的 `active_size` 上。
+
+`Cell` 用细胞内宽度取代整细胞单阈值：每个隐藏单元各自拐弯，存活的单元再汇总回 `n` 个输出。`alive` 与隐藏激活相乘，死亡单元贡献精确为零，matmul 形状不变且保持稠密。`update_alive(x, m)` 以 `abs(m) * sum(abs(W2)) * mean(a * alive)` 为每个隐藏单元定价，平滑该收入，并把连续 `death_steps` 步低于种群均值 `income_floor` 倍的单元永久置 0。该细胞不携带学习规则；任何权重更新都由 `crates.rtr` 原样驱动。
 
 -----
 
